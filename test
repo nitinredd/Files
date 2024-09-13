@@ -1,1 +1,187 @@
-test
+import streamlit as st
+import PyPDF2
+import io
+from transformers import GPT2TokenizerFast
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chat_models import ChatOpenAI
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+import pdfplumber
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import Table, TableStyle
+from reportlab.lib import colors
+import time
+
+# Initialize OpenAI API
+import os
+from langchain.llms import AzureOpenAI
+
+os.environ["OPENAI_API_KEY"] = "your-api-key-here"
+os.environ["OPENAI_API_TYPE"] = "azure"
+os.environ["OPENAI_API_BASE"] = "your-api-base-url-here"
+os.environ["OPENAI_API_VERSION"] = "2023-05-15"  # Update this to the latest API version
+
+MODEL_NAME = "gpt-4"  # or your specific Azure OpenAI model deployment name
+
+def extract_content_from_pdf(pdf_file):
+    content = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            page_content = []
+            tables = page.extract_tables()
+            if tables:
+                for table in tables:
+                    page_content.append(("table", table))
+            text = page.extract_text()
+            if text:
+                page_content.append(("text", text))
+            content.append(page_content)
+    return content
+
+def chunk_text(text, chunk_size=1000, chunk_overlap=200):
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=lambda x: len(tokenizer.encode(x))
+    )
+    chunks = text_splitter.split_text(text)
+    return chunks
+
+def translate_text(text, source_lang):
+    llm = AzureOpenAI(
+        deployment_name=MODEL_NAME,
+        temperature=0,
+        max_tokens=1024,
+        top_p=1,
+        frequency_penalty=0,
+        presence_penalty=0
+    )
+    prompt = PromptTemplate(
+        input_variables=["text", "source_lang"],
+        template="Translate the following {source_lang} text to English, preserving the original meaning and style:\n\n{text}"
+    )
+    chain = LLMChain(llm=llm, prompt=prompt)
+    result = chain.run(text=text, source_lang=source_lang)
+    return result
+
+def translate_table(table, source_lang):
+    translated_table = []
+    for row in table:
+        translated_row = []
+        for cell in row:
+            if cell:
+                translated_cell = translate_text(cell, source_lang)
+                translated_row.append(translated_cell)
+            else:
+                translated_row.append("")
+        translated_table.append(translated_row)
+    return translated_table
+
+def create_pdf(translated_content):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    y = height - 50
+
+    for page_content in translated_content:
+        for content_type, content in page_content:
+            if content_type == "text":
+                for line in content.split('\n'):
+                    if y < 50:
+                        c.showPage()
+                        y = height - 50
+                    c.drawString(50, y, line)
+                    y -= 15
+            elif content_type == "table":
+                table = Table(content)
+                table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 14),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                    ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 12),
+                    ('TOPPADDING', (0, 1), (-1, -1), 6),
+                    ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
+                ]))
+                if y - table.wrap(width-100, height)[1] < 50:
+                    c.showPage()
+                    y = height - 50
+                table.wrapOn(c, width-100, height)
+                table.drawOn(c, 50, y - table.wrap(width-100, height)[1])
+                y -= table.wrap(width-100, height)[1] + 20
+        c.showPage()
+        y = height - 50
+
+    c.save()
+    buffer.seek(0)
+    return buffer
+
+st.title("PDF Translation App")
+
+uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
+source_lang = st.selectbox("Select source language", ["Chinese", "Japanese"])
+
+if uploaded_file is not None:
+    content = extract_content_from_pdf(uploaded_file)
+    
+    if st.button("Translate"):
+        translated_content = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        translated_text = st.empty()
+        total_pages = len(content)
+        
+        for page_num, page_content in enumerate(content):
+            translated_page = []
+            for content_type, item in page_content:
+                if content_type == "text":
+                    chunks = chunk_text(item)
+                    translated_chunks = []
+                    for chunk in chunks:
+                        translated_chunk = translate_text(chunk, source_lang)
+                        translated_chunks.append(translated_chunk)
+                    translated_page.append(("text", " ".join(translated_chunks)))
+                elif content_type == "table":
+                    translated_table = translate_table(item, source_lang)
+                    translated_page.append(("table", translated_table))
+            
+            translated_content.append(translated_page)
+            
+            # Update progress
+            progress = (page_num + 1) / total_pages
+            progress_bar.progress(progress)
+            status_text.text(f"Translating page {page_num + 1} of {total_pages} ({progress:.0%})")
+            
+            # Display live translation
+            translated_text.subheader(f"Translated Content (Page {page_num + 1})")
+            for content_type, item in translated_page:
+                if content_type == "text":
+                    translated_text.write(item)
+                elif content_type == "table":
+                    translated_text.table(item)
+            
+            # Add a small delay to make the progress visible
+            time.sleep(0.1)
+        
+        status_text.text("Translation completed!")
+        
+        # Only show download button if at least 50% is translated
+        if progress >= 0.5:
+            pdf_buffer = create_pdf(translated_content)
+            st.download_button(
+                label="Download translated PDF",
+                data=pdf_buffer,
+                file_name="translated_document.pdf",
+                mime="application/pdf"
+            )
+        else:
+            st.warning("Translation is less than 50% complete. Please wait for more pages to be translated before downloading.")
