@@ -1,1 +1,133 @@
-error
+import streamlit as st
+import google.generativeai as genai
+import os
+import pdfplumber
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from io import BytesIO
+import re
+
+genai.configure(api_key="") # Configure Google Gemini API
+
+def split_into_paragraphs(text):
+    paragraphs = text.split('\n\n')
+    return [p.strip() for p in paragraphs if p.strip()]
+def chunk_text(text, chunk_size=500):
+    paragraphs = split_into_paragraphs(text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    sentence_endings = re.compile(r'(?<=[.!?]) +')
+
+    for paragraph in paragraphs:
+        sentences = sentence_endings.split(paragraph)
+        for sentence in sentences:
+            # Check if adding this sentence exceeds chunk_size
+            if current_length + len(sentence) > chunk_size:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [sentence]
+                current_length = len(sentence)
+            else:
+                current_chunk.append(sentence)
+                current_length += len(sentence)
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+def translate_text(text, language):
+    model = genai.GenerativeModel("") #model_name
+    if language == "Chinese":
+        prompt = f"Translate the following Chinese text to English. Please provide a comprehensive and accurate translation that captures the original meaning and context. Follow a strictly word-by-word approach, followed by sentences and paragraphs. If there are any tables in the document, retain the table layout AS-IS even after translation. Ensure that the translation flows smoothly and is easy to understand. Stay strictly within the document provided for translation, avoiding any extraneous information or interpretations.:\n\n{text}"
+    elif language == "Japanese":
+        prompt = f"Translate the following Japanese text to English. Please provide a comprehensive and accurate translation that captures the original meaning and context. Follow a strictly word-by-word approach, followed by sentences and paragraphs. If there are any tables in the document, retain the table layout AS-IS even after translation. Ensure that the translation flows smoothly and is easy to understand. Stay strictly within the document provided for translation, avoiding any extraneous information or interpretations.:\n\n{text}"
+    response = model.generate_content(prompt)
+    return response.text
+
+def extract_text_and_tables(pdf_file):
+    text = ""
+    tables = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text()
+            for table in page.extract_tables():
+                bbox = page.bbox
+                tables.append({"data": table, "bbox": bbox})
+    return text, tables
+
+def create_pdf_with_tables(translated_text, tables):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    elements = []
+
+    styles = getSampleStyleSheet()
+    normal_style = styles['Normal']
+    
+    translated_lines = translated_text.split('\n')
+
+    for line in translated_lines:
+        paragraph = Paragraph(line, normal_style)
+        elements.append(paragraph)
+  
+    for table in tables:
+        table_data = table["data"]
+        col_widths = [1.5 * inch for _ in range(len(table_data[0]))]
+        t = Table(table_data, colWidths=col_widths)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), (0.9, 0.9, 0.9)),
+            ('GRID', (0, 0), (-1, -1), 0.5, (0, 0, 0)),
+        ]))
+        elements.append(t)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+st.title("PDF Translator - Chinese & Japanese to English")
+uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+language = st.selectbox("Select language for translation", ["Chinese", "Japanese"])
+if st.button("Submit"):
+    if uploaded_file:
+        try:
+            pdf_text, tables = extract_text_and_tables(uploaded_file)
+          
+            chunks = chunk_text(pdf_text)
+            total_chunks = len(chunks)
+            
+            translated_chunks = []
+            
+            with st.spinner("Translating..."):
+                progress_bar = st.progress(0)
+                
+                live_display = st.empty()
+                
+                for idx, chunk in enumerate(chunks):
+                    translated_chunk = translate_text(chunk, language)
+                    translated_chunks.append(translated_chunk)
+                    
+                    progress_bar.progress((idx + 1) / total_chunks)
+                    
+                    live_display.write(f"**Page {idx + 1} Translation:**\n\n{translated_chunk}")
+                
+                translated_text = "\n\n".join(translated_chunks)
+
+                try:
+                    pdf_output = create_pdf_with_tables(translated_text, tables)
+                    
+                    st.success("Translation completed!")
+                    st.download_button(
+                        label="Download Translated PDF",
+                        data=pdf_output,
+                        file_name="translated_document.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"Error creating PDF: {e}")
+        except Exception as e:
+            st.error(f"Error processing PDF: {e}")
+    else:
+        st.error("Please upload a PDF file.")
