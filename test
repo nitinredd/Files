@@ -1,1 +1,189 @@
-test 
+import streamlit as st
+import google.auth
+import os
+import pdfplumber
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from io import BytesIO
+from langchain_google_vertexai import VertexAI
+import re
+from google.auth import default
+from google.cloud import aiplatform
+import time
+import logging
+import tempfile
+import numpy as np
+from PIL import Image
+from paddleocr import PaddleOCR
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Config:
+    """
+    Contains the configuration of the LLM.
+    """
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "C:/Users/p00095189/Downloads/datascience-254609-genai.json"
+    credentials, project_id = default()
+    llm = VertexAI(model_name="gemini-pro", temperature=0.3)
+
+config = Config()
+
+ocr = PaddleOCR(use_angle_cls=True, lang='ch')
+
+def split_into_paragraphs(text):
+        paragraphs = text.split('\n\n')
+        return [p.strip() for p in paragraphs if p.strip()]
+def chunk_text(text, chunk_size=1500):
+    paragraphs = split_into_paragraphs(text)
+    chunks = []
+    current_chunk = []
+    current_length = 0
+
+    sentence_endings = re.compile(r'(?<=[.!?]) +')
+
+    for paragraph in paragraphs:
+        sentences = sentence_endings.split(paragraph)
+        for sentence in sentences:
+            # Check if adding this sentence exceeds chunk_size
+            if current_length + len(sentence) > chunk_size:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [sentence]
+                current_length = len(sentence)
+            else:
+                current_chunk.append(sentence)
+                current_length += len(sentence)
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+def translate_text(text, language):
+    if language == "Chinese":
+        prompt = f"Translate the following Chinese text to English. Please provide a comprehensive and accurate translation that captures the original meaning and context. Follow a strictly word-by-word approach, followed by sentences and paragraphs. Ensure that the translation flows smoothly and is easy to understand. Stay strictly within the document provided for translation, avoiding any extraneous information or interpretations.:\n\n{text}"
+    elif language == "Japanese":
+        prompt = f"Translate the following Japanese text to English. Please provide a comprehensive and accurate translation that captures the original meaning and context. Follow a strictly word-by-word approach, followed by sentences and paragraphs. If there are any tables in the document, retain the table layout AS-IS even after translation. Ensure that the translation flows smoothly and is easy to understand. Stay strictly within the document provided for translation, avoiding any extraneous information or interpretations.:\n\n{text}"
+    response = config.llm.predict(prompt)
+    return response
+
+def extract_text_from_pdf(pdf_file):
+    text = ""
+    try:
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+            temp_pdf.write(pdf_file.getvalue())
+            temp_pdf_path = temp_pdf.name
+        
+        with pdfplumber.open(temp_pdf_path) as pdf:
+            for page in pdf.pages:
+                
+                img = page.to_image()
+                img_array = np.array(img.original)
+                
+                img_rgb = Image.fromarray(img_array).convert('RGB')
+                
+                ocr_result = ocr.ocr(np.array(img_rgb), cls=True)
+                
+                for line in ocr_result:
+                    text += " ".join([word[1][0] for word in line]) + "\n"
+
+        os.unlink(temp_pdf_path)  
+        
+        logger.info(f"Extracted {len(text)} characters from PDF using OCR")
+        return text
+    except Exception as e:
+        logger.error(f"Error extracting text from PDF using OCR: {str(e)}")
+        st.error(f"Error extracting text from PDF using OCR: {str(e)}")
+        return ""
+
+def extract_text_and_tables(pdf_file):
+    text = ""
+    tables = []
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text()
+            for table in page.extract_tables():
+                bbox = page.bbox
+                tables.append({"data": table, "bbox": bbox})
+    return text, tables
+
+def create_pdf_with_tables(translated_text, tables):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    elements = []
+
+    styles = getSampleStyleSheet()
+    normal_style = styles['Normal']
+    
+    translated_lines = translated_text.split('\n')
+
+    for line in translated_lines:
+        paragraph = Paragraph(line, normal_style)
+        elements.append(paragraph)
+  
+    for table in tables:
+        table_data = table["data"]
+        col_widths = [1.5 * inch for _ in range(len(table_data[0]))]
+        t = Table(table_data, colWidths=col_widths)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), (0.9, 0.9, 0.9)),
+            ('GRID', (0, 0), (-1, -1), 0.5, (0, 0, 0)),
+        ]))
+        elements.append(t)
+
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+st.title("PDF Translator - Chinese & Japanese to English")
+uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+language = st.selectbox("Select language for translation", ["Chinese", "Japanese"])
+if st.button("Submit"):
+   if uploaded_file:
+    
+    with st.spinner('Extracting text from PDF using OCR (this may take a while)...'):
+        pdf_text = extract_text_from_pdf(uploaded_file)
+    
+    if pdf_text:
+        st.info(f"Extracted {len(pdf_text)} characters from the PDF using OCR")
+        
+        
+        st.subheader("Sample of Extracted Text (from OCR)")
+        st.text_area("", value=pdf_text[:500], height=100)
+        
+        
+        chunks = chunk_text(pdf_text)
+        total_chunks = len(chunks)
+        
+        
+        progress_bar = st.progress(0)
+        
+        
+        translated_chunks = []
+        for idx, chunk in enumerate(chunks):
+            with st.spinner(f'Translating chunk {idx+1} of {total_chunks} using LLM...'):
+                translated_chunk = translate_text(chunk, language)
+                translated_chunks.append(translated_chunk)
+            
+            
+            progress_bar.progress((idx + 1) / total_chunks)
+        
+        
+        translated_text = "\n\n".join(translated_chunks)
+        
+        
+        st.subheader("Translated Text (from LLM)")
+        st.text_area("", value=translated_text, height=300)
+        
+    
+        st.download_button(
+            label="Download Translated Text",
+            data=translated_text.encode('utf-8'),
+            file_name="translated_document.pdf",
+            mime="text/plain"
+        )
+    else:
+        st.error("Failed to extract text from the PDF using PaddleOCR. Please check if the file is corrupted or try a different PDF.")
