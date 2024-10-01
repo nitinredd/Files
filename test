@@ -1,1 +1,215 @@
-test
+import streamlit as st
+import cv2
+import numpy as np
+from sklearn.cluster import KMeans
+import matplotlib.pyplot as plt
+from scipy.signal import find_peaks
+import json
+import os
+import tempfile
+import io
+from google.auth import default
+from langchain_google_vertexai import VertexAI
+import google.api_core.exceptions
+from PIL import Image, ImageDraw, ImageFont
+
+# Configuration for VertexAI
+class Config:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "C:/Users/Downloads/filename-254609-genai.json"  # Path to your API file
+    credentials, project_id = default()
+    llm = VertexAI(model_name="gemini-pro", temperature=0.3)
+
+config = Config()
+
+def preprocess_image(image):
+    blurred = cv2.GaussianBlur(image, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                   cv2.THRESH_BINARY, 11, 2)
+    return thresh
+
+def detect_tablets(image):
+    edges = cv2.Canny(image, 50, 150)
+    edge_profile = np.sum(edges, axis=0)
+    peaks, _ = find_peaks(edge_profile, distance=50)
+    return peaks
+
+def analyze_tablet_porosity(image, n_clusters=3):
+    processed_img = preprocess_image(image)
+    tablet_boundaries = detect_tablets(processed_img)
+    
+    results = []
+    
+    for i in range(len(tablet_boundaries) - 1):
+        start, end = tablet_boundaries[i], tablet_boundaries[i+1]
+        tablet = processed_img[:, start:end]
+        
+        tablet_normalized = tablet.astype(float) / 255.0
+        pixel_values = tablet_normalized.reshape((-1, 1))
+        
+        optimal_n_clusters = min(n_clusters, len(np.unique(pixel_values)))
+        
+        kmeans = KMeans(n_clusters=optimal_n_clusters, random_state=42)
+        kmeans.fit(pixel_values)
+        
+        centers = kmeans.cluster_centers_.flatten()
+        sorted_centers = np.sort(centers)
+        
+        labels = ['Porous', 'Intermediate', 'Dense'][:optimal_n_clusters]
+        cluster_map = {i: label for i, label in enumerate(labels)}
+        
+        unique, counts = np.unique(kmeans.labels_, return_counts=True)
+        percentages = dict(zip([cluster_map[i] for i in unique], counts / len(kmeans.labels_) * 100))
+        
+        segmented_tablet = kmeans.labels_.reshape(tablet.shape)
+        
+        results.append({
+            'tablet_index': i,
+            'percentages': percentages,
+            'segmented_image': segmented_tablet.tolist(),
+            'start': int(start),
+            'end': int(end)
+        })
+    
+    return results
+
+def analyze_tablet_data_with_gemini(tablet_data):
+    summary = []
+    for i, tablet in enumerate(tablet_data):
+        summary.append(f"Tablet {i+1}:")
+        for category, percentage in tablet['percentages'].items():
+            summary.append(f"  {category}: {percentage:.2f}%")
+    
+    summary_text = "\n".join(summary)
+    
+    prompt = f"""
+    Analyze the following quantitative data for tablet porosity:
+
+    {summary_text}
+
+    Provide a scientific analysis of:
+    1. Overall porosity trends
+    2. Density variations between tablets
+    3. Potential implications for tablet quality
+    4. Recommendations for further analysis or process improvements
+
+    Format your response as a JSON object with the following structure:
+    {{
+        "overall_trend": "description of overall porosity trend",
+        "density_variations": "description of density variations between tablets",
+        "quality_implications": "potential implications for tablet quality",
+        "recommendations": ["recommendation1", "recommendation2", ...]
+    }}
+
+    Keep your analysis concise and focused on the most significant observations.
+    """
+    
+    try:
+        response = config.llm.predict(prompt)
+        return json.loads(response)
+    except Exception as e:
+        st.error(f"An error occurred during Gemini analysis: {str(e)}")
+        return None
+
+def create_annotated_image(original_image, cv_results, gemini_analysis):
+    # Convert grayscale to RGB if necessary
+    if len(original_image.shape) == 2:
+        original_image = cv2.cvtColor(original_image, cv2.COLOR_GRAY2RGB)
+    
+    # Create a PIL Image from the numpy array
+    pil_image = Image.fromarray(cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_image)
+    
+    # Use a default font
+    font = ImageFont.load_default()
+    
+    # Draw tablet boundaries and porosity percentages
+    for tablet in cv_results:
+        start, end = tablet['start'], tablet['end']
+        draw.line([(start, 0), (start, pil_image.height)], fill="red", width=2)
+        draw.line([(end, 0), (end, pil_image.height)], fill="red", width=2)
+        
+        y_pos = 20
+        for category, percentage in tablet['percentages'].items():
+            text = f"{category}: {percentage:.2f}%"
+            draw.text((start + 5, y_pos), text, fill="red", font=font)
+            y_pos += 20
+    
+    # Add Gemini analysis to the bottom of the image
+    if gemini_analysis:
+        analysis_text = "\n".join([
+            f"Overall Trend: {gemini_analysis['overall_trend']}",
+            f"Density Variations: {gemini_analysis['density_variations']}",
+            f"Quality Implications: {gemini_analysis['quality_implications']}",
+            "Recommendations:",
+            *[f"- {rec}" for rec in gemini_analysis['recommendations']]
+        ])
+        
+        # Calculate text size and position
+        text_width, text_height = draw.multiline_textsize(analysis_text, font=font)
+        text_position = (10, pil_image.height - text_height - 10)
+        
+        # Add a semi-transparent background for text readability
+        draw.rectangle([text_position, (pil_image.width, pil_image.height)], fill=(255, 255, 255, 128))
+        
+        # Draw the text
+        draw.multiline_text(text_position, analysis_text, fill="black", font=font)
+    
+    return pil_image
+
+def main():
+    st.title("Tablet Porosity Analysis App")
+
+    uploaded_file = st.file_uploader("Choose an image file", type=["jpg", "jpeg", "png"])
+
+    if uploaded_file is not None:
+        try:
+            file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+            image = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+
+            st.image(image, caption="Uploaded Image", use_column_width=True)
+
+            if st.button("Analyze Image"):
+                with st.spinner("Performing computer vision analysis..."):
+                    cv_results = analyze_tablet_porosity(image)
+                
+                st.success("Computer vision analysis complete!")
+                st.session_state.cv_results = cv_results
+                st.session_state.original_image = image
+
+                # Display a summary of the CV results
+                for i, tablet in enumerate(cv_results):
+                    st.subheader(f"Tablet {i+1}")
+                    st.write("Porosity Percentages:")
+                    for category, percentage in tablet['percentages'].items():
+                        st.write(f"  {category}: {percentage:.2f}%")
+
+                if st.button("Analyze with Gemini"):
+                    with st.spinner("Processing with Gemini..."):
+                        gemini_analysis = analyze_tablet_data_with_gemini(cv_results)
+                    if gemini_analysis:
+                        st.subheader("Gemini Analysis")
+                        st.json(gemini_analysis)
+
+                        # Create annotated image
+                        annotated_image = create_annotated_image(st.session_state.original_image, cv_results, gemini_analysis)
+                        
+                        # Display the annotated image
+                        st.image(annotated_image, caption="Annotated Analysis", use_column_width=True)
+                        
+                        # Provide download link for the annotated image
+                        buffered = io.BytesIO()
+                        annotated_image.save(buffered, format="JPEG")
+                        st.download_button(
+                            label="Download Annotated Image",
+                            data=buffered.getvalue(),
+                            file_name="annotated_tablet_analysis.jpg",
+                            mime="image/jpeg"
+                        )
+                    else:
+                        st.warning("Gemini analysis failed. Please check the error message above.")
+
+        except Exception as e:
+            st.error(f"An error occurred during analysis: {str(e)}")
+
+if __name__ == "__main__":
+    main()
