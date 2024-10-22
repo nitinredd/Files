@@ -20,25 +20,37 @@ credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-pro-vision")
 
 def get_safe_extraction_prompt():
-    return """Extract and analyze the document content with focus on structure and organization.
+    return """Extract and analyze the document content with precise attention to layout and structure.
     Tasks:
-    1. Identify document sections and hierarchy
-    2. Extract text content preserving formatting
-    3. Note any special formatting or structure
+    1. Identify document sections, tables, and hierarchy
+    2. For tables:
+       - Preserve exact column and row structure
+       - Maintain cell alignments and spacing
+       - Keep header rows distinct
+    3. Extract text content preserving all formatting
+    4. Note any special formatting or structure
     
     Format as JSON:
     {
         "elements": [
             {
-                "type": "section",
+                "type": "section|table|list",
                 "content": "text content",
                 "level": "heading level number",
-                "indent": "number of spaces"
+                "indent": "number of spaces",
+                "table_data": {
+                    "headers": ["col1", "col2", ...],
+                    "rows": [
+                        ["cell1", "cell2", ...],
+                        ["cell1", "cell2", ...]
+                    ],
+                    "column_alignments": ["left|center|right", ...]
+                }
             }
         ]
     }
     
-    Focus on accuracy and clarity. Maintain original formatting."""
+    Focus on accurately representing tables and maintaining exact document structure."""
 
 def safe_gemini_call(image, max_retries=3, delay=2):
     """Make API calls with retry logic and safety filter handling"""
@@ -52,14 +64,13 @@ def safe_gemini_call(image, max_retries=3, delay=2):
                     image
                 ],
                 safety_settings={
-                    "HARASSMENT": "block_none",
-                    "HATE_SPEECH": "block_none",
-                    "SEXUALLY_EXPLICIT": "block_none",
-                    "DANGEROUS_CONTENT": "block_none"
+                    "harassment": "block_none",
+                    "hate": "block_none",
+                    "sexual": "block_none",
+                    "dangerous": "block_none"
                 }
             )
             
-            # Check if we got a valid response
             if hasattr(response, 'text') and response.text:
                 return response
             
@@ -79,16 +90,32 @@ def translate_text(text, language):
     prompt = f"""Provide a professional translation from {language} to English.
     Original text: {text}
     Rules:
-    - Maintain all formatting
+    - Maintain all formatting and layout
     - Preserve technical terms
-    - Keep document structure"""
+    - Keep document structure
+    - For tables, translate cell contents while preserving alignment and format"""
     
     try:
         responses = multimodal_model.generate_content([prompt])
         return responses.text if hasattr(responses, 'text') else ''.join([r.text for r in responses])
     except Exception as e:
         logger.error(f"Translation error: {str(e)}")
-        return text  # Return original text if translation fails
+        return text
+
+def translate_table_data(table_data, language):
+    """Translate table contents while preserving structure"""
+    if not table_data:
+        return table_data
+    
+    translated_data = {
+        "headers": [translate_text(header, language) for header in table_data.get("headers", [])],
+        "rows": [
+            [translate_text(cell, language) for cell in row]
+            for row in table_data.get("rows", [])
+        ],
+        "column_alignments": table_data.get("column_alignments", [])
+    }
+    return translated_data
 
 def extract_images_from_pdf(pdf_file):
     images = []
@@ -101,7 +128,6 @@ def extract_images_from_pdf(pdf_file):
         doc = fitz.open(temp_pdf_path)
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            # Increased resolution and using RGB color space
             pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
             image_bytes = pix.tobytes("png")
             images.append(image_bytes)
@@ -117,19 +143,16 @@ def extract_images_from_pdf(pdf_file):
                 logger.error(f"Error deleting temporary PDF file: {str(e)}")
 
 def parse_response(response):
-    """Parse API response with robust error handling"""
+    """Parse API response with enhanced table handling"""
     try:
-        # Handle string response
         if isinstance(response, str):
             return json.loads(response)
             
-        # Handle Gemini response object
         if hasattr(response, 'text'):
             text = response.text
         else:
             text = ''.join([r.text for r in response])
         
-        # Try to find and parse JSON content
         start = text.find('{')
         end = text.rfind('}') + 1
         
@@ -140,7 +163,6 @@ def parse_response(response):
     except Exception as e:
         logger.error(f"Error parsing response: {str(e)}")
     
-    # Fallback: return text as single element
     return {
         "elements": [
             {
@@ -151,6 +173,34 @@ def parse_response(response):
             }
         ]
     }
+
+def create_table_html(table_data):
+    """Generate HTML for table with proper styling"""
+    if not table_data:
+        return ""
+    
+    html = """
+    <table style="width:100%; border-collapse: collapse; margin: 10px 0;">
+        <thead>
+            <tr>
+    """
+    
+    # Add headers with alignment
+    alignments = table_data.get("column_alignments", ["left"] * len(table_data.get("headers", [])))
+    for header, alignment in zip(table_data.get("headers", []), alignments):
+        html += f'<th style="border: 1px solid #ddd; padding: 8px; text-align: {alignment};">{header}</th>'
+    
+    html += "</tr></thead><tbody>"
+    
+    # Add rows with alignment
+    for row in table_data.get("rows", []):
+        html += "<tr>"
+        for cell, alignment in zip(row, alignments):
+            html += f'<td style="border: 1px solid #ddd; padding: 8px; text-align: {alignment};">{cell}</td>'
+        html += "</tr>"
+    
+    html += "</tbody></table>"
+    return html
 
 def convert_to_html(parsed_data):
     html_content = """
@@ -170,21 +220,38 @@ def convert_to_html(parsed_data):
             .level-2 { margin-left: 20px; font-weight: bold; }
             .level-3 { margin-left: 40px; }
             .level-4 { margin-left: 60px; }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 10px 0;
+            }
+            th, td {
+                border: 1px solid #ddd;
+                padding: 8px;
+                text-align: left;
+            }
+            th {
+                background-color: #f5f5f5;
+            }
         </style>
     </head>
     <body>
     """
     
     for element in parsed_data.get('elements', []):
+        element_type = element.get('type', 'section')
         indent = int(element.get('indent', 0))
         level = int(element.get('level', 1))
-        content = element.get('content', '')
         
-        html_content += f"""
-        <div class="section level-{level}" style="margin-left: {indent * 10}px">
-            {content}
-        </div>
-        """
+        if element_type == 'table':
+            html_content += create_table_html(element.get('table_data', {}))
+        else:
+            content = element.get('content', '')
+            html_content += f"""
+            <div class="section level-{level}" style="margin-left: {indent * 10}px">
+                {content}
+            </div>
+            """
     
     html_content += "</body></html>"
     return html_content
@@ -200,24 +267,31 @@ def create_pdf(html_content):
     return pdf_buffer
 
 def process_document(image_data, language):
-    """Process document with improved error handling"""
+    """Process document with enhanced table handling"""
     try:
-        # Get content with retries
         response = safe_gemini_call(image_data)
-        
-        # Parse the response
         parsed_data = parse_response(response)
         
-        # Translate content
         translated_data = {"elements": []}
         for element in parsed_data.get('elements', []):
-            translated_content = translate_text(element.get('content', ''), language)
-            translated_data['elements'].append({
-                "type": element.get('type', 'section'),
-                "content": translated_content,
-                "level": element.get('level', 1),
-                "indent": element.get('indent', 0)
-            })
+            if element.get('type') == 'table':
+                # Handle table translation
+                translated_table_data = translate_table_data(element.get('table_data', {}), language)
+                translated_data['elements'].append({
+                    "type": "table",
+                    "table_data": translated_table_data,
+                    "level": element.get('level', 1),
+                    "indent": element.get('indent', 0)
+                })
+            else:
+                # Handle regular content translation
+                translated_content = translate_text(element.get('content', ''), language)
+                translated_data['elements'].append({
+                    "type": element.get('type', 'section'),
+                    "content": translated_content,
+                    "level": element.get('level', 1),
+                    "indent": element.get('indent', 0)
+                })
         
         return translated_data
     except Exception as e:
@@ -227,7 +301,6 @@ def process_document(image_data, language):
 def main():
     st.title("Document Translator - Chinese & Japanese to English")
     
-    # File upload options
     option = st.selectbox("Select document type:", ["PDF", "Image"])
     
     if option == "PDF":
