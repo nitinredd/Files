@@ -18,44 +18,52 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json
 credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-pro-vision")
 
-def get_table_extraction_prompt():
-    return """Analyze this image and extract all tables and text with their exact layout.
-    Follow these steps:
-    1. Identify all tables in the image
-    2. For each table:
-       - Extract the exact content of each cell
-       - Preserve the row and column structure
-       - Maintain header rows if present
-    3. For non-table content:
-       - Identify paragraphs and headers
-       - Preserve their relative positions
+def get_layout_analysis_prompt():
+    return """Analyze this image and extract content while preserving the exact original layout.
+    Follow these strict rules:
+
+    1. Only identify ACTUAL tables (content organized in rows and columns with cells)
+       - Do not treat regular text or lists as tables
+       - Only mark something as a table if it has clear cells, rows, and columns
+    
+    2. For all other content:
+       - Preserve it as regular text
+       - Maintain the original indentation and formatting
+       - Keep section numbers and headers as plain text
     
     Return the result in this exact JSON format:
     {
         "elements": [
             {
-                "type": "table",
-                "content": [
-                    ["header1", "header2", "header3"],
-                    ["row1cell1", "row1cell2", "row1cell3"],
-                    ["row2cell1", "row2cell2", "row2cell3"]
-                ]
+                "type": "text",
+                "content": "exact text content",
+                "indentation": number_of_spaces,
+                "is_header": boolean
             },
             {
-                "type": "paragraph",
-                "content": "text content here"
+                "type": "table",
+                "position": "after_text_content_X", // Reference to preceding text
+                "content": [
+                    ["header1", "header2"],
+                    ["cell1", "cell2"]
+                ]
             }
         ]
     }
     
-    Only return the JSON object, nothing else."""
+    Only return the JSON object, nothing else.
+    Preserve ALL original formatting, spacing, and structure."""
 
 def translate_text(text, language):
     if not text:
         return ""
     
     prompt = f"""Translate the following {language} text to English. 
-    Maintain any tables or structured format in the translation.
+    Preserve exactly:
+    - All numbers and identifiers
+    - All formatting and spacing
+    - All technical terms
+    
     Original text:
     {text}
     
@@ -76,7 +84,7 @@ def extract_images_from_pdf(pdf_file):
         doc = fitz.open(temp_pdf_path)
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            pix = page.get_pixmap()
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Increased resolution
             image_bytes = pix.tobytes("png")
             images.append(image_bytes)
             logger.info(f"Extracted image from page {page_num}")
@@ -100,26 +108,38 @@ def parse_gemini_response(response):
         
         # If that fails, try to extract JSON from the text
         text = response.text if hasattr(response, 'text') else ''.join([r.text for r in response])
-        # Find the first { and last } to extract JSON object
         start = text.find('{')
         end = text.rfind('}') + 1
         if start >= 0 and end > start:
             json_str = text[start:end]
             return json.loads(json_str)
-    except Exception as e:
-        logger.error(f"Error parsing Gemini response: {str(e)}")
-        # Return a fallback format
+        
+        # If still no valid JSON, create structured format from text
         return {
             "elements": [
                 {
-                    "type": "paragraph",
-                    "content": text
+                    "type": "text",
+                    "content": text,
+                    "indentation": 0,
+                    "is_header": False
+                }
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Error parsing Gemini response: {str(e)}")
+        return {
+            "elements": [
+                {
+                    "type": "text",
+                    "content": str(response.text),
+                    "indentation": 0,
+                    "is_header": False
                 }
             ]
         }
 
 def get_gemini_response(image):
-    prompt = get_table_extraction_prompt()
+    prompt = get_layout_analysis_prompt()
     response = multimodal_model.generate_content([image, prompt])
     return parse_gemini_response(response)
 
@@ -128,18 +148,47 @@ def convert_to_html(layout_data):
     <html>
     <head>
         <style>
-            body { font-family: Arial, sans-serif; margin: 20px; }
-            table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
-            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-            th { background-color: #f2f2f2; }
-            p { margin-bottom: 15px; line-height: 1.5; }
+            body { 
+                font-family: Arial, sans-serif; 
+                margin: 20px;
+                line-height: 1.6;
+            }
+            .text-content {
+                white-space: pre-wrap;
+                margin: 8px 0;
+            }
+            .header {
+                font-weight: bold;
+                margin-top: 16px;
+            }
+            table { 
+                border-collapse: collapse; 
+                width: 100%;
+                margin: 16px 0;
+            }
+            th, td { 
+                border: 1px solid #ddd; 
+                padding: 8px; 
+                text-align: left; 
+            }
+            th { 
+                background-color: #f2f2f2; 
+            }
         </style>
     </head>
     <body>
     """
     
     for element in layout_data.get('elements', []):
-        if element['type'] == 'table':
+        if element['type'] == 'text':
+            style = f"margin-left: {element['indentation'] * 20}px"
+            classes = ['text-content']
+            if element.get('is_header'):
+                classes.append('header')
+            
+            html_content += f'<div class="{" ".join(classes)}" style="{style}">{element["content"]}</div>'
+            
+        elif element['type'] == 'table':
             html_content += "<table>"
             for i, row in enumerate(element['content']):
                 html_content += "<tr>"
@@ -148,8 +197,6 @@ def convert_to_html(layout_data):
                     html_content += f"<{tag}>{cell}</{tag}>"
                 html_content += "</tr>"
             html_content += "</table>"
-        else:
-            html_content += f"<p>{element['content']}</p>"
     
     html_content += "</body></html>"
     return html_content
@@ -169,7 +216,7 @@ def process_image(image_data, language):
         # Extract layout and content
         layout_data = get_gemini_response(image_data)
         
-        # Translate each element
+        # Translate each element while preserving structure
         translated_data = {"elements": []}
         for element in layout_data.get('elements', []):
             if element['type'] == 'table':
@@ -180,13 +227,17 @@ def process_image(image_data, language):
                     translated_table.append(translated_row)
                 translated_data['elements'].append({
                     "type": "table",
+                    "position": element.get('position', ''),
                     "content": translated_table
                 })
             else:
+                # Translate text while preserving formatting
                 translated_content = translate_text(element['content'], language)
                 translated_data['elements'].append({
-                    "type": element['type'],
-                    "content": translated_content
+                    "type": "text",
+                    "content": translated_content,
+                    "indentation": element.get('indentation', 0),
+                    "is_header": element.get('is_header', False)
                 })
         
         return translated_data
@@ -248,15 +299,11 @@ def main():
                         
                         # Show preview
                         st.subheader("Translation Preview")
-                        for element in translated_data['elements']:
-                            if element['type'] == 'table':
-                                st.table(element['content'])
-                            else:
-                                st.write(element['content'])
+                        html_preview = convert_to_html(translated_data)
+                        st.markdown(html_preview, unsafe_allow_html=True)
                         
-                        # Convert to HTML and PDF
-                        html_content = convert_to_html(translated_data)
-                        pdf_buffer = create_pdf_from_html(html_content)
+                        # Convert to PDF
+                        pdf_buffer = create_pdf_from_html(html_preview)
                         
                         # Offer download
                         st.download_button(
