@@ -4,6 +4,7 @@ import tempfile
 import logging
 from io import BytesIO
 import json
+import time
 import google.auth
 from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage
 import fitz  # PyMuPDF
@@ -18,60 +19,76 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json
 credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-pro-vision")
 
-def get_layout_analysis_prompt():
-    return """Analyze this image and extract content while preserving the exact original layout.
-    Follow these strict rules:
-
-    1. Only identify ACTUAL tables (content organized in rows and columns with cells)
-       - Do not treat regular text or lists as tables
-       - Only mark something as a table if it has clear cells, rows, and columns
+def get_safe_extraction_prompt():
+    return """Extract and analyze the document content with focus on structure and organization.
+    Tasks:
+    1. Identify document sections and hierarchy
+    2. Extract text content preserving formatting
+    3. Note any special formatting or structure
     
-    2. For all other content:
-       - Preserve it as regular text
-       - Maintain the original indentation and formatting
-       - Keep section numbers and headers as plain text
-    
-    Return the result in this exact JSON format:
+    Format as JSON:
     {
         "elements": [
             {
-                "type": "text",
-                "content": "exact text content",
-                "indentation": number_of_spaces,
-                "is_header": boolean
-            },
-            {
-                "type": "table",
-                "position": "after_text_content_X", // Reference to preceding text
-                "content": [
-                    ["header1", "header2"],
-                    ["cell1", "cell2"]
-                ]
+                "type": "section",
+                "content": "text content",
+                "level": "heading level number",
+                "indent": "number of spaces"
             }
         ]
     }
     
-    Only return the JSON object, nothing else.
-    Preserve ALL original formatting, spacing, and structure."""
+    Focus on accuracy and clarity. Maintain original formatting."""
+
+def safe_gemini_call(image, max_retries=3, delay=2):
+    """Make API calls with retry logic and safety filter handling"""
+    prompt = get_safe_extraction_prompt()
+    
+    for attempt in range(max_retries):
+        try:
+            response = multimodal_model.generate_content(
+                [
+                    prompt,
+                    image
+                ],
+                safety_settings={
+                    "HARASSMENT": "block_none",
+                    "HATE_SPEECH": "block_none",
+                    "SEXUALLY_EXPLICIT": "block_none",
+                    "DANGEROUS_CONTENT": "block_none"
+                }
+            )
+            
+            # Check if we got a valid response
+            if hasattr(response, 'text') and response.text:
+                return response
+            
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                continue
+            raise
+    
+    raise Exception("Failed to get valid response after maximum retries")
 
 def translate_text(text, language):
     if not text:
         return ""
     
-    prompt = f"""Translate the following {language} text to English. 
-    Preserve exactly:
-    - All numbers and identifiers
-    - All formatting and spacing
-    - All technical terms
+    prompt = f"""Provide a professional translation from {language} to English.
+    Original text: {text}
+    Rules:
+    - Maintain all formatting
+    - Preserve technical terms
+    - Keep document structure"""
     
-    Original text:
-    {text}
-    
-    Provide only the translation, no additional text."""
-    
-    responses = multimodal_model.generate_content([prompt])
-    translated_text = responses.text if hasattr(responses, 'text') else ''.join([response.text for response in responses])
-    return translated_text
+    try:
+        responses = multimodal_model.generate_content([prompt])
+        return responses.text if hasattr(responses, 'text') else ''.join([r.text for r in responses])
+    except Exception as e:
+        logger.error(f"Translation error: {str(e)}")
+        return text  # Return original text if translation fails
 
 def extract_images_from_pdf(pdf_file):
     images = []
@@ -84,7 +101,8 @@ def extract_images_from_pdf(pdf_file):
         doc = fitz.open(temp_pdf_path)
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # Increased resolution
+            # Increased resolution and using RGB color space
+            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
             image_bytes = pix.tobytes("png")
             images.append(image_bytes)
             logger.info(f"Extracted image from page {page_num}")
@@ -98,110 +116,80 @@ def extract_images_from_pdf(pdf_file):
             except Exception as e:
                 logger.error(f"Error deleting temporary PDF file: {str(e)}")
 
-def parse_gemini_response(response):
+def parse_response(response):
+    """Parse API response with robust error handling"""
     try:
-        # First try to parse as direct JSON
-        try:
-            return json.loads(response.text)
-        except:
-            pass
+        # Handle string response
+        if isinstance(response, str):
+            return json.loads(response)
+            
+        # Handle Gemini response object
+        if hasattr(response, 'text'):
+            text = response.text
+        else:
+            text = ''.join([r.text for r in response])
         
-        # If that fails, try to extract JSON from the text
-        text = response.text if hasattr(response, 'text') else ''.join([r.text for r in response])
+        # Try to find and parse JSON content
         start = text.find('{')
         end = text.rfind('}') + 1
+        
         if start >= 0 and end > start:
             json_str = text[start:end]
             return json.loads(json_str)
-        
-        # If still no valid JSON, create structured format from text
-        return {
-            "elements": [
-                {
-                    "type": "text",
-                    "content": text,
-                    "indentation": 0,
-                    "is_header": False
-                }
-            ]
-        }
+            
     except Exception as e:
-        logger.error(f"Error parsing Gemini response: {str(e)}")
-        return {
-            "elements": [
-                {
-                    "type": "text",
-                    "content": str(response.text),
-                    "indentation": 0,
-                    "is_header": False
-                }
-            ]
-        }
+        logger.error(f"Error parsing response: {str(e)}")
+    
+    # Fallback: return text as single element
+    return {
+        "elements": [
+            {
+                "type": "section",
+                "content": str(text),
+                "level": 1,
+                "indent": 0
+            }
+        ]
+    }
 
-def get_gemini_response(image):
-    prompt = get_layout_analysis_prompt()
-    response = multimodal_model.generate_content([image, prompt])
-    return parse_gemini_response(response)
-
-def convert_to_html(layout_data):
+def convert_to_html(parsed_data):
     html_content = """
     <html>
     <head>
         <style>
             body { 
                 font-family: Arial, sans-serif; 
-                margin: 20px;
+                margin: 20px; 
                 line-height: 1.6;
             }
-            .text-content {
+            .section {
+                margin: 10px 0;
                 white-space: pre-wrap;
-                margin: 8px 0;
             }
-            .header {
-                font-weight: bold;
-                margin-top: 16px;
-            }
-            table { 
-                border-collapse: collapse; 
-                width: 100%;
-                margin: 16px 0;
-            }
-            th, td { 
-                border: 1px solid #ddd; 
-                padding: 8px; 
-                text-align: left; 
-            }
-            th { 
-                background-color: #f2f2f2; 
-            }
+            .level-1 { margin-left: 0px; font-weight: bold; font-size: 1.2em; }
+            .level-2 { margin-left: 20px; font-weight: bold; }
+            .level-3 { margin-left: 40px; }
+            .level-4 { margin-left: 60px; }
         </style>
     </head>
     <body>
     """
     
-    for element in layout_data.get('elements', []):
-        if element['type'] == 'text':
-            style = f"margin-left: {element['indentation'] * 20}px"
-            classes = ['text-content']
-            if element.get('is_header'):
-                classes.append('header')
-            
-            html_content += f'<div class="{" ".join(classes)}" style="{style}">{element["content"]}</div>'
-            
-        elif element['type'] == 'table':
-            html_content += "<table>"
-            for i, row in enumerate(element['content']):
-                html_content += "<tr>"
-                for cell in row:
-                    tag = "th" if i == 0 else "td"
-                    html_content += f"<{tag}>{cell}</{tag}>"
-                html_content += "</tr>"
-            html_content += "</table>"
+    for element in parsed_data.get('elements', []):
+        indent = int(element.get('indent', 0))
+        level = int(element.get('level', 1))
+        content = element.get('content', '')
+        
+        html_content += f"""
+        <div class="section level-{level}" style="margin-left: {indent * 10}px">
+            {content}
+        </div>
+        """
     
     html_content += "</body></html>"
     return html_content
 
-def create_pdf_from_html(html_content):
+def create_pdf(html_content):
     pdf_buffer = BytesIO()
     pisa.CreatePDF(
         BytesIO(html_content.encode('utf-8')),
@@ -211,113 +199,96 @@ def create_pdf_from_html(html_content):
     pdf_buffer.seek(0)
     return pdf_buffer
 
-def process_image(image_data, language):
+def process_document(image_data, language):
+    """Process document with improved error handling"""
     try:
-        # Extract layout and content
-        layout_data = get_gemini_response(image_data)
+        # Get content with retries
+        response = safe_gemini_call(image_data)
         
-        # Translate each element while preserving structure
+        # Parse the response
+        parsed_data = parse_response(response)
+        
+        # Translate content
         translated_data = {"elements": []}
-        for element in layout_data.get('elements', []):
-            if element['type'] == 'table':
-                # Translate each cell in the table
-                translated_table = []
-                for row in element['content']:
-                    translated_row = [translate_text(cell, language) for cell in row]
-                    translated_table.append(translated_row)
-                translated_data['elements'].append({
-                    "type": "table",
-                    "position": element.get('position', ''),
-                    "content": translated_table
-                })
-            else:
-                # Translate text while preserving formatting
-                translated_content = translate_text(element['content'], language)
-                translated_data['elements'].append({
-                    "type": "text",
-                    "content": translated_content,
-                    "indentation": element.get('indentation', 0),
-                    "is_header": element.get('is_header', False)
-                })
+        for element in parsed_data.get('elements', []):
+            translated_content = translate_text(element.get('content', ''), language)
+            translated_data['elements'].append({
+                "type": element.get('type', 'section'),
+                "content": translated_content,
+                "level": element.get('level', 1),
+                "indent": element.get('indent', 0)
+            })
         
         return translated_data
     except Exception as e:
-        logger.error(f"Error processing image: {str(e)}")
+        logger.error(f"Document processing error: {str(e)}")
         raise
 
 def main():
     st.title("Document Translator - Chinese & Japanese to English")
     
-    option = st.selectbox("Upload a PDF or an Image?", ["PDF", "Image"])
+    # File upload options
+    option = st.selectbox("Select document type:", ["PDF", "Image"])
     
     if option == "PDF":
-        uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+        uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
     else:
-        uploaded_file = st.file_uploader("Upload Your Image", type=["png", "jpg", "jpeg"])
+        uploaded_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"])
     
-    language = st.selectbox("Select language for translation", ["Chinese", "Japanese"])
+    language = st.selectbox("Source language:", ["Chinese", "Japanese"])
     
-    if st.button("Submit"):
+    if st.button("Translate"):
         if uploaded_file:
             try:
-                if option == "PDF":
-                    with st.spinner('Processing PDF...'):
+                with st.spinner('Processing document...'):
+                    if option == "PDF":
                         images = extract_images_from_pdf(uploaded_file)
-                        
                         if not images:
-                            st.error("No images could be extracted from the PDF.")
+                            st.error("Could not extract images from PDF.")
                             return
                         
-                        all_translated_data = {"elements": []}
-                        progress_bar = st.progress(0)
+                        combined_data = {"elements": []}
+                        progress = st.progress(0)
                         
                         for idx, img_data in enumerate(images):
                             image = GeminiImage.from_bytes(img_data)
-                            translated_data = process_image(image, language)
-                            all_translated_data['elements'].extend(translated_data['elements'])
-                            progress_bar.progress((idx + 1) / len(images))
+                            page_data = process_document(image, language)
+                            combined_data['elements'].extend(page_data['elements'])
+                            progress.progress((idx + 1) / len(images))
                         
-                        # Convert to HTML and PDF
-                        html_content = convert_to_html(all_translated_data)
-                        pdf_buffer = create_pdf_from_html(html_content)
+                        html_content = convert_to_html(combined_data)
+                        pdf_buffer = create_pdf(html_content)
                         
-                        # Offer download
                         st.download_button(
-                            label="Download Translated PDF",
+                            "Download Translated PDF",
+                            data=pdf_buffer,
+                            file_name="translated_document.pdf",
+                            mime="application/pdf"
+                        )
+                    
+                    else:  # Single image
+                        st.image(uploaded_file, caption='Original Document', use_column_width=True)
+                        image = GeminiImage.from_bytes(uploaded_file.getvalue())
+                        
+                        translated_data = process_document(image, language)
+                        
+                        st.subheader("Translation Preview")
+                        html_content = convert_to_html(translated_data)
+                        st.markdown(html_content, unsafe_allow_html=True)
+                        
+                        pdf_buffer = create_pdf(html_content)
+                        st.download_button(
+                            "Download Translated PDF",
                             data=pdf_buffer,
                             file_name="translated_document.pdf",
                             mime="application/pdf"
                         )
                 
-                else:  # Single image
-                    with st.spinner('Processing image...'):
-                        st.image(uploaded_file, caption='Uploaded Image', use_column_width=True)
-                        image = GeminiImage.from_bytes(uploaded_file.getvalue())
-                        
-                        # Process the image
-                        translated_data = process_image(image, language)
-                        
-                        # Show preview
-                        st.subheader("Translation Preview")
-                        html_preview = convert_to_html(translated_data)
-                        st.markdown(html_preview, unsafe_allow_html=True)
-                        
-                        # Convert to PDF
-                        pdf_buffer = create_pdf_from_html(html_preview)
-                        
-                        # Offer download
-                        st.download_button(
-                            label="Download Translated PDF",
-                            data=pdf_buffer,
-                            file_name="translated_document.pdf",
-                            mime="application/pdf"
-                        )
-            
             except Exception as e:
-                logger.error(f"Error in processing: {str(e)}")
                 st.error(f"An error occurred: {str(e)}")
+                logger.exception("Processing error")
         else:
-            st.error("Please upload a file to proceed.")
+            st.error("Please upload a document to translate.")
 
 if __name__ == "__main__":
     main()
