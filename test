@@ -1,1 +1,349 @@
-test
+import os
+import streamlit as st
+import tempfile
+import logging
+from io import BytesIO
+import json
+import time
+import google.auth
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold, SafetySetting
+import fitz  # PyMuPDF
+from xhtml2pdf import pisa
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Set up Vertex AI
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+multimodal_model = GenerativeModel("gemini-pro-vision")
+
+# Configure safety settings
+safety_config = [
+    SafetySetting(category=cat, threshold=HarmBlockThreshold.BLOCK_NONE)
+    for cat in [
+        HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        HarmCategory.HARM_CATEGORY_HARASSMENT,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    ]
+]
+
+def get_safe_extraction_prompt():
+    return """Analyze and extract document content maintaining exact layout and structure.
+    
+    Required format:
+    {
+        "elements": [
+            {
+                "type": "section|table|list",
+                "content": "text content",
+                "level": "heading level (1-4)",
+                "indent": "indentation spaces",
+                "table_data": {
+                    "headers": ["col1", "col2"],
+                    "rows": [["cell1", "cell2"]],
+                    "column_widths": ["30%", "70%"],
+                    "column_alignments": ["left|center|right"]
+                }
+            }
+        ]
+    }
+    
+    Rules:
+    1. Preserve exact table structure and alignments
+    2. Maintain document hierarchy
+    3. Keep all formatting intact
+    4. Include column widths for tables"""
+
+def safe_gemini_call(image, max_retries=3, delay=2):
+    prompt = get_safe_extraction_prompt()
+    
+    for attempt in range(max_retries):
+        try:
+            response = multimodal_model.generate_content(
+                [prompt, image],
+                safety_settings=safety_config
+            )
+            
+            if hasattr(response, 'text') and response.text:
+                # Clean and validate JSON before parsing
+                cleaned_text = response.text.strip()
+                json_start = cleaned_text.find('{')
+                json_end = cleaned_text.rfind('}') + 1
+                
+                if json_start >= 0 and json_end > json_start:
+                    json_str = cleaned_text[json_start:json_end]
+                    parsed_json = json.loads(json_str)
+                    if parsed_json and 'elements' in parsed_json:
+                        return parsed_json
+            
+            raise ValueError("Invalid response format")
+            
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+                continue
+            raise
+    
+    raise Exception("Failed to get valid response after maximum retries")
+
+def translate_text(text, language):
+    if not text:
+        return ""
+    
+    prompt = f"""Translate from {language} to English:
+    
+    {text}
+    
+    Requirements:
+    - Maintain exact formatting
+    - Keep technical terms
+    - Preserve document structure"""
+    
+    try:
+        response = multimodal_model.generate_content([prompt])
+        return response.text if hasattr(response, 'text') else ''
+    except Exception as e:
+        logger.error(f"Translation error: {str(e)}")
+        return text
+
+def translate_table_data(table_data, language):
+    if not table_data:
+        return table_data
+    
+    return {
+        "headers": [translate_text(header, language) for header in table_data.get("headers", [])],
+        "rows": [[translate_text(cell, language) for cell in row] for row in table_data.get("rows", [])],
+        "column_widths": table_data.get("column_widths", []),
+        "column_alignments": table_data.get("column_alignments", [])
+    }
+
+def create_table_html(table_data):
+    """Generate responsive table HTML with proper column widths"""
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+    widths = table_data.get("column_widths", ["auto"] * len(headers))
+    alignments = table_data.get("column_alignments", ["left"] * len(headers))
+
+    if not headers or not rows:
+        return ""
+
+    html = """
+    <div style="width:100%; overflow-x:auto; margin: 10px 0;">
+    <table style="width:100%; border-collapse: collapse; table-layout: auto;">
+        <thead>
+            <tr>
+    """
+
+    for header, width, alignment in zip(headers, widths, alignments):
+        html += f"""
+        <th style="border: 1px solid #ddd; 
+                   padding: 8px; 
+                   background-color: #f5f5f5;
+                   text-align: {alignment};
+                   width: {width};
+                   word-wrap: break-word;
+                   white-space: normal;">
+            {header}
+        </th>"""
+
+    html += "</tr></thead><tbody>"
+
+    for row in rows:
+        html += "<tr>"
+        for cell, width, alignment in zip(row, widths, alignments):
+            html += f"""
+            <td style="border: 1px solid #ddd; 
+                       padding: 8px; 
+                       text-align: {alignment};
+                       width: {width};
+                       word-wrap: break-word;
+                       white-space: normal;">
+                {cell}
+            </td>"""
+        html += "</tr>"
+
+    html += "</tbody></table></div>"
+    return html
+
+def convert_to_html(parsed_data):
+    """Convert parsed elements to HTML with improved styling"""
+    html_content = """
+    <html>
+    <head>
+        <style>
+            @page { 
+                size: A4; 
+                margin: 2cm;
+            }
+            body { 
+                font-family: Arial, sans-serif;
+                line-height: 1.6;
+                margin: 0;
+                padding: 20px;
+            }
+            .section {
+                margin: 10px 0;
+                white-space: pre-wrap;
+            }
+            .level-1 { font-size: 18px; font-weight: bold; margin: 20px 0 10px 0; }
+            .level-2 { font-size: 16px; font-weight: bold; margin: 15px 0 10px 20px; }
+            .level-3 { font-size: 14px; margin: 10px 0 5px 40px; }
+            .level-4 { font-size: 12px; margin: 5px 0 5px 60px; }
+            table { page-break-inside: auto; }
+            tr { page-break-inside: avoid; }
+            thead { display: table-header-group; }
+        </style>
+    </head>
+    <body>
+    """
+    
+    for element in parsed_data.get('elements', []):
+        element_type = element.get('type', 'section')
+        level = int(element.get('level', 1))
+        
+        if element_type == 'table':
+            html_content += create_table_html(element.get('table_data', {}))
+        else:
+            content = element.get('content', '')
+            html_content += f"""
+            <div class="section level-{level}">
+                {content}
+            </div>
+            """
+    
+    html_content += "</body></html>"
+    return html_content
+
+def create_pdf(html_content):
+    pdf_buffer = BytesIO()
+    
+    # Configure PDF options
+    pdf_options = {
+        'page-size': 'A4',
+        'margin-top': '2cm',
+        'margin-right': '2cm',
+        'margin-bottom': '2cm',
+        'margin-left': '2cm',
+        'encoding': 'UTF-8',
+        'no-outline': None
+    }
+    
+    pisa_status = pisa.CreatePDF(
+        BytesIO(html_content.encode('utf-8')),
+        dest=pdf_buffer,
+        encoding='utf-8',
+        show_error_as_pdf=True
+    )
+    
+    if pisa_status.err:
+        logger.error("PDF creation failed")
+        return None
+    
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+def process_document(image_data, language):
+    """Process document with improved error handling"""
+    try:
+        parsed_data = safe_gemini_call(image_data)
+        
+        translated_data = {"elements": []}
+        for element in parsed_data.get('elements', []):
+            translated_element = {
+                "type": element.get('type', 'section'),
+                "level": element.get('level', 1),
+                "indent": element.get('indent', 0)
+            }
+            
+            if element.get('type') == 'table':
+                translated_element['table_data'] = translate_table_data(
+                    element.get('table_data', {}), 
+                    language
+                )
+            else:
+                translated_element['content'] = translate_text(
+                    element.get('content', ''), 
+                    language
+                )
+            
+            translated_data['elements'].append(translated_element)
+        
+        return translated_data
+    except Exception as e:
+        logger.error(f"Document processing error: {str(e)}")
+        raise
+
+def main():
+    st.title("Document Translator - Chinese & Japanese to English")
+    
+    option = st.selectbox("Select document type:", ["PDF", "Image"])
+    uploaded_file = st.file_uploader(
+        "Upload document", 
+        type=["pdf"] if option == "PDF" else ["png", "jpg", "jpeg"]
+    )
+    language = st.selectbox("Source language:", ["Chinese", "Japanese"])
+    
+    if st.button("Translate") and uploaded_file:
+        try:
+            with st.spinner('Processing document...'):
+                if option == "PDF":
+                    images = extract_images_from_pdf(uploaded_file)
+                    if not images:
+                        st.error("Could not extract images from PDF.")
+                        return
+                    
+                    combined_data = {"elements": []}
+                    progress_bar = st.progress(0)
+                    
+                    for idx, img_data in enumerate(images):
+                        image = GeminiImage.from_bytes(img_data)
+                        page_data = process_document(image, language)
+                        combined_data['elements'].extend(page_data['elements'])
+                        progress_bar.progress((idx + 1) / len(images))
+                    
+                    html_content = convert_to_html(combined_data)
+                    pdf_buffer = create_pdf(html_content)
+                    
+                    if pdf_buffer:
+                        st.download_button(
+                            "Download Translated PDF",
+                            data=pdf_buffer,
+                            file_name="translated_document.pdf",
+                            mime="application/pdf"
+                        )
+                    else:
+                        st.error("Failed to create PDF")
+                
+                else:  # Single image
+                    st.image(uploaded_file, caption='Original Document', use_column_width=True)
+                    image = GeminiImage.from_bytes(uploaded_file.getvalue())
+                    translated_data = process_document(image, language)
+                    
+                    html_content = convert_to_html(translated_data)
+                    st.markdown(html_content, unsafe_allow_html=True)
+                    
+                    pdf_buffer = create_pdf(html_content)
+                    if pdf_buffer:
+                        st.download_button(
+                            "Download Translated PDF",
+                            data=pdf_buffer,
+                            file_name="translated_document.pdf",
+                            mime="application/pdf"
+                        )
+                    else:
+                        st.error("Failed to create PDF")
+        
+        except Exception as e:
+            st.error(f"An error occurred: {str(e)}")
+            logger.exception("Processing error")
+    
+    elif not uploaded_file:
+        st.info("Please upload a document to translate.")
+
+if __name__ == "__main__":
+    main()
