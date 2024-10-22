@@ -1,1 +1,219 @@
-test
+import os
+import streamlit as st
+import tempfile
+import logging
+from io import BytesIO
+import google.auth
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage
+import fitz  # PyMuPDF
+from xhtml2pdf import pisa
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Set up Vertex AI
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+multimodal_model = GenerativeModel("gemini-pro-vision")
+
+def translate_text(text, language):
+    prompt = ""
+    if language == "Chinese":
+        prompt = f"Translate the following Chinese text to English. Ensure accurate translation retaining context and nuances:\n\n{text}"
+    elif language == "Japanese":
+        prompt = f"Translate the following Japanese text to English. Ensure accurate translation retaining context and nuances:\n\n{text}"
+    
+    responses = multimodal_model.generate_content([prompt])
+    translated_text = responses.text if hasattr(responses, 'text') else ''.join([response.text for response in responses])
+    return translated_text
+
+def extract_images_from_pdf(pdf_file):
+    images = []
+    temp_pdf_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+            temp_pdf.write(pdf_file.getvalue())
+            temp_pdf_path = temp_pdf.name
+        
+        doc = fitz.open(temp_pdf_path)
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap()
+            image_bytes = pix.tobytes("png")
+            images.append(image_bytes)
+            logger.info(f"Extracted image from page {page_num}")
+
+        doc.close()
+        logger.info(f"Extracted {len(images)} image(s) from PDF")
+        return images
+    except Exception as e:
+        logger.error(f"Error extracting images from PDF: {str(e)}")
+        st.error(f"Error extracting images from PDF: {str(e)}")
+        return []
+    finally:
+        if temp_pdf_path and os.path.exists(temp_pdf_path):
+            try:
+                os.unlink(temp_pdf_path)
+            except Exception as e:
+                logger.error(f"Error deleting temporary PDF file: {str(e)}")
+
+def get_gemini_response(image, prompt):
+    responses = multimodal_model.generate_content([image, prompt])
+    try:
+        response_json = responses.json() if hasattr(responses, 'json') else None
+        if response_json:
+            return response_json
+        else:
+            response_text = responses.text if hasattr(responses, 'text') else ''.join([response.text for response in responses])
+            return [{'type': 'paragraph', 'content': response_text}]
+    except Exception as e:
+        logger.error(f"Error parsing Gemini response: {str(e)}")
+        return [{'type': 'paragraph', 'content': "Error extracting response"}]
+
+def sanitize_layout_response(layout_response):
+    if isinstance(layout_response, list):
+        sanitized = []
+        for item in layout_response:
+            if isinstance(item, dict) and 'type' in item and 'content' in item:
+                sanitized.append(item)
+            else:
+                if isinstance(item, dict) and 'content' in item:
+                    content = item['content']
+                else:
+                    content = str(item) 
+                sanitized.append({'type': 'paragraph', 'content': content})
+        return sanitized
+    else:
+        content = layout_response if isinstance(layout_response, str) else str(layout_response)
+        return [{'type': 'paragraph', 'content': content}]
+
+def convert_json_to_html(layout_json):
+    html_content = "<html><body style='font-family: Arial, sans-serif;'>"
+
+    for line in layout_json:
+        if line['type'] == 'table':
+            rows = line['content']
+            html_content += "<table border='1' style='border-collapse: collapse; width: 100%;'>"
+            for row in rows:
+                html_content += "<tr>"
+                for cell in row:
+                    html_content += f"<td style='padding: 5px;'>{cell}</td>"
+                html_content += "</tr>"
+            html_content += "</table><br/>"
+        else:
+            html_content += f"<p>{line['content']}</p>"
+
+    html_content += "</body></html>"
+    return html_content
+
+def create_pdf_from_html(html_content):
+    pdf_buffer = BytesIO()
+    pisa_status = pisa.CreatePDF(
+        BytesIO(html_content.encode('utf-8')), dest=pdf_buffer
+    )
+    if pisa_status.err:
+        logger.error("Error converting HTML to PDF")
+        return None
+    pdf_buffer.seek(0)
+    return pdf_buffer
+
+st.title("Translator - Chinese & Japanese to English")
+
+option = st.selectbox("Upload a PDF or an Image?", ["PDF", "Image"])
+
+if option == "PDF":
+    uploaded_file = st.file_uploader("Upload PDF", type="pdf")
+else:
+    uploaded_file = st.file_uploader("Upload Your Image", type=["png", "jpg", "jpeg"])
+
+language = st.selectbox("Select language for translation", ["Chinese", "Japanese"])
+
+if st.button("Submit"):
+    if uploaded_file:
+        if option == "PDF":
+            with st.spinner('Extracting images from PDF...'):
+                images = extract_images_from_pdf(uploaded_file)
+                logger.info(f"Images extracted: {len(images)}")
+
+            if images:
+                extracted_layout = []
+                translated_layout = []
+                total_images = len(images)
+                progress_bar = st.progress(0)
+
+                for idx, img_data in enumerate(images):
+                    with st.spinner(f'Processing page {idx + 1} of {total_images}...'):
+                        img = GeminiImage.from_bytes(img_data)
+                        layout_response = get_gemini_response(img, "Extract detailed layout including tables, rows, columns and preserve the original structure.")
+                        text_response = get_gemini_response(img, "Extract text exactly as in the document")
+
+                        logger.info(f"Page {idx + 1} layout: {layout_response}")
+                        logger.info(f"Page {idx + 1} text: {text_response}")
+
+                        sanitized_layout = sanitize_layout_response(layout_response)
+
+                        for elem in sanitized_layout:
+                            translated_item = {
+                                'type': elem['type'],
+                                'content': translate_text(elem['content'], language)
+                            }
+                            translated_layout.append(translated_item)
+
+                    progress_bar.progress((idx + 1) / total_images)
+
+                html_content = convert_json_to_html(translated_layout)
+                pdf_buffer = create_pdf_from_html(html_content)
+                if pdf_buffer:
+                    st.download_button(
+                        label="Download Translated PDF",
+                        data=pdf_buffer,
+                        file_name="translated_document.pdf",
+                        mime="application/pdf"
+                    )
+                else:
+                    st.error("Failed to convert HTML to PDF.")
+            else:
+                st.error("Failed to extract images from the PDF. Please check if the file is corrupted or try a different PDF.")
+        else:
+            st.image(uploaded_file, caption='Uploaded Image.', use_column_width=True)
+            bytes_data = uploaded_file.getvalue()
+            uploaded_image = GeminiImage.from_bytes(bytes_data)
+
+            with st.spinner('Extracting layout and text from Image...'):
+                layout_response = get_gemini_response(uploaded_image, "Extract detailed layout including tables, rows, columns and preserve the original structure.")
+                text_response = get_gemini_response(uploaded_image, "Extract text exactly as in the document")
+
+                logger.info(f"Extracted layout: {layout_response}")
+                logger.info(f"Extracted text: {text_response}")
+
+                sanitized_layout = sanitize_layout_response(layout_response)
+
+                translated_layout = []
+                for elem in sanitized_layout:
+                    translated_item = {
+                        'type': elem['type'],
+                        'content': translate_text(elem['content'], language)
+                    }
+                    translated_layout.append(translated_item)
+
+                st.subheader("Extracted Information")
+                st.write(text_response)
+
+                st.subheader("Translated Text")
+                st.text_area("", value="\n".join([item['content'] for item in translated_layout]), height=300)
+
+                html_content = convert_json_to_html(translated_layout)
+                translated_pdf_buffer = create_pdf_from_html(html_content)
+                if translated_pdf_buffer:
+                    st.download_button(
+                        label="Download Translated Document",
+                        data=translated_pdf_buffer,
+                        file_name="translated_document.pdf",
+                        mime="application/pdf"
+                    )
+                else:
+                    st.error("Failed to convert HTML to PDF.")
+    else:
+        st.error("Please upload a file to proceed.")
+
