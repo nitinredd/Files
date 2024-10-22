@@ -6,7 +6,7 @@ from io import BytesIO
 import json
 import time
 import google.auth
-from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold,SafetySetting
 import fitz  # PyMuPDF
 from xhtml2pdf import pisa
 
@@ -19,16 +19,41 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json
 credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-pro-vision")
 
+# Configure the Model and Safety settings
+multimodal_model = GenerativeModel("gemini-pro-vision")
+
+safety_config = [
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+]
+
 def get_safe_extraction_prompt():
-    return """Extract and analyze the document content with precise attention to layout and structure.
+    return """Please Extract and analyze the document content with precise attention to layout and structure.
     Tasks:
-    1. Identify document sections, tables, and hierarchy
+    1. Identify sections, tables its rows coloumns cells, and lists in the document
     2. For tables:
-       - Preserve exact column and row structure
+       - Please Preserve exact column and row structure
        - Maintain cell alignments and spacing
        - Keep header rows distinct
-    3. Extract text content preserving all formatting
-    4. Note any special formatting or structure
+    3. Extract text content preserving all formatting intact
     
     Format as JSON:
     {
@@ -50,7 +75,7 @@ def get_safe_extraction_prompt():
         ]
     }
     
-    Focus on accurately representing tables and maintaining exact document structure."""
+   Please Focus on accurately representing tables and maintaining exact document structure."""
 
 def safe_gemini_call(image, max_retries=3, delay=2):
     """Make API calls with retry logic and safety filter handling"""
@@ -63,17 +88,16 @@ def safe_gemini_call(image, max_retries=3, delay=2):
                     prompt,
                     image
                 ],
-                safety_settings={
-                    "harassment": "block_none",
-                    "hate": "block_none",
-                    "sexual": "block_none",
-                    "dangerous": "block_none"
-                }
+                safety_settings=safety_config
             )
             
             if hasattr(response, 'text') and response.text:
                 return response
             
+            # Check for blocked content indication
+            if "blocked" in response or "Candidate text" in response:
+                raise ValueError("Content blocked by safety filters.")
+                
         except Exception as e:
             logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
             if attempt < max_retries - 1:
@@ -83,11 +107,14 @@ def safe_gemini_call(image, max_retries=3, delay=2):
     
     raise Exception("Failed to get valid response after maximum retries")
 
+    
+    raise Exception("Failed to get valid response after maximum retries")
+
 def translate_text(text, language):
     if not text:
         return ""
     
-    prompt = f"""Provide a professional translation from {language} to English.
+    prompt = f"""Please Provide a professional, accurate and complete translation from {language} to English 'as-is' without exceeding to any other content other than the document provided.
     Original text: {text}
     Rules:
     - Maintain all formatting and layout
@@ -142,24 +169,45 @@ def extract_images_from_pdf(pdf_file):
             except Exception as e:
                 logger.error(f"Error deleting temporary PDF file: {str(e)}")
 
+def parse_json_response(response_text):
+    try:
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        
+        if start >= 0 and end > start:
+            json_str = response_text[start:end]
+            return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON decoding error: {e}")
+    except Exception as e:
+        logger.error(f"General error in parsing JSON response: {e}")
+
+    return {}
+
 def parse_response(response):
-    """Parse API response with enhanced table handling"""
     try:
         if isinstance(response, str):
-            return json.loads(response)
-            
-        if hasattr(response, 'text'):
+            text = response
+        elif hasattr(response, 'text'):
             text = response.text
         else:
             text = ''.join([r.text for r in response])
-        
-        start = text.find('{')
-        end = text.rfind('}') + 1
-        
-        if start >= 0 and end > start:
-            json_str = text[start:end]
-            return json.loads(json_str)
-            
+
+        parsed_json = parse_json_response(text)
+
+        # Validate table data
+        for element in parsed_json.get('elements', []):
+            if element.get('type') == 'table':
+                table_data = element.get('table_data', {})
+                headers = table_data.get('headers', [])
+                rows = table_data.get('rows', [])
+
+                if not headers or not rows:
+                    logger.warning(f"Skipping malformed table data: {table_data}")
+                    parsed_json['elements'].remove(element)
+
+        return parsed_json
+
     except Exception as e:
         logger.error(f"Error parsing response: {str(e)}")
     
@@ -174,35 +222,44 @@ def parse_response(response):
         ]
     }
 
+
+
 def create_table_html(table_data):
     """Generate HTML for table with proper styling"""
-    if not table_data:
+    headers = table_data.get("headers", [])
+    rows = table_data.get("rows", [])
+
+    # Check for empty headers or rows
+    if not headers or not rows:
+        logger.warning("Empty table data detected, skipping table.")
         return ""
-    
+
     html = """
-    <table style="width:100%; border-collapse: collapse; margin: 10px 0;">
+    <table style="width:100%; border-collapse: collapse; margin: 10px 0; table-layout: fixed;">
         <thead>
             <tr>
     """
-    
+
     # Add headers with alignment
-    alignments = table_data.get("column_alignments", ["left"] * len(table_data.get("headers", [])))
-    for header, alignment in zip(table_data.get("headers", []), alignments):
-        html += f'<th style="border: 1px solid #ddd; padding: 8px; text-align: {alignment};">{header}</th>'
-    
+    alignments = table_data.get("column_alignments", ["left"] * len(headers))
+    for header, alignment in zip(headers, alignments):
+        html += f'<th style="border: 1px solid #ddd; padding: 8px; text-align: {alignment}; word-wrap: break-word; max-width: 100%;">{header}</th>'
+
     html += "</tr></thead><tbody>"
-    
+
     # Add rows with alignment
-    for row in table_data.get("rows", []):
+    for row in rows:
         html += "<tr>"
         for cell, alignment in zip(row, alignments):
-            html += f'<td style="border: 1px solid #ddd; padding: 8px; text-align: {alignment};">{cell}</td>'
+            html += f'<td style="border: 1px solid #ddd; padding: 8px; text-align: {alignment}; word-wrap: break-word; max-width: 100%;">{cell}</td>'
         html += "</tr>"
-    
+
     html += "</tbody></table>"
     return html
 
+
 def convert_to_html(parsed_data):
+    """Convert parsed elements to HTML"""
     html_content = """
     <html>
     <head>
@@ -222,6 +279,9 @@ def convert_to_html(parsed_data):
             .level-4 { margin-left: 60px; }
             table {
                 width: 100%;
+                max-width: 100%;
+                word-wrap: break-word;
+                table-layout: fixed;
                 border-collapse: collapse;
                 margin: 10px 0;
             }
@@ -229,6 +289,8 @@ def convert_to_html(parsed_data):
                 border: 1px solid #ddd;
                 padding: 8px;
                 text-align: left;
+                word-wrap: break-word;
+                max-width: 100%;
             }
             th {
                 background-color: #f5f5f5;
@@ -258,13 +320,20 @@ def convert_to_html(parsed_data):
 
 def create_pdf(html_content):
     pdf_buffer = BytesIO()
-    pisa.CreatePDF(
+    pisa_status = pisa.CreatePDF(
         BytesIO(html_content.encode('utf-8')),
         dest=pdf_buffer,
         encoding='utf-8'
     )
     pdf_buffer.seek(0)
+
+    if pisa_status.err:
+        logger.error("Failed to create PDF file.")
+        return None
+
     return pdf_buffer
+
+
 
 def process_document(image_data, language):
     """Process document with enhanced table handling"""
