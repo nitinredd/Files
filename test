@@ -1,73 +1,147 @@
-Input Costs:
+import os
+import streamlit as st
+import tempfile
+import logging
+from io import BytesIO
+import json
+import time
+import google.auth
+from vertexai.preview.generative_models import GenerativeModel
+from pyzerox import zerox
+import asyncio
+from xhtml2pdf import pisa
 
-Image Input:
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
+# Set up Vertex AI credentials
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/credentials.json"
+credentials, project_id = google.auth.default()
+multimodal_model = GenerativeModel("gemini-pro-vision")
 
-Lower tier: $0.00032875/image
-Higher tier: $0.0006575/image
+async def process_with_zerox(file_path, language):
+    """Process document using Zerox OCR with Gemini Pro Vision"""
+    try:
+        custom_system_prompt = f"""Please analyze and translate the document from {language} to English.
+        Maintain all formatting, layout, and technical terms while providing an accurate translation.
+        Pay special attention to:
+        1. Table structures and alignments
+        2. Lists and bullet points
+        3. Section headers and hierarchy
+        4. Technical terminology
+        5. Document flow and spacing"""
+        
+        # Use Gemini Pro Vision model
+        model = "gemini-pro-vision"
+        output_dir = tempfile.mkdtemp()
+        
+        # Add model kwargs for Gemini Pro Vision
+        kwargs = {
+            "temperature": 0.3,  # Lower temperature for more accurate translations
+            "max_output_tokens": 2048,  # Adjust based on your needs
+        }
+        
+        result = await zerox(
+            file_path=file_path,
+            model=model,
+            output_dir=output_dir,
+            custom_system_prompt=custom_system_prompt,
+            **kwargs
+        )
+        
+        return result
+    except Exception as e:
+        logger.error(f"Zerox processing error: {str(e)}")
+        raise
 
+def create_pdf(content):
+    """Create PDF from content"""
+    pdf_buffer = BytesIO()
+    
+    # Convert markdown to HTML first
+    from markdown import markdown
+    html_content = markdown(content)
+    
+    # Add CSS for better formatting
+    html_content = f"""
+    <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                table {{ border-collapse: collapse; width: 100%; margin: 10px 0; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f5f5f5; }}
+                h1, h2, h3 {{ color: #333; }}
+                pre {{ background-color: #f9f9f9; padding: 10px; border-radius: 4px; }}
+            </style>
+        </head>
+        <body>
+            {html_content}
+        </body>
+    </html>
+    """
+    
+    # Create PDF
+    pisa_status = pisa.CreatePDF(
+        html_content,
+        dest=pdf_buffer
+    )
+    
+    if pisa_status.err:
+        logger.error("PDF creation failed")
+        return None
+        
+    pdf_buffer.seek(0)
+    return pdf_buffer
 
-Video Input:
+def main():
+    st.title("Advanced Document Translator")
+    st.write("Supports Chinese & Japanese to English translation with layout preservation")
+    
+    # File upload section
+    uploaded_file = st.file_uploader(
+        "Upload document", 
+        type=["pdf", "png", "jpg", "jpeg"],
+        help="Support for PDF and image files (PNG, JPG)"
+    )
+    
+    language = st.selectbox("Source language:", ["Chinese", "Japanese"])
+    
+    if st.button("Translate"):
+        if uploaded_file:
+            try:
+                with st.spinner('Processing document...'):
+                    # Save uploaded file temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.name.split('.')[-1]}") as tmp_file:
+                        tmp_file.write(uploaded_file.getvalue())
+                        tmp_path = tmp_file.name
+                    
+                    # Process with Zerox using Gemini Pro Vision
+                    result = asyncio.run(process_with_zerox(tmp_path, language))
+                    
+                    # Display preview
+                    st.subheader("Translation Preview")
+                    st.markdown(result, unsafe_allow_html=True)
+                    
+                    # Create downloadable PDF
+                    pdf_buffer = create_pdf(result)
+                    if pdf_buffer:
+                        st.download_button(
+                            "Download Translated PDF",
+                            data=pdf_buffer,
+                            file_name="translated_document.pdf",
+                            mime="application/pdf"
+                        )
+                    
+                    # Cleanup
+                    os.unlink(tmp_path)
+                    
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+                logger.exception("Processing error")
+        else:
+            st.error("Please upload a document to translate.")
 
-
-Lower tier: $0.00032875/second
-Higher tier: $0.0006575/second
-
-
-Text Input:
-
-
-Lower tier: $0.0003125/1k characters
-Higher tier: $0.000625/1k characters
-
-
-Audio Input:
-
-
-Lower tier: $0.00003125/second
-Higher tier: $0.0000625/second
-
-Output Costs:
-Text Output:
-
-Lower tier: $0.00125/1k characters
-Higher tier: $0.0025/1k characters
-
-For your PDF translation app workflow:
-
-When scanning a PDF page with an image:
-
-Image input cost: $0.00032875 (lower tier) per image
-Output cost for extracted text: $0.00125 per 1k characters
-
-
-For translation:
-
-Text input cost: $0.0003125 per 1k characters
-Output cost for translated text: $0.00125 per 1k characters
-
-
-
-Example calculation for a single page PDF:
-Let's say you have:
-
-1 image to process
-Extracted text is 2k characters
-Translation generates 2k characters
-
-Lower tier costs would be:
-
-Image processing:
-
-Input: $0.00032875
-Output (2k chars): $0.0025
-
-
-Translation:
-
-Input (2k chars): $0.000625
-Output (2k chars): $0.0025
-
-
-
-Total cost: ~$0.005925 per page
+if __name__ == "__main__":
+    main()
