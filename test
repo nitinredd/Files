@@ -4,16 +4,15 @@ from PIL import Image
 import numpy as np
 import cv2
 from docx import Document
-from docx.shared import Inches, Pt, Cm, Twips
+from docx.shared import Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx2pdf import convert
-import pandas as pd
 from tqdm import tqdm
+from pathlib import Path
 import os
 import logging
-from pathlib import Path
+
 
 class RobustDocumentConverter:
     def __init__(self, input_path, output_path, output_format='docx', dpi=300):
@@ -24,7 +23,7 @@ class RobustDocumentConverter:
         self.doc = Document()
         self.setup_logging()
         self.setup_document()
-        
+
     def setup_logging(self):
         """Setup logging configuration"""
         logging.basicConfig(
@@ -42,7 +41,6 @@ class RobustDocumentConverter:
         style = self.doc.styles['Normal']
         style.font.name = 'Yu Gothic'
         style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
-        
         sections = self.doc.sections
         for section in sections:
             section.left_margin = Cm(2.54)
@@ -51,232 +49,172 @@ class RobustDocumentConverter:
             section.bottom_margin = Cm(2.54)
 
     def detect_tables(self, image):
-        """Simple and direct table detection"""
+        """Improved table detection using OpenCV"""
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        
+
         # Detect horizontal and vertical lines
         horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
         vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-        
+
         horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
         vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
-        
-        # Combine lines
-        table_mask = cv2.addWeighted(horizontal_lines, 1, vertical_lines, 1, 0)
-        
-        # Find table boundaries
-        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        tables = []
-        min_size = 50  # Minimum size for table detection
-        
+
+        # Combine lines to detect tables
+        combined_mask = cv2.addWeighted(horizontal_lines, 1, vertical_lines, 1, 0)
+        contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        table_coordinates = []
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            if w > min_size and h > min_size:
-                tables.append((y, y+h, x, x+w))
-        
-        return sorted(tables)
+            if w > 50 and h > 50:  # Filter small detections
+                table_coordinates.append((y, y + h, x, x + w))
 
-    def clean_cell_text(self, text):
-        """Clean and validate cell text"""
-        if not text or not isinstance(text, str):
-            return ""
-        text = text.replace('\x00', '').strip()
-        text = ' '.join(text.split())
-        return text[:32767]  # Word cell text limit
+        return sorted(table_coordinates, key=lambda coord: coord[0])  # Sort by y-coordinate
 
     def process_table(self, image, table_coords):
-        """Simplified table processing without preprocessing"""
+        """Advanced table processing with improved cell extraction"""
         try:
             y1, y2, x1, x2 = table_coords
-            if y1 >= y2 or x1 >= x2:  # Invalid coordinates
-                return table_coords[1]
-                
             table_image = image[y1:y2, x1:x2]
-            if table_image.size == 0:  # Check for empty image
-                return table_coords[1]
-                
-            # Get table structure
             gray = cv2.cvtColor(table_image, cv2.COLOR_RGB2GRAY)
             thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-            
-            # Detect lines
+
+            # Detect grid lines
             horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
             vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-            
-            horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
-            vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
-            
-            # Find line positions
-            horizontal_lines = cv2.HoughLinesP(horizontal, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
-            vertical_lines = cv2.HoughLinesP(vertical, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
-            
-            if horizontal_lines is None or vertical_lines is None:
-                return table_coords[1]
-                
-            # Extract row and column positions
-            row_positions = sorted(set(y1 for line in horizontal_lines for x1, y1, x2, y2 in line))
-            col_positions = sorted(set(x1 for line in vertical_lines for x1, y1, x2, y2 in line))
-            
-            if len(row_positions) < 2 or len(col_positions) < 2:
-                return table_coords[1]
-                
-            # Create table
-            num_rows = len(row_positions) - 1
-            num_cols = len(col_positions) - 1
-            table = self.doc.add_table(rows=num_rows, cols=num_cols)
-            table.style = 'Table Grid'
-            
-            # Process cells directly without preprocessing
-            for i in range(num_rows):
-                for j in range(num_cols):
-                    # Get cell coordinates
-                    cell_y1 = row_positions[i]
-                    cell_y2 = row_positions[i + 1]
-                    cell_x1 = col_positions[j]
-                    cell_x2 = col_positions[j + 1]
-                    
-                    # Ensure valid cell coordinates
-                    if cell_y1 >= cell_y2 or cell_x1 >= cell_x2:
-                        continue
-                        
-                    # Extract cell image
-                    cell_image = table_image[cell_y1:cell_y2, cell_x1:cell_x2]
-                    if cell_image.size == 0:
-                        continue
-                    
-                    # Direct OCR without preprocessing
-                    cell_text = pytesseract.image_to_string(
-                        cell_image,
-                        lang='jpn+eng',
-                        config='--psm 6'
-                    ).strip()
-                    
-                    cell_text = self.clean_cell_text(cell_text)
-                    
-                    # Apply cell content
-                    cell = table.cell(i, j)
-                    cell.text = cell_text
-                    
-                    # Apply formatting
-                    paragraph = cell.paragraphs[0]
-                    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-                    run.font.name = 'Yu Gothic'
-                    run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
-            
-            # Add spacing after table
-            self.doc.add_paragraph()
+
+            horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+            vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+
+            # Combine and find intersections
+            grid = cv2.addWeighted(horizontal_lines, 1, vertical_lines, 1, 0)
+            contours, _ = cv2.findContours(grid, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+
+            row_positions = sorted(set(y for _, y, _, _ in contours))
+            col_positions = sorted(set(x for x, _, _, _ in contours))
+
+            # Create table in Word
+            if len(row_positions) > 1 and len(col_positions) > 1:
+                num_rows = len(row_positions) - 1
+                num_cols = len(col_positions) - 1
+                table = self.doc.add_table(rows=num_rows, cols=num_cols)
+                table.style = 'Table Grid'
+
+                for i in range(num_rows):
+                    for j in range(num_cols):
+                        y_start, y_end = row_positions[i], row_positions[i + 1]
+                        x_start, x_end = col_positions[j], col_positions[j + 1]
+                        cell_image = table_image[y_start:y_end, x_start:x_end]
+
+                        # Extract cell text with OCR
+                        cell_text = pytesseract.image_to_string(
+                            cell_image, lang='jpn+eng', config='--psm 6'
+                        ).strip()
+                        cell_text = ' '.join(cell_text.split())
+
+                        cell = table.cell(i, j)
+                        cell.text = cell_text
+
+                        # Format cell text
+                        paragraph = cell.paragraphs[0]
+                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                        run.font.name = 'Yu Gothic'
+                        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+
             return y2
-            
         except Exception as e:
             self.logger.error(f"Table processing error: {str(e)}")
             return table_coords[1]
 
     def convert(self):
-        """Main conversion process with progress bar"""
+        """Main conversion process"""
         try:
             pdf_document = fitz.open(self.input_path)
             total_pages = pdf_document.page_count
-            
+
             with tqdm(total=total_pages, desc="Converting PDF") as pbar:
                 for page_num in range(total_pages):
                     try:
-                        # Get page and convert to image
                         page = pdf_document[page_num]
-                        pix = page.get_pixmap(matrix=fitz.Matrix(self.dpi/72, self.dpi/72))
+                        pix = page.get_pixmap(matrix=fitz.Matrix(self.dpi / 72, self.dpi / 72))
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         img_np = np.array(img)
-                        
-                        # Detect and process tables
+
                         tables = self.detect_tables(img_np)
                         last_y = 0
-                        
+
                         for table_coords in tables:
-                            # Process text before table
                             if table_coords[0] > last_y:
                                 text_region = img_np[last_y:table_coords[0], :]
-                                text = pytesseract.image_to_string(
-                                    text_region, lang='jpn+eng'
-                                )
+                                text = pytesseract.image_to_string(text_region, lang='jpn+eng')
                                 if text.strip():
                                     p = self.doc.add_paragraph(text.strip())
                                     for run in p.runs:
                                         run.font.name = 'Yu Gothic'
-                                        run._element.rPr.rFonts.set(
-                                            qn('w:eastAsia'), 'Yu Gothic'
-                                        )
-                            
-                            # Process table
+                                        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
                             last_y = self.process_table(img_np, table_coords)
-                        
-                        # Process remaining text
+
                         if last_y < img_np.shape[0]:
                             text_region = img_np[last_y:, :]
-                            text = pytesseract.image_to_string(
-                                text_region, lang='jpn+eng'
-                            )
+                            text = pytesseract.image_to_string(text_region, lang='jpn+eng')
                             if text.strip():
                                 p = self.doc.add_paragraph(text.strip())
                                 for run in p.runs:
                                     run.font.name = 'Yu Gothic'
-                                    run._element.rPr.rFonts.set(
-                                        qn('w:eastAsia'), 'Yu Gothic'
-                                    )
-                        
-                        # Add page break if not last page
+                                    run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+
                         if page_num < total_pages - 1:
                             self.doc.add_page_break()
-                        
-                        img.close()
+
                         pbar.update(1)
-                        
+
                     except Exception as e:
                         self.logger.error(f"Error processing page {page_num + 1}: {str(e)}")
                         continue
-            
-            # Save document
+
             output_dir = os.path.dirname(self.output_path)
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-            
+            os.makedirs(output_dir, exist_ok=True)
+
             temp_docx = self.output_path
             if self.output_format == 'pdf':
                 temp_docx = str(Path(self.output_path).with_suffix('.docx'))
-            
+
             self.doc.save(temp_docx)
-            
+
             if self.output_format == 'pdf':
                 convert(temp_docx, self.output_path)
                 os.remove(temp_docx)
-            
+
             self.logger.info(f"Document successfully saved as {self.output_path}")
-            
+
         except Exception as e:
             self.logger.error(f"Conversion error: {str(e)}")
         finally:
             if 'pdf_document' in locals():
                 pdf_document.close()
 
+
 def main():
     print("Robust Document Converter")
     print("-" * 30)
-    
+
     input_path = input("Enter input PDF path: ")
     output_format = input("Enter desired output format (docx/pdf): ").lower()
     while output_format not in ['docx', 'pdf']:
         output_format = input("Please enter either 'docx' or 'pdf': ").lower()
-    
+
     try:
         dpi = int(input("Enter DPI (300-600, press Enter for default 300): ") or 300)
         dpi = max(300, min(600, dpi))
     except ValueError:
         dpi = 300
-    
+
     output_path = str(Path(input_path).with_suffix(f'.{output_format}'))
-    
+
     converter = RobustDocumentConverter(input_path, output_path, output_format, dpi)
     converter.convert()
+
 
 if __name__ == "__main__":
     main()
