@@ -6,14 +6,13 @@ import cv2
 from docx import Document
 from docx.shared import Cm
 from docx.oxml.ns import qn
-from docx2pdf import convert
 from tqdm import tqdm
 import os
 from pathlib import Path
 import logging
 
 
-class RobustDocumentConverter:
+class EnhancedDocumentConverter:
     def __init__(self, input_path, output_path, output_format='docx', dpi=300):
         self.input_path = input_path
         self.output_path = output_path
@@ -24,22 +23,19 @@ class RobustDocumentConverter:
         self.setup_document()
 
     def setup_logging(self):
-        """Setup logging configuration"""
+        """Setup logging configuration."""
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('conversion.log'),
-                logging.StreamHandler()
-            ]
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            handlers=[logging.FileHandler("conversion.log"), logging.StreamHandler()],
         )
         self.logger = logging.getLogger(__name__)
 
     def setup_document(self):
-        """Initialize document settings"""
-        style = self.doc.styles['Normal']
-        style.font.name = 'Yu Gothic'
-        style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+        """Initialize document settings."""
+        style = self.doc.styles["Normal"]
+        style.font.name = "Yu Gothic"
+        style._element.rPr.rFonts.set(qn("w:eastAsia"), "Yu Gothic")
 
         sections = self.doc.sections
         for section in sections:
@@ -48,110 +44,82 @@ class RobustDocumentConverter:
             section.top_margin = Cm(2.54)
             section.bottom_margin = Cm(2.54)
 
-    def detect_tables(self, image):
-        """Table detection using line detection"""
+    def detect_and_extract_tables(self, image):
+        """Advanced table detection and extraction."""
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
 
         # Detect horizontal and vertical lines
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
 
-        horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
-        vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
+        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
 
-        # Combine lines to detect table structure
-        table_mask = cv2.addWeighted(horizontal_lines, 1, vertical_lines, 1, 0)
+        # Combine lines to form the table grid
+        table_grid = cv2.add(horizontal_lines, vertical_lines)
 
-        # Find contours of tables
-        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Detect contours for table boundaries
+        contours, _ = cv2.findContours(
+            table_grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         tables = []
 
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            if w > 50 and h > 50:  # Minimum size for table detection
-                tables.append((y, y + h, x, x + w))
+            if w > 50 and h > 50:  # Minimum size to consider as a table
+                tables.append((x, y, w, h))
 
-        return sorted(tables)
+        return tables
 
-    def clean_cell_text(self, text):
-        """Clean and validate cell text"""
-        if not text or not isinstance(text, str):
-            return ""
-        text = text.replace('\x00', '').strip()
-        text = ' '.join(text.split())
-        return text[:32767]  # Word cell text limit
+    def extract_table_cells(self, table_image, x, y, w, h):
+        """Extract table cells using precise segmentation."""
+        cropped_table = table_image[y : y + h, x : x + w]
+        gray = cv2.cvtColor(cropped_table, cv2.COLOR_RGB2GRAY)
+        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+
+        # Find contours for cells
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+        cells = []
+
+        for contour in contours:
+            cell_x, cell_y, cell_w, cell_h = cv2.boundingRect(contour)
+            if cell_w > 20 and cell_h > 20:  # Filter out very small boxes
+                cells.append((cell_x, cell_y, cell_w, cell_h))
+
+        # Sort cells by position
+        cells = sorted(cells, key=lambda c: (c[1], c[0]))  # Sort by row, then column
+        return cells
 
     def process_table(self, image, table_coords):
-        """Enhanced table processing with robust cell handling"""
-        try:
-            y1, y2, x1, x2 = table_coords
-            if y1 >= y2 or x1 >= x2:
-                return table_coords[1]
+        """Process a detected table and add it to the Word document."""
+        x, y, w, h = table_coords
+        cells = self.extract_table_cells(image, x, y, w, h)
 
-            # Crop table region
-            table_image = image[y1:y2, x1:x2]
-            if table_image.size == 0:
-                return table_coords[1]
+        if not cells:
+            return
 
-            # Convert to grayscale and binarize
-            gray = cv2.cvtColor(table_image, cv2.COLOR_RGB2GRAY)
-            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        # Determine the number of rows and columns
+        rows = len(set(cell[1] for cell in cells))
+        cols = len(set(cell[0] for cell in cells))
+        table = self.doc.add_table(rows=rows, cols=cols)
+        table.style = "Table Grid"
 
-            # Detect horizontal and vertical lines
-            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-            vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        # Add text to the table cells
+        for cell_x, cell_y, cell_w, cell_h in cells:
+            cropped_cell = image[cell_y : cell_y + cell_h, cell_x : cell_x + cell_w]
+            text = pytesseract.image_to_string(cropped_cell, lang="eng", config="--psm 6").strip()
+            if text:
+                row_idx = cell_y // (h // rows)
+                col_idx = cell_x // (w // cols)
+                table.cell(row_idx, col_idx).text = text
 
-            horizontal = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
-            vertical = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
-
-            # Find line positions
-            horizontal_lines = np.unique(np.where(horizontal > 0)[0])
-            vertical_lines = np.unique(np.where(vertical > 0)[1])
-
-            row_positions = sorted(horizontal_lines.tolist())
-            col_positions = sorted(vertical_lines.tolist())
-
-            if len(row_positions) < 2 or len(col_positions) < 2:
-                return table_coords[1]
-
-            # Create table in the document
-            num_rows = len(row_positions) - 1
-            num_cols = len(col_positions) - 1
-            table = self.doc.add_table(rows=num_rows, cols=num_cols)
-            table.style = 'Table Grid'
-
-            for i in range(num_rows):
-                for j in range(num_cols):
-                    # Define cell boundaries
-                    cell_y1, cell_y2 = row_positions[i], row_positions[i + 1]
-                    cell_x1, cell_x2 = col_positions[j], col_positions[j + 1]
-
-                    if cell_y1 >= cell_y2 or cell_x1 >= cell_x2:
-                        continue
-
-                    # Crop cell image
-                    cell_image = table_image[cell_y1:cell_y2, cell_x1:cell_x2]
-                    if cell_image.size == 0:
-                        continue
-
-                    # Perform OCR
-                    cell_text = pytesseract.image_to_string(cell_image, lang='jpn+eng', config='--psm 6').strip()
-                    cell_text = self.clean_cell_text(cell_text)
-
-                    # Write text to document cell
-                    cell = table.cell(i, j)
-                    cell.text = cell_text
-
-            self.doc.add_paragraph()
-            return y2
-
-        except Exception as e:
-            self.logger.error(f"Table processing error: {str(e)}")
-            return table_coords[1]
+        self.doc.add_paragraph()
 
     def convert(self):
-        """Main conversion process"""
+        """Main conversion process."""
         try:
             pdf_document = fitz.open(self.input_path)
             total_pages = pdf_document.page_count
@@ -164,26 +132,10 @@ class RobustDocumentConverter:
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         img_np = np.array(img)
 
-                        tables = self.detect_tables(img_np)
-                        last_y = 0
+                        tables = self.detect_and_extract_tables(img_np)
 
                         for table_coords in tables:
-                            if table_coords[0] > last_y:
-                                text_region = img_np[last_y:table_coords[0], :]
-                                text = pytesseract.image_to_string(text_region, lang='jpn+eng').strip()
-                                if text:
-                                    self.doc.add_paragraph(text)
-
-                            last_y = self.process_table(img_np, table_coords)
-
-                        if last_y < img_np.shape[0]:
-                            text_region = img_np[last_y:, :]
-                            text = pytesseract.image_to_string(text_region, lang='jpn+eng').strip()
-                            if text:
-                                self.doc.add_paragraph(text)
-
-                        if page_num < total_pages - 1:
-                            self.doc.add_page_break()
+                            self.process_table(img_np, table_coords)
 
                         pbar.update(1)
 
@@ -195,42 +147,33 @@ class RobustDocumentConverter:
                 os.makedirs(output_dir, exist_ok=True)
 
             temp_docx = self.output_path
-            if self.output_format == 'pdf':
-                temp_docx = str(Path(self.output_path).with_suffix('.docx'))
+            if self.output_format == "pdf":
+                temp_docx = str(Path(self.output_path).with_suffix(".docx"))
 
             self.doc.save(temp_docx)
-
-            if self.output_format == 'pdf':
-                convert(temp_docx, self.output_path)
-                os.remove(temp_docx)
 
             self.logger.info(f"Document successfully saved as {self.output_path}")
 
         except Exception as e:
             self.logger.error(f"Conversion error: {str(e)}")
         finally:
-            if 'pdf_document' in locals():
+            if "pdf_document" in locals():
                 pdf_document.close()
 
 
 def main():
-    print("Robust Document Converter")
+    print("Enhanced Document Converter")
     print("-" * 30)
 
     input_path = input("Enter input PDF path: ")
     output_format = input("Enter desired output format (docx/pdf): ").lower()
-    while output_format not in ['docx', 'pdf']:
+    while output_format not in ["docx", "pdf"]:
         output_format = input("Please enter either 'docx' or 'pdf': ").lower()
 
-    try:
-        dpi = int(input("Enter DPI (300-600, press Enter for default 300): ") or 300)
-        dpi = max(300, min(600, dpi))
-    except ValueError:
-        dpi = 300
+    dpi = int(input("Enter DPI (300-600, default is 300): ") or 300)
+    output_path = str(Path(input_path).with_suffix(f".{output_format}"))
 
-    output_path = str(Path(input_path).with_suffix(f'.{output_format}'))
-
-    converter = RobustDocumentConverter(input_path, output_path, output_format, dpi)
+    converter = EnhancedDocumentConverter(input_path, output_path, output_format, dpi)
     converter.convert()
 
 
