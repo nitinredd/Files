@@ -1,352 +1,69 @@
-import streamlit as st
+import fitz  # PyMuPDF
 import pytesseract
-import fitz
-import numpy as np
-import cv2
-from PIL import Image, ImageDraw
-import io
+from PIL import Image
 from docx import Document
-from docx.shared import Inches, Pt, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-import platform
-import warnings
-import logging
-import time
-import traceback
-from datetime import datetime
-import os
-from pathlib import Path
-import json
-from typing import Dict, List, Tuple, Any
+import io
+import numpy as np
 
-# Configure logging
-def setup_logger():
-    """Set up logger with both file and stream handlers"""
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+def convert_pdf_to_word(pdf_path, output_path, dpi=300):
+    """
+    Convert a scanned PDF to Word document using PyMuPDF and OCR.
     
-    log_filename = f"ocr_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    log_path = log_dir / log_filename
-    
-    logger = logging.getLogger('OCRApp')
-    logger.setLevel(logging.DEBUG)
-    
-    # File handler
-    file_handler = logging.FileHandler(log_path, encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)
-    file_formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-    
-    # Stream handler
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.INFO)
-    stream_formatter = logging.Formatter('%(levelname)s - %(message)s')
-    stream_handler.setFormatter(stream_formatter)
-    logger.addHandler(stream_handler)
-    
-    return logger, log_path
-
-# Configure Tesseract path for Windows
-if platform.system() == "Windows":
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-class OCRProcessor:
-    def __init__(self, logger):
-        self.logger = logger
-        self.processing_stats: Dict[str, Any] = {
-            'start_time': None,
-            'end_time': None,
-            'total_pages': 0,
-            'processed_pages': 0,
-            'tables_detected': 0,
-            'errors': []
-        }
-
-    def enhance_image(self, image: Image.Image) -> Image.Image:
-        """Enhanced image preprocessing with error handling"""
-        try:
-            self.logger.debug("Starting image enhancement")
-            img_array = np.array(image)
-            
-            # Convert to grayscale
-            gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            
-            # Apply CLAHE
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            gray = clahe.apply(gray)
-            
-            # Bilateral filtering
-            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
-            
-            # Adaptive thresholding
-            binary = cv2.adaptiveThreshold(
-                denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8
-            )
-            
-            # Morphological operations
-            kernel = np.ones((2,2), np.uint8)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-            
-            self.logger.debug("Image enhancement completed successfully")
-            return Image.fromarray(binary)
-        except Exception as e:
-            self.logger.error(f"Error in image enhancement: {str(e)}")
-            self.processing_stats['errors'].append(f"Image enhancement error: {str(e)}")
-            raise
-
-    def detect_table_cells(self, image: Image.Image) -> List[Tuple[int, int, int, int]]:
-        """Advanced table cell detection with error handling"""
-        try:
-            self.logger.debug("Starting table cell detection")
-            img_array = np.array(image)
-            if len(img_array.shape) == 3:
-                gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-            else:
-                gray = img_array
-            
-            binary = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
-            )
-            
-            # Multi-scale line detection
-            scales = [(40, 1), (80, 1), (20, 1)]
-            horizontal_lines = np.zeros_like(binary)
-            vertical_lines = np.zeros_like(binary)
-            
-            for h_scale in scales:
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, h_scale)
-                horizontal_lines = cv2.add(horizontal_lines, 
-                                         cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel))
-            
-            for v_scale in [(1, 40), (1, 80), (1, 20)]:
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, v_scale)
-                vertical_lines = cv2.add(vertical_lines, 
-                                       cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel))
-            
-            table_structure = cv2.add(horizontal_lines, vertical_lines)
-            
-            # Refined contour detection
-            contours, hierarchy = cv2.findContours(
-                table_structure, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-            )
-            
-            cells = []
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                if w * h > 100:  # Filter out noise
-                    cells.append((x, y, w, h))
-            
-            cells.sort(key=lambda x: (x[1], x[0]))
-            
-            self.logger.debug(f"Detected {len(cells)} table cells")
-            self.processing_stats['tables_detected'] += 1
-            return cells
-        except Exception as e:
-            self.logger.error(f"Error in table cell detection: {str(e)}")
-            self.processing_stats['errors'].append(f"Table detection error: {str(e)}")
-            raise
-
-    def process_page(self, page, progress_bar) -> Tuple[str, List[List[str]]]:
-        """Process a single PDF page with progress tracking"""
-        try:
-            # Convert page to image
-            pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72))
-            image = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            
-            # Process image
-            enhanced_image = self.enhance_image(image)
-            cells = self.detect_table_cells(enhanced_image)
-            
-            if cells:
-                table_data = self.process_table_cells(image, cells)
-                
-                # Process non-table regions
-                mask = Image.new('L', image.size, 255)
-                draw = ImageDraw.Draw(mask)
-                for x, y, w, h in cells:
-                    draw.rectangle([x, y, x+w, y+h], fill=0)
-                non_table_region = Image.composite(
-                    image, Image.new('RGB', image.size, 'white'), mask
-                )
-                text = pytesseract.image_to_string(non_table_region, lang='jpn')
-            else:
-                table_data = []
-                text = pytesseract.image_to_string(enhanced_image, lang='jpn')
-            
-            self.processing_stats['processed_pages'] += 1
-            progress_bar.progress(
-                self.processing_stats['processed_pages'] / 
-                self.processing_stats['total_pages']
-            )
-            
-            return text, table_data
-        except Exception as e:
-            self.logger.error(f"Error processing page: {str(e)}")
-            self.processing_stats['errors'].append(f"Page processing error: {str(e)}")
-            raise
-
-    def process_document(self, pdf_bytes: bytes) -> Tuple[Document, Dict[str, Any]]:
-        """Process entire PDF document with comprehensive logging"""
-        self.processing_stats['start_time'] = time.time()
+    Args:
+        pdf_path (str): Path to the input PDF file
+        output_path (str): Path where the Word document will be saved
+        dpi (int): DPI for image rendering (higher means better quality but slower)
+    """
+    try:
+        # Open the PDF
+        pdf_document = fitz.open(pdf_path)
+        doc = Document()
         
-        try:
-            # Create progress bars
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        for page_num in range(pdf_document.page_count):
+            print(f"Processing page {page_num + 1}/{pdf_document.page_count}...")
             
-            pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-            self.processing_stats['total_pages'] = len(pdf_document)
+            # Get the page
+            page = pdf_document[page_num]
             
-            processed_texts = []
-            tables_data = []
+            # Convert page to image
+            pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
             
-            for page_num in range(self.processing_stats['total_pages']):
-                status_text.text(f"Processing page {page_num + 1}/{self.processing_stats['total_pages']}")
-                self.logger.info(f"Processing page {page_num + 1}")
-                
-                text, table_data = self.process_page(pdf_document[page_num], progress_bar)
-                processed_texts.append(text)
-                tables_data.append(table_data)
+            # Convert to PIL Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
-            # Create document
-            doc = self.create_docx_with_tables(processed_texts, tables_data)
+            # Extract text using OCR
+            text = pytesseract.image_to_string(img)
             
-            pdf_document.close()
-            progress_bar.empty()
-            status_text.empty()
-            
-            self.processing_stats['end_time'] = time.time()
-            self.processing_stats['processing_time'] = (
-                self.processing_stats['end_time'] - 
-                self.processing_stats['start_time']
-            )
-            
-            return doc, self.processing_stats
-            
-        except Exception as e:
-            self.logger.error(f"Error in document processing: {str(e)}")
-            self.processing_stats['errors'].append(f"Document processing error: {str(e)}")
-            raise
-
-    def create_docx_with_tables(self, texts, tables_data) -> Document:
-        """Create Word document with enhanced table formatting"""
-        try:
-            self.logger.debug("Creating Word document")
-            doc = Document()
-            
-            style = doc.styles['Normal']
-            style.font.name = 'Arial'
-            style.font.size = Pt(10)
-            
-            for page_num, (text, table_data) in enumerate(zip(texts, tables_data), 1):
-                doc.add_heading(f'Page {page_num}', level=1)
-                
-                if table_data:
-                    max_cols = max(len(row) for row in table_data)
-                    table = doc.add_table(rows=len(table_data), cols=max_cols)
-                    table.style = 'Table Grid'
-                    
-                    for cell in table.rows[0].cells:
-                        cell.width = Cm(3)
-                    
-                    for i, row in enumerate(table_data):
-                        for j, cell_text in enumerate(row):
-                            try:
-                                cell = table.cell(i, j)
-                                cell.text = cell_text
-                                paragraph = cell.paragraphs[0]
-                                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                                run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
-                                run.font.size = Pt(9)
-                            except IndexError:
-                                continue
-                
-                if text:
-                    doc.add_paragraph(text)
-                
+            # Add a page break if it's not the first page
+            if page_num > 0:
                 doc.add_page_break()
             
-            self.logger.debug("Word document created successfully")
-            return doc
+            # Add the extracted text to the document
+            doc.add_paragraph(text)
             
-        except Exception as e:
-            self.logger.error(f"Error creating Word document: {str(e)}")
-            self.processing_stats['errors'].append(f"Document creation error: {str(e)}")
-            raise
+            # Clean up
+            img.close()
+        
+        # Save the document
+        doc.save(output_path)
+        print(f"Document successfully saved to {output_path}")
+        
+        # Close the PDF
+        pdf_document.close()
+        
+    except Exception as e:
+        print(f"An error occurred: {str(e)}")
 
-def main():
-    st.title("Enhanced Japanese Document OCR with Complex Table Detection")
-    st.write("Upload a PDF document to extract text and complex tables")
-    
-    # Setup logging
-    logger, log_path = setup_logger()
-    logger.info("Application started")
-    
-    # Initialize OCR processor
-    processor = OCRProcessor(logger)
-    
-    uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-    
-    if uploaded_file is not None:
-        try:
-            pdf_bytes = uploaded_file.read()
-            
-            with st.spinner("Processing document..."):
-                # Process document
-                doc, stats = processor.process_document(pdf_bytes)
-                
-                # Save document
-                docx_bytes = io.BytesIO()
-                doc.save(docx_bytes)
-                docx_bytes.seek(0)
-                
-                # Create download buttons
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.download_button(
-                        label="Download DOCX file",
-                        data=docx_bytes,
-                        file_name="extracted_document.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-                
-                with col2:
-                    # Save processing log
-                    log_content = {
-                        "filename": uploaded_file.name,
-                        "processing_stats": stats,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    log_bytes = json.dumps(log_content, indent=2).encode('utf-8')
-                    st.download_button(
-                        label="Download Processing Log",
-                        data=log_bytes,
-                        file_name="processing_log.json",
-                        mime="application/json"
-                    )
-                
-                # Display processing statistics
-                st.success("Document processed successfully!")
-                st.write("Processing Statistics:")
-                st.write(f"- Total pages: {stats['total_pages']}")
-                st.write(f"- Tables detected: {stats['tables_detected']}")
-                st.write(f"- Processing time: {stats['processing_time']:.2f} seconds")
-                
-                if stats['errors']:
-                    st.warning("Some errors occurred during processing:")
-                    for error in stats['errors']:
-                        st.write(f"- {error}")
-                
-        except Exception as e:
-            logger.error(f"Critical error: {str(e)}\n{traceback.format_exc()}")
-            st.error("An error occurred during processing")
-            st.error(str(e))
-            st.error("Please check the logs for details")
+def get_ocr_confidence(image):
+    """
+    Get OCR confidence score for an image
+    """
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    confidences = [int(conf) for conf in data['conf'] if conf != '-1']
+    return sum(confidences) / len(confidences) if confidences else 0
 
 if __name__ == "__main__":
-    main()
+    # Example usage
+    pdf_path = "input.pdf"
+    output_path = "output.docx"
+    convert_pdf_to_word(pdf_path, output_path)
