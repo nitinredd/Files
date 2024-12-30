@@ -1,23 +1,38 @@
-import fitz  # PyMuPDF
+import fitz
 import pytesseract
 from PIL import Image
 from docx import Document
-import io
+from docx.shared import Inches
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import numpy as np
 
-def convert_pdf_to_word(pdf_path, output_path, dpi=300):
+def set_japanese_font(paragraph):
+    """Set Japanese font for a paragraph"""
+    for run in paragraph.runs:
+        run.font.name = 'Yu Gothic'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+
+def convert_secure_pdf_to_word(pdf_path, output_path, dpi=300):
     """
-    Convert a scanned PDF to Word document using PyMuPDF and OCR.
+    Convert Japanese PDF to Word document securely using only local processing
     
     Args:
-        pdf_path (str): Path to the input PDF file
-        output_path (str): Path where the Word document will be saved
-        dpi (int): DPI for image rendering (higher means better quality but slower)
+        pdf_path (str): Path to input PDF
+        output_path (str): Path for output Word document
+        dpi (int): Resolution for image processing
     """
     try:
-        # Open the PDF
-        pdf_document = fitz.open(pdf_path)
+        # Create Word document
         doc = Document()
+        
+        # Set default font for Japanese
+        style = doc.styles['Normal']
+        style.font.name = 'Yu Gothic'
+        style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+        
+        # Open PDF
+        pdf_document = fitz.open(pdf_path)
         
         for page_num in range(pdf_document.page_count):
             print(f"Processing page {page_num + 1}/{pdf_document.page_count}...")
@@ -25,45 +40,60 @@ def convert_pdf_to_word(pdf_path, output_path, dpi=300):
             # Get the page
             page = pdf_document[page_num]
             
-            # Convert page to image
+            # Convert to image
             pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
-            
-            # Convert to PIL Image
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
-            # Extract text using OCR
-            text = pytesseract.image_to_string(img)
+            # Configure OCR for Japanese
+            custom_config = r'--oem 3 --psm 6 -l jpn'
             
-            # Add a page break if it's not the first page
-            if page_num > 0:
+            # Get text with layout analysis
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, 
+                                           config=custom_config)
+            
+            current_block = -1
+            text_buffer = []
+            
+            # Process OCR results
+            for i in range(len(data['text'])):
+                if int(data['conf'][i]) > 20:  # Filter low-confidence results
+                    if data['block_num'][i] != current_block:
+                        # Write buffered text
+                        if text_buffer:
+                            text = ' '.join(text_buffer).strip()
+                            if text:
+                                p = doc.add_paragraph(text)
+                                set_japanese_font(p)
+                            text_buffer = []
+                        current_block = data['block_num'][i]
+                    
+                    text_buffer.append(data['text'][i])
+            
+            # Write remaining text
+            if text_buffer:
+                text = ' '.join(text_buffer).strip()
+                if text:
+                    p = doc.add_paragraph(text)
+                    set_japanese_font(p)
+            
+            # Add page break if not last page
+            if page_num < pdf_document.page_count - 1:
                 doc.add_page_break()
-            
-            # Add the extracted text to the document
-            doc.add_paragraph(text)
             
             # Clean up
             img.close()
         
-        # Save the document
+        # Save document
         doc.save(output_path)
         print(f"Document successfully saved to {output_path}")
         
-        # Close the PDF
+        # Close PDF
         pdf_document.close()
         
     except Exception as e:
         print(f"An error occurred: {str(e)}")
 
-def get_ocr_confidence(image):
-    """
-    Get OCR confidence score for an image
-    """
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    confidences = [int(conf) for conf in data['conf'] if conf != '-1']
-    return sum(confidences) / len(confidences) if confidences else 0
-
 if __name__ == "__main__":
-    # Example usage
     pdf_path = "input.pdf"
     output_path = "output.docx"
-    convert_pdf_to_word(pdf_path, output_path)
+    convert_secure_pdf_to_word(pdf_path, output_path)
