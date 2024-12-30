@@ -1,99 +1,282 @@
 import fitz
 import pytesseract
 from PIL import Image
+import numpy as np
+import cv2
 from docx import Document
-from docx.shared import Inches
+from docx.shared import Inches, Pt, Cm, Twips
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-import numpy as np
+from docx2pdf import convert
+import pandas as pd
+from collections import defaultdict
 
-def set_japanese_font(paragraph):
-    """Set Japanese font for a paragraph"""
-    for run in paragraph.runs:
-        run.font.name = 'Yu Gothic'
-        run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+class AdvancedDocumentConverter:
+    def __init__(self, input_path, output_path, output_format='docx', dpi=300):
+        self.input_path = input_path
+        self.output_path = output_path
+        self.output_format = output_format.lower()
+        self.dpi = dpi
+        self.doc = Document()
+        self.setup_document()
 
-def convert_secure_pdf_to_word(pdf_path, output_path, dpi=300):
-    """
-    Convert Japanese PDF to Word document securely using only local processing
-    
-    Args:
-        pdf_path (str): Path to input PDF
-        output_path (str): Path for output Word document
-        dpi (int): Resolution for image processing
-    """
-    try:
-        # Create Word document
-        doc = Document()
-        
-        # Set default font for Japanese
-        style = doc.styles['Normal']
+    def setup_document(self):
+        """Initialize document settings"""
+        # Set up Japanese font
+        style = self.doc.styles['Normal']
         style.font.name = 'Yu Gothic'
         style._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
         
-        # Open PDF
-        pdf_document = fitz.open(pdf_path)
+        # Set up default margins
+        sections = self.doc.sections
+        for section in sections:
+            section.left_margin = Cm(2.54)
+            section.right_margin = Cm(2.54)
+            section.top_margin = Cm(2.54)
+            section.bottom_margin = Cm(2.54)
+
+    def detect_complex_tables(self, image):
+        """Enhanced table detection for complex and nested tables"""
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         
-        for page_num in range(pdf_document.page_count):
-            print(f"Processing page {page_num + 1}/{pdf_document.page_count}...")
+        # Adaptive thresholding for better line detection
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+
+        # Detect lines with different scales
+        def detect_lines(img, min_length, thickness):
+            horizontal = np.copy(img)
+            vertical = np.copy(img)
             
-            # Get the page
-            page = pdf_document[page_num]
+            # Detect horizontal lines
+            horizontal_size = min_length
+            horizontalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (horizontal_size, 1))
+            horizontal = cv2.erode(horizontal, horizontalStructure)
+            horizontal = cv2.dilate(horizontal, horizontalStructure)
             
-            # Convert to image
-            pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            # Detect vertical lines
+            vertical_size = min_length
+            verticalStructure = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_size))
+            vertical = cv2.erode(vertical, verticalStructure)
+            vertical = cv2.dilate(vertical, verticalStructure)
             
-            # Configure OCR for Japanese
-            custom_config = r'--oem 3 --psm 6 -l jpn'
+            return horizontal, vertical
+
+        # Detect lines at different scales for nested tables
+        scales = [(30, 1), (50, 2), (100, 3)]  # (min_length, thickness)
+        combined_mask = np.zeros_like(binary)
+        
+        for min_length, thickness in scales:
+            h_lines, v_lines = detect_lines(binary, min_length, thickness)
+            scale_mask = cv2.addWeighted(h_lines, 1, v_lines, 1, 0)
+            combined_mask = cv2.addWeighted(combined_mask, 1, scale_mask, 1, 0)
+
+        # Find contours for table regions
+        contours, hierarchy = cv2.findContours(
+            combined_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        # Analyze hierarchy for nested tables
+        tables = []
+        if hierarchy is not None:
+            hierarchy = hierarchy[0]
+            for i, contour in enumerate(contours):
+                x, y, w, h = cv2.boundingRect(contour)
+                if w > 50 and h > 50:  # Filter small regions
+                    level = 0
+                    parent = hierarchy[i][3]
+                    while parent != -1:
+                        level += 1
+                        parent = hierarchy[parent][3]
+                    tables.append({
+                        'coords': (y, y+h, x, x+w),
+                        'level': level,
+                        'area': w * h
+                    })
+
+        # Sort tables by vertical position and nesting level
+        tables.sort(key=lambda x: (x['coords'][0], -x['level']))
+        return tables
+
+    def analyze_table_structure(self, image):
+        """Analyze table structure including cells and spans"""
+        # Edge detection for cell boundaries
+        edges = cv2.Canny(image, 50, 150)
+        
+        # Detect horizontal and vertical lines
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=50, 
+                               minLineLength=50, maxLineGap=10)
+        
+        horizontal_lines = []
+        vertical_lines = []
+        
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if abs(y2 - y1) < 10:  # Horizontal line
+                    horizontal_lines.append((min(x1, x2), y1, max(x1, x2), y2))
+                elif abs(x2 - x1) < 10:  # Vertical line
+                    vertical_lines.append((x1, min(y1, y2), x2, max(y1, y2)))
+
+        # Sort lines
+        horizontal_lines.sort(key=lambda x: x[1])
+        vertical_lines.sort(key=lambda x: x[0])
+
+        return horizontal_lines, vertical_lines
+
+    def extract_cell_content(self, image, cell_coords):
+        """Extract and process cell content"""
+        y1, y2, x1, x2 = cell_coords
+        cell_image = image[y1:y2, x1:x2]
+        
+        # OCR with specific configuration for cell content
+        custom_config = r'--oem 3 --psm 6 -l jpn+eng'
+        text = pytesseract.image_to_string(cell_image, config=custom_config)
+        
+        return text.strip()
+
+    def build_complex_table(self, image, table_info):
+        """Build complex table with nested structure"""
+        y1, y2, x1, x2 = table_info['coords']
+        table_image = image[y1:y2, x1:x2]
+        
+        # Analyze table structure
+        h_lines, v_lines = self.analyze_table_structure(table_image)
+        
+        # Calculate row and column positions
+        row_positions = sorted(set(y for _, y, _, _ in h_lines))
+        col_positions = sorted(set(x for x, _, _, _ in v_lines))
+        
+        # Create table
+        num_rows = len(row_positions) - 1
+        num_cols = len(col_positions) - 1
+        if num_rows > 0 and num_cols > 0:
+            table = self.doc.add_table(rows=num_rows, cols=num_cols)
+            table.style = 'Table Grid'
             
-            # Get text with layout analysis
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, 
-                                           config=custom_config)
-            
-            current_block = -1
-            text_buffer = []
-            
-            # Process OCR results
-            for i in range(len(data['text'])):
-                if int(data['conf'][i]) > 20:  # Filter low-confidence results
-                    if data['block_num'][i] != current_block:
-                        # Write buffered text
-                        if text_buffer:
-                            text = ' '.join(text_buffer).strip()
-                            if text:
-                                p = doc.add_paragraph(text)
-                                set_japanese_font(p)
-                            text_buffer = []
-                        current_block = data['block_num'][i]
+            # Process each cell
+            for i in range(num_rows):
+                for j in range(num_cols):
+                    cell_coords = (
+                        row_positions[i],
+                        row_positions[i+1],
+                        col_positions[j],
+                        col_positions[j+1]
+                    )
+                    cell_text = self.extract_cell_content(table_image, cell_coords)
                     
-                    text_buffer.append(data['text'][i])
+                    # Apply cell content
+                    table_cell = table.cell(i, j)
+                    table_cell.text = cell_text
+                    
+                    # Apply Japanese font
+                    paragraph = table_cell.paragraphs[0]
+                    run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                    run.font.name = 'Yu Gothic'
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+                    
+                    # Adjust cell width based on content
+                    if cell_text:
+                        width = len(cell_text) * Pt(12)  # Approximate width
+                        table_cell._tc.tcPr.tcW.w = min(width, Inches(3).twips)
+
+        return y2
+
+    def process_text_region(self, image, y1, y2):
+        """Process text regions between tables"""
+        if y2 > y1:
+            region_image = image[y1:y2, :]
+            text = pytesseract.image_to_string(region_image, lang='jpn+eng')
+            if text.strip():
+                p = self.doc.add_paragraph(text.strip())
+                for run in p.runs:
+                    run.font.name = 'Yu Gothic'
+                    run._element.rPr.rFonts.set(qn('w:eastAsia'), 'Yu Gothic')
+
+    def convert(self):
+        """Main conversion process"""
+        try:
+            pdf_document = fitz.open(self.input_path)
             
-            # Write remaining text
-            if text_buffer:
-                text = ' '.join(text_buffer).strip()
-                if text:
-                    p = doc.add_paragraph(text)
-                    set_japanese_font(p)
+            for page_num in range(pdf_document.page_count):
+                print(f"Processing page {page_num + 1}/{pdf_document.page_count}...")
+                
+                # Convert page to image
+                page = pdf_document[page_num]
+                pix = page.get_pixmap(matrix=fitz.Matrix(self.dpi/72, self.dpi/72))
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                img_np = np.array(img)
+                
+                # Detect tables
+                tables = self.detect_complex_tables(img_np)
+                
+                # Process page content
+                last_y = 0
+                for table in tables:
+                    y1 = table['coords'][0]
+                    
+                    # Process text region before table
+                    self.process_text_region(img_np, last_y, y1)
+                    
+                    # Process table
+                    last_y = self.build_complex_table(img_np, table)
+                
+                # Process remaining text
+                self.process_text_region(img_np, last_y, img_np.shape[0])
+                
+                # Add page break if not last page
+                if page_num < pdf_document.page_count - 1:
+                    self.doc.add_page_break()
+                
+                img.close()
             
-            # Add page break if not last page
-            if page_num < pdf_document.page_count - 1:
-                doc.add_page_break()
+            # Save in requested format
+            temp_docx = self.output_path
+            if self.output_format == 'pdf':
+                temp_docx = self.output_path.rsplit('.', 1)[0] + '_temp.docx'
             
-            # Clean up
-            img.close()
-        
-        # Save document
-        doc.save(output_path)
-        print(f"Document successfully saved to {output_path}")
-        
-        # Close PDF
-        pdf_document.close()
-        
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
+            self.doc.save(temp_docx)
+            
+            if self.output_format == 'pdf':
+                convert(temp_docx, self.output_path)
+                import os
+                os.remove(temp_docx)
+            
+            print(f"Document successfully saved as {self.output_path}")
+            
+        except Exception as e:
+            print(f"An error occurred: {str(e)}")
+        finally:
+            if 'pdf_document' in locals():
+                pdf_document.close()
+
+def main():
+    print("Advanced Document Converter")
+    print("-" * 30)
+    
+    # Get input parameters
+    input_path = input("Enter input PDF path: ")
+    output_format = input("Enter desired output format (docx/pdf): ").lower()
+    while output_format not in ['docx', 'pdf']:
+        output_format = input("Please enter either 'docx' or 'pdf': ").lower()
+    
+    # Get optional DPI setting
+    try:
+        dpi = int(input("Enter DPI (300-600, press Enter for default 300): ") or 300)
+        dpi = max(300, min(600, dpi))
+    except ValueError:
+        dpi = 300
+    
+    # Generate output path
+    output_path = input_path.rsplit('.', 1)[0] + '.' + output_format
+    
+    # Create converter and process document
+    converter = AdvancedDocumentConverter(input_path, output_path, output_format, dpi)
+    converter.convert()
 
 if __name__ == "__main__":
-    pdf_path = "input.pdf"
-    output_path = "output.docx"
-    convert_secure_pdf_to_word(pdf_path, output_path)
+    main()
