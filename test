@@ -3,120 +3,103 @@ import pytesseract
 from PIL import Image
 import numpy as np
 import cv2
-from docx import Document
-from docx.shared import Cm
-from docx.oxml.ns import qn
-from tqdm import tqdm
+from openpyxl import Workbook
 import os
-from pathlib import Path
 import logging
+from pathlib import Path
+from tqdm import tqdm
 
 
-class EnhancedDocumentConverter:
-    def __init__(self, input_path, output_path, output_format='docx', dpi=300):
+class PDFTableToExcelConverter:
+    def __init__(self, input_path, output_path, dpi=300):
         self.input_path = input_path
         self.output_path = output_path
-        self.output_format = output_format.lower()
         self.dpi = dpi
-        self.doc = Document()
+        self.wb = Workbook()
+        self.ws = self.wb.active
+        self.ws.title = "Extracted Tables"
         self.setup_logging()
-        self.setup_document()
 
     def setup_logging(self):
         """Setup logging configuration."""
         logging.basicConfig(
             level=logging.INFO,
-            format="%(asctime)s - %(levelname)s - %(message)s",
-            handlers=[logging.FileHandler("conversion.log"), logging.StreamHandler()],
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('conversion.log'),
+                logging.StreamHandler()
+            ]
         )
         self.logger = logging.getLogger(__name__)
 
-    def setup_document(self):
-        """Initialize document settings."""
-        style = self.doc.styles["Normal"]
-        style.font.name = "Yu Gothic"
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), "Yu Gothic")
-
-        sections = self.doc.sections
-        for section in sections:
-            section.left_margin = Cm(2.54)
-            section.right_margin = Cm(2.54)
-            section.top_margin = Cm(2.54)
-            section.bottom_margin = Cm(2.54)
-
-    def detect_and_extract_tables(self, image):
-        """Advanced table detection and extraction."""
+    def detect_tables(self, image):
+        """Detect table boundaries in an image."""
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 11, 2)
 
         # Detect horizontal and vertical lines
-        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (50, 1))
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 50))
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+        vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
 
-        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
+        # Combine horizontal and vertical lines to detect tables
+        table_mask = cv2.addWeighted(horizontal_lines, 1, vertical_lines, 1, 0)
+        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # Combine lines to form the table grid
-        table_grid = cv2.add(horizontal_lines, vertical_lines)
-
-        # Detect contours for table boundaries
-        contours, _ = cv2.findContours(
-            table_grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
         tables = []
-
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
-            if w > 50 and h > 50:  # Minimum size to consider as a table
-                tables.append((x, y, w, h))
+            if w > 50 and h > 50:  # Minimum size to qualify as a table
+                tables.append((y, y + h, x, x + w))
+        return sorted(tables)
 
-        return tables
+    def extract_table(self, image, table_coords):
+        """Extract text data from the table region."""
+        y1, y2, x1, x2 = table_coords
+        table_image = image[y1:y2, x1:x2]
 
-    def extract_table_cells(self, table_image, x, y, w, h):
-        """Extract table cells using precise segmentation."""
-        cropped_table = table_image[y : y + h, x : x + w]
-        gray = cv2.cvtColor(cropped_table, cv2.COLOR_RGB2GRAY)
-        _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY_INV)
+        # Detect horizontal and vertical lines within the table
+        gray = cv2.cvtColor(table_image, cv2.COLOR_RGB2GRAY)
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY_INV, 11, 2)
 
-        # Find contours for cells
-        contours, _ = cv2.findContours(
-            binary, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-        )
-        cells = []
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+        horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
+        vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
 
-        for contour in contours:
-            cell_x, cell_y, cell_w, cell_h = cv2.boundingRect(contour)
-            if cell_w > 20 and cell_h > 20:  # Filter out very small boxes
-                cells.append((cell_x, cell_y, cell_w, cell_h))
+        # Detect lines
+        horizontal_lines = cv2.HoughLinesP(horizontal_lines, 1, np.pi / 180, 100,
+                                           minLineLength=50, maxLineGap=10)
+        vertical_lines = cv2.HoughLinesP(vertical_lines, 1, np.pi / 180, 100,
+                                         minLineLength=50, maxLineGap=10)
 
-        # Sort cells by position
-        cells = sorted(cells, key=lambda c: (c[1], c[0]))  # Sort by row, then column
-        return cells
+        if not horizontal_lines or not vertical_lines:
+            return []
 
-    def process_table(self, image, table_coords):
-        """Process a detected table and add it to the Word document."""
-        x, y, w, h = table_coords
-        cells = self.extract_table_cells(image, x, y, w, h)
+        # Get row and column positions
+        row_positions = sorted({y1 for line in horizontal_lines for _, y1, _, y2 in line})
+        col_positions = sorted({x1 for line in vertical_lines for x1, _, x2, _ in line})
 
-        if not cells:
-            return
+        # Extract cells
+        table_data = []
+        for i in range(len(row_positions) - 1):
+            row = []
+            for j in range(len(col_positions) - 1):
+                cell_image = table_image[row_positions[i]:row_positions[i + 1],
+                                         col_positions[j]:col_positions[j + 1]]
+                cell_text = pytesseract.image_to_string(cell_image, lang='eng', config='--psm 6')
+                row.append(cell_text.strip())
+            table_data.append(row)
+        return table_data
 
-        # Determine the number of rows and columns
-        rows = len(set(cell[1] for cell in cells))
-        cols = len(set(cell[0] for cell in cells))
-        table = self.doc.add_table(rows=rows, cols=cols)
-        table.style = "Table Grid"
-
-        # Add text to the table cells
-        for cell_x, cell_y, cell_w, cell_h in cells:
-            cropped_cell = image[cell_y : cell_y + cell_h, cell_x : cell_x + cell_w]
-            text = pytesseract.image_to_string(cropped_cell, lang="eng", config="--psm 6").strip()
-            if text:
-                row_idx = cell_y // (h // rows)
-                col_idx = cell_x // (w // cols)
-                table.cell(row_idx, col_idx).text = text
-
-        self.doc.add_paragraph()
+    def write_table_to_excel(self, table_data):
+        """Write extracted table data to Excel sheet."""
+        for row_data in table_data:
+            self.ws.append(row_data)
+        self.ws.append([])  # Add an empty row after each table
 
     def convert(self):
         """Main conversion process."""
@@ -124,7 +107,7 @@ class EnhancedDocumentConverter:
             pdf_document = fitz.open(self.input_path)
             total_pages = pdf_document.page_count
 
-            with tqdm(total=total_pages, desc="Converting PDF") as pbar:
+            with tqdm(total=total_pages, desc="Processing PDF") as pbar:
                 for page_num in range(total_pages):
                     try:
                         page = pdf_document[page_num]
@@ -132,48 +115,46 @@ class EnhancedDocumentConverter:
                         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                         img_np = np.array(img)
 
-                        tables = self.detect_and_extract_tables(img_np)
-
+                        tables = self.detect_tables(img_np)
                         for table_coords in tables:
-                            self.process_table(img_np, table_coords)
+                            table_data = self.extract_table(img_np, table_coords)
+                            if table_data:
+                                self.write_table_to_excel(table_data)
 
                         pbar.update(1)
-
                     except Exception as e:
                         self.logger.error(f"Error processing page {page_num + 1}: {str(e)}")
+                        continue
 
+            # Save Excel file
             output_dir = os.path.dirname(self.output_path)
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
 
-            temp_docx = self.output_path
-            if self.output_format == "pdf":
-                temp_docx = str(Path(self.output_path).with_suffix(".docx"))
-
-            self.doc.save(temp_docx)
-
-            self.logger.info(f"Document successfully saved as {self.output_path}")
+            self.wb.save(self.output_path)
+            self.logger.info(f"Excel file successfully saved as {self.output_path}")
 
         except Exception as e:
             self.logger.error(f"Conversion error: {str(e)}")
         finally:
-            if "pdf_document" in locals():
+            if 'pdf_document' in locals():
                 pdf_document.close()
 
 
 def main():
-    print("Enhanced Document Converter")
+    print("PDF Table to Excel Converter")
     print("-" * 30)
 
-    input_path = input("Enter input PDF path: ")
-    output_format = input("Enter desired output format (docx/pdf): ").lower()
-    while output_format not in ["docx", "pdf"]:
-        output_format = input("Please enter either 'docx' or 'pdf': ").lower()
+    input_path = input("Enter the input PDF path: ")
+    output_path = str(Path(input_path).with_suffix('.xlsx'))
 
-    dpi = int(input("Enter DPI (300-600, default is 300): ") or 300)
-    output_path = str(Path(input_path).with_suffix(f".{output_format}"))
+    try:
+        dpi = int(input("Enter DPI (300-600, press Enter for default 300): ") or 300)
+        dpi = max(300, min(600, dpi))
+    except ValueError:
+        dpi = 300
 
-    converter = EnhancedDocumentConverter(input_path, output_path, output_format, dpi)
+    converter = PDFTableToExcelConverter(input_path, output_path, dpi)
     converter.convert()
 
 
