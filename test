@@ -1,57 +1,344 @@
-def extract_table(self, image, table_coords):
-    """Extract text data from the table region."""
-    y1, y2, x1, x2 = table_coords
-    table_image = image[y1:y2, x1:x2]
+import streamlit as st
+from PIL import Image
+import google.generativeai as genai
+import pandas as pd
+import io
+import os
+import json
+from dotenv import load_dotenv
+import time
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime
+import tempfile
 
-    # Detect horizontal and vertical lines within the table
-    gray = cv2.cvtColor(table_image, cv2.COLOR_RGB2GRAY)
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, 11, 2)
+# Load environment variables
+load_dotenv()
 
-    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
-    horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, horizontal_kernel)
-    vertical_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, vertical_kernel)
+# Configure Google Gemini API
+genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
 
-    # Detect lines
-    horizontal_lines = cv2.HoughLinesP(horizontal_lines, 1, np.pi / 180, 100,
-                                       minLineLength=50, maxLineGap=10)
-    vertical_lines = cv2.HoughLinesP(vertical_lines, 1, np.pi / 180, 100,
-                                     minLineLength=50, maxLineGap=10)
+# Set page configuration
+st.set_page_config(
+    page_title="Japanese Table Extractor & Translator",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-    # Check for valid lines
-    if horizontal_lines is None or len(horizontal_lines) == 0:
-        self.logger.info("No horizontal lines detected.")
-        return []
+# Custom CSS for better UI
+st.markdown("""
+<style>
+.main {
+    padding: 2rem;
+}
+.stButton>button {
+    width: 100%;
+}
+.uploaded-image {
+    max-width: 100%;
+    height: auto;
+    margin: 1rem 0;
+}
+.success-message {
+    padding: 1rem;
+    background-color: #d4edda;
+    border-color: #c3e6cb;
+    color: #155724;
+    border-radius: 0.25rem;
+    margin: 1rem 0;
+}
+.error-message {
+    padding: 1rem;
+    background-color: #f8d7da;
+    border-color: #f5c6cb;
+    color: #721c24;
+    border-radius: 0.25rem;
+    margin: 1rem 0;
+}
+.copy-button {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+}
+.result-container {
+    position: relative;
+    padding: 1rem;
+    border: 1px solid #ddd;
+    border-radius: 0.25rem;
+    margin: 1rem 0;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    if vertical_lines is None or len(vertical_lines) == 0:
-        self.logger.info("No vertical lines detected.")
-        return []
+class TableExtractor:
+    def __init__(self):
+        self.model = genai.GenerativeModel('gemini-pro-vision')
+        self.chat_model = genai.GenerativeModel('gemini-pro')
+        self.history = []
+        
+    def process_image(self, image, prompt, retries=3, delay=2):
+        for attempt in range(retries):
+            try:
+                response = self.model.generate_content([prompt, image])
+                return {
+                    'status': 'success',
+                    'data': response.text,
+                    'error': None
+                }
+            except Exception as e:
+                if attempt == retries - 1:
+                    return {
+                        'status': 'error',
+                        'data': None,
+                        'error': str(e)
+                    }
+                time.sleep(delay)
+    
+    def process_table_format(self, table_text, output_format):
+        try:
+            if output_format == "markdown":
+                return table_text
+            elif output_format == "csv":
+                # Convert markdown table to CSV
+                lines = table_text.split('\n')
+                csv_data = []
+                for line in lines:
+                    if '|' in line and '-|-' not in line:
+                        cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                        csv_data.append(','.join(cells))
+                return '\n'.join(csv_data)
+            elif output_format == "json":
+                # Convert markdown table to JSON
+                lines = [line for line in table_text.split('\n') if '|' in line and '-|-' not in line]
+                headers = [h.strip() for h in lines[0].split('|')[1:-1]]
+                data = []
+                for line in lines[1:]:
+                    values = [v.strip() for v in line.split('|')[1:-1]]
+                    data.append(dict(zip(headers, values)))
+                return json.dumps(data, indent=2, ensure_ascii=False)
+        except Exception as e:
+            return {
+                'status': 'error',
+                'data': None,
+                'error': f"Error converting table format: {str(e)}"
+            }
 
-    # Get row and column positions
-    row_positions = sorted({y1 for line in horizontal_lines for _, y1, _, y2 in line})
-    col_positions = sorted({x1 for line in vertical_lines for x1, _, x2, _ in line})
+def initialize_session_state():
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'extractor' not in st.session_state:
+        st.session_state.extractor = TableExtractor()
+    if 'extraction_history' not in st.session_state:
+        st.session_state.extraction_history = []
+    if 'current_result' not in st.session_state:
+        st.session_state.current_result = None
 
-    # Ensure we have enough rows and columns to form a table
-    if len(row_positions) < 2 or len(col_positions) < 2:
-        self.logger.info("Insufficient rows or columns to form a table.")
-        return []
+def save_extraction_history(image, result):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.extraction_history.append({
+        'timestamp': timestamp,
+        'image': image,
+        'result': result
+    })
 
-    # Extract cells
-    table_data = []
-    for i in range(len(row_positions) - 1):
-        row = []
-        for j in range(len(col_positions) - 1):
-            cell_image = table_image[row_positions[i]:row_positions[i + 1],
-                                     col_positions[j]:col_positions[j + 1]]
+def display_result_with_copy(result, title="Result"):
+    st.subheader(title)
+    with st.container():
+        st.markdown(result)
+        if st.button("📋 Copy to Clipboard", key=f"copy_{title}"):
+            st.code(result)
+            st.success("Content copied to clipboard!")
 
-            # Ensure cell_image is valid
-            if cell_image.size == 0:
-                row.append("")
-                continue
+def create_table_visualization(table_text):
+    try:
+        # Parse markdown table
+        lines = [line for line in table_text.split('\n') if '|' in line and '-|-' not in line]
+        headers = [h.strip() for h in lines[0].split('|')[1:-1]]
+        data = []
+        for line in lines[1:]:
+            values = [v.strip() for v in line.split('|')[1:-1]]
+            data.append(values)
+            
+        # Create Plotly table
+        fig = go.Figure(data=[go.Table(
+            header=dict(
+                values=headers,
+                fill_color='paleturquoise',
+                align='center'
+            ),
+            cells=dict(
+                values=list(zip(*data)),
+                fill_color='lavender',
+                align='center'
+            )
+        )])
+        
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+        return fig
+    except Exception as e:
+        st.error(f"Error creating visualization: {str(e)}")
+        return None
 
-            cell_text = pytesseract.image_to_string(cell_image, lang='eng', config='--psm 6')
-            row.append(cell_text.strip())
-        table_data.append(row)
+def main():
+    initialize_session_state()
+    
+    st.title("🗾 Japanese Table Extractor & Translator")
+    
+    with st.sidebar:
+        st.header("Mode Selection")
+        mode = st.radio(
+            "Choose Mode",
+            ["Table Extraction & Translation", "General Chat", "Extraction History"]
+        )
+        
+        st.header("About")
+        st.info("""
+        This app specializes in extracting and translating tables from images 
+        containing Japanese text. Features include:
+        - Complex table extraction
+        - Multiple output formats
+        - Interactive visualizations
+        - Extraction history
+        - Error handling and retries
+        """)
+    
+    if mode == "Table Extraction & Translation":
+        handle_table_extraction()
+    elif mode == "General Chat":
+        handle_chat()
+    else:
+        handle_extraction_history()
 
-    return table_data
+def handle_table_extraction():
+    st.header("Upload Image with Japanese Table")
+    
+    uploaded_file = st.file_uploader(
+        "Choose an image file",
+        type=['png', 'jpg', 'jpeg'],
+        help="Upload an image containing Japanese tables"
+    )
+    
+    if uploaded_file:
+        image = Image.open(uploaded_file)
+        st.image(image, caption="Uploaded Image", use_column_width=True)
+        
+        with st.expander("Advanced Options", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                maintain_structure = st.checkbox("Maintain Original Table Structure", value=True)
+                include_formatting = st.checkbox("Include Cell Formatting", value=True)
+                handle_nested = st.checkbox("Handle Nested Tables", value=True)
+            
+            with col2:
+                output_format = st.selectbox(
+                    "Output Format",
+                    ["markdown", "csv", "json"]
+                )
+                
+                visualization_type = st.selectbox(
+                    "Visualization Type",
+                    ["Interactive Table", "Simple Table", "None"]
+                )
+        
+        prompt = f"""
+        Extract and translate the Japanese table from this image to English.
+        Rules:
+        1. Maintain the exact table structure: {maintain_structure}
+        2. Translate all Japanese text to English
+        3. Preserve formatting: {include_formatting}
+        4. Handle nested tables: {handle_nested}
+        5. Return the result in a markdown table format
+        """
+        
+        if st.button("Extract and Translate Table"):
+            with st.spinner("Processing image..."):
+                try:
+                    # Process image
+                    result = st.session_state.extractor.process_image(image, prompt)
+                    
+                    if result['status'] == 'success':
+                        # Convert to desired format
+                        formatted_result = st.session_state.extractor.process_table_format(
+                            result['data'],
+                            output_format
+                        )
+                        
+                        # Save to history
+                        save_extraction_history(image, formatted_result)
+                        
+                        # Display results
+                        st.success("Table extracted and translated successfully!")
+                        
+                        # Display the result with copy button
+                        display_result_with_copy(formatted_result, "Extracted and Translated Table")
+                        
+                        # Create visualization if requested
+                        if visualization_type != "None":
+                            st.subheader("Table Visualization")
+                            if visualization_type == "Interactive Table":
+                                fig = create_table_visualization(result['data'])
+                                if fig:
+                                    st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.table(pd.read_csv(io.StringIO(formatted_result)))
+                        
+                        # Download options
+                        st.download_button(
+                            "Download Results",
+                            formatted_result,
+                            f"translated_table.{output_format}",
+                            mime=f"text/{output_format}"
+                        )
+                        
+                    else:
+                        st.error(f"Error: {result['error']}")
+                        
+                except Exception as e:
+                    st.error(f"An unexpected error occurred: {str(e)}")
+
+def handle_chat():
+    st.header("General Chat")
+    
+    # Display chat history
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+    
+    # Chat input
+    if prompt := st.chat_input("Ask anything..."):
+        # Add user message to chat history
+        st.session_state.chat_history.append({"role": "user", "content": prompt})
+        
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Generate and display assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    response = st.session_state.extractor.chat(st.session_state.chat_history)
+                    st.write(response)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
+                except Exception as e:
+                    st.error(f"Error generating response: {str(e)}")
+
+def handle_extraction_history():
+    st.header("Extraction History")
+    
+    if not st.session_state.extraction_history:
+        st.info("No extraction history available yet.")
+        return
+    
+    for idx, entry in enumerate(reversed(st.session_state.extraction_history)):
+        with st.expander(f"Extraction {idx + 1} - {entry['timestamp']}", expanded=False):
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                st.image(entry['image'], caption="Original Image", use_column_width=True)
+            
+            with col2:
+                display_result_with_copy(entry['result'], "Extracted Result")
+
+if __name__ == "__main__":
+    main()
