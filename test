@@ -1,44 +1,47 @@
 import streamlit as st
 from PIL import Image
-import google.generativeai as genai
 import pandas as pd
 import io
 import os
 import json
-from dotenv import load_dotenv
 import time
-import numpy as np
-import plotly.graph_objects as go
 from datetime import datetime
 import tempfile
+import logging
+import google.auth
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage
+import plotly.graph_objects as go
 
-# Load environment variables
-load_dotenv()
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Configure Google Gemini API
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
-
-# Set page configuration
-st.set_page_config(
-    page_title="Japanese Table Extractor & Translator",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Service account authentication setup and model initialization
+@st.cache_resource
+def initialize_models():
+    try:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/service-account.json"
+        credentials, project_id = google.auth.default()
+        
+        return {
+            'multimodal_model': GenerativeModel("gemini-pro-vision"),
+            'chat_model': GenerativeModel("gemini-pro"),
+            'safety_config': {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_MEDIUM_AND_ABOVE",
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error initializing Google credentials: {str(e)}")
+        st.error("Failed to initialize models. Please check your service account configuration.")
+        raise
 
 # Custom CSS for better UI
 st.markdown("""
 <style>
-.main {
-    padding: 2rem;
-}
-.stButton>button {
-    width: 100%;
-}
-.uploaded-image {
-    max-width: 100%;
-    height: auto;
-    margin: 1rem 0;
-}
+.main { padding: 2rem; }
+.stButton>button { width: 100%; }
+.uploaded-image { max-width: 100%; height: auto; margin: 1rem 0; }
 .success-message {
     padding: 1rem;
     background-color: #d4edda;
@@ -71,21 +74,41 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 class TableExtractor:
-    def __init__(self):
-        self.model = genai.GenerativeModel('gemini-pro-vision')
-        self.chat_model = genai.GenerativeModel('gemini-pro')
+    def __init__(self, models):
+        self.multimodal_model = models['multimodal_model']
+        self.chat_model = models['chat_model']
+        self.safety_config = models['safety_config']
         self.history = []
         
     def process_image(self, image, prompt, retries=3, delay=2):
         for attempt in range(retries):
             try:
-                response = self.model.generate_content([prompt, image])
+                # Convert PIL Image to Gemini Image format
+                gemini_image = GeminiImage.from_bytes(
+                    image_bytes=self._convert_pil_to_bytes(image)
+                )
+                
+                # Generate content with safety settings
+                response = self.multimodal_model.generate_content(
+                    contents=[prompt, gemini_image],
+                    safety_settings=self.safety_config,
+                    generation_config={
+                        "temperature": 0.2,
+                        "top_p": 0.8,
+                        "top_k": 40
+                    }
+                )
+                
+                response.resolve()
+                
                 return {
                     'status': 'success',
                     'data': response.text,
                     'error': None
                 }
+                
             except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 if attempt == retries - 1:
                     return {
                         'status': 'error',
@@ -94,12 +117,16 @@ class TableExtractor:
                     }
                 time.sleep(delay)
     
+    def _convert_pil_to_bytes(self, pil_image):
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='PNG')
+        return img_byte_arr.getvalue()
+    
     def process_table_format(self, table_text, output_format):
         try:
             if output_format == "markdown":
                 return table_text
             elif output_format == "csv":
-                # Convert markdown table to CSV
                 lines = table_text.split('\n')
                 csv_data = []
                 for line in lines:
@@ -108,7 +135,6 @@ class TableExtractor:
                         csv_data.append(','.join(cells))
                 return '\n'.join(csv_data)
             elif output_format == "json":
-                # Convert markdown table to JSON
                 lines = [line for line in table_text.split('\n') if '|' in line and '-|-' not in line]
                 headers = [h.strip() for h in lines[0].split('|')[1:-1]]
                 data = []
@@ -122,16 +148,29 @@ class TableExtractor:
                 'data': None,
                 'error': f"Error converting table format: {str(e)}"
             }
+    
+    def chat(self, messages):
+        try:
+            chat = self.chat_model.start_chat()
+            response = chat.send_message(
+                messages[-1]["content"],
+                safety_settings=self.safety_config
+            )
+            return response.text
+        except Exception as e:
+            logger.error(f"Chat error: {str(e)}")
+            return f"Error in chat: {str(e)}"
 
 def initialize_session_state():
     if 'chat_history' not in st.session_state:
         st.session_state.chat_history = []
-    if 'extractor' not in st.session_state:
-        st.session_state.extractor = TableExtractor()
     if 'extraction_history' not in st.session_state:
         st.session_state.extraction_history = []
     if 'current_result' not in st.session_state:
         st.session_state.current_result = None
+    if 'extractor' not in st.session_state:
+        models = initialize_models()
+        st.session_state.extractor = TableExtractor(models)
 
 def save_extraction_history(image, result):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -180,6 +219,13 @@ def create_table_visualization(table_text):
         return None
 
 def main():
+    # Set page config
+    st.set_page_config(
+        page_title="Japanese Table Extractor & Translator",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
     initialize_session_state()
     
     st.title("🗾 Japanese Table Extractor & Translator")
@@ -188,7 +234,7 @@ def main():
         st.header("Mode Selection")
         mode = st.radio(
             "Choose Mode",
-            ["Table Extraction & Translation", "General Chat", "Extraction History"]
+            ["Table Extraction & Translation", "Extraction History"]
         )
         
         st.header("About")
@@ -204,8 +250,6 @@ def main():
     
     if mode == "Table Extraction & Translation":
         handle_table_extraction()
-    elif mode == "General Chat":
-        handle_chat()
     else:
         handle_extraction_history()
 
@@ -296,32 +340,6 @@ def handle_table_extraction():
                         
                 except Exception as e:
                     st.error(f"An unexpected error occurred: {str(e)}")
-
-def handle_chat():
-    st.header("General Chat")
-    
-    # Display chat history
-    for message in st.session_state.chat_history:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-    
-    # Chat input
-    if prompt := st.chat_input("Ask anything..."):
-        # Add user message to chat history
-        st.session_state.chat_history.append({"role": "user", "content": prompt})
-        
-        with st.chat_message("user"):
-            st.write(prompt)
-        
-        # Generate and display assistant response
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                try:
-                    response = st.session_state.extractor.chat(st.session_state.chat_history)
-                    st.write(response)
-                    st.session_state.chat_history.append({"role": "assistant", "content": response})
-                except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
 
 def handle_extraction_history():
     st.header("Extraction History")
