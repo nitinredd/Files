@@ -1,105 +1,199 @@
-import fitz  # PyMuPDF
-import pytesseract
-from PIL import Image
+# Import required libraries
 import os
-import io
-import tempfile
-from pathlib import Path
+from google.colab import userdata
+import numpy as np
+from typing import List
+import pandas as pd
+import json
+import re
+from sklearn.cluster import BisectingKMeans
+from sklearn.metrics import silhouette_score, silhouette_samples
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
+from langchain.schema import HumanMessage
 
-def pdf_to_images(pdf_path):
-    """
-    Convert PDF pages to images using PyMuPDF with optimal resolution
-    Returns a list of PIL Images
-    """
-    pdf_document = fitz.open(pdf_path)
-    
-    images = []
-    for page_num in range(pdf_document.page_count):
-        page = pdf_document[page_num]
-        
-        # Using 200% zoom - balances quality and Word compatibility
-        zoom = 2.0
-        mat = fitz.Matrix(zoom, zoom)
-        
-        # Get original page size for DPI calculation
-        rect = page.rect
-        dpi = int(zoom * 72)  # Default PDF DPI is 72
-        
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_data = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_data))
-        
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        images.append((img, dpi))
-    
-    pdf_document.close()
-    return images
+# Configuration
+filename = 'docs.xlsx'
+text_column = 'para'
+n_subtopics = 25
+n_topics = int(n_subtopics ** 0.5)
+min_similarity = 0.40
 
-def process_images_and_create_pdf(images, output_path):
+# Azure OpenAI Configuration
+azure_openai_endpoint = "YOUR_AZURE_ENDPOINT"  # e.g., "https://your-resource.openai.azure.com/"
+azure_api_key = "YOUR_AZURE_API_KEY"
+azure_api_version = "2024-02-15-preview"  # Update this as needed
+azure_embedding_deployment = "YOUR_EMBEDDING_DEPLOYMENT_NAME"  # The deployment name for your embedding model
+azure_chat_deployment = "YOUR_CHAT_DEPLOYMENT_NAME"  # The deployment name for your chat model
+
+# Install required packages
+!pip install langchain langchain-openai openai tiktoken scikit-learn
+
+# Set up langchain embeddings with Azure OpenAI
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    azure_endpoint=azure_openai_endpoint,
+    azure_deployment=azure_embedding_deployment,
+    api_key=azure_api_key,
+    api_version=azure_api_version,
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace="azure_cache")
+
+def classify(docs: List[str], topics: List[str], **kwargs):
     """
-    Perform OCR on images and create a new PDF with structure preservation
+    Classify documents against topics using embeddings
+    
+    Args:
+        docs: List of document texts
+        topics: List of topic names
+        
+    Returns:
+        Similarity matrix between documents and topics
     """
-    # Enhanced Tesseract configuration for structure preservation
-    custom_config = (
-        '--oem 1 '  # LSTM OCR Engine Mode
-        '--psm 3 '  # Auto-page segmentation with orientation and script detection
-        '-l jpn+jpn_vert+eng '  # Japanese + vertical Japanese + English
-        '-c preserve_interword_spaces=1 '
-        '-c textord_heavy_nr=1 '  # Better table detection
-        '-c textord_tablefind_recognize_tables=1 '
-        '-c textord_tabfind_find_tables=1 '
-        '-c tessedit_do_invert=0 '  # Don't invert text
-        '-c tessedit_pageseg_mode=1 '  # Automatic page segmentation with orientation
-        '-c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-.,:;¥$€£%()[]{}「」、。 '
+    doc_embed = np.array(cached_embeddings.embed_documents(docs))
+    topic_embed = np.array(cached_embeddings.embed_documents(topics))
+    return np.dot(doc_embed, topic_embed.T)
+
+def cluster(docs: List[str], n: int = 20, **kwargs):
+    """
+    Cluster documents using BisectingKMeans
+    
+    Args:
+        docs: List of document texts
+        n: Number of clusters
+        
+    Returns:
+        Dictionary containing clustering results
+    """
+    cluster_model = BisectingKMeans(init='k-means++', n_clusters=n, n_init=10, max_iter=300)
+    doc_embed = np.array(cached_embeddings.embed_documents(docs))
+    cluster_model.fit(doc_embed)
+    distances = np.linalg.norm(doc_embed[:, np.newaxis] - cluster_model.cluster_centers_.T, axis=2)
+    
+    return {
+        "label": cluster_model.labels_,
+        "score": silhouette_score(doc_embed, cluster_model.labels_),
+        "scores": silhouette_samples(doc_embed, cluster_model.labels_),
+        "centroid": np.argmin(distances, axis=0),
+    }
+
+# Read and process documents
+print("Reading documents...")
+docs = pd.read_excel(filename).dropna(subset=text_column).fillna('').astype(str)
+result = cluster(docs[text_column].tolist(), n=n_subtopics)
+docs['cluster'] = result['label']
+docs['score'] = result['scores']
+clusters = (
+    docs.groupby('cluster')
+    .apply(lambda group: group.nlargest(3, 'score')[text_column].tolist())
+    .tolist()
+)
+
+print(f"Processed {len(docs)} documents into {len(clusters)} clusters")
+
+# Set up Azure OpenAI Chat model
+chat_model = AzureChatOpenAI(
+    azure_endpoint=azure_openai_endpoint,
+    azure_deployment=azure_chat_deployment,
+    api_key=azure_api_key,
+    api_version=azure_api_version,
+    temperature=0
+)
+
+# Generate subtopics
+print("Generating subtopics...")
+messages = [
+    HumanMessage(
+        content=f'''Here are {len(clusters)} clusters of documents.
+        Suggest 2-4 word topic names for each cluster.
+        Return a JSON string array of length {len(clusters)}.
+        {json.dumps(clusters, indent=2)}'''
     )
-    
-    # Create a new PDF
-    output_pdf = fitz.open()
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for i, (image, dpi) in enumerate(images):
-            print(f"Processing page {i+1}/{len(images)}...")
-            
-            # Save high quality image temporarily
-            temp_img_path = Path(temp_dir) / f"temp_img_{i}.png"
-            image.save(temp_img_path, 'PNG', quality=95, dpi=(dpi, dpi))
-            
-            try:
-                # Perform OCR with custom configuration
-                ocr_data = pytesseract.image_to_pdf_or_hocr(
-                    image,
-                    lang='jpn+jpn_vert+eng',
-                    config=custom_config,
-                    extension='pdf'
-                )
-                
-                # Save OCR result to temporary PDF
-                temp_pdf_path = Path(temp_dir) / f"temp_ocr_{i}.pdf"
-                temp_pdf_path.write_bytes(ocr_data)
-                
-                # Open temporary PDF and add it to output PDF
-                temp_pdf = fitz.open(temp_pdf_path)
-                output_pdf.insert_pdf(temp_pdf)
-                temp_pdf.close()
-                
-            except Exception as e:
-                print(f"Error processing page {i+1}: {str(e)}")
-                continue
-    
-    try:
-        # Save with optimized settings for Word compatibility
-        output_pdf.save(
-            output_path,
-            garbage=4,
-            deflate=True,
-            clean=True,
-            linear=True,
-            pretty=False,  # Reduces file complexity
-            ascii=False    # Better encoding support
-        )
-    finally:
-        output_pdf.close()
+]
 
-# ... rest of the code remains the same (clean_path and main functions) ...
+subtopic_response = chat_model.invoke(messages)
+match = re.search(r'```json(.*?)```', subtopic_response.content, re.DOTALL)
+subtopics = json.loads(match.group(1) if match else subtopic_response.content)
+
+print(f"Generated {len(subtopics)} subtopics")
+
+# Create higher-level topic groups
+print("Creating topic groups...")
+messages = [
+    HumanMessage(
+        content=f'''Cluster these topics into {n_topics} groups.
+        Return a JSON object with keys as a 2-4 word group name and values as arrays of topics.
+        Ensure at least 2 topics per group.
+        {json.dumps(subtopics, indent=2)}'''
+    )
+]
+
+topic_response = chat_model.invoke(messages)
+match = re.search(r'```json(.*?)```', topic_response.content, re.DOTALL)
+topics = json.loads(match.group(1) if match else topic_response.content)
+topics = pd.DataFrame([
+    {'topic': topic, 'subtopic': subtopic}
+    for topic, subtopics in topics.items()
+    for subtopic in subtopics
+])
+
+print(f"Created {len(topics['topic'].unique())} topic groups")
+
+# Calculate document-topic similarities
+print("Calculating similarities...")
+data = {
+    'docs': docs.to_dict(orient='records'),
+    'topics': topics.to_dict(orient='records'),
+}
+
+matches = data['matches'] = []
+similarity = classify(
+    [row[text_column] for row in data['docs']],
+    [row['subtopic'] for row in data['topics']]
+)
+
+for row in range(len(similarity)):
+    for col in range(len(similarity[row])):
+        if similarity[row][col] > min_similarity:
+            matches.append({'doc': row, 'topic': col, 'similarity': similarity[row][col]})
+
+print(f"Found {len(matches)} matches above similarity threshold {min_similarity}")
+
+# Save results to Excel
+print("Saving results to Excel...")
+with pd.ExcelWriter('docexplore.xlsx') as writer:
+    # Save documents sheet
+    docs.to_excel(writer, sheet_name='docs', index=False)
+    
+    # Save topics sheet
+    topics.to_excel(writer, sheet_name='topics', index=False)
+    
+    # Create and save matches sheet
+    grid = pd.DataFrame(matches).pivot_table(index='doc', columns='topic', values='similarity')
+    grid.index = pd.Series(grid.index).replace(dict(enumerate(docs[text_column].tolist())))
+    grid.columns = pd.Series(grid.columns).replace(dict(enumerate(topics['subtopic'].tolist())))
+    grid.index.name = text_column
+    grid.reset_index().to_excel(writer, sheet_name='matches', index=False)
+
+# Save results to JSON
+print("Saving results to JSON...")
+with open("docexplore.json", "w") as handle:
+    handle.write(json.dumps(data, indent=2))
+
+print("Process complete!")
+print("Results saved to:")
+print("1. docexplore.xlsx (sheets: docs, topics, matches)")
+print("2. docexplore.json")
+
+# Usage instructions
+print("\nHow to use this notebook:")
+print("1. Replace the Azure OpenAI configuration variables at the top with your credentials:")
+print("   - azure_openai_endpoint")
+print("   - azure_api_key")
+print("   - azure_api_version")
+print("   - azure_embedding_deployment")
+print("   - azure_chat_deployment")
+print("2. Upload your docs.xlsx file with a 'para' column containing the text to analyze")
+print("3. Adjust n_subtopics and min_similarity if needed")
+print("4. Run all cells")
