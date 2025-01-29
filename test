@@ -1,204 +1,57 @@
-import os
-import pandas as pd
-import json
-from typing import List
-import numpy as np
-from tqdm import tqdm
-from openai import AzureOpenAI
+Slide Title: RAG vs. Graph RAG: Technical Deep Dive
 
-class TopicAnalyzer:
-    def __init__(self, azure_endpoint, azure_api_key, azure_deployment, api_version="2024-02-15-preview"):
-        """
-        Initialize the TopicAnalyzer with Azure OpenAI credentials
-        """
-        self.client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=azure_api_key,
-            api_version=api_version,
-        )
-        self.deployment = azure_deployment
+Subtitle: Advanced retrieval, embeddings, and knowledge graph integration.
 
-    def chunk_documents(self, docs: List[str], chunk_size: int = 10) -> List[List[str]]:
-        """
-        Split documents into smaller chunks for processing
-        """
-        return [docs[i:i + chunk_size] for i in range(0, len(docs), chunk_size)]
+Layout:
 
-    def analyze_documents(self, docs: List[str], n_clusters: int = 25) -> dict:
-        """
-        Analyze documents and group them into clusters using GPT-4O
-        """
-        chunks = self.chunk_documents(docs)
-        all_clusters = []
-        
-        for chunk in tqdm(chunks, desc="Analyzing documents"):
-            prompt = f"""Analyze these documents and group them into coherent clusters based on their content.
-            Return only a JSON object with cluster numbers as keys and arrays of document indices as values.
-            Documents to analyze:
-            {json.dumps(chunk)}"""
+Left Column (RAG):
 
-            response = self.client.chat.completions.create(
-                model=self.deployment,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            chunk_clusters = json.loads(response.choices[0].message.content)
-            all_clusters.append(chunk_clusters)
+Core Mechanism:
+Vector Embeddings: Text → dense vectors (e.g., SBERT, OpenAI embeddings).
+Top-K Retrieval: Cosine/FAISS-based similarity search over chunks.
+Hybrid Search: Combine BM25 (keyword) + vector similarity for relevance.
+Pipeline:
+Chunking: Split docs into text blocks (fixed-size or semantic).
+Embed: Encode chunks into vectors (Transformer models).
+Retrieve: Query vector DB (e.g., Pinecone, Milvus) with top-K candidates.
+Rerank: Cross-encoder (e.g., MiniLM) to refine final context.
+Optimization:
+Dynamic chunk sizes | Query expansion | Embedding fine-tuning.
+Right Column (Graph RAG):
 
-        # Combine cluster results
-        final_clusters = {}
-        current_cluster = 0
-        doc_index = 0
-        
-        for chunk_result in all_clusters:
-            for cluster_docs in chunk_result.values():
-                adjusted_indices = [i + doc_index for i in cluster_docs]
-                final_clusters[str(current_cluster)] = adjusted_indices
-                current_cluster += 1
-            doc_index += len(chunk_result[list(chunk_result.keys())[0]])
+Core Mechanism:
+Graph Embeddings: Entities → vectors (Node2Vec, TransE, GraphSAGE).
+Multi-Hop Retrieval: Traverse relationships (e.g., Cypher queries in Neo4j).
+Subgraph Extraction: Isolate context-rich graph segments.
+Pipeline:
+Graph Construction: Extract entities/relations (LLM/NLP tools).
+Embed: Encode nodes/edges into graph-aware vectors.
+Retrieve: Path-based traversal + vector similarity.
+Reasoning: Graph neural networks (GNNs) for inference.
+Optimization:
+Schema alignment | Edge weighting | Hierarchical graphs.
+Visuals:
 
-        return final_clusters
+RAG Diagram (Top Left):
+Input → Vector DB (Top-K similarity) → LLM → Output.
+Annotate with "Hybrid Search (BM25 + Vector)" and "Cross-Encoder Reranking."
+Graph RAG Diagram (Top Right):
+Knowledge graph with interconnected nodes → Subgraph extraction → LLM.
+Highlight "Multi-Hop Traversal" and "GNN Reasoning."
+Technical Comparisons (Center Table):
 
-    def generate_topics(self, docs: List[str], clusters: dict, n_topics: int) -> tuple:
-        """
-        Generate topics and subtopics using GPT-4O
-        """
-        # Generate subtopics for each cluster
-        subtopics = []
-        for cluster_id, doc_indices in tqdm(clusters.items(), desc="Generating subtopics"):
-            cluster_docs = [docs[i] for i in doc_indices]
-            prompt = f"""Analyze these related documents and suggest a 2-4 word topic name that best describes their common theme.
-            Return only the topic name as a string, nothing else.
-            Documents:
-            {json.dumps(cluster_docs)}"""
+Aspect	RAG	Graph RAG
+Retrieval	Top-K vectors + keyword	Graph traversal + embeddings
+Embedding Type	Text (SBERT, OpenAI)	Graph (Node2Vec, TransE)
+Query Handling	Single-hop	Multi-hop reasoning
+Data Structure	Vector DB (FAISS, Pinecone)	Graph DB (Neo4j, TigerGraph)
+Key Takeaways (Bottom):
 
-            response = self.client.chat.completions.create(
-                model=self.deployment,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0
-            )
-            subtopics.append(response.choices[0].message.content.strip())
+RAG: Speed + scalability for unstructured data; use hybrid search for precision.
+Graph RAG: Semantic depth for interconnected data; leverage GNNs for complex QA.
+Design Execution:
 
-        # Generate main topics by grouping subtopics
-        topic_prompt = f"""Group these subtopics into {n_topics} broader categories.
-        Return only a JSON object with keys as 2-4 word category names and values as arrays of subtopics.
-        Ensure at least 2 subtopics per category.
-        Subtopics:
-        {json.dumps(subtopics)}"""
-
-        topic_response = self.client.chat.completions.create(
-            model=self.deployment,
-            messages=[{"role": "user", "content": topic_prompt}],
-            temperature=0
-        )
-        topics = json.loads(topic_response.choices[0].message.content)
-
-        return subtopics, topics
-
-    def calculate_similarity(self, doc: str, topic: str) -> float:
-        """
-        Calculate semantic similarity between a document and a topic using GPT-4O
-        """
-        prompt = f"""On a scale of 0 to 1, how semantically similar is this document to this topic?
-        Return only a decimal number between 0 and 1, nothing else.
-        
-        Topic: {topic}
-        Document: {doc}"""
-
-        response = self.client.chat.completions.create(
-            model=self.deployment,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        
-        try:
-            return float(response.choices[0].message.content.strip())
-        except ValueError:
-            return 0.0
-
-def main():
-    # Configuration
-    config = {
-        "azure_endpoint": "YOUR_AZURE_ENDPOINT",  # e.g., "https://your-resource.openai.azure.com/"
-        "azure_api_key": "YOUR_AZURE_API_KEY",
-        "azure_deployment": "YOUR_DEPLOYMENT_NAME",  # Your GPT-4O deployment name
-        "filename": "docs.xlsx",
-        "text_column": "para",
-        "n_subtopics": 25,
-        "min_similarity": 0.40
-    }
-    
-    # Initialize analyzer
-    analyzer = TopicAnalyzer(
-        azure_endpoint=config["azure_endpoint"],
-        azure_api_key=config["azure_api_key"],
-        azure_deployment=config["azure_deployment"]
-    )
-
-    # Read documents
-    print("Reading documents...")
-    docs = pd.read_excel(config["filename"]).dropna(subset=[config["text_column"]]).fillna('').astype(str)
-    doc_texts = docs[config["text_column"]].tolist()
-
-    # Analyze and cluster documents
-    print("Analyzing documents...")
-    clusters = analyzer.analyze_documents(doc_texts, config["n_subtopics"])
-    
-    # Generate topics
-    print("Generating topics...")
-    n_topics = int(config["n_subtopics"] ** 0.5)
-    subtopics, topic_groups = analyzer.generate_topics(doc_texts, clusters, n_topics)
-    
-    # Create topics DataFrame
-    topics = pd.DataFrame([
-        {'topic': topic, 'subtopic': subtopic}
-        for topic, subtopics in topic_groups.items()
-        for subtopic in subtopics
-    ])
-
-    # Calculate similarities
-    print("Calculating similarities...")
-    matches = []
-    for i, doc in enumerate(tqdm(doc_texts, desc="Calculating similarities")):
-        for j, subtopic in enumerate(topics['subtopic']):
-            similarity = analyzer.calculate_similarity(doc, subtopic)
-            if similarity > config["min_similarity"]:
-                matches.append({
-                    'doc': i,
-                    'topic': j,
-                    'similarity': similarity
-                })
-
-    # Prepare data for export
-    data = {
-        'docs': docs.to_dict(orient='records'),
-        'topics': topics.to_dict(orient='records'),
-        'matches': matches
-    }
-
-    # Save results
-    print("Saving results...")
-    with pd.ExcelWriter('docexplore.xlsx') as writer:
-        docs.to_excel(writer, sheet_name='docs', index=False)
-        topics.to_excel(writer, sheet_name='topics', index=False)
-        
-        grid = pd.DataFrame(matches).pivot_table(
-            index='doc',
-            columns='topic',
-            values='similarity'
-        )
-        grid.index = pd.Series(grid.index).replace(dict(enumerate(doc_texts)))
-        grid.columns = pd.Series(grid.columns).replace(dict(enumerate(topics['subtopic'].tolist())))
-        grid.index.name = config["text_column"]
-        grid.reset_index().to_excel(writer, sheet_name='matches', index=False)
-
-    with open("docexplore.json", "w") as handle:
-        handle.write(json.dumps(data, indent=2))
-
-    print("Process complete!")
-    print("Results saved to:")
-    print("1. docexplore.xlsx (sheets: docs, topics, matches)")
-    print("2. docexplore.json")
-
-if __name__ == "__main__":
-    main()
+Colors: Teal for RAG (technical/clean), purple for Graph RAG (complex/innovative).
+Icons: Vector DB chip (🖥️), graph node (🔵), neural network (🧠).
+Fonts: Roboto Condensed for headings, bullet points in 10-12pt.
+This slide balances advanced technical terms with intuitive visuals (diagrams, icons, and a comparison table) to keep the audience engaged while conveying depth. Let me know if you need code snippets for diagrams or specific tool examples!
