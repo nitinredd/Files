@@ -19,8 +19,53 @@ shap.initjs()
 # Initialize session state
 if 'params' not in st.session_state:
     st.session_state.params = {
-        'D': 0.1, 'R': 0.5, 'Sw': 2.0, 'k': 0.1, 'n': 0.5
+        'D': 0.1, 'R': 0.5, 'Sw': 2.0, 'k': 0.1, 'n': 0.5,
+        'gamma_dose': 25.0, 'hydrophobicity': 0.5
     }
+
+# ---------------------- Advanced Modules ----------------------
+class IrradiationEffects:
+    def __init__(self, gamma_dose=25):
+        self.dose = gamma_dose  # kGy units
+        
+    def polymer_degradation(self):
+        """Empirical relationship from DOI: 10.1016/j.jconrel.2020.09.045"""
+        return 1 + 0.023 * self.dose - 0.0004 * self.dose**2
+    
+    def modified_release(self, base_release):
+        return base_release * self.polymer_degradation()
+
+class NanoscaleModels:
+    def __init__(self, hydrophobicity):
+        self.hydrophobicity = hydrophobicity  # 0-1 scale
+        
+    def effective_diffusion(self, D_base):
+        """From DOI: 10.1021/acs.molpharmaceut.9b00924"""
+        return D_base * (0.82 + 0.18 * np.tanh(5*(0.7-self.hydrophobicity)))
+    
+    def particle_size_effect(self, R_base):
+        return R_base * (1.1 if self.hydrophobicity > 0.5 else 0.95)
+
+def solve_tissue_transport_cfd(D, initial_concentration, time_steps=50):
+    """Finite difference solver for porous media transport"""
+    nx, ny = 50, 50
+    dx, dy = 1e-4, 1e-4  # 0.1mm grid
+    dt = 60  # 1 minute steps
+    
+    # Initialize concentration grid
+    C = np.zeros((nx, ny))
+    C[nx//2-5:nx//2+5, ny//2-5:ny//2+5] = initial_concentration
+    
+    # Porous media parameters
+    porosity = 0.3
+    tortuosity = 1.5
+    
+    for _ in range(time_steps):
+        C[1:-1, 1:-1] += (D * dt / (porosity * tortuosity**2)) * (
+            (C[2:, 1:-1] - 2*C[1:-1, 1:-1] + C[:-2, 1:-1])/dx**2 +
+            (C[1:-1, 2:] - 2*C[1:-1, 1:-1] + C[1:-1, :-2])/dy**2
+        )
+    return C
 
 # ---------------------- Enhanced Drug Release Models ----------------------
 MODELS = {
@@ -44,6 +89,16 @@ MODELS = {
     "Korsmeyer-Peppas": {
         "function": lambda t, k, n: k * t**n,
         "params": ["k", "n"]
+    },
+    "Erosion-Controlled (Irradiated)": {
+        "function": lambda t, k, gamma_dose: IrradiationEffects(gamma_dose).modified_release(1 - np.exp(-k * t)),
+        "params": ["k", "gamma_dose"]
+    },
+    "Nanoscale Diffusion": {
+        "function": lambda t, D, R, hydrophobicity: (
+            NanoscaleModels(hydrophobicity).effective_diffusion(D) * t**0.5 / R
+        ),
+        "params": ["D", "R", "hydrophobicity"]
     }
 }
 
@@ -102,46 +157,6 @@ class AIOptimizer:
         xopt, fopt = pso(wrapped_obj, lb, ub, swarmsize=50, maxiter=100)
         return {'params': dict(zip(param_space.keys(), xopt)), 'target': -fopt}
 
-# ---------------------- Enhanced 3D Visualization ----------------------
-def create_3d_diffusion(time_step, grid_size=50):
-    """Create dynamic 3D diffusion visualization"""
-    x = np.linspace(-2, 2, grid_size)
-    y = np.linspace(-2, 2, grid_size)
-    X, Y = np.meshgrid(x, y)
-    
-    # Simulate time-evolving diffusion
-    Z = np.exp(-0.1*time_step) * np.sin(np.pi*np.sqrt(X**2 + Y**2)) * np.exp(-time_step/10)
-    
-    fig = go.Figure(data=[
-        go.Surface(
-            z=Z,
-            x=X,
-            y=Y,
-            colorscale='Viridis',
-            opacity=0.8,
-            contours_z=dict(
-                show=True,
-                usecolormap=True,
-                project_z=True
-            )
-        )
-    ])
-    
-    fig.update_layout(
-        title=f'3D Drug Diffusion at Time Step {time_step}',
-        scene=dict(
-            xaxis_title='X Position (mm)',
-            yaxis_title='Y Position (mm)',
-            zaxis_title='Concentration',
-            camera=dict(
-                eye=dict(x=1.5, y=1.5, z=0.5)
-            )
-        ),
-        height=800,
-        margin=dict(l=0, r=0, b=0, t=40)
-    )
-    return fig
-
 # ---------------------- Streamlit UI ----------------------
 st.set_page_config(page_title="PharmaAI: Advanced Drug Release", layout="wide")
 st.sidebar.title("⚙️ Simulation Controls")
@@ -180,6 +195,10 @@ with st.sidebar.expander("🔬 Core Parameters", expanded=True):
     time_range = st.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
     num_points = st.slider("Data Points", 50, 1000, 200)
 
+with st.sidebar.expander("⚙️ Advanced Parameters", expanded=False):
+    st.session_state.params['gamma_dose'] = st.number_input("γ-Dose (kGy)", 0.0, 50.0, 25.0)
+    st.session_state.params['hydrophobicity'] = st.slider("Hydrophobicity", 0.0, 1.0, 0.5)
+
 # ---------------------- Model Parameters ----------------------
 model_config = MODELS[model_choice]
 for param in model_config["params"]:
@@ -205,7 +224,17 @@ with tab1:
     t = np.linspace(0, time_range, num_points)
     
     try:
-        Mt = model_config["function"](t, *[st.session_state.params[p] for p in model_config["params"]])
+        # Handle special models
+        if model_choice == "Nanoscale Diffusion":
+            nano = NanoscaleModels(st.session_state.params['hydrophobicity'])
+            D_eff = nano.effective_diffusion(st.session_state.params['D'])
+            R_eff = nano.particle_size_effect(st.session_state.params['R'])
+            Mt = model_config["function"](t, D_eff, R_eff, st.session_state.params['hydrophobicity'])
+        elif "Irradiated" in model_choice:
+            Mt = model_config["function"](t, st.session_state.params['k'], st.session_state.params['gamma_dose'])
+        else:
+            Mt = model_config["function"](t, *[st.session_state.params[p] for p in model_config["params"]])
+        
         Mt = np.clip(Mt, 0, 1)
         
         # Main release profile
@@ -291,9 +320,34 @@ with tab2:
             except Exception as e:
                 st.error(f"SHAP analysis failed: {str(e)}")
     
-    with st.expander("🌐 3D Diffusion Visualization"):
-        time_step = st.slider("Select Time Step", 0, 50, 0)
-        st.plotly_chart(create_3d_diffusion(time_step), use_container_width=True)
+    with st.expander("🧠 Tissue Transport CFD"):
+        if st.button("Run Tissue Transport Simulation"):
+            try:
+                cfd_result = solve_tissue_transport_cfd(
+                    D=st.session_state.params['D'],
+                    initial_concentration=1.0
+                )
+                
+                fig = go.Figure(data=[
+                    go.Surface(
+                        z=cfd_result,
+                        colorscale='Hot',
+                        contours_z=dict(show=True, usecolormap=True)
+                    )
+                ])
+                fig.update_layout(
+                    title="Tissue Drug Concentration (CFD)",
+                    scene=dict(
+                        xaxis_title='Tissue Depth (mm)',
+                        yaxis_title='Tissue Width (mm)',
+                        zaxis_title='Concentration'
+                    ),
+                    height=600
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+            except Exception as e:
+                st.error(f"CFD simulation failed: {str(e)}")
 
 # ---------------------- System Monitoring ----------------------
 st.sidebar.header("📊 Performance Metrics")
@@ -306,20 +360,20 @@ with st.expander("📘 User Guide"):
     st.markdown("""
     **PharmaAI User Guide**
     
-    1. **Parameter Input**:
-       - Choose between direct input or Stokes-Einstein calculation
-       - Enter required physical parameters
-       
-    2. **Simulation**:
-       - Select release model from dropdown
-       - Adjust time range and resolution
-       
-    3. **Advanced Features**:
-       - AI Optimization for parameter tuning
-       - SHAP analysis for model explainability
-       - Interactive 3D visualization
-       
-    4. **Data Management**:
-       - Export results via download button
-       - All parameters persist between sessions
+    1. **Core Features**:
+       - Multiple drug release models (Fickian, Erosion, Swelling, etc.)
+       - γ-Irradiation effects modeling
+       - Nanoscale differentiation (hydrophobic/hydrophilic)
+    
+    2. **Advanced Features**:
+       - AI-powered parameter optimization
+       - Tissue transport CFD simulation
+       - SHAP explainable AI analysis
+    
+    3. **Usage Tips**:
+       - Use Stokes-Einstein calculator for nanoparticle D
+       - Adjust hydrophobicity slider for nanoscale effects
+       - Run CFD simulation in Advanced Analysis tab
     """)
+
+# ---------------------- End of Code ----------------------
