@@ -4,136 +4,219 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from scipy.integrate import solve_ivp
-from sklearn.linear_model import LinearRegression
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-import time
+from scipy.optimize import curve_fit
+from sklearn.metrics import r2_score, mean_absolute_error
 from bayes_opt import BayesianOptimization
 
-# ---------------------- Drug Release Models ----------------------
+# Initialize session state for parameter persistence
+if 'D' not in st.session_state:
+    st.session_state.D = 0.1
+if 'calculated_D' not in st.session_state:
+    st.session_state.calculated_D = None
 
-def fickian_diffusion(t, D, R):
-    """Simulates diffusion-controlled drug release using Fick's law."""
-    Mt = 1 - (6/np.pi**2) * np.exp(-D * np.pi**2 * t / R**2)
-    return Mt
+# ---------------------- Enhanced Drug Release Models ----------------------
+MODELS = {
+    "Fickian Diffusion": {
+        "function": lambda t, D, R: 1 - (6/np.pi**2) * np.sum([np.exp(-D*(n**2)*np.pi**2*t/R**2)/n**2 for n in range(1, 100)], axis=0),
+        "params": ["D", "R"]
+    },
+    "Erosion-Controlled": {
+        "function": lambda t, k: 1 - np.exp(-k * t),
+        "params": ["k"]
+    },
+    "Swelling-Controlled": {
+        "function": lambda t, D, Sw: 1 - np.exp(-D * t / Sw),
+        "params": ["D", "Sw"]
+    },
+    "Higuchi Model": {
+        "function": lambda t, k: k * np.sqrt(t),
+        "params": ["k"]
+    },
+    "Korsmeyer-Peppas": {
+        "function": lambda t, k, n: k * t**n,
+        "params": ["k", "n"]
+    }
+}
 
-def erosion_model(t, k, R):
-    """Simulates erosion-controlled drug release."""
-    Mt = 1 - np.exp(-k * t)
-    return Mt
+# ---------------------- Streamlit UI Configuration ----------------------
+st.set_page_config(page_title="PharmaSIM: Advanced Drug Release", layout="wide")
+st.sidebar.title("⚙️ Simulation Controls")
 
-def swelling_diffusion(t, D, Sw):
-    """Simulates swelling-controlled drug release."""
-    Mt = 1 - np.exp(-D * t / Sw)
-    return Mt
-
-# ---------------------- Generative AI for Drug Optimization ----------------------
-
-def optimize_drug_formulation():
-    """Uses Bayesian Optimization to suggest the best drug formulation parameters."""
-    def objective(D, R, Sw):
-        """Defines the objective function to optimize drug release."""
-        t = np.linspace(0, 10, 100)
-        Mt = fickian_diffusion(t, D, R) + swelling_diffusion(t, D, Sw)
-        return np.max(Mt)  # Maximize drug release
-
-    optimizer = BayesianOptimization(f=objective, pbounds={"D": (0.01, 1.0), "R": (0.1, 2.0), "Sw": (0.5, 5.0)}, random_state=42)
-    optimizer.maximize(init_points=5, n_iter=20)
+# ---------------------- Parameter Input Section ----------------------
+with st.sidebar.expander("🔬 Core Parameters", expanded=True):
+    input_method = st.radio("Parameter Input Method", ["Direct Input", "Calculate Diffusion Coefficient"])
     
-    best_params = optimizer.max["params"]
-    return best_params
+    if input_method == "Direct Input":
+        st.session_state.D = st.number_input(
+            "Diffusion Coefficient (cm²/s)", 
+            min_value=0.0001, 
+            max_value=10.0, 
+            value=st.session_state.D,
+            format="%.4f"
+        )
+    else:
+        # Stokes-Einstein Equation Calculator
+        st.markdown("**Calculate D using Stokes-Einstein:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            T = st.number_input("Temperature (K)", 273.0, 373.0, 298.0)
+            r = st.number_input("Radius (m)", 1e-9, 1e-4, 1e-6, format="%.2e")
+        with col2:
+            eta = st.number_input("Viscosity (Pa·s)", 0.001, 10.0, 0.001)
+            k_B = 1.380649e-23  # Boltzmann constant
+        
+        if st.button("Calculate D"):
+            D_m2s = (k_B * T) / (6 * np.pi * eta * r)
+            st.session_state.calculated_D = D_m2s * 10000  # Convert to cm²/s
+            st.session_state.D = st.session_state.calculated_D
+        
+        if st.session_state.calculated_D:
+            st.success(f"Calculated D: {st.session_state.calculated_D:.2e} cm²/s")
 
-# ---------------------- Live Real-Time 3D Diffusion ----------------------
+    # Common Parameters
+    model_choice = st.selectbox("Release Model", list(MODELS.keys()))
+    time_range = st.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
+    num_points = st.slider("Data Points", 50, 1000, 200)
 
-def create_3d_diffusion_plot(time_step):
-    """Generates a real-time updating 3D visualization of drug diffusion over time."""
-    X, Y, T = np.meshgrid(np.linspace(-1, 1, 20), np.linspace(-1, 1, 20), np.linspace(0, 10, 20))
-    Z = np.exp(-T) * np.sin(np.pi * np.sqrt(X**2 + Y**2))
+# ---------------------- Model-Specific Parameters ----------------------
+params = {}
+model_config = MODELS[model_choice]
+for param in model_config["params"]:
+    with st.sidebar.expander(f"⚙️ {param} Parameters", expanded=True):
+        if param == "R":
+            params[param] = st.number_input(
+                "Radius (cm)", 0.01, 5.0, 0.5, 
+                help="Microsphere radius in centimeters"
+            )
+        elif param == "k":
+            params[param] = st.number_input(
+                "Release Constant", 0.001, 2.0, 0.1,
+                format="%.3f"
+            )
+        elif param == "Sw":
+            params[param] = st.number_input(
+                "Swelling Factor", 0.1, 10.0, 2.0,
+                step=0.1
+            )
+        elif param == "n":
+            params[param] = st.number_input(
+                "Release Exponent", 0.1, 1.0, 0.5,
+                help="Korsmeyer-Peppas release exponent"
+            )
 
-    fig = go.Figure(data=[go.Surface(z=Z[:, :, time_step], x=X[:, :, time_step], y=Y[:, :, time_step])])
-    fig.update_layout(title="3D Drug Diffusion Over Time", autosize=True)
-    return fig
+# Add calculated D to parameters if needed
+if 'D' in model_config["params"]:
+    params['D'] = st.session_state.D
 
-# ---------------------- Python-Based CFD Solver for Drug Diffusion ----------------------
+# ---------------------- Main Simulation Interface ----------------------
+tab1, tab2 = st.tabs(["Simulation Results", "Advanced Analysis"])
 
-def solve_diffusion_equation(grid_size=50, time_steps=200, D=0.1):
-    """
-    Solves the 2D drug diffusion equation using finite difference methods.
-    """
-    dx = 1.0 / grid_size
-    dt = 0.01
-    alpha = D * dt / dx**2  # Diffusivity factor
+with tab1:
+    st.header("📈 Drug Release Profile")
+    
+    # Run simulation
+    t = np.linspace(0, time_range, num_points)
+    try:
+        Mt = model_config["function"](t, *params.values())
+        Mt = np.clip(Mt, 0, 1)
+        
+        # Plot results
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(t, Mt, 'b-', linewidth=2)
+        ax.set_xlabel("Time (hours)", fontsize=12)
+        ax.set_ylabel("Fractional Release", fontsize=12)
+        ax.set_title(f"{model_choice} Release Profile", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+        
+        # Display parameters
+        st.subheader("Simulation Parameters")
+        param_table = pd.DataFrame(params.items(), columns=["Parameter", "Value"])
+        st.table(param_table)
+        
+    except Exception as e:
+        st.error(f"Simulation error: {str(e)}")
 
-    U = np.zeros((grid_size, grid_size))
-    U[grid_size//2, grid_size//2] = 1.0  # Initial drug concentration at center
+with tab2:
+    st.header("🧪 Advanced Analysis")
+    
+    # Bayesian Optimization
+    with st.expander("🤖 AI Parameter Optimization"):
+        st.write("Optimize formulation parameters using Bayesian methods:")
+        
+        def optimization_objective(D, R, Sw):
+            t = np.linspace(0, 10, 100)
+            Mt = MODELS["Fickian Diffusion"]["function"](t, D, R) + \
+                 MODELS["Swelling-Controlled"]["function"](t, D, Sw)
+            return np.max(Mt)
+        
+        if st.button("Run Optimization"):
+            optimizer = BayesianOptimization(
+                f=optimization_objective,
+                pbounds={"D": (0.01, 1.0), "R": (0.1, 2.0), "Sw": (0.5, 5.0)},
+                random_state=42
+            )
+            optimizer.maximize(init_points=5, n_iter=20)
+            best_params = optimizer.max["params"]
+            
+            st.subheader("Optimization Results")
+            st.write(f"Maximum Release: {optimizer.max['target']:.2f}")
+            st.json(best_params)
 
-    for _ in range(time_steps):
-        U_new = U.copy()
-        for i in range(1, grid_size-1):
-            for j in range(1, grid_size-1):
-                U_new[i, j] = U[i, j] + alpha * (
-                    U[i+1, j] + U[i-1, j] + U[i, j+1] + U[i, j-1] - 4 * U[i, j]
+    # Experimental Data Fitting
+    with st.expander("🔍 Experimental Data Fitting"):
+        exp_data = st.file_uploader("Upload CSV Data", type=["csv"])
+        if exp_data:
+            df_exp = pd.read_csv(exp_data)
+            try:
+                t_data = df_exp['Time'].values
+                y_data = df_exp['Release'].values
+                
+                # Fit selected model
+                params_fit, r2, mae, pcov = fit_model_to_data(
+                    model_config["function"],
+                    t_data,
+                    y_data,
+                    bounds=(tuple([0.001]*len(model_config["params"])),
+                           tuple([10.0]*len(model_config["params"])))
                 )
-        U = U_new
+                
+                st.success(f"Fitting successful (R² = {r2:.2f})")
+                st.write("Fitted Parameters:")
+                for name, value in zip(model_config["params"], params_fit):
+                    st.write(f"{name}: {value:.4f}")
+                
+            except Exception as e:
+                st.error(f"Data fitting error: {str(e)}")
 
-    return U
+# ---------------------- 3D Visualization ----------------------
+st.sidebar.header("🌐 Visualization Settings")
+with st.sidebar.expander("3D Parameters"):
+    vis_resolution = st.slider("Grid Resolution", 10, 100, 30)
+    vis_time_steps = st.slider("Time Steps", 10, 100, 20)
 
-# ---------------------- Streamlit UI ----------------------
+if st.sidebar.button("Render 3D Diffusion"):
+    with st.spinner("Generating 3D visualization..."):
+        X, Y = np.meshgrid(np.linspace(-1, 1, vis_resolution), 
+                         np.linspace(-1, 1, vis_resolution))
+        Z = np.exp(-0.2*vis_time_steps) * np.sin(np.pi * np.sqrt(X**2 + Y**2))
+        
+        fig = go.Figure(data=[go.Surface(z=Z, x=X, y=Y)])
+        fig.update_layout(
+            title="3D Drug Diffusion Profile",
+            scene=dict(
+                xaxis_title='X Position',
+                yaxis_title='Y Position',
+                zaxis_title='Concentration'
+            ),
+            height=800
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-st.set_page_config(page_title="AI-Powered Drug Release Simulator", layout="wide")
-
-st.sidebar.title("⚙️ Simulation Settings")
-model_choice = st.sidebar.selectbox("Select Drug Release Model", ["Fickian Diffusion", "Erosion-Controlled", "Swelling-Controlled", "AI Optimization"])
-time_range = st.sidebar.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
-
-# Parameters
-D = st.sidebar.slider("Diffusion Coefficient (cm²/s)", 0.01, 1.0, 0.1)
-R = st.sidebar.slider("Radius of Microsphere (cm)", 0.1, 2.0, 0.5)
-k = st.sidebar.slider("Erosion Rate Constant", 0.01, 1.0, 0.1)
-Sw = st.sidebar.slider("Swelling Factor", 0.5, 5.0, 2.0)
-
-# AI Optimization
-if model_choice == "AI Optimization":
-    st.sidebar.subheader("🔬 Optimizing Drug Formulation...")
-    best_params = optimize_drug_formulation()
-    st.sidebar.write("Optimal Parameters:", best_params)
-    D, R, Sw = best_params["D"], best_params["R"], best_params["Sw"]
-
-# Run Simulation
-t = np.linspace(0, time_range, 100)
-
-if model_choice == "Fickian Diffusion":
-    Mt = fickian_diffusion(t, D, R)
-elif model_choice == "Erosion-Controlled":
-    Mt = erosion_model(t, k, R)
-elif model_choice == "Swelling-Controlled":
-    Mt = swelling_diffusion(t, D, Sw)
-
-# Display Results
-st.header("📊 Drug Release Simulation Results")
-fig, ax = plt.subplots()
-ax.plot(t, Mt, label=model_choice, linewidth=2)
-ax.set_xlabel("Time (hours)")
-ax.set_ylabel("Drug Release Fraction (Mt/M∞)")
-ax.set_title("Drug Release Profile")
-ax.legend()
-st.pyplot(fig)
-
-# Live 3D Drug Diffusion
-st.subheader("🧬 Real-Time 3D Drug Diffusion")
-for time_step in range(10):
-    time.sleep(0.5)  # Simulating real-time updates
-    st.plotly_chart(create_3d_diffusion_plot(time_step), use_container_width=True)
-
-# Python-Based CFD Simulation
-st.subheader("🌊 CFD-Based Drug Transport (Pure Python)")
-cfd_result = solve_diffusion_equation()
-plt.imshow(cfd_result, cmap="coolwarm", origin="lower")
-plt.colorbar(label="Drug Concentration")
-st.pyplot(plt)
-
-# Download Results
-st.subheader("📥 Download Simulation Data")
-df = pd.DataFrame({"Time (hours)": t, "Drug Release": Mt})
-st.download_button("Download CSV", df.to_csv(index=False), "drug_release.csv", "text/csv")
+# ---------------------- Data Export ----------------------
+st.sidebar.download_button(
+    label="📥 Export Simulation Data",
+    data=pd.DataFrame({"Time": t, "Release": Mt}).to_csv(index=False),
+    file_name="drug_release_data.csv",
+    mime="text/csv"
+)
