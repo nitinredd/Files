@@ -3,332 +3,221 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.svm import SVR
-from xgboost import XGBRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error
-from skopt import BayesSearchCV
-from geneticalgorithm import geneticalgorithm as ga
-from pyswarm import pso
+from scipy.optimize import curve_fit
+from sklearn.metrics import r2_score, mean_absolute_error
+from bayes_opt import BayesianOptimization
 from deap import base, creator, tools, algorithms
 import shap
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-from bayes_opt import BayesianOptimization
+from pyswarm import pso
+import warnings
 
-# ---------------------- Initialize Session State ----------------------
+# Suppress SHAP warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Initialize session state
 if 'params' not in st.session_state:
     st.session_state.params = {
-        'D': 0.1,
-        'R': 0.5,
-        'Sw': 2.0,
-        'k': 0.1,
-        'n': 0.5
+        'D': 0.1, 'R': 0.5, 'Sw': 2.0, 'k': 0.1, 'n': 0.5
     }
 
 # ---------------------- Enhanced Drug Release Models ----------------------
-def fickian_diffusion(t, D, R):
-    return 1 - (6/np.pi**2) * np.sum([np.exp(-D*(n**2)*np.pi**2*t/R**2)/n**2 for n in range(1, 50)], axis=0)
+MODELS = {
+    "Fickian Diffusion": {
+        "function": lambda t, D, R: 1 - (6/np.pi**2) * np.sum(
+            [np.exp(-D*(n**2)*np.pi**2*t/R**2)/n**2 for n in range(1, 50)], axis=0),
+        "params": ["D", "R"]
+    },
+    "Erosion-Controlled": {
+        "function": lambda t, k: 1 - np.exp(-k * t),
+        "params": ["k"]
+    },
+    "Swelling-Controlled": {
+        "function": lambda t, D, Sw: 1 - np.exp(-D * t / Sw),
+        "params": ["D", "Sw"]
+    },
+    "Higuchi Model": {
+        "function": lambda t, k: k * np.sqrt(t),
+        "params": ["k"]
+    },
+    "Korsmeyer-Peppas": {
+        "function": lambda t, k, n: k * t**n,
+        "params": ["k", "n"]
+    }
+}
 
-def swelling_controlled(t, D, Sw):
-    return 1 - np.exp(-D * t / Sw)
-
-def korsmeyer_peppas(t, k, n):
-    return k * t**n
-
-# ---------------------- Core Objective Function ----------------------
-def objective_function(D, R, Sw, k, n):
-    """Composite objective function for optimization"""
-    try:
-        t = np.linspace(0, 10, 100)
-        release_profile = (
-            0.4 * fickian_diffusion(t, D, R) +
-            0.3 * swelling_controlled(t, D, Sw) +
-            0.3 * korsmeyer_peppas(t, k, n)
-        )
-        stability_penalty = 0.1 * (1 / (1 + np.exp(-(D-0.5))))  # Sigmoid penalty
-        return float(np.mean(release_profile) - stability_penalty)
-    except Exception as e:
-        st.error(f"Objective function error: {str(e)}")
-        return 0.0
-
-# ---------------------- Enhanced AI Optimization Framework ----------------------
-class AIDrugOptimizer:
-    def __init__(self, model_type='bayesian'):
-        self.model_type = model_type
-        self.hyperparameters = {}
-        self.explainer = None
+# ---------------------- AI Optimization Techniques ----------------------
+class AIOptimizer:
+    def __init__(self, method='bayesian'):
+        self.method = method
         
-    def optimize(self, param_space, init_points=10, n_iter=50):
-        if self.model_type == 'bayesian':
-            return self._bayesian_optimization(param_space, init_points, n_iter)
-        elif self.model_type == 'genetic':
-            return self._genetic_algorithm(param_space)
-        elif self.model_type == 'pso':
-            return self._particle_swarm(param_space)
-        elif self.model_type == 'evolutionary':
-            return self._evolutionary_strategy(param_space)
+    def optimize(self, objective_func, param_space):
+        if self.method == 'bayesian':
+            return self._bayesian_optimization(objective_func, param_space)
+        elif self.method == 'genetic':
+            return self._genetic_algorithm(objective_func, param_space)
+        elif self.method == 'pso':
+            return self._particle_swarm(objective_func, param_space)
             
-    def _bayesian_optimization(self, param_space, init_points, n_iter):
-        optimizer = BayesianOptimization(f=objective_function, pbounds=param_space, random_state=42)
-        optimizer.maximize(init_points=init_points, n_iter=n_iter)
+    def _bayesian_optimization(self, objective_func, param_space):
+        optimizer = BayesianOptimization(f=objective_func, pbounds=param_space)
+        optimizer.maximize(init_points=5, n_iter=20)
         return optimizer.max
     
-    def _genetic_algorithm(self, param_space):
-        varbound = np.array([[v[0], v[1]] for v in param_space.values()])
-        algorithm_param = {'max_num_iteration': 100,
-                          'population_size': 100,
-                          'mutation_probability': 0.1,
-                          'elit_ratio': 0.01,
-                          'crossover_probability': 0.5,
-                          'parents_portion': 0.3,
-                          'crossover_type': 'uniform',
-                          'max_iteration_without_improv': 50}
-        
-        model = ga(function=lambda x: -objective_function(**dict(zip(param_space.keys(), x))),
-                 dimension=len(param_space),
-                 variable_type='real',
-                 variable_boundaries=varbound,
-                 algorithm_parameters=algorithm_param)
-        model.run()
-        return {'params': model.output_dict['variable'], 'target': -model.output_dict['function']}
-    
-    def _particle_swarm(self, param_space):
-        lb = [v[0] for v in param_space.values()]
-        ub = [v[1] for v in param_space.values()]
-        
-        def wrapped_obj(x):
-            return -objective_function(**dict(zip(param_space.keys(), x)))
-            
-        xopt, fopt = pso(wrapped_obj, lb, ub, swarmsize=100, maxiter=200)
-        return {'params': dict(zip(param_space.keys(), xopt)), 'target': -fopt}
-    
-    def _evolutionary_strategy(self, param_space):
+    def _genetic_algorithm(self, objective_func, param_space):
         creator.create("FitnessMax", base.Fitness, weights=(1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMax)
 
         toolbox = base.Toolbox()
-        param_bounds = [v for v in param_space.values()]
+        param_bounds = list(param_space.values())
         
         toolbox.register("attr_float", np.random.uniform, param_bounds[0][0], param_bounds[0][1])
-        toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=len(param_space))
+        toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, 
+                       n=len(param_space))
         toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
         def eval_individual(individual):
             params = dict(zip(param_space.keys(), individual))
-            return (objective_function(**params),)
+            return (objective_func(**params),)
             
         toolbox.register("evaluate", eval_individual)
         toolbox.register("mate", tools.cxBlend, alpha=0.5)
         toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
         toolbox.register("select", tools.selTournament, tournsize=3)
 
-        population = toolbox.population(n=300)
-        algorithms.eaSimple(population, toolbox, cxpb=0.5, mutpb=0.2, ngen=100, verbose=False)
+        population = toolbox.population(n=50)
+        algorithms.eaSimple(population, toolbox, cxpb=0.5, mutpb=0.2, ngen=30, verbose=False)
         best_individual = tools.selBest(population, k=1)[0]
         return {'params': dict(zip(param_space.keys(), best_individual)), 
                 'target': best_individual.fitness.values[0]}
+    
+    def _particle_swarm(self, objective_func, param_space):
+        lb = [v[0] for v in param_space.values()]
+        ub = [v[1] for v in param_space.values()]
+        
+        def wrapped_obj(x):
+            return -objective_func(**dict(zip(param_space.keys(), x)))
+            
+        xopt, fopt = pso(wrapped_obj, lb, ub, swarmsize=50, maxiter=100)
+        return {'params': dict(zip(param_space.keys(), xopt)), 'target': -fopt}
 
-# ---------------------- Streamlit Application ----------------------
-st.set_page_config(page_title="PharmaAI 2.0: Advanced Formulation System", layout="wide")
-
-# ---------------------- Sidebar Controls ----------------------
-st.sidebar.header("⚙️ Control Panel")
+# ---------------------- Streamlit UI ----------------------
+st.set_page_config(page_title="PharmaAI: Drug Release Analyzer", layout="wide")
+st.sidebar.title("⚙️ Simulation Controls")
 
 # Parameter Input Section
-with st.sidebar.expander("🧪 Model Parameters", expanded=True):
-    st.session_state.params['D'] = st.number_input(
-        "Diffusion Coefficient (cm²/s)", 0.001, 2.0, st.session_state.params['D'], step=0.001,
-        help="Molecular diffusion rate in the polymer matrix"
-    )
-    st.session_state.params['R'] = st.number_input(
-        "Particle Radius (cm)", 0.01, 5.0, st.session_state.params['R'], step=0.01,
-        help="Microsphere radius affecting surface area"
-    )
-    st.session_state.params['Sw'] = st.number_input(
-        "Swelling Factor", 0.1, 10.0, st.session_state.params['Sw'], step=0.1,
-        help="Polymer swelling ratio in aqueous media"
-    )
-    st.session_state.params['k'] = st.number_input(
-        "Release Constant", 0.001, 2.0, st.session_state.params['k'], step=0.001,
-        help="Kinetic release rate constant"
-    )
-    st.session_state.params['n'] = st.number_input(
-        "Release Exponent", 0.1, 1.0, st.session_state.params['n'], step=0.01,
-        help="Diffusion mechanism indicator (Fickian/non-Fickian)"
-    )
-
-# AI Optimization Controls
-with st.sidebar.expander("🤖 AI Optimization", expanded=True):
-    optimizer_type = st.selectbox(
-        "Algorithm", 
-        ['bayesian', 'genetic', 'pso', 'evolutionary'],
-        help="Select optimization strategy"
-    )
-    optimization_goal = st.selectbox(
-        "Target Objective",
-        ['Maximize Release', 'Prolong Release', 'Stabilize Profile'],
-        help="Optimization target configuration"
-    )
-
-# ---------------------- Main Interface ----------------------
-st.header("Pharmaceutical Formulation Intelligence Platform")
-
-# Simulation Results Section
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.subheader("Release Profile Simulation")
+with st.sidebar.expander("🔬 Core Parameters", expanded=True):
+    input_method = st.radio("Input Method", ["Direct Input", "Calculate D"])
     
-    # Generate simulation data
-    t = np.linspace(0, 24, 100)
+    if input_method == "Direct Input":
+        st.session_state.params['D'] = st.number_input(
+            "Diffusion Coefficient (cm²/s)", 0.0001, 10.0, st.session_state.params['D'], format="%.4f")
+    else:
+        st.markdown("**Stokes-Einstein Calculator**")
+        col1, col2 = st.columns(2)
+        with col1:
+            T = st.number_input("Temperature (K)", 273.0, 373.0, 298.0)
+            r = st.number_input("Radius (m)", 1e-9, 1e-4, 1e-6, format="%.1e")
+        with col2:
+            eta = st.number_input("Viscosity (Pa·s)", 0.001, 10.0, 0.001)
+            k_B = 1.380649e-23
+        
+        if st.button("Calculate D"):
+            D_m2s = (k_B * T) / (6 * np.pi * eta * r)
+            st.session_state.params['D'] = D_m2s * 10000
+            st.success(f"Calculated D: {st.session_state.params['D']:.2e} cm²/s")
+
+    model_choice = st.selectbox("Release Model", list(MODELS.keys()))
+    time_range = st.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
+    num_points = st.slider("Data Points", 50, 1000, 200)
+
+# Model Parameters
+model_config = MODELS[model_choice]
+for param in model_config["params"]:
+    with st.sidebar.expander(f"⚙️ {param} Parameters"):
+        if param == "R":
+            st.session_state.params[param] = st.number_input(
+                "Radius (cm)", 0.01, 5.0, 0.5, step=0.01)
+        elif param == "k":
+            st.session_state.params[param] = st.number_input(
+                "Release Constant", 0.001, 2.0, 0.1, step=0.001)
+        elif param == "Sw":
+            st.session_state.params[param] = st.number_input(
+                "Swelling Factor", 0.1, 10.0, 2.0, step=0.1)
+        elif param == "n":
+            st.session_state.params[param] = st.number_input(
+                "Release Exponent", 0.1, 1.0, 0.5, step=0.01)
+
+# Main Interface
+tab1, tab2 = st.tabs(["Simulation Results", "Advanced Analysis"])
+
+with tab1:
+    st.header("📈 Drug Release Profile")
+    t = np.linspace(0, time_range, num_points)
+    
     try:
-        release_profile = (
-            0.4 * fickian_diffusion(t, st.session_state.params['D'], st.session_state.params['R']) +
-            0.3 * swelling_controlled(t, st.session_state.params['D'], st.session_state.params['Sw']) +
-            0.3 * korsmeyer_peppas(t, st.session_state.params['k'], st.session_state.params['n'])
-        )
+        Mt = model_config["function"](t, *[st.session_state.params[p] for p in model_config["params"]])
+        Mt = np.clip(Mt, 0, 1)
         
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(t, release_profile, 'b-', linewidth=2)
-        ax.set_xlabel("Time (hours)", fontsize=12)
-        ax.set_ylabel("Fraction Released", fontsize=12)
-        ax.set_title("Composite Release Profile", fontsize=14)
+        ax.plot(t, Mt, 'b-', linewidth=2)
+        ax.set_xlabel("Time (hours)")
+        ax.set_ylabel("Fractional Release")
         ax.grid(True, alpha=0.3)
         st.pyplot(fig)
+        
+        st.download_button(
+            label="📥 Export Data",
+            data=pd.DataFrame({"Time": t, "Release": Mt}).to_csv(index=False),
+            file_name="release_data.csv",
+            mime="text/csv"
+        )
         
     except Exception as e:
         st.error(f"Simulation error: {str(e)}")
 
-with col2:
-    st.subheader("System Parameters")
-    st.write("Current Configuration:")
-    st.json(st.session_state.params)
+with tab2:
+    st.header("🧪 Advanced Analysis")
     
-    if st.button("⚡ Run AI Optimization"):
+    with st.expander("🤖 AI Optimization", expanded=True):
+        opt_method = st.selectbox("Optimization Algorithm", ["bayesian", "genetic", "pso"])
         param_space = {
-            'D': (0.01, 1.0),
-            'R': (0.1, 2.0),
-            'Sw': (0.5, 5.0),
-            'k': (0.001, 2.0),
-            'n': (0.1, 1.0)
+            'D': (0.01, 1.0), 'R': (0.1, 2.0), 
+            'Sw': (0.5, 5.0), 'k': (0.001, 2.0), 'n': (0.1, 1.0)
         }
         
-        optimizer = AIDrugOptimizer(optimizer_type)
-        with st.spinner(f"Running {optimizer_type.replace('_', ' ').title()} Optimization..."):
-            result = optimizer.optimize(param_space)
+        def objective(D, R, Sw, k, n):
+            t = np.linspace(0, 10, 100)
+            return np.mean(MODELS["Korsmeyer-Peppas"]["function"](t, k, n) + 
+                          MODELS["Fickian Diffusion"]["function"](t, D, R))
         
-        st.session_state.params.update(result['params'])
-        st.success("Optimization Complete!")
-        st.metric("Optimal Release Efficiency", f"{result['target']*100:.2f}%")
-        st.write("Optimized Parameters:")
-        st.json(result['params'])
-
-# ---------------------- Advanced Analytics ----------------------
-st.subheader("Intelligent Formulation Analytics")
-
-tab1, tab2, tab3 = st.tabs(["3D Optimization Space", "SHAP Explanations", "Predictive Modeling"])
-
-with tab1:
-    # Generate 3D optimization landscape
-    D_vals = np.linspace(0.01, 1.0, 50)
-    R_vals = np.linspace(0.1, 2.0, 50)
-    Z = np.zeros((50,50))
+        if st.button("Run Optimization"):
+            optimizer = AIOptimizer(opt_method)
+            result = optimizer.optimize(objective, param_space)
+            
+            st.session_state.params.update(result['params'])
+            st.success(f"Optimized Release Efficiency: {result['target']*100:.2f}%")
+            st.write("Optimized Parameters:", result['params'])
     
-    for i in range(50):
-        for j in range(50):
-            Z[i,j] = objective_function(D_vals[i], R_vals[j], 2.5, 0.5, 0.7)
-    
-    fig = go.Figure(data=[go.Surface(z=Z, x=D_vals, y=R_vals)])
-    fig.update_layout(title="Drug Release Optimization Landscape",
-                    scene=dict(xaxis_title='Diffusion Coeff (D)',
-                               yaxis_title='Radius (R)',
-                               zaxis_title='Release Efficiency'))
-    st.plotly_chart(fig, use_container_width=True)
+    with st.expander("🔍 SHAP Analysis"):
+        if st.button("Explain Model"):
+            # Generate synthetic data for explanation
+            X = np.random.rand(100, 5)
+            y = np.array([objective(**dict(zip(param_space.keys(), x))) for x in X])
+            
+            model = XGBRegressor().fit(X, y)
+            explainer = shap.Explainer(model)
+            shap_values = explainer(X[:50])  # Limit to 50 samples
+            
+            st.subheader("Feature Importance")
+            fig, ax = plt.subplots()
+            shap.summary_plot(shap_values, X[:50], feature_names=list(param_space.keys()), show=False)
+            st.pyplot(fig, bbox_inches='tight')
 
-with tab2:
-    # SHAP Feature Importance
-    if st.button("Generate Feature Explanations"):
-        X = pd.DataFrame([st.session_state.params])
-        model = XGBRegressor().fit(X, [objective_function(**st.session_state.params)])
+    with st.expander("📊 3D Visualization"):
+        time_step = st.slider("Time Step", 0, 100, 0)
+        X, Y = np.meshgrid(np.linspace(-1, 1, 30), np.linspace(-1, 1, 30))
+        Z = np.exp(-0.2*time_step) * np.sin(np.pi * np.sqrt(X**2 + Y**2))
         
-        explainer = shap.Explainer(model)
-        shap_values = explainer(X)
-        
-        fig, ax = plt.subplots()
-        shap.plots.waterfall(shap_values[0], show=False)
-        st.pyplot(fig)
-
-with tab3:
-    # Predictive Modeling Interface
-    st.write("Deep Learning Release Predictor")
-    time_steps = st.slider("Sequence Length", 10, 100, 50)
-    
-    if st.button("Train Neural Network"):
-        # Generate synthetic training data
-        X_train = np.random.rand(100, time_steps, 5)
-        y_train = np.random.rand(100)
-        
-        model = Sequential([
-            LSTM(64, input_shape=(time_steps, 5)),
-            Dense(32, activation='relu'),
-            Dense(1, activation='sigmoid')
-        ])
-        model.compile(loss='mse', optimizer='adam')
-        
-        history = model.fit(X_train, y_train, epochs=50, verbose=0)
-        
-        fig, ax = plt.subplots()
-        ax.plot(history.history['loss'])
-        ax.set_title("Training Progress")
-        st.pyplot(fig)
-
-# ---------------------- System Recommendations ----------------------
-st.sidebar.header("💡 AI Recommendations")
-if st.sidebar.button("Generate Formulation Strategy"):
-    recommendation = f"""
-    **Optimal Formulation Strategy:**
-    - Target diffusion coefficient: {st.session_state.params['D']:.2f}-{st.session_state.params['D']*1.1:.2f} cm²/s
-    - Ideal particle size: {st.session_state.params['R']*1000:.0f}-{st.session_state.params['R']*1100:.0f} μm
-    - Recommended swelling factor: {st.session_state.params['Sw']:.1f}-{st.session_state.params['Sw']*1.15:.1f}
-    - Optimal release exponent: {st.session_state.params['n']:.2f}-{st.session_state.params['n']*1.05:.2f}
-    """
-    st.sidebar.markdown(recommendation)
-
-# ---------------------- Data Management ----------------------
-with st.sidebar.expander("📂 Knowledge Base"):
-    uploaded_data = st.file_uploader("Upload Formulation Data", type=['csv'])
-    if uploaded_data:
-        knowledge_base = pd.read_csv(uploaded_data)
-        st.success(f"Loaded {len(knowledge_base)} formulations")
-        
-        if st.button("Enhance AI Models"):
-            # Implement active learning logic here
-            st.success("AI models updated with new formulations")
-
-# ---------------------- System Monitoring ----------------------
-st.sidebar.header("📈 Performance Metrics")
-st.sidebar.metric("Model Accuracy", "96.4% ± 2.1%")
-st.sidebar.metric("Optimization Speed", "27.4 formulations/sec")
-st.sidebar.metric("Prediction Confidence", "92.8%")
-
-# ---------------------- Documentation ----------------------
-with st.expander("📘 System Documentation"):
-    st.markdown("""
-    **PharmaAI 2.0 Documentation**
-    
-    *Features:*
-    1. Multi-Algorithm Optimization Engine
-    2. Composite Drug Release Modeling
-    3. Explainable AI (XAI) Integration
-    4. Deep Learning Predictions
-    5. Real-time Formulation Analytics
-    
-    *Usage Guide:*
-    1. Adjust parameters in the left panel
-    2. Run simulations or AI optimization
-    3. Explore results in analytics tabs
-    4. Upload experimental data for model improvement
-    5. Generate formulation strategies using AI recommendations
-    """)
+        fig = go.Figure(data=[go.Surface(z=Z, x=X, y=Y)])
+        fig.update_layout(title="3D Diffusion Profile", height=600)
+        st.plotly_chart(fig, use_container_width=True)
