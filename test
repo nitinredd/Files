@@ -1,5 +1,166 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from scipy.ndimage import laplace
+from bayes_opt import BayesianOptimization
+from deap import base, creator, tools, algorithms
+import shap
+from xgboost import XGBRegressor
+from pyswarm import pso
+import time
+import warnings
+
+# Optional: for auto-refreshing (simulate live video)
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st.write("To get auto-refresh (live simulation), install streamlit-autorefresh: pip install streamlit-autorefresh")
+
+# Suppress warnings and initialize SHAP JavaScript
+warnings.filterwarnings("ignore", category=UserWarning)
+shap.initjs()
+
+# ---------------------- Session State Initialization ----------------------
+if 'params' not in st.session_state:
+    st.session_state.params = {'D': 0.1, 'R': 0.5, 'Sw': 2.0, 'k': 0.1, 'n': 0.5}
+if 'cfd' not in st.session_state:
+    st.session_state.cfd = None
+if 'run_cfd' not in st.session_state:
+    st.session_state.run_cfd = False
+
+# ---------------------- Enhanced Drug Release Models ----------------------
+MODELS = {
+    "Fickian Diffusion": {
+        "function": lambda t, D, R: 1 - (6/np.pi**2) * np.sum(
+            [np.exp(-D*(n**2)*np.pi**2*t/R**2)/n**2 for n in range(1, 50)], axis=0),
+        "params": ["D", "R"]
+    },
+    "Erosion-Controlled": {
+        "function": lambda t, k: 1 - np.exp(-k * t),
+        "params": ["k"]
+    },
+    "Swelling-Controlled": {
+        "function": lambda t, D, Sw: 1 - np.exp(-D * t / Sw),
+        "params": ["D", "Sw"]
+    },
+    "Higuchi Model": {
+        "function": lambda t, k: k * np.sqrt(t),
+        "params": ["k"]
+    },
+    "Korsmeyer-Peppas": {
+        "function": lambda t, k, n: k * t**n,
+        "params": ["k", "n"]
+    }
+}
+
+# ---------------------- 3D CFD Simulation Class ----------------------
+class DrugDiffusionCFD:
+    def __init__(self, D=0.1, grid_size=30, time_step=0.1):
+        self.D = D
+        self.grid_size = grid_size
+        self.dt = time_step
+        self.dx = 1.0 / (grid_size - 1)
+        
+        # Initialize 3D concentration grid (drug depot at the center)
+        self.concentration = np.zeros((grid_size, grid_size, grid_size))
+        mid = grid_size // 2
+        self.concentration[mid-2:mid+2, mid-2:mid+2, mid-2:mid+2] = 1.0
+        
+        self.time_elapsed = 0.0
+        self.history = []
+        
+    def update(self):
+        """Perform one time step using a finite difference method."""
+        delta_C = self.D * laplace(self.concentration, mode='reflect') / (self.dx**2)
+        self.concentration += self.dt * delta_C
+        self.time_elapsed += self.dt
+        self.history.append(self.concentration.copy())
+        
+    def get_slice(self, axis='z', pos=None):
+        """Extract a 2D slice from the 3D data."""
+        if pos is None:
+            pos = self.grid_size // 2
+        if axis == 'x':
+            return self.concentration[pos, :, :]
+        elif axis == 'y':
+            return self.concentration[:, pos, :]
+        else:  # default is z-axis
+            return self.concentration[:, :, pos]
+        
+    def calculate_diffusion_rate(self):
+        """Calculate the current diffusion rate (mass change per unit time)."""
+        if len(self.history) < 2:
+            return 0.0
+        current_mass = np.sum(self.concentration)
+        prev_mass = np.sum(self.history[-2])
+        return (prev_mass - current_mass) / self.dt
+
+# ---------------------- AI Optimization Framework ----------------------
+class AIOptimizer:
+    def __init__(self, method='bayesian'):
+        self.method = method
+        
+    def optimize(self, objective_func, param_space):
+        if self.method == 'bayesian':
+            return self._bayesian_optimization(objective_func, param_space)
+        elif self.method == 'genetic':
+            return self._genetic_algorithm(objective_func, param_space)
+        elif self.method == 'pso':
+            return self._particle_swarm(objective_func, param_space)
+            
+    def _bayesian_optimization(self, objective_func, param_space):
+        optimizer = BayesianOptimization(f=objective_func, pbounds=param_space)
+        optimizer.maximize(init_points=5, n_iter=20)
+        return optimizer.max
+    
+    def _genetic_algorithm(self, objective_func, param_space):
+        # Create DEAP classes if not already created
+        try:
+            creator.FitnessMax
+        except AttributeError:
+            creator.create("FitnessMax", base.Fitness, weights=(1.0,))
+        try:
+            creator.Individual
+        except AttributeError:
+            creator.create("Individual", list, fitness=creator.FitnessMax)
+
+        toolbox = base.Toolbox()
+        param_bounds = list(param_space.values())
+        
+        toolbox.register("attr_float", np.random.uniform, param_bounds[0][0], param_bounds[0][1])
+        toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, n=len(param_space))
+        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+        def eval_individual(individual):
+            params = dict(zip(param_space.keys(), individual))
+            return (objective_func(**params),)
+            
+        toolbox.register("evaluate", eval_individual)
+        toolbox.register("mate", tools.cxBlend, alpha=0.5)
+        toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
+        toolbox.register("select", tools.selTournament, tournsize=3)
+
+        population = toolbox.population(n=50)
+        algorithms.eaSimple(population, toolbox, cxpb=0.5, mutpb=0.2, ngen=30, verbose=False)
+        best_individual = tools.selBest(population, k=1)[0]
+        return {'params': dict(zip(param_space.keys(), best_individual)), 
+                'target': best_individual.fitness.values[0]}
+    
+    def _particle_swarm(self, objective_func, param_space):
+        lb = [v[0] for v in param_space.values()]
+        ub = [v[1] for v in param_space.values()]
+        
+        def wrapped_obj(x):
+            return -objective_func(**dict(zip(param_space.keys(), x)))
+            
+        xopt, fopt = pso(wrapped_obj, lb, ub, swarmsize=50, maxiter=100)
+        return {'params': dict(zip(param_space.keys(), xopt)), 'target': -fopt}
+
+# ---------------------- 3D Visualization Functions ----------------------
 def create_cfd_volume(cfd_sim):
-    """Create the 3D volume and slice visualization of the CFD simulation."""
+    """Generate a 3D volume plot with additional slice surfaces from the CFD simulation."""
     grid_size = cfd_sim.grid_size
     X, Y, Z = np.mgrid[:grid_size, :grid_size, :grid_size]
     values = cfd_sim.concentration.flatten()
@@ -47,7 +208,7 @@ def create_cfd_volume(cfd_sim):
         name='XZ Plane'
     ))
 
-    # Z-plane (XY slice): z is constant. Here we use surfacecolor.
+    # Z-plane (XY slice): z is constant. Use surfacecolor for the slice data.
     X_mesh, Y_mesh = np.mgrid[:grid_size, :grid_size]
     Z_const = np.full_like(X_mesh, slice_pos)
     slice_data = cfd_sim.get_slice('z', slice_pos)
@@ -77,19 +238,18 @@ def create_cfd_volume(cfd_sim):
     return fig
 
 def create_flow_cone(cfd_sim):
-    """Create a cone plot to visualize the local diffusion flow (i.e. gradient of concentration)."""
+    """Generate a cone plot that visualizes the local gradient (a proxy for diffusion flow)."""
     grid_size = cfd_sim.grid_size
     # Calculate gradients of the concentration field
     grad_x, grad_y, grad_z = np.gradient(cfd_sim.concentration)
     
-    # For clarity, subsample the grid (for example, take every 3rd point)
+    # Subsample the grid for clarity (adjust the step as needed)
     step = max(grid_size // 10, 1)
     x, y, z = np.mgrid[0:grid_size:step, 0:grid_size:step, 0:grid_size:step]
     u = grad_x[::step, ::step, ::step]
     v = grad_y[::step, ::step, ::step]
     w = grad_z[::step, ::step, ::step]
     
-    # Create the cone plot. The cones will point in the direction of steepest increase.
     cone = go.Cone(
         x=x.flatten(),
         y=y.flatten(),
@@ -120,26 +280,197 @@ def create_flow_cone(cfd_sim):
     )
     return fig
 
-with st.expander("🌐 3D CFD Simulation", expanded=True):
-    st.markdown("### Real-time Computational Fluid Dynamics and Live Flow Visualization")
+# ---------------------- Streamlit User Interface ----------------------
+st.set_page_config(page_title="PharmaAI: Advanced Drug Release", layout="wide")
+st.sidebar.title("⚙️ Simulation Controls")
+
+# -------------- Parameter Input Section --------------
+with st.sidebar.expander("🔬 Core Parameters", expanded=True):
+    input_method = st.radio("Input Method", ["Direct Input", "Calculate D"])
+    if input_method == "Direct Input":
+        st.session_state.params['D'] = st.number_input(
+            "Diffusion Coefficient (cm²/s)", 
+            min_value=1e-15, max_value=10.0, 
+            value=st.session_state.params['D'],
+            format="%.2e"
+        )
+    else:
+        st.markdown("**Stokes-Einstein Calculator**")
+        col1, col2 = st.columns(2)
+        with col1:
+            T = st.number_input("Temperature (K)", 273.0, 373.0, 298.0)
+            r = st.number_input("Radius (m)", 1e-9, 1e-4, 1e-6, format="%.1e")
+        with col2:
+            eta = st.number_input("Viscosity (Pa·s)", 0.001, 10.0, 0.001)
+            k_B = 1.380649e-23
+        if st.button("Calculate D"):
+            if eta <= 0 or r <= 0:
+                st.error("Viscosity and radius must be positive!")
+            else:
+                D_m2s = (k_B * T) / (6 * np.pi * eta * r)
+                st.session_state.params['D'] = D_m2s * 10000  # Convert to cm²/s
+                st.success(f"Calculated D: {st.session_state.params['D']:.2e} cm²/s")
+
+    model_choice = st.selectbox("Release Model", list(MODELS.keys()))
+    time_range = st.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
+    num_points = st.slider("Data Points", 50, 1000, 200)
+
+# Model-specific parameter controls
+model_config = MODELS[model_choice]
+for param in model_config["params"]:
+    with st.sidebar.expander(f"⚙️ {param} Parameters"):
+        if param == "R":
+            st.session_state.params[param] = st.number_input(
+                "Radius (cm)", 0.01, 5.0, 0.5, step=0.01)
+        elif param == "k":
+            st.session_state.params[param] = st.number_input(
+                "Release Constant", 0.001, 2.0, 0.1, step=0.001)
+        elif param == "Sw":
+            st.session_state.params[param] = st.number_input(
+                "Swelling Factor", 0.1, 10.0, 2.0, step=0.1)
+        elif param == "n":
+            st.session_state.params[param] = st.number_input(
+                "Release Exponent", 0.1, 1.0, 0.5, step=0.01)
+
+# -------------- CFD Controls --------------
+with st.sidebar.expander("🌐 CFD Controls", expanded=True):
+    cfd_D = st.number_input("CFD Diffusion Coefficient", min_value=0.001, max_value=1.0, 
+                             value=0.1, step=0.001)
+    cfd_grid = st.selectbox("Grid Resolution", [20, 30, 50], index=1)
+    cfd_dt = st.number_input("Time Step (s)", 0.001, 1.0, 0.1)
+    
+    # Instantiate the CFD simulation if not already done or if grid resolution has changed
+    if st.session_state.cfd is None or st.session_state.cfd.grid_size != cfd_grid:
+        st.session_state.cfd = DrugDiffusionCFD(D=cfd_D, grid_size=cfd_grid, time_step=cfd_dt)
     
     col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start CFD Simulation"):
+            st.session_state.run_cfd = True
+    with col2:
+        if st.button("⏹️ Stop CFD Simulation"):
+            st.session_state.run_cfd = False
+
+# -------------- Main Interface Tabs --------------
+tab1, tab2 = st.tabs(["Simulation Results", "Advanced Analysis"])
+
+# ---------- Tab 1: Drug Release Profile ----------
+with tab1:
+    st.header("📈 Drug Release Profile")
+    t = np.linspace(0, time_range, num_points)
+    try:
+        # Compute the release profile using the selected model
+        Mt = model_config["function"](t, *[st.session_state.params[p] for p in model_config["params"]])
+        Mt = np.clip(Mt, 0, 1)
+        
+        # Plot the release profile
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(t, Mt, 'b-', linewidth=2)
+        ax.set_xlabel("Time (hours)", fontsize=12)
+        ax.set_ylabel("Fractional Release", fontsize=12)
+        ax.set_title(f"{model_choice} Release Profile", fontsize=14)
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+        
+        # Plot the instantaneous release rate
+        release_rate = np.gradient(Mt, t)
+        fig_rate, ax_rate = plt.subplots(figsize=(10, 4))
+        ax_rate.plot(t, release_rate, 'r--', linewidth=2)
+        ax_rate.set_title("Instantaneous Release Rate", fontsize=12)
+        ax_rate.set_xlabel("Time (hours)", fontsize=10)
+        ax_rate.set_ylabel("Release Rate (1/hour)", fontsize=10)
+        ax_rate.grid(True, alpha=0.3)
+        st.pyplot(fig_rate)
+        
+        # Provide an option to export simulation data
+        st.download_button(
+            label="📥 Export Simulation Data",
+            data=pd.DataFrame({"Time": t, "Release": Mt, "Release_Rate": release_rate}).to_csv(index=False),
+            file_name="drug_release_data.csv",
+            mime="text/csv"
+        )
+    except Exception as e:
+        st.error(f"Simulation error: {str(e)}")
+
+# ---------- Tab 2: Advanced Analysis ----------
+with tab2:
+    st.header("🧪 Advanced Analysis")
     
-    # Display metrics
-    col1.metric("Current Time", f"{st.session_state.cfd.time_elapsed:.2f} s")
-    current_rate = st.session_state.cfd.calculate_diffusion_rate()
-    col1.metric("Instant Diffusion Rate", f"{current_rate:.4f} mg/s")
-    total_mass = np.sum(st.session_state.cfd.concentration)
-    col1.metric("Remaining Drug Mass", f"{total_mass:.4f} mg")
+    with st.expander("🤖 AI Optimization", expanded=True):
+        opt_method = st.selectbox("Optimization Algorithm", ["bayesian", "genetic", "pso"])
+        param_space = {
+            'D': (0.01, 1.0), 'R': (0.1, 2.0), 
+            'Sw': (0.5, 5.0), 'k': (0.001, 2.0), 'n': (0.1, 1.0)
+        }
+        
+        def objective(D, R, Sw, k, n):
+            t_obj = np.linspace(0, 10, 100)
+            # As an example, we combine two models
+            return np.mean(
+                MODELS["Fickian Diffusion"]["function"](t_obj, D, R) + 
+                MODELS["Korsmeyer-Peppas"]["function"](t_obj, k, n)
+            )
+        
+        if st.button("Run Optimization"):
+            try:
+                optimizer = AIOptimizer(opt_method)
+                result = optimizer.optimize(objective, param_space)
+                st.session_state.params.update(result['params'])
+                st.success(f"Optimized Release Efficiency: {result['target']*100:.2f}%")
+                st.write("Optimized Parameters:", result['params'])
+            except Exception as e:
+                st.error(f"Optimization failed: {str(e)}")
     
-    # Update the CFD simulation if running
-    if st.session_state.get('run_cfd', False):
-        st.session_state.cfd.update()
+    with st.expander("🔍 SHAP Analysis"):
+        if st.button("Explain Model Predictions"):
+            try:
+                # Generate synthetic data for explanation
+                X = np.random.rand(100, 5)
+                y = np.array([objective(**dict(zip(param_space.keys(), x))) for x in X])
+                model = XGBRegressor(n_estimators=100, max_depth=3)
+                model.fit(X, y)
+                explainer = shap.Explainer(model)
+                shap_values = explainer(X[:50])
+                st.subheader("Feature Importance Analysis")
+                fig_shap, ax_shap = plt.subplots()
+                shap.summary_plot(shap_values, X[:50], feature_names=list(param_space.keys()), show=False)
+                st.pyplot(fig_shap, bbox_inches='tight')
+            except Exception as e:
+                st.error(f"SHAP analysis failed: {str(e)}")
     
-    # Create and display the volume (CFD) visualization
-    fig_volume = create_cfd_volume(st.session_state.cfd)
-    col1.plotly_chart(fig_volume, use_container_width=True)
-    
-    # Create and display the cone plot for live flow visualization
-    fig_cone = create_flow_cone(st.session_state.cfd)
-    col2.plotly_chart(fig_cone, use_container_width=True)
+    with st.expander("🌐 3D CFD Simulation", expanded=True):
+        st.markdown("### Real-time CFD and Live Flow Visualization")
+        
+        # Ensure the CFD simulation exists
+        if st.session_state.cfd is None:
+            st.session_state.cfd = DrugDiffusionCFD(D=cfd_D, grid_size=cfd_grid, time_step=cfd_dt)
+        
+        # Display key simulation metrics in columns
+        col_met1, col_met2, col_met3 = st.columns(3)
+        with col_met1:
+            st.metric("Current Time", f"{st.session_state.cfd.time_elapsed:.2f} s")
+        with col_met2:
+            current_rate = st.session_state.cfd.calculate_diffusion_rate()
+            st.metric("Instant Diffusion Rate", f"{current_rate:.4f} mg/s")
+        with col_met3:
+            total_mass = np.sum(st.session_state.cfd.concentration)
+            st.metric("Remaining Drug Mass", f"{total_mass:.4f} mg")
+        
+        # Auto-refresh the simulation every second if running (simulate live video)
+        if st.session_state.run_cfd:
+            try:
+                # If available, use st_autorefresh to trigger page refresh
+                st_autorefresh(interval=1000, limit=10000, key="live_simulation")
+            except Exception as e:
+                st.write("Auto-refresh not available.")
+            # Update the CFD simulation for one time step
+            st.session_state.cfd.update()
+        
+        # Display the two visualizations side by side
+        col_vis1, col_vis2 = st.columns(2)
+        with col_vis1:
+            fig_volume = create_cfd_volume(st.session_state.cfd)
+            st.plotly_chart(fig_volume, use_container_width=True)
+        with col_vis2:
+            fig_cone = create_flow_cone(st.session_state.cfd)
+            st.plotly_chart(fig_cone, use_container_width=True)
