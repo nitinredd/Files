@@ -1,297 +1,136 @@
 import streamlit as st
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from scipy.optimize import curve_fit
-from sklearn.metrics import r2_score, mean_absolute_error
-from bayes_opt import BayesianOptimization
-from deap import base, creator, tools, algorithms
-import shap
-from xgboost import XGBRegressor
-from pyswarm import pso
-import warnings
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import gym
+from stable_baselines3 import PPO
 
-# Suppress warnings and configure SHAP
-warnings.filterwarnings("ignore", category=UserWarning)
-shap.initjs()
+# ---------------------- Streamlit Configuration ----------------------
+st.set_page_config(page_title="AI-Powered Drug Release Simulator", layout="wide")
+st.title("🧪 AI-Powered Drug Release Simulator")
+st.sidebar.title("⚙️ Controls")
 
-# Initialize session state
-if 'params' not in st.session_state:
-    st.session_state.params = {
-        'D': 0.1, 'R': 0.5, 'k': 0.1, 'n': 0.5,
-        'r_nano': 50e-7, 'visc': 0.001, 'density': 997.0
-    }
+# ---------------------- Physics-Informed Neural Networks (PINNs) ----------------------
+st.sidebar.subheader("PINN: Drug Diffusion Solver")
 
-# ---------------------- Simplified Drug Release Models ----------------------
-MODELS = {
-    "Fickian Diffusion": {
-        "function": lambda t, D, R, r_nano: (1 - (6/np.pi**2) * np.sum(
-            [np.exp(-D*(n**2)*np.pi**2*t/(R**2 + r_nano**2))/n**2 
-             for n in range(1, 50)], axis=0)),
-        "params": ["D", "R", "r_nano"]
-    },
-    "Erosion-Controlled": {
-        "function": lambda t, k: 1 - np.exp(-k * t),
-        "params": ["k"]
-    },
-    "Swelling-Controlled": {
-        "function": lambda t, D, R: 1 - np.exp(-D * t / R),
-        "params": ["D", "R"]
-    },
-    "Higuchi Model": {
-        "function": lambda t, k: k * np.sqrt(t),
-        "params": ["k"]
-    },
-    "Korsmeyer-Peppas": {
-        "function": lambda t, k, n: k * t**n,
-        "params": ["k", "n"]
-    }
-}
-
-# ---------------------- CFD Solver with Drug Release Integration ----------------------
-class CFDSolver:
-    def __init__(self, size=50):
-        self.size = size
-        self.x = np.linspace(-2, 2, size)
-        self.y = np.linspace(-2, 2, size)
-        self.z = np.linspace(-2, 2, size)
-        self.X, self.Y, self.Z = np.meshgrid(self.x, self.y, self.z)
-        
-    def solve_transport(self, D, visc, density, release_rate, dt=0.01):
-        """Solve transport equations with drug release integration"""
-        velocity = np.zeros((3, self.size, self.size, self.size))
-        concentration = np.zeros_like(self.X)
-        
-        # Initialize drug release at center
-        concentration[self.size//2, self.size//2, self.size//2] = release_rate[0]
-        
-        for i in range(1, len(release_rate)):
-            # Update fluid dynamics
-            velocity += dt * (visc * np.gradient(np.gradient(velocity, axis=1), axis=1) - 
-                            density * velocity * np.abs(velocity))
-            
-            # Update drug concentration
-            grad_c = np.gradient(concentration)
-            concentration += dt * (D * np.sum(np.gradient(grad_c), axis=0) -
-                                  np.dot(velocity.T, grad_c)) + release_rate[i]
-            
-            # Apply boundary conditions
-            concentration = np.clip(concentration, 0, 1)
-            
-        return concentration, velocity
-
-# ---------------------- 3D Visualization ----------------------
-def create_cfd_visualization(concentration, velocity):
-    """Create interactive 3D CFD visualization"""
-    x, y, z = np.mgrid[-2:2:50j, -2:2:50j, -2:2:50j]
-    
-    fig = go.Figure(data=go.Volume(
-        x=x.flatten(),
-        y=y.flatten(),
-        z=z.flatten(),
-        value=concentration.flatten(),
-        isomin=0.1,
-        isomax=0.8,
-        opacity=0.1,
-        surface_count=20,
-        colorscale='Plasma',
-    ))
-    
-    # Add velocity vectors
-    skip = 5
-    fig.add_trace(go.Cone(
-        x=x[::skip, ::skip, ::skip].flatten(),
-        y=y[::skip, ::skip, ::skip].flatten(),
-        z=z[::skip, ::skip, ::skip].flatten(),
-        u=velocity[0, ::skip, ::skip, ::skip].flatten(),
-        v=velocity[1, ::skip, ::skip, ::skip].flatten(),
-        w=velocity[2, ::skip, ::skip, ::skip].flatten(),
-        sizemode="absolute",
-        sizeref=0.5,
-        showscale=False,
-        colorscale='Blues',
-    ))
-    
-    fig.update_layout(scene=dict(
-        xaxis_title='X (mm)',
-        yaxis_title='Y (mm)',
-        zaxis_title='Z (mm)',
-        camera=dict(eye=dict(x=1.5, y=-1.5, z=0.5)),
-    ), height=800)
-    
-    return fig
-
-# ---------------------- Streamlit UI ----------------------
-st.set_page_config(page_title="PharmaAI: Drug Release Simulator", layout="wide")
-st.sidebar.title("⚙️ Simulation Controls")
-
-# ---------------------- Parameter Input Section ----------------------
-with st.sidebar.expander("🔬 Core Parameters", expanded=True):
-    input_method = st.radio("Input Method", ["Direct Input", "Calculate D"])
-    
-    if input_method == "Direct Input":
-        st.session_state.params['D'] = st.number_input(
-            "Diffusion Coefficient (cm²/s)", 
-            min_value=1e-15,
-            max_value=10.0, 
-            value=st.session_state.params['D'],
-            format="%.2e"
+# PINN Model Definition
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 32),
+            nn.Tanh(),
+            nn.Linear(32, 32),
+            nn.Tanh(),
+            nn.Linear(32, 1)
         )
-    else:
-        st.markdown("**Stokes-Einstein Calculator**")
-        col1, col2 = st.columns(2)
-        with col1:
-            T = st.number_input("Temperature (K)", 273.0, 373.0, 298.0)
-            r = st.number_input("Radius (m)", 1e-9, 1e-4, 1e-6, format="%.1e")
-        with col2:
-            eta = st.number_input("Viscosity (Pa·s)", 0.001, 10.0, 0.001)
-            k_B = 1.380649e-23
-        
-        if st.button("Calculate D"):
-            if eta <= 0 or r <= 0:
-                st.error("Viscosity and radius must be positive!")
-            else:
-                D_m2s = (k_B * T) / (6 * np.pi * eta * r)
-                st.session_state.params['D'] = D_m2s * 10000  # Convert to cm²/s
-                st.success(f"Calculated D: {st.session_state.params['D']:.2e} cm²/s")
 
-    model_choice = st.selectbox("Release Model", list(MODELS.keys()))
-    time_range = st.slider("Simulation Time (hours)", 0.1, 24.0, 10.0)
-    num_points = st.slider("Data Points", 50, 1000, 200)
+    def forward(self, x, t):
+        inputs = torch.cat((x, t), dim=1)
+        return self.net(inputs)
 
-# ---------------------- Advanced Parameters ----------------------
-with st.sidebar.expander("⚛️ Advanced Parameters"):
-    if model_choice == "Fickian Diffusion":
-        st.session_state.params['r_nano'] = st.number_input(
-            "Nanoparticle Radius (cm)", 1e-7, 1e-3, 50e-7, format="%.1e")
+# PINN Loss (Solving Diffusion PDE)
+def pde_loss(model, x, t, D=0.1):
+    u = model(x, t)
+    u_t = autograd.grad(u, t, grad_outputs=torch.ones_like(u), create_graph=True)[0]
+    u_xx = autograd.grad(autograd.grad(u, x, grad_outputs=torch.ones_like(u), create_graph=True)[0], x, grad_outputs=torch.ones_like(u), create_graph=True)[0]
     
-    st.session_state.params['visc'] = st.number_input(
-        "Tissue Viscosity (Pa·s)", 0.001, 10.0, 0.001)
-    st.session_state.params['density'] = st.number_input(
-        "Tissue Density (kg/m³)", 800.0, 2000.0, 997.0)
+    return ((u_t - D * u_xx) ** 2).mean()
 
-# ---------------------- Main Interface ----------------------
-tab1, tab2 = st.tabs(["Simulation Results", "Advanced Analysis"])
+# PINN Training
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pinn_model = PINN().to(device)
+optimizer = torch.optim.Adam(pinn_model.parameters(), lr=1e-3)
 
-with tab1:
-    st.header("📈 Drug Release Profile")
-    t = np.linspace(0, time_range, num_points)
+if st.sidebar.button("Train PINN Model"):
+    x_train = torch.rand(100, 1, device=device, requires_grad=True)
+    t_train = torch.rand(100, 1, device=device, requires_grad=True)
     
-    try:
-        Mt = MODELS[model_choice]["function"](
-            t, *[st.session_state.params[p] for p in MODELS[model_choice]["params"]])
-        Mt = np.clip(Mt, 0, 1)
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.plot(t, Mt, 'b-', linewidth=2)
-        ax.set_xlabel("Time (hours)", fontsize=12)
-        ax.set_ylabel("Fractional Release", fontsize=12)
-        ax.set_title(f"{model_choice} Release Profile", fontsize=14)
-        ax.grid(True, alpha=0.3)
-        st.pyplot(fig)
-        
-        release_rate = np.gradient(Mt, t)
-        
-        # CFD Simulation Integration
-        with st.expander("🌊 Tissue Transport Simulation", expanded=True):
-            resolution = st.selectbox("Mesh Resolution", [50, 100], index=0)
-            
-            if st.button("Run Transport Simulation"):
-                with st.spinner("Solving Transport Equations..."):
-                    cfd_solver = CFDSolver(resolution)
-                    concentration, velocity = cfd_solver.solve_transport(
-                        D=st.session_state.params['D']/10000,  # Convert to m²/s
-                        visc=st.session_state.params['visc'],
-                        density=st.session_state.params['density'],
-                        release_rate=release_rate
-                    )
-                    
-                    st.plotly_chart(create_cfd_visualization(
-                        concentration, velocity), use_container_width=True)
-        
-        st.download_button(
-            label="📥 Export Simulation Data",
-            data=pd.DataFrame({"Time": t, "Release": Mt, "Release_Rate": release_rate}).to_csv(index=False),
-            file_name="drug_release_data.csv",
-            mime="text/csv"
-        )
-        
-    except Exception as e:
-        st.error(f"Simulation error: {str(e)}")
+    for epoch in range(5000):
+        optimizer.zero_grad()
+        loss = pde_loss(pinn_model, x_train, t_train)
+        loss.backward()
+        optimizer.step()
 
-with tab2:
-    st.header("🧪 Advanced Analysis")
-    
-    with st.expander("🤖 AI Optimization"):
-        opt_method = st.selectbox("Optimization Algorithm", ["bayesian", "genetic", "pso"])
-        param_space = {
-            'D': (0.01, 1.0), 
-            'R': (0.1, 2.0), 
-            'r_nano': (1e-7, 1e-3), 
-            'k': (0.01, 1.0),
-            'n': (0.1, 1.0)
-        }
-        
-        def objective(D, R, r_nano, k, n):
-            t = np.linspace(0, 10, 100)
-            return np.mean(
-                MODELS["Fickian Diffusion"]["function"](t, D, R, r_nano) +
-                MODELS["Korsmeyer-Peppas"]["function"](t, k, n)
-            )
-        
-        if st.button("Run Optimization"):
-            try:
-                optimizer = BayesianOptimization(f=objective, pbounds=param_space)
-                optimizer.maximize(init_points=5, n_iter=20)
-                result = optimizer.max
-                st.session_state.params.update(result['params'])
-                st.success(f"Optimized Release Efficiency: {result['target']*100:.2f}%")
-                st.write("Optimized Parameters:", result['params'])
-                
-            except Exception as e:
-                st.error(f"Optimization failed: {str(e)}")
-    
-    with st.expander("🔍 SHAP Analysis"):
-        if st.button("Explain Model Predictions"):
-            try:
-                X = np.random.rand(100, 5)
-                y = np.array([objective(**dict(zip(param_space.keys(), x))) for x in X])
-                
-                model = XGBRegressor(n_estimators=100, max_depth=3)
-                model.fit(X, y)
-                
-                explainer = shap.Explainer(model)
-                shap_values = explainer(X[:50])
-                
-                fig_shap, ax_shap = plt.subplots()
-                shap.summary_plot(shap_values, X[:50], 
-                                feature_names=list(param_space.keys()), show=False)
-                st.pyplot(fig_shap, bbox_inches='tight')
-                
-            except Exception as e:
-                st.error(f"SHAP analysis failed: {str(e)}")
+        if epoch % 500 == 0:
+            st.sidebar.text(f"Epoch {epoch}, Loss: {loss.item():.6f}")
 
-# ---------------------- Documentation ----------------------
-with st.expander("📘 User Guide"):
-    st.markdown("""
-    **PharmaAI Simplified Features Guide**
+    st.sidebar.success("PINN Model Trained!")
+
+# PINN Prediction
+st.subheader("📈 PINN Prediction of Drug Diffusion")
+x_test = torch.linspace(0, 1, 100).reshape(-1, 1).to(device)
+t_test = torch.ones_like(x_test) * 0.5
+u_pred = pinn_model(x_test, t_test).detach().cpu().numpy()
+
+fig_pinn, ax_pinn = plt.subplots()
+ax_pinn.plot(x_test.cpu().numpy(), u_pred, label="PINN Prediction", color='blue')
+ax_pinn.set_xlabel("Position (x)")
+ax_pinn.set_ylabel("Concentration (u)")
+ax_pinn.set_title("Drug Diffusion Prediction using PINN")
+ax_pinn.legend()
+st.pyplot(fig_pinn)
+
+# ---------------------- Reinforcement Learning (RL) for Optimization ----------------------
+st.sidebar.subheader("RL: Optimize Drug Formulation")
+
+# Custom Gym Environment for Drug Release Optimization
+class DrugReleaseEnv(gym.Env):
+    def __init__(self):
+        super(DrugReleaseEnv, self).__init__()
+        self.action_space = gym.spaces.Box(low=np.array([0.01, 0.1]), high=np.array([1.0, 2.0]), dtype=np.float32)  # (D, k)
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(100,), dtype=np.float32)
+        self.time = np.linspace(0, 10, 100)
+
+    def step(self, action):
+        D, k = action
+        release_profile = 1 - np.exp(-k * self.time)  # Approximate drug release
+        reward = -np.abs(release_profile[-1] - 0.8)  # Reward reaching 80% release
+        return release_profile, reward, False, {}
+
+    def reset(self):
+        return np.zeros(100, dtype=np.float32)
+
+# Train RL Agent
+if st.sidebar.button("Train RL Agent"):
+    env = DrugReleaseEnv()
+    rl_model = PPO("MlpPolicy", env, verbose=1)
+    rl_model.learn(total_timesteps=10000)
+    st.sidebar.success("RL Agent Trained!")
+
+    # Test Optimized Formulation
+    obs = env.reset()
+    action, _states = rl_model.predict(obs)
+    st.sidebar.write("Optimized Parameters:", action)
+
+# ---------------------- Visualization of RL Optimization ----------------------
+st.subheader("🤖 RL Optimization of Drug Formulation")
+if "rl_model" in locals():
+    env = DrugReleaseEnv()
+    obs = env.reset()
+    action, _states = rl_model.predict(obs)
     
-    1. **Core Release Models**:
-       - Enhanced Fickian diffusion with nanoparticle size parameter
-       - Classic erosion, swelling, and Korsmeyer-Peppas models
-       
-    2. **Integrated Transport Simulation**:
-       - Direct coupling of release profile with CFD simulation
-       - Real-time visualization of drug distribution in tissue
-       - Adjustable tissue properties and mesh resolution
-       
-    3. **Optimization & Analysis**:
-       - Bayesian optimization of key parameters
-       - SHAP explainability for model predictions
-       
-    4. **Key Improvements**:
-       - Simplified parameter set focused on practical variables
-       - Robust CFD implementation with stability checks
-       - Enhanced numerical stability in all models
-    """)
+    D_opt, k_opt = action
+    release_opt = 1 - np.exp(-k_opt * env.time)
+
+    fig_rl, ax_rl = plt.subplots()
+    ax_rl.plot(env.time, release_opt, label="Optimized Release Profile", color='green')
+    ax_rl.set_xlabel("Time (hours)")
+    ax_rl.set_ylabel("Fractional Release")
+    ax_rl.set_title("Optimized Drug Release Using RL")
+    ax_rl.legend()
+    st.pyplot(fig_rl)
+else:
+    st.warning("Train the RL model first to see optimized results.")
+
+# ---------------------- Download Options ----------------------
+st.subheader("📥 Export Simulation Data")
+csv_data = np.column_stack((env.time, release_opt if "release_opt" in locals() else np.zeros(100)))
+csv_content = "Time,Fractional Release\n" + "\n".join([f"{t},{r}" for t, r in csv_data])
+st.download_button("Download Results", csv_content, file_name="optimized_drug_release.csv", mime="text/csv")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("Developed with **AI-powered modeling** for better drug release predictions.")
