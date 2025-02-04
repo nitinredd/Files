@@ -1,4 +1,4 @@
-# ---------------------- Corrected CFD Solver ----------------------
+# ---------------------- Revised CFD Solver with Diagnostics ----------------------
 class CFDSolver:
     def __init__(self, size=50):
         self.size = size
@@ -7,50 +7,90 @@ class CFDSolver:
         self.z = np.linspace(-2, 2, size)
         self.X, self.Y, self.Z = np.meshgrid(self.x, self.y, self.z)
         
-    def solve_transport(self, D, visc, density, release_rate, dt=0.01):
-        """Solve transport equations with proper dimension handling"""
+    def solve_transport(self, D, visc, density, release_rate, dt=0.1):
+        """Enhanced transport solver with stability controls"""
         velocity = np.zeros((3, self.size, self.size, self.size))
         concentration = np.zeros_like(self.X)
         
-        # Initialize drug release at center
-        concentration[self.size//2, self.size//2, self.size//2] = release_rate[0]
+        # Initial drug deposit
+        mid = self.size//2
+        concentration[mid-2:mid+2, mid-2:mid+2, mid-2:mid+2] = 0.5
         
-        for i in range(1, len(release_rate)):
-            # Update fluid dynamics with proper gradient calculations
-            new_velocity = np.zeros_like(velocity)
-            for comp in range(3):
-                # Calculate Laplacian for velocity component
-                grad_x = np.gradient(velocity[comp], axis=0)
-                grad_y = np.gradient(velocity[comp], axis=1)
-                grad_z = np.gradient(velocity[comp], axis=2)
-                
-                laplacian = (np.gradient(grad_x, axis=0) + 
-                            np.gradient(grad_y, axis=1) + 
-                            np.gradient(grad_z, axis=2))
-                
-                # Navier-Stokes equation components
-                viscous_term = visc * laplacian
-                advection_term = density * (
-                    velocity[0] * np.gradient(velocity[comp], axis=0) +
-                    velocity[1] * np.gradient(velocity[comp], axis=1) +
-                    velocity[2] * np.gradient(velocity[comp], axis=2)
-                )
-                
-                new_velocity[comp] = velocity[comp] + dt * (viscous_term - advection_term)
+        for i in range(len(release_rate)):
+            # Simplified fluid dynamics (Stokes flow approximation)
+            velocity += dt * (
+                visc * np.array([np.gradient(np.gradient(v, axis=0), axis=0) +
+                                np.gradient(np.gradient(v, axis=1), axis=1) +
+                                np.gradient(np.gradient(v, axis=2), axis=2)
+                                for v in velocity]) -
+                density * velocity * 0.01
+            )
             
-            velocity = np.clip(new_velocity, -1e3, 1e3)  # Stability clipping
-            
-            # Update drug concentration with proper advection-diffusion
+            # Diffusion and advection
             grad_c = np.array(np.gradient(concentration))
             laplacian_c = np.sum([np.gradient(grad_c[i], axis=i) for i in range(3)], axis=0)
             
-            advection = np.sum([
-                velocity[0] * grad_c[0],
-                velocity[1] * grad_c[1],
-                velocity[2] * grad_c[2]
-            ], axis=0)
+            concentration += dt * (
+                D * laplacian_c -
+                np.sum(velocity * grad_c, axis=0) +
+                release_rate[i] * 0.01  # Scaled release rate
+            )
             
-            concentration += dt * (D * laplacian_c - advection) + release_rate[i]
+            # Boundary conditions and stability
             concentration = np.clip(concentration, 0, 1)
+            velocity = np.clip(velocity, -1e2, 1e2)
             
         return concentration, velocity
+
+# ---------------------- Enhanced Visualization ----------------------
+def create_cfd_visualization(concentration, velocity):
+    """Visualization with automatic scaling"""
+    x, y, z = np.mgrid[-2:2:50j, -2:2:50j, -2:2:50j]
+    
+    # Auto-scale visualization parameters
+    c_min, c_max = concentration.min(), concentration.max()
+    v_mag = np.sqrt(np.sum(velocity**2, axis=0))
+    v_scale = v_mag.max() if v_mag.max() > 0 else 1
+    
+    fig = go.Figure()
+    
+    if c_max > 0.01:
+        fig.add_trace(go.Volume(
+            x=x.flatten(),
+            y=y.flatten(),
+            z=z.flatten(),
+            value=concentration.flatten(),
+            isomin=max(c_min, 0.05),
+            isomax=min(c_max, 0.95),
+            opacity=0.1,
+            surface_count=20,
+            colorscale='Plasma',
+        ))
+    
+    if v_scale > 0.01:
+        skip = 5
+        fig.add_trace(go.Cone(
+            x=x[::skip, ::skip, ::skip].flatten(),
+            y=y[::skip, ::skip, ::skip].flatten(),
+            z=z[::skip, ::skip, ::skip].flatten(),
+            u=velocity[0, ::skip, ::skip, ::skip].flatten()/v_scale,
+            v=velocity[1, ::skip, ::skip, ::skip].flatten()/v_scale,
+            w=velocity[2, ::skip, ::skip, ::skip].flatten()/v_scale,
+            sizemode="absolute",
+            sizeref=0.2,
+            showscale=False,
+            colorscale='Blues',
+        ))
+    
+    fig.update_layout(
+        scene=dict(
+            xaxis_title='X (mm)',
+            yaxis_title='Y (mm)',
+            zaxis_title='Z (mm)',
+            camera=dict(eye=dict(x=1.5, y=-1.5, z=0.5)),
+        ),
+        height=800,
+        margin=dict(l=0, r=0, b=0, t=0)
+    )
+    
+    return fig
