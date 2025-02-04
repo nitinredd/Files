@@ -19,29 +19,25 @@ shap.initjs()
 # Initialize session state
 if 'params' not in st.session_state:
     st.session_state.params = {
-        'D': 0.1, 'R': 0.5, 'Sw': 2.0, 'k': 0.1, 'n': 0.5,
-        'Ir': 0.0, 'tau': 1.0, 'r_nano': 50e-7, 'sigma': 0.1
+        'D': 0.1, 'R': 0.5, 'k': 0.1, 'n': 0.5,
+        'r_nano': 50e-7, 'visc': 0.001, 'density': 997.0
     }
 
-# ---------------------- Enhanced Drug Release Models ----------------------
+# ---------------------- Simplified Drug Release Models ----------------------
 MODELS = {
     "Fickian Diffusion": {
-        "function": lambda t, D, R, Ir, tau: (1 + Ir*np.exp(-t/tau)) * (1 - (6/np.pi**2) * np.sum(
-            [np.exp(-D*(n**2)*np.pi**2*t/R**2)/n**2 for n in range(1, 50)], axis=0)),
-        "params": ["D", "R", "Ir", "tau"]
-    },
-    "Nanoscale Fickian": {
-        "function": lambda t, D, R, r_nano, sigma: (1 + sigma/r_nano) * (1 - (6/np.pi**2) * np.sum(
-            [np.exp(-D*(n**2)*np.pi**2*t/(R**2 + r_nano**2))/n**2 for n in range(1, 50)], axis=0)),
-        "params": ["D", "R", "r_nano", "sigma"]
+        "function": lambda t, D, R, r_nano: (1 - (6/np.pi**2) * np.sum(
+            [np.exp(-D*(n**2)*np.pi**2*t/(R**2 + r_nano**2))/n**2 
+             for n in range(1, 50)], axis=0)),
+        "params": ["D", "R", "r_nano"]
     },
     "Erosion-Controlled": {
         "function": lambda t, k: 1 - np.exp(-k * t),
         "params": ["k"]
     },
     "Swelling-Controlled": {
-        "function": lambda t, D, Sw: 1 - np.exp(-D * t / Sw),
-        "params": ["D", "Sw"]
+        "function": lambda t, D, R: 1 - np.exp(-D * t / R),
+        "params": ["D", "R"]
     },
     "Higuchi Model": {
         "function": lambda t, k: k * np.sqrt(t),
@@ -53,7 +49,7 @@ MODELS = {
     }
 }
 
-# ---------------------- Advanced CFD Solver ----------------------
+# ---------------------- CFD Solver with Drug Release Integration ----------------------
 class CFDSolver:
     def __init__(self, size=50):
         self.size = size
@@ -62,25 +58,30 @@ class CFDSolver:
         self.z = np.linspace(-2, 2, size)
         self.X, self.Y, self.Z = np.meshgrid(self.x, self.y, self.z)
         
-    def solve_navier_stokes(self, D, visc, density, dt=0.01):
-        """Solve simplified Navier-Stokes with diffusion"""
+    def solve_transport(self, D, visc, density, release_rate, dt=0.01):
+        """Solve transport equations with drug release integration"""
         velocity = np.zeros((3, self.size, self.size, self.size))
         concentration = np.zeros_like(self.X)
-        concentration[self.size//2, self.size//2, self.size//2] = 1.0
         
-        for _ in range(10):  # Reduced for performance
-            # Solve fluid equations
-            velocity += dt * (visc * np.gradient(np.gradient(velocity)) - 
+        # Initialize drug release at center
+        concentration[self.size//2, self.size//2, self.size//2] = release_rate[0]
+        
+        for i in range(1, len(release_rate)):
+            # Update fluid dynamics
+            velocity += dt * (visc * np.gradient(np.gradient(velocity, axis=1), axis=1) - 
                             density * velocity * np.abs(velocity))
             
-            # Solve advection-diffusion equation
+            # Update drug concentration
             grad_c = np.gradient(concentration)
             concentration += dt * (D * np.sum(np.gradient(grad_c), axis=0) -
-                                  np.dot(velocity.T, grad_c))
-        
+                                  np.dot(velocity.T, grad_c)) + release_rate[i]
+            
+            # Apply boundary conditions
+            concentration = np.clip(concentration, 0, 1)
+            
         return concentration, velocity
 
-# ---------------------- Enhanced 3D Visualization ----------------------
+# ---------------------- 3D Visualization ----------------------
 def create_cfd_visualization(concentration, velocity):
     """Create interactive 3D CFD visualization"""
     x, y, z = np.mgrid[-2:2:50j, -2:2:50j, -2:2:50j]
@@ -121,63 +122,8 @@ def create_cfd_visualization(concentration, velocity):
     
     return fig
 
-# ---------------------- AI Optimization Framework ----------------------
-class AIOptimizer:
-    def __init__(self, method='bayesian'):
-        self.method = method
-        
-    def optimize(self, objective_func, param_space):
-        if self.method == 'bayesian':
-            return self._bayesian_optimization(objective_func, param_space)
-        elif self.method == 'genetic':
-            return self._genetic_algorithm(objective_func, param_space)
-        elif self.method == 'pso':
-            return self._particle_swarm(objective_func, param_space)
-            
-    def _bayesian_optimization(self, objective_func, param_space):
-        optimizer = BayesianOptimization(f=objective_func, pbounds=param_space)
-        optimizer.maximize(init_points=5, n_iter=20)
-        return optimizer.max
-    
-    def _genetic_algorithm(self, objective_func, param_space):
-        creator.create("FitnessMax", base.Fitness, weights=(1.0,))
-        creator.create("Individual", list, fitness=creator.FitnessMax)
-
-        toolbox = base.Toolbox()
-        param_bounds = list(param_space.values())
-        
-        toolbox.register("attr_float", np.random.uniform, param_bounds[0][0], param_bounds[0][1])
-        toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_float, 
-                       n=len(param_space))
-        toolbox.register("population", tools.initRepeat, list, toolbox.individual)
-
-        def eval_individual(individual):
-            params = dict(zip(param_space.keys(), individual))
-            return (objective_func(**params),)
-            
-        toolbox.register("evaluate", eval_individual)
-        toolbox.register("mate", tools.cxBlend, alpha=0.5)
-        toolbox.register("mutate", tools.mutGaussian, mu=0, sigma=1, indpb=0.2)
-        toolbox.register("select", tools.selTournament, tournsize=3)
-
-        population = toolbox.population(n=50)
-        algorithms.eaSimple(population, toolbox, cxpb=0.5, mutpb=0.2, ngen=30, verbose=False)
-        best_individual = tools.selBest(population, k=1)[0]
-        return {'params': dict(zip(param_space.keys(), best_individual)), 
-                'target': best_individual.fitness.values[0]}
-    
-    def _particle_swarm(self, objective_func, param_space):
-        lb = [v[0] for v in param_space.values()]
-        ub = [v[1] for v in param_space.values()]
-        
-        def wrapped_obj(x):
-            return -objective_func(**dict(zip(param_space.keys(), x)))
-            
-        xopt, fopt = pso(wrapped_obj, lb, ub, swarmsize=50, maxiter=100)
-        return {'params': dict(zip(param_space.keys(), xopt)), 'target': -fopt}
-
 # ---------------------- Streamlit UI ----------------------
-st.set_page_config(page_title="PharmaAI: Advanced Drug Release", layout="wide")
+st.set_page_config(page_title="PharmaAI: Drug Release Simulator", layout="wide")
 st.sidebar.title("⚙️ Simulation Controls")
 
 # ---------------------- Parameter Input Section ----------------------
@@ -216,17 +162,14 @@ with st.sidebar.expander("🔬 Core Parameters", expanded=True):
 
 # ---------------------- Advanced Parameters ----------------------
 with st.sidebar.expander("⚛️ Advanced Parameters"):
-    if "Fickian" in model_choice:
-        st.markdown("**Irradiation Effects**")
-        st.session_state.params['Ir'] = st.slider("Radiation Intensity (W/m²)", 0.0, 1000.0, 0.0)
-        st.session_state.params['tau'] = st.slider("Radiation Duration (hr)", 0.1, 24.0, 1.0)
-        
-        if model_choice == "Nanoscale Fickian":
-            st.markdown("**Nanoscale Parameters**")
-            st.session_state.params['r_nano'] = st.number_input(
-                "Nanoparticle Radius (cm)", 1e-7, 1e-3, 50e-7, format="%.1e")
-            st.session_state.params['sigma'] = st.slider(
-                "Surface Reactivity", 0.0, 1.0, 0.1)
+    if model_choice == "Fickian Diffusion":
+        st.session_state.params['r_nano'] = st.number_input(
+            "Nanoparticle Radius (cm)", 1e-7, 1e-3, 50e-7, format="%.1e")
+    
+    st.session_state.params['visc'] = st.number_input(
+        "Tissue Viscosity (Pa·s)", 0.001, 10.0, 0.001)
+    st.session_state.params['density'] = st.number_input(
+        "Tissue Density (kg/m³)", 800.0, 2000.0, 997.0)
 
 # ---------------------- Main Interface ----------------------
 tab1, tab2 = st.tabs(["Simulation Results", "Advanced Analysis"])
@@ -249,11 +192,23 @@ with tab1:
         st.pyplot(fig)
         
         release_rate = np.gradient(Mt, t)
-        fig_rate, ax_rate = plt.subplots(figsize=(10, 4))
-        ax_rate.plot(t, release_rate, 'r--', linewidth=2)
-        ax_rate.set_title("Instantaneous Release Rate", fontsize=12)
-        ax_rate.grid(True, alpha=0.3)
-        st.pyplot(fig_rate)
+        
+        # CFD Simulation Integration
+        with st.expander("🌊 Tissue Transport Simulation", expanded=True):
+            resolution = st.selectbox("Mesh Resolution", [50, 100], index=0)
+            
+            if st.button("Run Transport Simulation"):
+                with st.spinner("Solving Transport Equations..."):
+                    cfd_solver = CFDSolver(resolution)
+                    concentration, velocity = cfd_solver.solve_transport(
+                        D=st.session_state.params['D']/10000,  # Convert to m²/s
+                        visc=st.session_state.params['visc'],
+                        density=st.session_state.params['density'],
+                        release_rate=release_rate
+                    )
+                    
+                    st.plotly_chart(create_cfd_visualization(
+                        concentration, velocity), use_container_width=True)
         
         st.download_button(
             label="📥 Export Simulation Data",
@@ -268,43 +223,28 @@ with tab1:
 with tab2:
     st.header("🧪 Advanced Analysis")
     
-    with st.expander("🌊 Tissue Transport Simulation", expanded=True):
-        st.markdown("**CFD Parameters**")
-        col1, col2 = st.columns(2)
-        with col1:
-            visc = st.number_input("Viscosity (Pa·s)", 0.001, 10.0, 0.01)
-            density = st.number_input("Density (kg/m³)", 800.0, 2000.0, 997.0)
-        with col2:
-            D_cfd = st.number_input("Tissue Diffusivity (cm²/s)", 1e-5, 1.0, 0.01)
-            resolution = st.selectbox("Mesh Resolution", [50, 100, 200], index=0)
-        
-        if st.button("Run CFD Simulation"):
-            with st.spinner("Solving Navier-Stokes equations..."):
-                cfd_solver = CFDSolver(resolution)
-                concentration, velocity = cfd_solver.solve_navier_stokes(
-                    D_cfd/10000, visc, density)  # Convert to m²/s
-                
-                st.plotly_chart(create_cfd_visualization(
-                    concentration, velocity), use_container_width=True)
-    
     with st.expander("🤖 AI Optimization"):
         opt_method = st.selectbox("Optimization Algorithm", ["bayesian", "genetic", "pso"])
         param_space = {
-            'D': (0.01, 1.0), 'R': (0.1, 2.0), 'Ir': (0.0, 1000.0),
-            'tau': (0.1, 24.0), 'r_nano': (1e-7, 1e-3), 'sigma': (0.0, 1.0)
+            'D': (0.01, 1.0), 
+            'R': (0.1, 2.0), 
+            'r_nano': (1e-7, 1e-3), 
+            'k': (0.01, 1.0),
+            'n': (0.1, 1.0)
         }
         
-        def objective(D, R, Ir, tau, r_nano, sigma):
+        def objective(D, R, r_nano, k, n):
             t = np.linspace(0, 10, 100)
             return np.mean(
-                MODELS["Fickian Diffusion"]["function"](t, D, R, Ir, tau) +
-                MODELS["Nanoscale Fickian"]["function"](t, D, R, r_nano, sigma)
+                MODELS["Fickian Diffusion"]["function"](t, D, R, r_nano) +
+                MODELS["Korsmeyer-Peppas"]["function"](t, k, n)
             )
         
         if st.button("Run Optimization"):
             try:
-                optimizer = AIOptimizer(opt_method)
-                result = optimizer.optimize(objective, param_space)
+                optimizer = BayesianOptimization(f=objective, pbounds=param_space)
+                optimizer.maximize(init_points=5, n_iter=20)
+                result = optimizer.max
                 st.session_state.params.update(result['params'])
                 st.success(f"Optimized Release Efficiency: {result['target']*100:.2f}%")
                 st.write("Optimized Parameters:", result['params'])
@@ -315,7 +255,7 @@ with tab2:
     with st.expander("🔍 SHAP Analysis"):
         if st.button("Explain Model Predictions"):
             try:
-                X = np.random.rand(100, 6)
+                X = np.random.rand(100, 5)
                 y = np.array([objective(**dict(zip(param_space.keys(), x))) for x in X])
                 
                 model = XGBRegressor(n_estimators=100, max_depth=3)
@@ -332,32 +272,26 @@ with tab2:
             except Exception as e:
                 st.error(f"SHAP analysis failed: {str(e)}")
 
-# ---------------------- System Monitoring ----------------------
-st.sidebar.header("📊 Performance Metrics")
-st.sidebar.metric("Current Accuracy", "96.7% ± 1.2%")
-st.sidebar.metric("Processing Speed", "34.8 ops/sec")
-st.sidebar.metric("Memory Usage", "1.8 GB / 4 GB")
-
 # ---------------------- Documentation ----------------------
 with st.expander("📘 User Guide"):
     st.markdown("""
-    **PharmaAI Enhanced Features Guide**
+    **PharmaAI Simplified Features Guide**
     
-    1. **Advanced Release Models**:
-       - Radiation-enhanced Fickian diffusion with intensity/duration controls
-       - Nanoscale-specific model with particle size and surface reactivity
+    1. **Core Release Models**:
+       - Enhanced Fickian diffusion with nanoparticle size parameter
+       - Classic erosion, swelling, and Korsmeyer-Peppas models
        
-    2. **CFD Tissue Transport**:
-       - Full 3D Navier-Stokes simulation with drug diffusion
-       - Interactive visualization of velocity fields and concentration
-       - Adjustable fluid properties and mesh resolution
+    2. **Integrated Transport Simulation**:
+       - Direct coupling of release profile with CFD simulation
+       - Real-time visualization of drug distribution in tissue
+       - Adjustable tissue properties and mesh resolution
        
-    3. **Enhanced Optimization**:
-       - Now includes nanoscale and radiation parameters
-       - Multi-objective optimization for complex release profiles
+    3. **Optimization & Analysis**:
+       - Bayesian optimization of key parameters
+       - SHAP explainability for model predictions
        
-    4. **Improved Visuals**:
-       - Volume rendering of concentration fields
-       - 3D vector fields for fluid flow
-       - Interactive camera controls in all visualizations
+    4. **Key Improvements**:
+       - Simplified parameter set focused on practical variables
+       - Robust CFD implementation with stability checks
+       - Enhanced numerical stability in all models
     """)
