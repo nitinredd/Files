@@ -1,142 +1,194 @@
-# Add right after your existing row_variance() function
 # =============================================================================
-# NEW REGULATORY COMPARISON FUNCTIONS
+# NEW OPTIMIZATION MODULE START
 # =============================================================================
+def generate_valid_combinations(reference_df, test_df, regulation):
+    """Generate regulation-compliant time point combinations"""
+    # Get common time points (assuming aligned after previous checks)
+    times = reference_df.iloc[:, 0].tolist()
+    
+    # Regulation-specific truncation
+    if regulation == "FDA":
+        ref_trunc = next((i for i, val in enumerate(reference_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        test_trunc = next((i for i, val in enumerate(test_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        trunc_idx = min(ref_trunc, test_trunc)
+    elif regulation in ["EMA", "ICH", "Canada"]:
+        ref_trunc = next((i for i, val in enumerate(reference_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        trunc_idx = ref_trunc
+    else:  # For ANVISA/others
+        trunc_idx = len(times)
+    
+    valid_times = times[:trunc_idx+1]
+    
+    # Generate combinations with ≥3 points
+    return [valid_times[:i+1] for i in range(2, len(valid_times)) if len(valid_times[:i+1]) >=3]
 
-REGULATION_RULES = {
-    1: {"name": "FDA", "color": "blue", "min_points": 3},
-    2: {"name": "EMA", "color": "green", "min_points": 3},
-    3: {"name": "WHO", "color": "red", "min_points": 4}, 
-    4: {"name": "Canada", "color": "purple", "min_points": 3},
-    5: {"name": "ANVISA", "color": "orange", "min_points": 3}
-}
-
-def process_subset(ref_sub, test_sub, regulation):
-    """Apply regulation-specific truncation rules"""
-    ref_means = ref_sub.iloc[:,1:].mean(axis=1)
-    test_means = test_sub.iloc[:,1:].mean(axis=1)
-    
-    # FDA - Both ≥85%
-    if regulation == 1:
-        for i in range(len(ref_means)):
-            if ref_means.iloc[i] >=85 and test_means.iloc[i] >=85:
-                return truncate_at(i, ref_sub, test_sub, "FDA both ≥85%")
-    
-    # EMA/Canada - Either >85%
-    elif regulation in [2,4]:
-        for i in range(len(ref_means)):
-            if ref_means.iloc[i] >85 or test_means.iloc[i] >85:
-                return truncate_at(i, ref_sub, test_sub, f"{REGULATION_RULES[regulation]['name']} >85%")
-    
-    # WHO - Either ≥85% (keep ≥3 points)
-    elif regulation == 3:
-        for i in range(len(ref_means)):
-            if (ref_means.iloc[i] >=85 or test_means.iloc[i] >=85) and (i+1)>=3:
-                return truncate_at(i, ref_sub, test_sub, "WHO ≥85%")
-    
-    # ANVISA - Either ≥85% (max 1 post-85 point)
-    elif regulation == 5:
-        post_85 = 0
-        for i in range(len(ref_means)):
-            if ref_means.iloc[i] >=85 or test_means.iloc[i] >=85:
-                post_85 +=1
-                if post_85 >1:
-                    return truncate_at(i-1, ref_sub, test_sub, "ANVISA max 1 post-85%")
-    
-    return ref_sub, test_sub, "No truncation needed"
-
-def truncate_at(index, ref_df, test_df, reason):
-    """Helper function for truncation"""
-    return (ref_df.iloc[:index+1], 
-            test_df.iloc[:index+1], 
-            f"Truncated at {ref_df.iloc[index,0]}min ({reason})")
-
-def validate_canada_cv(ref_sub, test_sub):
-    """Health Canada's stricter CV requirement (≤15%)"""
-    cv_ref = ref_sub.iloc[:,1:].std(axis=1)/ref_sub.iloc[:,1:].mean(axis=1)*100
-    cv_test = test_sub.iloc[:,1:].std(axis=1)/test_sub.iloc[:,1:].mean(axis=1)*100
-    return (cv_ref <=15).all() and (cv_test <=15).all()
-# Add before your existing check_sample_units() function
-def validate_regulatory_subset(ref_sub, test_sub, regulation):
-    """Expanded validation for all regulations"""
-    # Common checks
-    if not check_same_time_points(ref_sub, test_sub) or len(ref_sub)<3:
-        return False
-    
-    # Regulation-specific checks
-    if regulation == 3:  # WHO
-        if ref_sub.iloc[0,0] !=0 or len(ref_sub)<4:
-            return False
-    
-    if regulation ==4:  # Canada
-        if not validate_canada_cv(ref_sub, test_sub):
-            return False
-    
-    if regulation ==5:  # ANVISA
-        post_85 = sum(ref_sub.iloc[:,1:].mean(axis=1) >=85)
-        if post_85 >1:
-            return False
-    
-    return check_sample_units(ref_sub) and check_sample_units(test_sub)
-# Add before your existing R_Regulation() function
-def analyze_time_windows(reference_df, test_df):
-    """Main comparison function across all regulations"""
+def calculate_all_f2_combinations(ref_df, test_df, combinations):
+    """Calculate f2 for all time combinations"""
     results = []
-    
-    for reg in REGULATION_RULES:
-        reg_results = []
-        for start in range(0, len(reference_df)-REGULATION_RULES[reg]["min_points"]+1):
-            end = start + REGULATION_RULES[reg]["min_points"]
-            ref_sub = reference_df.iloc[start:end]
-            test_sub = test_df.iloc[start:end]
+    for combo in combinations:
+        try:
+            # Get indices for the time points
+            ref_subset = ref_df[ref_df.iloc[:,0].isin(combo)]
+            test_subset = test_df[test_df.iloc[:,0].isin(combo)]
             
-            p_ref, p_test, reason = process_subset(ref_sub, test_sub, reg)
-            if validate_regulatory_subset(p_ref, p_test, reg):
-                f2 = calculate_f2_metrics(p_ref, p_test)
-                reg_results.append({
-                    "regulation": REGULATION_RULES[reg]["name"],
-                    "time_points": p_ref.iloc[:,0].tolist(),
-                    "conventional": f2['conventional'],
-                    "reason": reason
-                })
-        
-        if reg_results:
-            best = max(reg_results, key=lambda x: x['conventional'])
-            results.append(best)
-    
+            # Original f2 calculation
+            p = len(combo)
+            ref_means = ref_subset.iloc[:,1:].mean(axis=1)
+            test_means = test_subset.iloc[:,1:].mean(axis=1)
+            sum_sq_diff = ((test_means - ref_means)**2).sum()
+            f2 = 100 - 25 * np.log10(1 + (1/p)*sum_sq_diff)
+            
+            results.append({
+                'times': combo,
+                'n_points': len(combo),
+                'f2': round(f2, 2)
+            })
+        except:
+            continue
     return results
 
-def plot_regulatory_comparison(results):
-    """Generate comparative visualization"""
-    plt.figure(figsize=(12,6))
-    for res in results:
-        times = res['time_points']
-        plt.plot(times, [res['conventional']]*len(times), 
-                 marker='o', 
-                 linestyle='-',
-                 color=REGULATION_RULES[res['regulation']]['color'],
-                 label=f"{res['regulation']} ({res['conventional']:.1f})")
+def display_optimal_combinations(results):
+    """Display optimization results"""
+    if not results:
+        print("No valid combinations found for optimization analysis")
+        return
     
-    plt.title("Optimal f2 Scores Across Regulatory Guidelines")
-    plt.xlabel("Time Points (minutes)")
-    plt.ylabel("Conventional f2 Score")
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('regulatory_comparison.png', dpi=300)
-    plt.close()
-# Replace your existing input handling block (from line 1184 onward) with:
+    print("\n\n=== Additional Time Point Optimization Analysis ===")
+    print("All valid combinations and their f2 scores:")
+    for res in sorted(results, key=lambda x: x['f2'], reverse=True):
+        print(f"Time Points: {res['times']} ({res['n_points']} points) → f2: {res['f2']}")
+    
+    best = max(results, key=lambda x: x['f2'])
+    print(f"\nOptimal combination: {best['times']} → f2: {best['f2']}")
+# =============================================================================
+# NEW OPTIMIZATION MODULE END
+# =============================================================================
 
-if __name__ == "__main__":
-    # ... [keep existing data loading and checks] ...
+# ====================== NEW OPTIMIZATION FUNCTIONS START ======================
+def generate_valid_combinations(ref_df, test_df, regulation):
+    """Generate regulation-compliant time combinations"""
+    times = ref_df.iloc[:, 0].tolist()
     
-    # Run comparative analysis
-    comparison_results = analyze_time_windows(reference_df, test_df)
-    plot_regulatory_comparison(comparison_results)
+    # Regulation-specific truncation
+    if regulation == "FDA":
+        ref_idx = next((i for i, val in enumerate(ref_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        test_idx = next((i for i, val in enumerate(test_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        trunc = min(ref_idx, test_idx)
+    elif regulation in ["EMA", "Canada", "ICH"]:
+        ref_idx = next((i for i, val in enumerate(ref_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        test_idx = next((i for i, val in enumerate(test_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        trunc = min(ref_idx, test_idx)
+    elif regulation == "ANVISA":
+        trunc = len(times)
+    elif regulation == "China":
+        ref_idx = next((i for i, val in enumerate(ref_df.iloc[:,1:].mean(axis=1)) if val >= 85), len(times))
+        trunc = ref_idx
+    else:  # ASEAN
+        trunc = len(times)
     
-    # Existing regulation selection
-    print("Choose Market for Detailed Analysis:")
-    print("1: FDA\n2: EMA\n3: WHO\n4: Canada\n5: ANVISA")
-    input1 = int(input("Input number: "))
+    valid_times = times[:trunc+1]
+    return [valid_times[:i+1] for i in range(2, len(valid_times)) if len(valid_times[:i+1]) >=3]
+
+def calculate_combination_f2(ref_sub, test_sub):
+    """Calculate f2 for a time combination subset"""
+    try:
+        p = len(ref_sub)
+        diff = test_sub.iloc[:,1:].mean(axis=1) - ref_sub.iloc[:,1:].mean(axis=1)
+        sum_sq = (diff**2).sum()
+        return 100 - 25 * np.log10(1 + (1/p)*sum_sq)
+    except:
+        return None
+
+def display_optimization(results):
+    """Display optimization analysis"""
+    if not results:
+        return
     
-    # ... [keep existing regulation-specific handling] ...
+    print("\n" + "="*60)
+    print(" Time Point Combination Analysis (Additional Feature)")
+    print("="*60)
+    
+    # Display all valid combinations
+    print("\nAll Valid Combinations:")
+    for res in sorted(results, key=lambda x: x['f2'], reverse=True):
+        print(f" - Times: {res['times']} ({len(res['times'])} pts) → f2: {res['f2']:.2f}")
+    
+    # Show best combination
+    best = max(results, key=lambda x: x['f2'])
+    print(f"\nOptimal Combination: {best['times']} → f2: {best['f2']:.2f}")
+    print("="*60 + "\n")
+# ====================== NEW OPTIMIZATION FUNCTIONS END ======================
+Add this code block IMMEDIATELY AFTER each regulation's original analysis block:
+
+For FDA (input1 == 1),
+changed_data_either85_FDA_bca(reference_df, test_df)
+
+        # Optimization analysis
+        if check_same_time_points(reference_df, test_df):
+            combos = generate_valid_combinations(reference_df, test_df, "FDA")
+            results = []
+            for combo in combos:
+                ref_sub = reference_df[reference_df.iloc[:,0].isin(combo)]
+                test_sub = test_df[test_df.iloc[:,0].isin(combo)]
+                f2 = calculate_combination_f2(ref_sub, test_sub)
+                if f2: 
+                    results.append({'times': combo, 'f2': f2})
+            display_optimization(results)
+2
+
+        # Optimization analysis
+        if check_same_time_points(reference_df, test_df):
+            combos = generate_valid_combinations(reference_df, test_df, "EMA")
+            results = []
+            for combo in combos:
+                ref_sub = reference_df[reference_df.iloc[:,0].isin(combo)]
+                test_sub = test_df[test_df.iloc[:,0].isin(combo)]
+                f2 = calculate_combination_f2(ref_sub, test_sub)
+                if f2: 
+                    results.append({'times': combo, 'f2': f2})
+            display_optimization(results)
+
+3
+
+        # Optimization analysis
+        if check_same_time_points(reference_df, test_df):
+            combos = generate_valid_combinations(reference_df, test_df, "China")
+            results = []
+            for combo in combos:
+                ref_sub = reference_df[reference_df.iloc[:,0].isin(combo)]
+                test_sub = test_df[test_df.iloc[:,0].isin(combo)]
+                f2 = calculate_combination_f2(ref_sub, test_sub)
+                if f2: 
+                    results.append({'times': combo, 'f2': f2})
+            display_optimization(results)
+
+4
+
+        # Optimization analysis
+        if check_same_time_points(reference_df, test_df):
+            combos = generate_valid_combinations(reference_df, test_df, "ASEAN")
+            results = []
+            for combo in combos:
+                ref_sub = reference_df[reference_df.iloc[:,0].isin(combo)]
+                test_sub = test_df[test_df.iloc[:,0].isin(combo)]
+                f2 = calculate_combination_f2(ref_sub, test_sub)
+                if f2: 
+                    results.append({'times': combo, 'f2': f2})
+            display_optimization(results)
+
+5
+        # Optimization analysis
+        if check_same_time_points(reference_df, test_df):
+            combos = generate_valid_combinations(reference_df, test_df, "ANVISA")
+            results = []
+            for combo in combos:
+                ref_sub = reference_df[reference_df.iloc[:,0].isin(combo)]
+                test_sub = test_df[test_df.iloc[:,0].isin(combo)]
+                f2 = calculate_combination_f2(ref_sub, test_sub)
+                if f2: 
+                    results.append({'times': combo, 'f2': f2})
+            display_optimization(results)
+
+
+
+
