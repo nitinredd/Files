@@ -1,232 +1,142 @@
-import numpy as np
-import pandas as pd
-from scipy.stats import norm
-import matplotlib.pyplot as plt
-from sklearn.utils import resample
-import warnings
-warnings.filterwarnings('ignore')
+# Add right after your existing row_variance() function
+# =============================================================================
+# NEW REGULATORY COMPARISON FUNCTIONS
+# =============================================================================
 
-# --------------------------
-# Core Calculation Functions
-# --------------------------
+REGULATION_RULES = {
+    1: {"name": "FDA", "color": "blue", "min_points": 3},
+    2: {"name": "EMA", "color": "green", "min_points": 3},
+    3: {"name": "WHO", "color": "red", "min_points": 4}, 
+    4: {"name": "Canada", "color": "purple", "min_points": 3},
+    5: {"name": "ANVISA", "color": "orange", "min_points": 3}
+}
 
-def calculate_f2_metrics(ref_data, test_data):
-    """Calculate all three f2 variants for given datasets"""
-    # Mean calculations
-    ref_means = ref_data.iloc[:, 1:].mean(axis=1)
-    test_means = test_data.iloc[:, 1:].mean(axis=1)
+def process_subset(ref_sub, test_sub, regulation):
+    """Apply regulation-specific truncation rules"""
+    ref_means = ref_sub.iloc[:,1:].mean(axis=1)
+    test_means = test_sub.iloc[:,1:].mean(axis=1)
     
-    # Difference calculations
-    diff_squared = (test_means - ref_means)**2
-    sum_diff_sq = diff_squared.sum()
-    p = len(ref_data)
+    # FDA - Both ≥85%
+    if regulation == 1:
+        for i in range(len(ref_means)):
+            if ref_means.iloc[i] >=85 and test_means.iloc[i] >=85:
+                return truncate_at(i, ref_sub, test_sub, "FDA both ≥85%")
     
-    # Variance calculations
-    ref_var = ref_data.iloc[:, 1:].var(axis=1, ddof=1)
-    test_var = test_data.iloc[:, 1:].var(axis=1, ddof=1)
-    sum_var = (ref_var + test_var).sum()
-    n = ref_data.shape[1] - 1  # Number of units
+    # EMA/Canada - Either >85%
+    elif regulation in [2,4]:
+        for i in range(len(ref_means)):
+            if ref_means.iloc[i] >85 or test_means.iloc[i] >85:
+                return truncate_at(i, ref_sub, test_sub, f"{REGULATION_RULES[regulation]['name']} >85%")
     
-    # Conventional f2
-    conventional = 100 - 25 * np.log10(1 + sum_diff_sq/p)
+    # WHO - Either ≥85% (keep ≥3 points)
+    elif regulation == 3:
+        for i in range(len(ref_means)):
+            if (ref_means.iloc[i] >=85 or test_means.iloc[i] >=85) and (i+1)>=3:
+                return truncate_at(i, ref_sub, test_sub, "WHO ≥85%")
     
-    # Expected f2
-    expected = 100 - 25 * np.log10(1 + (sum_diff_sq + sum_var/n)/p)
+    # ANVISA - Either ≥85% (max 1 post-85 point)
+    elif regulation == 5:
+        post_85 = 0
+        for i in range(len(ref_means)):
+            if ref_means.iloc[i] >=85 or test_means.iloc[i] >=85:
+                post_85 +=1
+                if post_85 >1:
+                    return truncate_at(i-1, ref_sub, test_sub, "ANVISA max 1 post-85%")
     
-    # Bias-corrected f2
-    left_side = sum_var/n
-    right_side = sum_diff_sq + p
-    if left_side >= right_side:
-        bias_corrected = 100 - 25 * np.log10(1 + (sum_diff_sq - left_side)/p)
-    else:
-        bias_corrected = None
-    
-    return {
-        'conventional': conventional,
-        'expected': expected,
-        'bias_corrected': bias_corrected
-    }
-
-# ----------------------------
-# Regulatory Processing Logic
-# ----------------------------
-
-def process_fda_subset(ref_sub, test_sub):
-    """FDA-specific processing: truncate when either reaches ≥85%"""
-    ref_means = ref_sub.iloc[:, 1:].mean(axis=1)
-    test_means = test_sub.iloc[:, 1:].mean(axis=1)
-    
-    trunc_idx = None
-    for i in range(len(ref_means)):
-        if ref_means.iloc[i] >= 85 or test_means.iloc[i] >= 85:
-            trunc_idx = i
-            break
-    
-    if trunc_idx is not None:
-        return (ref_sub.iloc[:trunc_idx+1], 
-                test_sub.iloc[:trunc_idx+1],
-                f"Truncated at {ref_sub.iloc[trunc_idx,0]}min (FDA ≥85%)")
     return ref_sub, test_sub, "No truncation needed"
 
-def process_ema_subset(ref_sub, test_sub):
-    """EMA/ICH-specific processing: truncate when either exceeds 85%"""
-    ref_means = ref_sub.iloc[:, 1:].mean(axis=1)
-    test_means = test_sub.iloc[:, 1:].mean(axis=1)
-    
-    trunc_idx = None
-    for i in range(len(ref_means)):
-        if ref_means.iloc[i] > 85 or test_means.iloc[i] > 85:
-            trunc_idx = i
-            break
-    
-    if trunc_idx is not None:
-        return (ref_sub.iloc[:trunc_idx+1], 
-                test_sub.iloc[:trunc_idx+1],
-                f"Truncated at {ref_sub.iloc[trunc_idx,0]}min (EMA >85%)")
-    return ref_sub, test_sub, "No truncation needed"
+def truncate_at(index, ref_df, test_df, reason):
+    """Helper function for truncation"""
+    return (ref_df.iloc[:index+1], 
+            test_df.iloc[:index+1], 
+            f"Truncated at {ref_df.iloc[index,0]}min ({reason})")
 
-# ------------------------
-# Validation & Subsetting
-# ------------------------
-
-def validate_subset(ref_sub, test_sub):
-    """Check if subset meets basic requirements"""
-    # Check matching time points
-    if not ref_sub.iloc[:,0].equals(test_sub.iloc[:,0]):
+def validate_canada_cv(ref_sub, test_sub):
+    """Health Canada's stricter CV requirement (≤15%)"""
+    cv_ref = ref_sub.iloc[:,1:].std(axis=1)/ref_sub.iloc[:,1:].mean(axis=1)*100
+    cv_test = test_sub.iloc[:,1:].std(axis=1)/test_sub.iloc[:,1:].mean(axis=1)*100
+    return (cv_ref <=15).all() and (cv_test <=15).all()
+# Add before your existing check_sample_units() function
+def validate_regulatory_subset(ref_sub, test_sub, regulation):
+    """Expanded validation for all regulations"""
+    # Common checks
+    if not check_same_time_points(ref_sub, test_sub) or len(ref_sub)<3:
         return False
     
-    # Check minimum time points (≥3)
-    if len(ref_sub) < 3:
-        return False
+    # Regulation-specific checks
+    if regulation == 3:  # WHO
+        if ref_sub.iloc[0,0] !=0 or len(ref_sub)<4:
+            return False
     
-    # Check sample units (≥12)
-    if (ref_sub.shape[1] < 13) or (test_sub.shape[1] < 13):
-        return False
+    if regulation ==4:  # Canada
+        if not validate_canada_cv(ref_sub, test_sub):
+            return False
     
-    # Check CV requirements
-    def check_cv(df):
-        cv = df.iloc[:,1:].std(axis=1) / df.iloc[:,1:].mean(axis=1) * 100
-        first_cv = cv.iloc[0]
-        rest_cv = cv.iloc[1:]
-        return (first_cv < 20) and (rest_cv < 10).all()
+    if regulation ==5:  # ANVISA
+        post_85 = sum(ref_sub.iloc[:,1:].mean(axis=1) >=85)
+        if post_85 >1:
+            return False
     
-    return check_cv(ref_sub) and check_cv(test_sub)
-
-def generate_subsets(df, regulation):
-    """Generate valid time windows based on regulation"""
-    time_points = df.iloc[:,0]
-    subsets = []
-    
-    # FDA requires excluding initial zero if present
-    if regulation == 1 and time_points.iloc[0] in (0, '0'):
-        min_points = 3
-        start_idx = 1
-    else:
-        min_points = 3
-        start_idx = 0
-    
-    # Generate all possible consecutive windows
-    for window_size in range(min_points, len(time_points)+1):
-        for start in range(start_idx, len(time_points) - window_size + 1):
-            end = start + window_size
-            subsets.append( (start, end) )
-    
-    return subsets
-
-# ------------------
-# Main Analysis Flow
-# ------------------
-
-def analyze_profiles(reference_df, test_df, regulation):
-    """Main analysis function with detailed comparison"""
+    return check_sample_units(ref_sub) and check_sample_units(test_sub)
+# Add before your existing R_Regulation() function
+def analyze_time_windows(reference_df, test_df):
+    """Main comparison function across all regulations"""
     results = []
     
-    # Generate all valid time windows
-    subsets = generate_subsets(reference_df, regulation)
-    
-    for start, end in subsets:
-        # Extract subset
-        ref_sub = reference_df.iloc[start:end]
-        test_sub = test_df.iloc[start:end]
+    for reg in REGULATION_RULES:
+        reg_results = []
+        for start in range(0, len(reference_df)-REGULATION_RULES[reg]["min_points"]+1):
+            end = start + REGULATION_RULES[reg]["min_points"]
+            ref_sub = reference_df.iloc[start:end]
+            test_sub = test_df.iloc[start:end]
+            
+            p_ref, p_test, reason = process_subset(ref_sub, test_sub, reg)
+            if validate_regulatory_subset(p_ref, p_test, reg):
+                f2 = calculate_f2_metrics(p_ref, p_test)
+                reg_results.append({
+                    "regulation": REGULATION_RULES[reg]["name"],
+                    "time_points": p_ref.iloc[:,0].tolist(),
+                    "conventional": f2['conventional'],
+                    "reason": reason
+                })
         
-        # Apply regulation-specific processing
-        if regulation == 1:
-            p_ref, p_test, trunc_reason = process_fda_subset(ref_sub, test_sub)
-        else:
-            p_ref, p_test, trunc_reason = process_ema_subset(ref_sub, test_sub)
-        
-        # Validate processed subset
-        if validate_subset(p_ref, p_test):
-            # Calculate metrics
-            metrics = calculate_f2_metrics(p_ref, p_test)
-            results.append({
-                'original_window': ref_sub.iloc[:,0].tolist(),
-                'processed_window': p_ref.iloc[:,0].tolist(),
-                'truncation_reason': trunc_reason,
-                'conventional': metrics['conventional'],
-                'expected': metrics['expected'],
-                'bias_corrected': metrics['bias_corrected']
-            })
+        if reg_results:
+            best = max(reg_results, key=lambda x: x['conventional'])
+            results.append(best)
     
-    # Sort results by conventional f2 score
-    results.sort(key=lambda x: x['conventional'], reverse=True)
     return results
 
-def format_results(results):
-    """Generate formatted output with comparison table"""
-    # Find best conventional score
-    best_score = max(r['conventional'] for r in results) if results else 0
-    
-    # Print detailed comparison
-    print("\nTime Window Analysis Results:")
-    print(f"{'Original Time Points':<25} | {'Processed Points':<20} | {'Conventional':<10} | {'Expected':<10} | {'Bias Corrected':<15} | Best")
-    print("-"*110)
-    
+def plot_regulatory_comparison(results):
+    """Generate comparative visualization"""
+    plt.figure(figsize=(12,6))
     for res in results:
-        # Format time points
-        orig_times = ', '.join(map(str, res['original_window']))
-        proc_times = ', '.join(map(str, res['processed_window']))
-        
-        # Format scores
-        conv = f"{res['conventional']:.2f}"
-        exp = f"{res['expected']:.2f}"
-        bias = f"{res['bias_corrected']:.2f}" if res['bias_corrected'] else "N/A"
-        
-        # Best marker
-        best_flag = "★" if res['conventional'] == best_score else ""
-        
-        print(f"{orig_times:<25} | {proc_times:<20} | {conv:<10} | {exp:<10} | {bias:<15} | {best_flag}")
+        times = res['time_points']
+        plt.plot(times, [res['conventional']]*len(times), 
+                 marker='o', 
+                 linestyle='-',
+                 color=REGULATION_RULES[res['regulation']]['color'],
+                 label=f"{res['regulation']} ({res['conventional']:.1f})")
+    
+    plt.title("Optimal f2 Scores Across Regulatory Guidelines")
+    plt.xlabel("Time Points (minutes)")
+    plt.ylabel("Conventional f2 Score")
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig('regulatory_comparison.png', dpi=300)
+    plt.close()
+# Replace your existing input handling block (from line 1184 onward) with:
 
-    # Print optimal scenario
-    if results:
-        best = next(r for r in results if r['conventional'] == best_score)
-        print("\nOptimal Scenario:")
-        print(f"- Time Points: {best['processed_window']}")
-        print(f"- Conventional f2: {best['conventional']:.2f}")
-        print(f"- Truncation Reason: {best['truncation_reason']}")
-    else:
-        print("\nNo valid time windows found meeting requirements")
-
-# ----------------
-# Execution Flow
-# ----------------
-
-# Load data
-file_path = "your_data.xlsx"
-reference_df = pd.read_excel(file_path, sheet_name=0)
-test_df = pd.read_excel(file_path, sheet_name=1)
-
-# User input
-print("Select Regulation:")
-print("1: FDA\n2: EMA/ICH\n3: WHO\n4: Canada\n5: ANVISA")
-regulation = int(input("Enter choice (1-5): "))
-
-# Perform analysis
-analysis_results = analyze_profiles(reference_df, test_df, regulation)
-
-# Display results
-format_results(analysis_results)
-
-# Generate plots
-dissolution_curve(reference_df, test_df)
-dissolution_curve_interval(reference_df, test_df)
+if __name__ == "__main__":
+    # ... [keep existing data loading and checks] ...
+    
+    # Run comparative analysis
+    comparison_results = analyze_time_windows(reference_df, test_df)
+    plot_regulatory_comparison(comparison_results)
+    
+    # Existing regulation selection
+    print("Choose Market for Detailed Analysis:")
+    print("1: FDA\n2: EMA\n3: WHO\n4: Canada\n5: ANVISA")
+    input1 = int(input("Input number: "))
+    
+    # ... [keep existing regulation-specific handling] ...
