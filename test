@@ -1,166 +1,184 @@
-# ====================== COMPLETE ANALYSIS FUNCTIONS ======================
+# ====================== PERMUTATION-BASED ANALYSIS ======================
 import itertools
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
+from sklearn.utils import resample
 
-def generate_all_combinations_with_zero(times):
-    """Generate all 3+ point combinations including zero"""
+def generate_time_permutations(times):
+    """Generate all permutations of 3-7 time points including zero"""
     try:
-        # Convert to integers and maintain original order
-        times = sorted([int(t) for t in times], key=lambda x: x if x != 0 else -1)
+        # Convert to integers and preserve zero
+        times = [int(t) for t in times]
         
-        # Generate all combinations of 3 or more points
-        all_combos = []
+        # Generate all permutations for lengths 3-7
+        all_perms = []
         for r in range(3, len(times)+1):
-            all_combos.extend(itertools.combinations(times, r))
+            all_perms.extend(itertools.permutations(times, r))
             
-        # Convert to lists and sort individual combinations
-        return [sorted(list(combo)) for combo in all_combos]
+        print(f"Generated {len(all_perms)} permutations")
+        return [list(perm) for perm in all_perms]
     except Exception as e:
-        print(f"Combination generation error: {str(e)}")
+        print(f"Permutation generation error: {str(e)}")
         return []
 
-def enhanced_compliance_check(combo, regulation, ref_means, test_means):
-    """Check compliance with detailed zero-handling and regulation-specific rules"""
+def permutation_compliance_check(perm, regulation, ref_means, test_means):
+    """Check compliance for permutations (order-sensitive)"""
     reasons = []
     compliant = True
-    combo = sorted(combo)  # Ensure sorted time points
     
-    # FDA: Truncate at first 85% point (including zero)
+    # FDA: No points after first 85% dissolution
     if regulation == "FDA":
-        trunc_points = []
-        for t in combo:
+        found_85 = False
+        for i, t in enumerate(perm):
             if ref_means.get(t, 0) >= 85 or test_means.get(t, 0) >= 85:
-                trunc_points.append(t)
-        
-        if trunc_points:
-            trunc_at = min(trunc_points)
-            post_trunc = [t for t in combo if t > trunc_at]
-            if post_trunc:
-                reasons.append(f"Contains post-85% points after {trunc_at}: {post_trunc}")
-                compliant = False
-        # Special case: Allow zero even if 0% dissolution
-        if 0 in combo:
-            reasons.append("Zero time point allowed regardless of dissolution")
-                
-    # EMA: All points <85% (including zero)
-    elif regulation == "EMA":
-        over_ref = [t for t in combo if ref_means.get(t, 0) >= 85]
-        over_test = [t for t in combo if test_means.get(t, 0) >= 85]
-        
-        if over_ref:
-            reasons.append(f"Reference exceeds 85% at: {over_ref}")
+                if i < len(perm)-1:  # Allow 85% only at last position
+                    reasons.append(f"Early 85% at position {i+1} ({t} min)")
+                    compliant = False
+                found_85 = True
+                break
+        if not found_85 and 0 not in perm:
+            reasons.append("Missing zero time point")
             compliant = False
-        if over_test:
-            reasons.append(f"Test exceeds 85% at: {over_test}")
+                
+    # EMA: All points must be <85%
+    elif regulation == "EMA":
+        over_points = [t for t in perm if ref_means.get(t, 0) >= 85 or test_means.get(t, 0) >= 85]
+        if over_points:
+            reasons.append(f"85%+ dissolution at: {over_points}")
+            compliant = False
+        if len(perm) < 4:
+            reasons.append("Requires ≥4 time points")
             compliant = False
     
-    # China: Reference product only <85%
+    # China: Reference product only checks
     elif regulation == "China":
-        over_ref = [t for t in combo if ref_means.get(t, 0) >= 85]
+        over_ref = [t for t in perm if ref_means.get(t, 0) >= 85]
         if over_ref:
-            reasons.append(f"Reference exceeds 85% at: {over_ref}")
+            reasons.append(f"Reference ≥85% at: {over_ref}")
             compliant = False
     
     # ASEAN: First 3 points <85%
     elif regulation == "ASEAN":
-        check_points = combo[:3] if len(combo) >=3 else combo
+        check_points = perm[:3] if len(perm) >=3 else perm
         over_ref = [t for t in check_points if ref_means.get(t, 0) >= 85]
         over_test = [t for t in check_points if test_means.get(t, 0) >= 85]
-        
         if over_ref:
-            reasons.append(f"Reference exceeds 85% in first 3 points: {over_ref}")
+            reasons.append(f"Reference ≥85% in first 3 points: {over_ref}")
             compliant = False
         if over_test:
-            reasons.append(f"Test exceeds 85% in first 3 points: {over_test}")
+            reasons.append(f"Test ≥85% in first 3 points: {over_test}")
             compliant = False
     
-    # ANVISA: Requires zero + 2+ other points
+    # ANVISA: Zero must be in first position
     elif regulation == "ANVISA":
-        if 0 not in combo:
-            reasons.append("Missing required zero time point")
+        if 0 not in perm:
+            reasons.append("Missing zero time point")
             compliant = False
-        if len(combo) < 3:
-            reasons.append("Needs at least 3 points including zero")
+        elif perm[0] != 0:
+            reasons.append("Zero not in first position")
             compliant = False
     
-    reason = " | ".join(reasons) if reasons else "Compliant with regulation"
-    return (compliant, reason)
+    return (compliant, " | ".join(reasons) if reasons else "Compliant")
 
-def full_combination_analysis(ref_df, test_df, regulation):
-    """Complete combination analysis with zero handling"""
+def full_permutation_analysis(ref_df, test_df, regulation):
+    """Complete permutation analysis with order sensitivity"""
     try:
-        # Get time points including zero
+        # Get original time points
         times = ref_df.iloc[:,0].tolist()
         
-        # Prepare dissolution means
-        ref_means = ref_df.set_index(ref_df.columns[0]).iloc[:,1:].mean(axis=1)
-        test_means = test_df.set_index(test_df.columns[0]).iloc[:,1:].mean(axis=1)
+        # Prepare dissolution data
+        ref_means = ref_df.set_index(ref_df.columns[0]).iloc[:,1:].mean(axis=1).to_dict()
+        test_means = test_df.set_index(test_df.columns[0]).iloc[:,1:].mean(axis=1).to_dict()
         
-        # Generate combinations
-        combos = generate_all_combinations_with_zero(times)
-        print(f"\nAnalyzing {len(combos)} combinations for {regulation}...")
+        # Generate permutations
+        perms = generate_time_permutations(times)
+        print(f"Analyzing {len(perms)} permutations for {regulation}...")
         
         results = []
-        for combo in combos:
+        for perm in perms:
             try:
-                # Subset data
-                ref_sub = ref_df[ref_df.iloc[:,0].isin(combo)].sort_values(ref_df.columns[0])
-                test_sub = test_df[test_df.iloc[:,0].isin(combo)].sort_values(test_df.columns[0])
+                # Calculate f2 considering time order
+                p = len(perm)
+                time_order = pd.Series(perm).sort_values().tolist()  # Actual time sequence
+                
+                # Get means in permutation order
+                ref_values = [ref_means.get(t, 0) for t in time_order]
+                test_values = [test_means.get(t, 0) for t in time_order]
                 
                 # Calculate f2
-                p = len(combo)
-                diff = test_sub.iloc[:,1:].mean(axis=1) - ref_sub.iloc[:,1:].mean(axis=1)
-                sum_sq = (diff**2).sum()
+                diff = np.array(test_values) - np.array(ref_values)
+                sum_sq = (diff ** 2).sum()
                 f2 = 100 - 25 * np.log10(1 + (sum_sq/p)) if p > 0 else 0
                 
                 # Check compliance
-                compliant, reason = enhanced_compliance_check(combo, regulation, ref_means, test_means)
+                compliant, reason = permutation_compliance_check(time_order, regulation, ref_means, test_means)
                 
                 results.append({
-                    'times': combo,
+                    'permutation': time_order,
                     'f2': round(f2, 2),
-                    'points': len(combo),
+                    'length': p,
                     'compliant': compliant,
                     'reason': reason
                 })
             except Exception as e:
-                print(f"Error processing {combo}: {str(e)}")
+                print(f"Error processing {perm}: {str(e)}")
                 continue
-        
-        return sorted(results, key=lambda x: (-x['f2'], x['points']))
+                
+        return sorted(results, key=lambda x: (-x['f2'], x['length']))
     
     except Exception as e:
         print(f"Analysis failed: {str(e)}")
         return []
 
-def display_full_results(results, regulation):
-    """Display results with pagination and compliance reasons"""
+def display_permutation_results(results, regulation):
+    """Display permutation results with order-sensitive analysis"""
     if not results:
-        print("\nNo valid combinations found")
+        print("\nNo valid permutations found")
         return
     
-    print(f"\n{'='*100}")
-    print(f" Complete Combination Analysis ({regulation})")
-    print(f"{'='*100}")
-    print(f"{'Time Points':<25} | {'Points':<6} | {'f2':<8} | {'Status':<8} | Compliance Details")
-    print("-"*100)
+    print(f"\n{'='*120}")
+    print(f" Complete Permutation Analysis ({regulation})")
+    print(f"{'='*120}")
+    print(f"{'Time Sequence':<40} | {'Length':<6} | {'f2':<8} | {'Status':<8} | Compliance Details")
+    print("-"*120)
     
     page_size = 20
     for page in range(0, len(results), page_size):
         for res in results[page:page+page_size]:
             status = "✅" if res['compliant'] else "❌"
-            print(f"{str(res['times']):<25} | {res['points']:^6} | {res['f2']:^8.2f} | {status:^8} | {res['reason']}")
+            print(f"{str(res['permutation']):<40} | {res['length']:^6} | {res['f2']:^8.2f} | {status:^8} | {res['reason']}")
         
         if page + page_size < len(results):
-            input("\nPress Enter for more combinations...")
+            input("\nPress Enter for more permutations...")
     
     compliant_results = [r for r in results if r['compliant']]
     if compliant_results:
         best = max(compliant_results, key=lambda x: x['f2'])
         print(f"\nOptimal Compliant Combination:")
-        print(f"Time Points: {best['times']}")
+        print(f"Sequence: {best['permutation']}")
         print(f"f2 Score: {best['f2']:.2f}")
-        print(f"Compliance Reason: {best['reason']}")
-    print("="*100 + "\n")
-# ====================== END ANALYSIS FUNCTIONS ======================
+        print(f"Compliance: {best['reason']}")
+    print("="*120 + "\n")
+# ====================== END PERMUTATION ANALYSIS ======================
+
+# ====================== INTEGRATION WITH MAIN CODE ======================
+# Add this in each regulation block after original analysis
+regulation_map = {
+    1: "FDA",
+    2: "EMA", 
+    3: "China",
+    4: "ASEAN",
+    5: "ANVISA"
+}
+
+if check_same_time_points(reference_df, test_df):
+    print("\nRunning advanced permutation analysis...")
+    perm_results = full_permutation_analysis(
+        reference_df.copy(),
+        test_df.copy(),
+        regulation_map[input1]
+    )
+    display_permutation_results(perm_results, regulation_map[input1])
+else:
+    print("\nSkipping permutation analysis - Time points mismatch")
