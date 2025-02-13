@@ -1,16 +1,145 @@
-====================================================================================================
- Complete Combination Analysis (FDA)
-====================================================================================================
-Time Points                   | Points |   f2    | Status      | Compliance Reason
-----------------------------------------------------------------------------------------------------
-[0, 10, 15]                  |   3    |  72.34  | ✅          | Compliant with FDA truncation rules
-[0, 10, 15, 20]              |   4    |  68.91  | ❌          | Contains post-85% points: [20]
-[10, 15, 20]                 |   3    |  65.22  | ❌          | Contains post-85% points: [20]
-...
-[0, 10, 15, 20, 30, 45, 60] |   7    |  51.23  | ❌          | Contains post-85% points: [20, 30, 45, 60]
+# ====================== COMPLETE COMBINATION ANALYSIS ======================
+def generate_all_combinations(times):
+    """Generate all combinations of 3+ time points including zero"""
+    from itertools import combinations
+    times = sorted([int(t) for t in times])
+    combos = []
+    for r in range(3, len(times)+1):
+        combos.extend(combinations(times, r))
+    return [list(combo) for combo in combos]
 
-Optimal Compliant Combination:
-Time Points: [0, 10, 15]
-f2 Score: 72.34
-Compliance Reason: Compliant with FDA truncation rules
-====================================================================================================
+def get_compliance_reason(combo, regulation, ref_means, test_means):
+    """Return compliance status and detailed reason"""
+    reasons = []
+    
+    # FDA: Truncate at first 85% point
+    if regulation == "FDA":
+        ref_85 = next((t for t in combo if ref_means.get(t, 0) >= 85), None)
+        test_85 = next((t for t in combo if test_means.get(t, 0) >= 85), None)
+        trunc_point = min(filter(None, [ref_85, test_85])) if any([ref_85, test_85]) else max(combo)
+        
+        over_points = [t for t in combo if t > trunc_point]
+        if over_points:
+            reasons.append(f"Contains post-85% points: {over_points}")
+            return (False, " | ".join(reasons))
+        return (True, "Compliant with FDA truncation rules")
+    
+    # EMA: All points <85%
+    if regulation == "EMA":
+        over_ref = [t for t in combo if ref_means.get(t, 0) >= 85]
+        over_test = [t for t in combo if test_means.get(t, 0) >= 85]
+        if over_ref:
+            reasons.append(f"Reference exceeds 85% at: {over_ref}")
+        if over_test:
+            reasons.append(f"Test exceeds 85% at: {over_test}")
+        return (len(reasons) == 0, " | ".join(reasons) if reasons else "Compliant")
+    
+    # ANVISA: No restrictions
+    if regulation == "ANVISA":
+        return (True, "No dissolution restrictions")
+    
+    # China: Reference only <85%
+    if regulation == "China":
+        over_ref = [t for t in combo if ref_means.get(t, 0) >= 85]
+        if over_ref:
+            reasons.append(f"Reference exceeds 85% at: {over_ref}")
+        return (len(reasons) == 0, " | ".join(reasons) if reasons else "Compliant")
+    
+    # ASEAN: First 3 points <85%
+    if regulation == "ASEAN":
+        first_three = combo[:3] if len(combo)>=3 else combo
+        over_ref = [t for t in first_three if ref_means.get(t, 0) >= 85]
+        over_test = [t for t in first_three if test_means.get(t, 0) >= 85]
+        if over_ref:
+            reasons.append(f"Reference exceeds 85% in first 3 points: {over_ref}")
+        if over_test:
+            reasons.append(f"Test exceeds 85% in first 3 points: {over_test}")
+        return (len(reasons) == 0, " | ".join(reasons) if reasons else "Compliant")
+    
+    return (False, "Unknown regulation")
+
+def full_combination_analysis(ref_df, test_df, regulation):
+    """Complete analysis of all time combinations with reasons"""
+    # Get time points and means
+    times = ref_df.iloc[:,0].tolist()
+    ref_means = ref_df.set_index(ref_df.columns[0]).iloc[:,1:].mean(axis=1)
+    test_means = test_df.set_index(test_df.columns[0]).iloc[:,1:].mean(axis=1)
+    
+    # Generate all combinations
+    all_combos = generate_all_combinations(times)
+    print(f"\nAnalyzing {len(all_combos)} combinations for {regulation}...")
+    
+    results = []
+    for combo in all_combos:
+        try:
+            # Subset data
+            ref_sub = ref_df[ref_df.iloc[:,0].isin(combo)].sort_values(ref_df.columns[0])
+            test_sub = test_df[test_df.iloc[:,0].isin(combo)].sort_values(test_df.columns[0])
+            
+            # Calculate f2
+            p = len(combo)
+            diff = test_sub.iloc[:,1:].mean(axis=1) - ref_sub.iloc[:,1:].mean(axis=1)
+            sum_sq = (diff**2).sum()
+            f2 = 100 - 25 * np.log10(1 + (sum_sq/p)) if p > 0 else 0
+            
+            # Check compliance
+            compliant, reason = get_compliance_reason(combo, regulation, ref_means, test_means)
+            
+            results.append({
+                'times': combo,
+                'f2': round(f2, 2),
+                'points': len(combo),
+                'compliant': compliant,
+                'reason': reason
+            })
+        except Exception as e:
+            continue
+    
+    return sorted(results, key=lambda x: (-x['f2'], x['points']))
+
+def display_full_results(results, regulation):
+    """Display all combinations with compliance reasons"""
+    print(f"\n{'='*100}")
+    print(f" Complete Combination Analysis ({regulation})")
+    print(f"{'='*100}")
+    print(f"{'Time Points':<30} | {'Points':<6} | {'f2':<8} | {'Status':<12} | Compliance Reason")
+    print("-"*100)
+    
+    page_size = 20
+    for page in range(0, len(results), page_size):
+        for res in results[page:page+page_size]:
+            status = "✅" if res['compliant'] else "❌"
+            print(f"{str(res['times']):<30} | {res['points']:^6} | {res['f2']:^8.2f} | {status:<12} | {res['reason']}")
+        
+        if page + page_size < len(results):
+            input("\nPress Enter for more combinations...")
+    
+    compliant = [r for r in results if r['compliant']]
+    if compliant:
+        best = max(compliant, key=lambda x: x['f2'])
+        print(f"\nOptimal Compliant Combination:")
+        print(f"Time Points: {best['times']}")
+        print(f"f2 Score: {best['f2']}")
+        print(f"Compliance Reason: {best['reason']}")
+    print("="*100 + "\n")
+# ====================== END ANALYSIS CODE ======================
+
+# ====================== INTEGRATION ======================
+# Add this in each regulation block after original analysis
+regulation_map = {
+    1: "FDA",
+    2: "EMA",
+    3: "China",
+    4: "ASEAN",
+    5: "ANVISA"
+}
+
+if check_same_time_points(reference_df, test_df):
+    analysis_results = full_combination_analysis(
+        reference_df.copy(),
+        test_df.copy(),
+        regulation_map[input1]
+    )
+    display_full_results(analysis_results, regulation_map[input1])
+else:
+    print("\nTime points mismatch - Combination analysis skipped")
