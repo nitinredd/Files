@@ -1,45 +1,54 @@
 import itertools
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import norm
 from sklearn.utils import resample
 
-def generate_time_permutations(times):
+# -------------------------- PERMUTATION ANALYSIS FUNCTIONS --------------------------
+
+def generate_time_permutations_fixed_zero(times):
     """
     Generate all order-sensitive permutations of time points for lengths
-    between 3 and len(times) (inclusive). If 0 is not present in the input list,
-    it is added automatically.
+    between 3 and len(times) (inclusive) with 0 fixed as the first element.
+    Assumes that the input 'times' is a list of numeric time points.
     """
     try:
-        # Convert to integers
-        times = [int(t) for t in times]
-        # Ensure 0 is included even if its row is all zeros
+        # Ensure times are integers and sorted so that 0 is first if present
+        times = sorted([int(t) for t in times])
+        # Ensure 0 is present
         if 0 not in times:
             times.insert(0, 0)
-        
+        # Separate 0 from the other time points
+        nonzero = [t for t in times if t != 0]
         all_perms = []
-        for r in range(3, len(times)+1):
-            perms = list(itertools.permutations(times, r))
-            all_perms.extend(perms)
-        print(f"Generated {len(all_perms)} permutations")
-        return [list(perm) for perm in all_perms]
+        total = len(times)  # total including 0
+        # For sequence lengths from 3 up to total
+        for r in range(3, total + 1):
+            # We choose (r-1) time points from nonzero values in all possible orders
+            for perm in itertools.permutations(nonzero, r - 1):
+                seq = [0] + list(perm)  # Prepend 0 as fixed starting point
+                all_perms.append(seq)
+        print(f"Generated {len(all_perms)} permutations with 0 fixed at start")
+        return all_perms
     except Exception as e:
         print(f"Permutation generation error: {str(e)}")
         return []
 
 def permutation_compliance_check(perm, regulation, ref_means, test_means):
     """
-    Check compliance for a given time sequence (order-sensitive) based on the regulatory rules.
+    Check compliance for a given time sequence (with 0 fixed at the start) 
+    based on regulatory rules.
     """
     reasons = []
     compliant = True
-    
-    # FDA: No points after the first 85% dissolution
+
+    # FDA: If an 85% (or higher) dissolution is observed, it must be at the last point.
     if regulation == "FDA":
         found_85 = False
         for i, t in enumerate(perm):
             if ref_means.get(t, 0) >= 85 or test_means.get(t, 0) >= 85:
-                if i < len(perm)-1:  # 85% dissolution allowed only at the last time point
+                if i < len(perm) - 1:  # Must be the final measurement
                     reasons.append(f"Early 85% at position {i+1} ({t} min)")
                     compliant = False
                 found_85 = True
@@ -47,8 +56,8 @@ def permutation_compliance_check(perm, regulation, ref_means, test_means):
         if not found_85 and 0 not in perm:
             reasons.append("Missing zero time point")
             compliant = False
-                
-    # EMA: All points must be below 85% and at least 4 time points
+
+    # EMA: All time points must have dissolution <85% and at least 4 time points are required.
     elif regulation == "EMA":
         over_points = [t for t in perm if ref_means.get(t, 0) >= 85 or test_means.get(t, 0) >= 85]
         if over_points:
@@ -57,15 +66,15 @@ def permutation_compliance_check(perm, regulation, ref_means, test_means):
         if len(perm) < 4:
             reasons.append("Requires ≥4 time points")
             compliant = False
-    
-    # China: Only the reference product is checked (no point with ≥85% dissolution)
+
+    # China: Only the reference product is considered; no time point should have ≥85% dissolution.
     elif regulation == "China":
         over_ref = [t for t in perm if ref_means.get(t, 0) >= 85]
         if over_ref:
             reasons.append(f"Reference ≥85% at: {over_ref}")
             compliant = False
-    
-    # ASEAN: First 3 points must be below 85% for both reference and test
+
+    # ASEAN: The first 3 time points must be below 85% for both reference and test.
     elif regulation == "ASEAN":
         check_points = perm[:3] if len(perm) >= 3 else perm
         over_ref = [t for t in check_points if ref_means.get(t, 0) >= 85]
@@ -76,8 +85,8 @@ def permutation_compliance_check(perm, regulation, ref_means, test_means):
         if over_test:
             reasons.append(f"Test ≥85% in first 3 points: {over_test}")
             compliant = False
-    
-    # ANVISA: Zero must be the first time point
+
+    # ANVISA: The 0 time point must be present and must be the first element.
     elif regulation == "ANVISA":
         if 0 not in perm:
             reasons.append("Missing zero time point")
@@ -85,52 +94,53 @@ def permutation_compliance_check(perm, regulation, ref_means, test_means):
         elif perm[0] != 0:
             reasons.append("Zero not in first position")
             compliant = False
-    
+
     return (compliant, " | ".join(reasons) if reasons else "Compliant")
 
 def full_permutation_analysis(ref_df, test_df, regulation):
     """
-    Complete permutation analysis using the generated permutations.
-    Each permutation (order-sensitive) is evaluated with an f2 calculation
-    and compliance check based on the specified regulation.
+    Perform a full permutation analysis:
+      - Generate all sequences (with 0 fixed at start) for lengths from 3 to n.
+      - Calculate f2 for each sequence.
+      - Check regulatory compliance.
     """
     try:
-        # Get original time points from the first column
+        # Extract original time points from the first column of the reference DataFrame.
         times = ref_df.iloc[:, 0].tolist()
-        # Force inclusion of 0 if missing
+        # Ensure 0 is included
         if 0 not in times:
             times.insert(0, 0)
         
-        # Prepare dissolution data by calculating the mean for each time point (row)
-        # If 0 was artificially added, assign its dissolution mean as 0.
+        # Calculate the mean dissolution values for each time point (row).
         ref_means = ref_df.set_index(ref_df.columns[0]).iloc[:, 1:].mean(axis=1).to_dict()
         test_means = test_df.set_index(test_df.columns[0]).iloc[:, 1:].mean(axis=1).to_dict()
+        # If 0 was artificially inserted, assign its dissolution mean as 0.
         if 0 not in ref_means:
             ref_means[0] = 0
         if 0 not in test_means:
             test_means[0] = 0
-        
-        # Generate all order-sensitive permutations for lengths 3 through len(times)
-        perms = generate_time_permutations(times)
+
+        # Generate all order-sensitive permutations with 0 fixed at start.
+        perms = generate_time_permutations_fixed_zero(times)
         print(f"Analyzing {len(perms)} permutations for {regulation}...")
         
         results = []
         for perm in perms:
             try:
                 p = len(perm)
-                # Use the permutation as generated (order matters)
+                # Use the permutation (0 is fixed at the beginning)
                 time_order = perm
                 
-                # Retrieve mean dissolution values in the order of the current sequence
+                # Retrieve the mean dissolution values for this sequence.
                 ref_values = [ref_means.get(t, 0) for t in time_order]
                 test_values = [test_means.get(t, 0) for t in time_order]
                 
-                # Calculate the f2 value (using the provided formula)
+                # Calculate f2 using the formula.
                 diff = np.array(test_values) - np.array(ref_values)
                 sum_sq = (diff ** 2).sum()
                 f2 = 100 - 25 * np.log10(1 + (sum_sq / p)) if p > 0 else 0
                 
-                # Perform the compliance check for the given regulation
+                # Check compliance based on the regulatory rule.
                 compliant, reason = permutation_compliance_check(time_order, regulation, ref_means, test_means)
                 
                 results.append({
@@ -144,7 +154,6 @@ def full_permutation_analysis(ref_df, test_df, regulation):
                 print(f"Error processing {perm}: {str(e)}")
                 continue
                 
-        # Sort the results (e.g., by descending f2 and then by sequence length)
         return sorted(results, key=lambda x: (-x['f2'], x['length']))
     
     except Exception as e:
@@ -153,13 +162,13 @@ def full_permutation_analysis(ref_df, test_df, regulation):
 
 def display_permutation_results(results, regulation):
     """
-    Display the permutation analysis results with details for each sequence.
+    Display the permutation analysis results.
     """
     if not results:
         print("\nNo valid permutations found")
         return
     
-    # Set page size to the total number of results so all are displayed on one page.
+    # Show all results on one page.
     page_size = len(results)
     
     print(f"\n{'='*120}")
@@ -171,17 +180,90 @@ def display_permutation_results(results, regulation):
         status = "✅" if res['compliant'] else "❌"
         print(f"{str(res['permutation']):<40} | {res['length']:^6} | {res['f2']:^8.2f} | {status:^8} | {res['reason']}")
     
+    print("="*120 + "\n")
+    
+    # Return the optimal (highest f2 among compliant) sequence if available.
     compliant_results = [r for r in results if r['compliant']]
     if compliant_results:
         best = max(compliant_results, key=lambda x: x['f2'])
-        print(f"\nOptimal Compliant Combination:")
+        print(f"Optimal Compliant Combination:")
         print(f"Sequence: {best['permutation']}")
         print(f"f2 Score: {best['f2']:.2f}")
         print(f"Compliance: {best['reason']}")
-    print("="*120 + "\n")
+        return best['permutation']
+    else:
+        return None
 
-# ====================== INTEGRATION WITH MAIN CODE ======================
-# Assumes that reference_df, test_df, input1, and check_same_time_points are defined.
+# -------------------------- PLOTTING FUNCTIONS --------------------------
+
+def plot_dissolution_curves(ref_df, test_df, optimal_seq):
+    """
+    Generate two graphs:
+      1. Full dissolution curves for the reference and test products, with vertical
+         lines marking the optimal time points.
+      2. Dissolution curves (points connected by lines) only for the optimal time points.
+    """
+    # Sort the DataFrames by time.
+    ref_df_sorted = ref_df.sort_values(by=ref_df.columns[0])
+    test_df_sorted = test_df.sort_values(by=test_df.columns[0])
+    
+    # Extract full time points and mean dissolution values.
+    time_points_full = ref_df_sorted.iloc[:, 0].astype(float).tolist()
+    ref_means_full = ref_df_sorted.iloc[:, 1:].mean(axis=1).tolist()
+    test_means_full = test_df_sorted.iloc[:, 1:].mean(axis=1).tolist()
+    
+    # Retrieve mean dissolution values at the optimal time points.
+    ref_means_opt = []
+    test_means_opt = []
+    for t in optimal_seq:
+        # Find the corresponding row in the DataFrame.
+        ref_row = ref_df[ref_df.iloc[:, 0] == t]
+        test_row = test_df[test_df.iloc[:, 0] == t]
+        if not ref_row.empty:
+            ref_mean = ref_row.iloc[:, 1:].mean(axis=1).values[0]
+        else:
+            ref_mean = 0
+        if not test_row.empty:
+            test_mean = test_row.iloc[:, 1:].mean(axis=1).values[0]
+        else:
+            test_mean = 0
+        ref_means_opt.append(ref_mean)
+        test_means_opt.append(test_mean)
+    
+    # --------------------- Graph 1: Full Curves with Optimal Time Points ---------------------
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_points_full, ref_means_full, marker='o', linestyle='-', color='blue', label='Reference Full')
+    plt.plot(time_points_full, test_means_full, marker='o', linestyle='-', color='red', label='Test Full')
+    for t in optimal_seq:
+        plt.axvline(x=t, color='gray', linestyle='--', alpha=0.5)
+    plt.title('Full Dissolution Curves with Optimal Time Points Indicated')
+    plt.xlabel('Time')
+    plt.ylabel('Dissolution Percentage')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+    # --------------------- Graph 2: Optimal Time Points Only ---------------------
+    plt.figure(figsize=(10, 6))
+    plt.plot(optimal_seq, ref_means_opt, marker='o', linestyle='-', color='blue', label='Reference Optimal')
+    plt.plot(optimal_seq, test_means_opt, marker='o', linestyle='-', color='red', label='Test Optimal')
+    plt.title('Dissolution Curves at Optimal Time Points')
+    plt.xlabel('Time')
+    plt.ylabel('Dissolution Percentage')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------- MAIN INTEGRATION --------------------------
+# Assume that the following are defined:
+# - reference_df: DataFrame with time in the first column and replicate dissolution data in other columns.
+# - test_df: DataFrame with time in the first column and replicate dissolution data in other columns.
+# - check_same_time_points: a function that validates that the time points match between dataframes.
+# - input1: an integer key (1-5) to select the regulation.
+# - regulation_map: a dictionary mapping keys to regulatory strings.
+
 regulation_map = {
     1: "FDA",
     2: "EMA", 
@@ -190,13 +272,21 @@ regulation_map = {
     5: "ANVISA"
 }
 
+# Only proceed if the time points in the reference and test data match.
 if check_same_time_points(reference_df, test_df):
-    print("\nRunning advanced permutation analysis...")
+    print("\nRunning advanced permutation analysis with 0 fixed at the start...")
     perm_results = full_permutation_analysis(
         reference_df.copy(),
         test_df.copy(),
         regulation_map[input1]
     )
-    display_permutation_results(perm_results, regulation_map[input1])
+    # Display all results and capture the optimal sequence.
+    optimal_sequence = display_permutation_results(perm_results, regulation_map[input1])
+    
+    # If an optimal sequence was found, generate the two graphs.
+    if optimal_sequence is not None:
+        plot_dissolution_curves(reference_df, test_df, optimal_sequence)
+    else:
+        print("No compliant sequence found; no graphs will be generated.")
 else:
     print("\nSkipping permutation analysis - Time points mismatch")
