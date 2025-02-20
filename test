@@ -6,20 +6,19 @@ from io import BytesIO
 import json
 import time
 import google.auth
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    Image as GeminiImage,
-    Part,
-    HarmCategory,
-    HarmBlockThreshold,
-    SafetySetting
-)
+import re
+
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold, SafetySetting
 import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt
-import re
+
 from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
 from gtts import gTTS
+
+# For transcription with Google Web Speech API
+import speech_recognition as sr
+from pydub import AudioSegment
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -54,7 +53,8 @@ safety_config = [
     ),
 ]
 
-# Initialize Gemini-1.5 for audio transcription
+# Initialize Gemini-1.5 for (optional) audio transcription – not used in this pipeline.
+# (We are replacing Gemini transcription with SpeechRecognition's Google API.)
 transcription_model = GenerativeModel("gemini-1.5-flash-002")
 
 #############################################
@@ -67,24 +67,25 @@ def extract_audio_from_video(video_path, output_audio_path):
     video_clip.audio.write_audiofile(output_audio_path, codec='mp3')
     video_clip.close()
 
-def transcribe_audio(audio_path):
+def transcribe_audio_with_google(audio_mp3_path):
     """
-    Attempts to transcribe the audio using Gemini-1.5.
-    The audio is provided via a file:// URI.
+    Converts an MP3 file to WAV using pydub and then transcribes it using SpeechRecognition's Google API.
     """
     try:
-        audio_uri = f"file://{audio_path}"
-        audio_part = Part.from_uri(audio_uri, mime_type="audio/mpeg")
-        prompt = (
-            "Can you transcribe this interview in the format of timecode, speaker, caption.\n"
-            "Use speaker A, speaker B, etc. to identify speakers."
-        )
-        contents = [audio_part, prompt]
-        response = transcription_model.generate_content(contents, safety_settings=safety_config)
-        logger.debug(f"Transcription response: {response.text}")
-        return response.text
+        # Convert the MP3 to WAV
+        wav_path = audio_mp3_path.replace(".mp3", ".wav")
+        sound = AudioSegment.from_mp3(audio_mp3_path)
+        sound.export(wav_path, format="wav")
+        
+        # Use SpeechRecognition to transcribe the WAV file.
+        r = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = r.record(source)
+        transcription = r.recognize_google(audio)
+        logger.debug(f"Google Transcription: {transcription}")
+        return transcription
     except Exception as e:
-        logger.error(f"Transcription error: {str(e)}")
+        logger.error(f"Transcription error with Google API: {str(e)}")
         return ""
 
 def translate_text(text, target_language="Spanish"):
@@ -163,8 +164,8 @@ def merge_video_audio(video_path, audio_path, subtitles, output_path):
 # Main Application Workflow
 #############################################
 def main():
-    st.title("Video Translator with Audio File Saving Option")
-    st.write("Upload an English video. After audio extraction, you may download the extracted audio file. Then, you can choose to get the transcription via Gemini or upload your own transcription file. The transcription will be translated to Spanish and converted to speech, and the final video will be merged with Spanish audio and subtitles.")
+    st.title("Video Translator with Google Speech Transcription")
+    st.write("Upload an English video. The app will extract audio, transcribe it using Google's Speech API, then translate the text to Spanish via Gemini, generate Spanish speech using gTTS, and finally merge the Spanish audio and subtitles with the video.")
 
     # Step 1: Upload Video
     uploaded_video = st.file_uploader("Upload Video", type=["mp4", "mov", "avi"])
@@ -180,29 +181,29 @@ def main():
         extract_audio_from_video(video_path, audio_path)
         st.success("Audio extracted from video.")
 
-        # NEW: Option to download the extracted audio file
+        # Option to download the extracted audio file
         with open(audio_path, "rb") as f:
             audio_bytes = f.read()
         st.download_button("Download Extracted Audio", audio_bytes, file_name="extracted_audio.mp3", mime="audio/mp3")
 
-        # Step 3: Attempt Gemini Transcription and Offer Download Option
-        if st.button("Get Transcription from Gemini"):
-            transcription = transcribe_audio(audio_path)
+        # Step 3: Transcribe Audio using Google Speech Recognition
+        if st.button("Transcribe Audio using Google"):
+            transcription = transcribe_audio_with_google(audio_path)
             if transcription:
                 st.text_area("Transcription:", transcription, height=200)
                 st.download_button("Download Transcription", transcription, file_name="transcription.txt", mime="text/plain")
-                st.session_state.transcription = transcription  # Save for later steps
+                st.session_state.transcription = transcription  # Save transcription for later steps
             else:
-                st.error("Gemini transcription failed. Please transcribe manually and upload the transcription file below.")
+                st.error("Google transcription failed. Please try again or upload your transcription manually.")
 
-        # Step 4: Upload Transcription File (if needed)
-        uploaded_transcription = st.file_uploader("Upload Transcription File (if Gemini transcription failed)", type=["txt"])
+        # Step 4: Optionally upload a transcription file if needed
+        uploaded_transcription = st.file_uploader("Upload Transcription File (if Google transcription failed)", type=["txt"])
         if uploaded_transcription is not None:
             transcription_text = uploaded_transcription.read().decode("utf-8")
             st.text_area("Uploaded Transcription:", transcription_text, height=200)
             st.session_state.transcription = transcription_text
 
-        # Proceed if we have a transcription (either from Gemini or manual upload)
+        # Proceed if we have a transcription (either from Google or manual upload)
         if "transcription" in st.session_state and st.session_state.transcription:
             if st.button("Translate Transcription to Spanish"):
                 translated_text = translate_text(st.session_state.transcription, target_language="Spanish")
