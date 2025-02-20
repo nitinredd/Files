@@ -1,91 +1,105 @@
 import os
-import re
-import json
-import time
+import streamlit as st
 import tempfile
 import logging
-import streamlit as st
+from io import BytesIO
+import json
+import time
 import google.auth
-
+from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold, SafetySetting
+import fitz  # PyMuPDF
+from docx import Document
+from docx.shared import Pt
+import re
 from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
 from gtts import gTTS
-import speech_recognition as sr
-
-# Import Gemini libraries (adjust if needed)
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    SafetySetting,
-    HarmCategory,
-    HarmBlockThreshold
-)
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Set up Google credentials and initialize Gemini model
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"  # Change path as needed
+# Gemini configuration as per template (no location specified)
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
-multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")  # For translation
 
-# Define safety settings for Gemini (as in your template)
+# Model and Safety settings required for Gemini filter
 safety_config = [
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
 ]
 
-#########################
-# Gemini Translation
-#########################
-def translate_to_spanish(text):
+# Initialize Gemini-1.5 for audio transcription (using your Gemini configuration style)
+transcription_model = GenerativeModel("gemini-1.5-flash-002")
+
+#############################################
+# Gemini-based Audio Transcription Function
+#############################################
+def transcribe_audio(audio_path):
     """
-    Use Gemini to translate English text to Spanish.
+    Transcribe the audio using Gemini-1.5.
+    Reads the local audio file, creates a Part, and sends it with a prompt
+    asking for a transcription (with timecodes, speaker labels, and captions).
     """
-    prompt = f"Translate the following English text to Spanish:\n\n{text}"
+    try:
+        with open(audio_path, "rb") as f:
+            audio_bytes = f.read()
+        # Create a Part from the audio bytes; assume the file is in MP3 format
+        audio_part = Part.from_bytes(audio_bytes, mime_type="audio/mpeg")
+        prompt = (
+            "Can you transcribe this interview in the format of timecode, speaker, caption.\n"
+            "Use speaker A, speaker B, etc. to identify speakers."
+        )
+        contents = [audio_part, prompt]
+        # Generate transcription (audio_timestamp flag can be added if supported)
+        response = transcription_model.generate_content(contents, safety_settings=safety_config)
+        logger.debug(f"Transcription response: {response.text}")
+        return response.text
+    except Exception as e:
+        logger.error(f"Transcription error: {str(e)}")
+        return ""
+
+#############################################
+# Gemini-based Translation Function
+#############################################
+def translate_text(text, target_language="Spanish"):
+    """
+    Translate English text to the target language using Gemini.
+    """
+    if not text:
+        return ""
+    prompt = f"Translate the following English text to {target_language}:\n\n{text}"
     try:
         responses = multimodal_model.generate_content([prompt], safety_settings=safety_config)
-        if hasattr(responses, 'text') and responses.text:
-            translated = responses.text
-        else:
-            # In case multiple responses are returned
-            translated = ''.join([r.text for r in responses])
+        translated = responses.text if hasattr(responses, 'text') else ''.join([r.text for r in responses])
         logger.debug(f"Translated text: {translated}")
         return translated
     except Exception as e:
         logger.error(f"Translation error: {str(e)}")
         return text
 
-#########################
-# Offline Speech Recognition
-#########################
-def transcribe_audio(audio_path):
-    """
-    Transcribe audio using SpeechRecognition with PocketSphinx (offline).
-    """
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        audio_data = recognizer.record(source)
-    try:
-        transcript = recognizer.recognize_sphinx(audio_data)
-        logger.debug(f"Transcript: {transcript}")
-        return transcript
-    except sr.UnknownValueError:
-        logger.error("PocketSphinx could not understand audio")
-        return ""
-    except sr.RequestError as e:
-        logger.error(f"PocketSphinx error: {e}")
-        return ""
-
-#########################
-# Spanish Audio Generation
-#########################
+#############################################
+# Generate Spanish Audio using gTTS
+#############################################
 def generate_spanish_audio(text, output_path):
-    """
-    Generate Spanish speech from text using gTTS.
-    """
     try:
         tts = gTTS(text=text, lang='es')
         tts.save(output_path)
@@ -93,13 +107,13 @@ def generate_spanish_audio(text, output_path):
     except Exception as e:
         logger.error(f"gTTS error: {str(e)}")
 
-#########################
-# Subtitle Creation
-#########################
+#############################################
+# Create Approximate Subtitles from Transcript
+#############################################
 def create_subtitles(text, video_duration):
     """
-    Split the English transcript into sentences and distribute them over the video duration.
-    This is an approximate method.
+    Split the transcript into sentences and evenly distribute them across the video duration.
+    This provides approximate timings for subtitles.
     """
     sentences = re.split(r'(?<=[.!?]) +', text)
     sentences = [s.strip() for s in sentences if s.strip()]
@@ -117,23 +131,26 @@ def create_subtitles(text, video_duration):
     logger.debug(f"Created {len(subtitles)} subtitle segments.")
     return subtitles
 
-#########################
-# Merge Video, Audio, and Subtitles
-#########################
+#############################################
+# Merge Video, New Audio, and Subtitles
+#############################################
 def merge_video_audio(video_path, audio_path, subtitles, output_path):
-    """
-    Replace the original video audio with the Spanish audio and overlay English subtitles.
-    """
     video = VideoFileClip(video_path)
     audio = AudioFileClip(audio_path)
-    # Replace audio with Spanish audio
+    # Replace original audio with the new Spanish audio
     video = video.set_audio(audio)
 
     subtitle_clips = []
     for start, end, text in subtitles:
-        # Create a TextClip for each subtitle segment.
-        txt_clip = TextClip(text, fontsize=24, color='white', bg_color='black',
-                            method='caption', size=(video.w, None))
+        # Create a TextClip for each subtitle segment
+        txt_clip = TextClip(
+            text,
+            fontsize=24,
+            color='white',
+            bg_color='black',
+            method='caption',
+            size=(video.w, None)
+        )
         txt_clip = txt_clip.set_position(('center', 'bottom')).set_start(start).set_duration(end - start)
         subtitle_clips.append(txt_clip)
     
@@ -143,9 +160,9 @@ def merge_video_audio(video_path, audio_path, subtitles, output_path):
     video.close()
     audio.close()
 
-#########################
-# Main Streamlit App
-#########################
+#############################################
+# Main Streamlit Application
+#############################################
 def main():
     st.title("Video Translator: English → Spanish with Subtitles")
     st.write("Upload an English video to translate its audio to Spanish and overlay English subtitles.")
@@ -163,43 +180,35 @@ def main():
         if st.button("Translate Video"):
             with st.spinner("Processing video..."):
                 try:
-                    # Open the video clip and extract its duration.
+                    # Extract video duration and audio
                     video_clip = VideoFileClip(temp_video_path)
                     video_duration = video_clip.duration
-                    # Save audio to a temporary WAV file.
-                    temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                    temp_audio_path = temp_audio_file.name
-                    temp_audio_file.close()
-                    video_clip.audio.write_audiofile(temp_audio_path, codec='pcm_s16le')
+                    # Save audio to a temporary MP3 file.
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
+                        temp_audio_path = temp_audio_file.name
+                    video_clip.audio.write_audiofile(temp_audio_path, codec='mp3')
                     video_clip.close()
 
-                    # Transcribe the extracted audio (offline)
-                    st.info("Transcribing audio...")
+                    st.info("Transcribing audio using Gemini-1.5...")
                     transcript = transcribe_audio(temp_audio_path)
                     if not transcript:
                         st.error("Could not transcribe audio.")
                         return
 
-                    # Translate the transcript from English to Spanish using Gemini.
                     st.info("Translating transcript to Spanish...")
-                    translated_text = translate_to_spanish(transcript)
+                    translated_text = translate_text(transcript, target_language="Spanish")
 
-                    # Generate Spanish audio using gTTS.
                     st.info("Generating Spanish audio...")
-                    temp_spanish_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                    temp_spanish_audio_path = temp_spanish_audio_file.name
-                    temp_spanish_audio_file.close()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_spanish_audio_file:
+                        temp_spanish_audio_path = temp_spanish_audio_file.name
                     generate_spanish_audio(translated_text, temp_spanish_audio_path)
 
-                    # Create English subtitles from the original transcript.
                     st.info("Creating subtitles...")
                     subtitles = create_subtitles(transcript, video_duration)
 
-                    # Merge the video with the new Spanish audio and subtitles.
                     st.info("Merging video, audio, and subtitles...")
-                    temp_output_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                    output_video_path = temp_output_video_file.name
-                    temp_output_video_file.close()
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_output_video_file:
+                        output_video_path = temp_output_video_file.name
                     merge_video_audio(temp_video_path, temp_spanish_audio_path, subtitles, output_video_path)
 
                     st.success("Video translation completed!")
