@@ -6,7 +6,14 @@ from io import BytesIO
 import json
 import time
 import google.auth
-from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold, SafetySetting
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    Image as GeminiImage,
+    Part,
+    HarmCategory,
+    HarmBlockThreshold,
+    SafetySetting
+)
 import fitz  # PyMuPDF
 from docx import Document
 from docx.shared import Pt
@@ -18,12 +25,12 @@ from gtts import gTTS
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Gemini configuration as per template (no location specified)
+# Gemini configuration following your template (no location specified)
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")  # For translation
 
-# Model and Safety settings required for Gemini filter
+# Safety settings required for Gemini filter 
 safety_config = [
     SafetySetting(
         category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
@@ -47,20 +54,25 @@ safety_config = [
     ),
 ]
 
-# Initialize Gemini-1.5 for audio transcription (using your Gemini configuration style)
+# Initialize Gemini-1.5 for audio transcription
 transcription_model = GenerativeModel("gemini-1.5-flash-002")
 
 #############################################
-# Gemini-based Audio Transcription Function
+# Utility Functions
 #############################################
+
+def extract_audio_from_video(video_path, output_audio_path):
+    """Extracts audio from a video using MoviePy."""
+    video_clip = VideoFileClip(video_path)
+    video_clip.audio.write_audiofile(output_audio_path, codec='mp3')
+    video_clip.close()
+
 def transcribe_audio(audio_path):
     """
-    Transcribe the audio using Gemini-1.5.
-    Reads the local audio file by creating a file:// URI and sends it along with a prompt
-    asking for a transcription (with timecodes, speaker labels, and captions).
+    Attempts to transcribe the audio using Gemini-1.5.
+    The audio is provided via a file:// URI.
     """
     try:
-        # Create a URI from the local file path
         audio_uri = f"file://{audio_path}"
         audio_part = Part.from_uri(audio_uri, mime_type="audio/mpeg")
         prompt = (
@@ -75,12 +87,9 @@ def transcribe_audio(audio_path):
         logger.error(f"Transcription error: {str(e)}")
         return ""
 
-#############################################
-# Gemini-based Translation Function
-#############################################
 def translate_text(text, target_language="Spanish"):
     """
-    Translate English text to the target language using Gemini.
+    Translates English text to the target language (Spanish) using Gemini-2.0.
     """
     if not text:
         return ""
@@ -94,10 +103,8 @@ def translate_text(text, target_language="Spanish"):
         logger.error(f"Translation error: {str(e)}")
         return text
 
-#############################################
-# Generate Spanish Audio using gTTS
-#############################################
 def generate_spanish_audio(text, output_path):
+    """Generates Spanish speech from text using gTTS."""
     try:
         tts = gTTS(text=text, lang='es')
         tts.save(output_path)
@@ -105,13 +112,10 @@ def generate_spanish_audio(text, output_path):
     except Exception as e:
         logger.error(f"gTTS error: {str(e)}")
 
-#############################################
-# Create Approximate Subtitles from Transcript
-#############################################
 def create_subtitles(text, video_duration):
     """
-    Split the transcript into sentences and evenly distribute them across the video duration.
-    This provides approximate timings for subtitles.
+    Splits the transcript into sentences and evenly distributes them over the video duration.
+    This creates approximate subtitle timing.
     """
     sentences = re.split(r'(?<=[.!?]) +', text)
     sentences = [s.strip() for s in sentences if s.strip()]
@@ -126,21 +130,18 @@ def create_subtitles(text, video_duration):
         end = current_time + duration_per_sentence
         subtitles.append((start, end, sentence))
         current_time = end
-    logger.debug(f"Created {len(subtitles)} subtitle segments.")
     return subtitles
 
-#############################################
-# Merge Video, New Audio, and Subtitles
-#############################################
 def merge_video_audio(video_path, audio_path, subtitles, output_path):
+    """
+    Merges the original video with the new Spanish audio track and overlays subtitles.
+    """
     video = VideoFileClip(video_path)
     audio = AudioFileClip(audio_path)
-    # Replace original audio with the new Spanish audio
     video = video.set_audio(audio)
 
     subtitle_clips = []
     for start, end, text in subtitles:
-        # Create a TextClip for each subtitle segment
         txt_clip = TextClip(
             text,
             fontsize=24,
@@ -159,76 +160,66 @@ def merge_video_audio(video_path, audio_path, subtitles, output_path):
     audio.close()
 
 #############################################
-# Main Streamlit Application
+# Main Application Workflow
 #############################################
 def main():
-    st.title("Video Translator: English → Spanish with Subtitles")
-    st.write("Upload an English video to translate its audio to Spanish and overlay English subtitles.")
+    st.title("Video Translator with Manual Transcription Option")
+    st.write("Upload an English video. After audio extraction, you can download the transcription generated via Gemini. If that fails, manually upload your transcription file. The transcription is then translated to Spanish and converted to Spanish speech before merging with the video.")
 
+    # Step 1: Upload Video
     uploaded_video = st.file_uploader("Upload Video", type=["mp4", "mov", "avi"])
-    
     if uploaded_video is not None:
-        # Save the uploaded video to a temporary file.
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
             temp_video_file.write(uploaded_video.read())
-            temp_video_path = temp_video_file.name
-        
-        st.video(temp_video_path)
+            video_path = temp_video_file.name
+        st.video(video_path)
 
-        if st.button("Translate Video"):
-            # Initialize temp file variables to None so that cleanup works even on error.
-            temp_video_path_var = temp_video_path
-            temp_audio_path = None
-            temp_spanish_audio_path = None
-            try:
-                # Extract video duration and audio
-                video_clip = VideoFileClip(temp_video_path_var)
-                video_duration = video_clip.duration
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
-                    temp_audio_path = temp_audio_file.name
-                video_clip.audio.write_audiofile(temp_audio_path, codec='mp3')
-                video_clip.close()
+        # Step 2: Extract Audio from Video
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
+            audio_path = temp_audio_file.name
+        extract_audio_from_video(video_path, audio_path)
+        st.success("Audio extracted from video.")
 
-                st.info("Transcribing audio using Gemini-1.5...")
-                transcript = transcribe_audio(temp_audio_path)
-                if not transcript:
-                    st.error("Could not transcribe audio.")
-                    return
+        # Step 3: Attempt Gemini Transcription and Offer Download Option
+        if st.button("Get Transcription from Gemini"):
+            transcription = transcribe_audio(audio_path)
+            if transcription:
+                st.text_area("Transcription:", transcription, height=200)
+                st.download_button("Download Transcription", transcription, file_name="transcription.txt", mime="text/plain")
+                st.session_state.transcription = transcription  # Save for later steps
+            else:
+                st.error("Gemini transcription failed. Please transcribe manually and upload the transcription file below.")
 
-                st.info("Translating transcript to Spanish...")
-                translated_text = translate_text(transcript, target_language="Spanish")
+        # Step 4: Upload Transcription File (if needed)
+        uploaded_transcription = st.file_uploader("Upload Transcription File (if Gemini transcription failed)", type=["txt"])
+        if uploaded_transcription is not None:
+            transcription_text = uploaded_transcription.read().decode("utf-8")
+            st.text_area("Uploaded Transcription:", transcription_text, height=200)
+            st.session_state.transcription = transcription_text
 
-                st.info("Generating Spanish audio...")
+        # Proceed if we have a transcription (either from Gemini or manual upload)
+        if "transcription" in st.session_state and st.session_state.transcription:
+            if st.button("Translate Transcription to Spanish"):
+                translated_text = translate_text(st.session_state.transcription, target_language="Spanish")
+                st.text_area("Translated Text:", translated_text, height=200)
+                st.download_button("Download Translated Text", translated_text, file_name="translated.txt", mime="text/plain")
+
+                # Step 5: Generate Spanish Audio from Translated Text
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_spanish_audio_file:
-                    temp_spanish_audio_path = temp_spanish_audio_file.name
-                generate_spanish_audio(translated_text, temp_spanish_audio_path)
+                    spanish_audio_path = temp_spanish_audio_file.name
+                generate_spanish_audio(translated_text, spanish_audio_path)
+                st.audio(spanish_audio_path, format="audio/mp3")
 
-                st.info("Creating subtitles...")
-                subtitles = create_subtitles(transcript, video_duration)
-
-                st.info("Merging video, audio, and subtitles...")
+                # Step 6: Merge Spanish Audio and Original Video with Subtitles
+                video_clip = VideoFileClip(video_path)
+                video_duration = video_clip.duration
+                video_clip.close()
+                subtitles = create_subtitles(st.session_state.transcription, video_duration)
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_output_video_file:
                     output_video_path = temp_output_video_file.name
-                merge_video_audio(temp_video_path_var, temp_spanish_audio_path, subtitles, output_video_path)
-
-                st.success("Video translation completed!")
+                merge_video_audio(video_path, spanish_audio_path, subtitles, output_video_path)
                 st.video(output_video_path)
-                with open(output_video_path, "rb") as video_file:
-                    st.download_button("Download Translated Video",
-                                       video_file.read(),
-                                       file_name="translated_video.mp4",
-                                       mime="video/mp4")
-            except Exception as e:
-                st.error(f"An error occurred during processing: {str(e)}")
-                logger.exception("Processing error")
-            finally:
-                # Clean up temporary files if they were created
-                for path in [temp_video_path_var, temp_audio_path, temp_spanish_audio_path]:
-                    if path is not None and os.path.exists(path):
-                        try:
-                            os.remove(path)
-                        except Exception as cleanup_e:
-                            logger.error(f"Error cleaning up temporary file {path}: {cleanup_e}")
+                st.download_button("Download Final Video", open(output_video_path, "rb").read(), file_name="final_translated_video.mp4", mime="video/mp4")
 
 if __name__ == "__main__":
     main()
