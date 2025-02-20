@@ -56,20 +56,18 @@ transcription_model = GenerativeModel("gemini-1.5-flash-002")
 def transcribe_audio(audio_path):
     """
     Transcribe the audio using Gemini-1.5.
-    Reads the local audio file, creates a Part, and sends it with a prompt
+    Reads the local audio file by creating a file:// URI and sends it along with a prompt
     asking for a transcription (with timecodes, speaker labels, and captions).
     """
     try:
-        with open(audio_path, "rb") as f:
-            audio_bytes = f.read()
-        # Create a Part from the audio bytes; assume the file is in MP3 format
-        audio_part = Part.from_bytes(audio_bytes, mime_type="audio/mpeg")
+        # Create a URI from the local file path
+        audio_uri = f"file://{audio_path}"
+        audio_part = Part.from_uri(audio_uri, mime_type="audio/mpeg")
         prompt = (
             "Can you transcribe this interview in the format of timecode, speaker, caption.\n"
             "Use speaker A, speaker B, etc. to identify speakers."
         )
         contents = [audio_part, prompt]
-        # Generate transcription (audio_timestamp flag can be added if supported)
         response = transcription_model.generate_content(contents, safety_settings=safety_config)
         logger.debug(f"Transcription response: {response.text}")
         return response.text
@@ -178,56 +176,57 @@ def main():
         st.video(temp_video_path)
 
         if st.button("Translate Video"):
-            with st.spinner("Processing video..."):
-                try:
-                    # Extract video duration and audio
-                    video_clip = VideoFileClip(temp_video_path)
-                    video_duration = video_clip.duration
-                    # Save audio to a temporary MP3 file.
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
-                        temp_audio_path = temp_audio_file.name
-                    video_clip.audio.write_audiofile(temp_audio_path, codec='mp3')
-                    video_clip.close()
+            # Initialize temp file variables to None so that cleanup works even on error.
+            temp_video_path_var = temp_video_path
+            temp_audio_path = None
+            temp_spanish_audio_path = None
+            try:
+                # Extract video duration and audio
+                video_clip = VideoFileClip(temp_video_path_var)
+                video_duration = video_clip.duration
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
+                    temp_audio_path = temp_audio_file.name
+                video_clip.audio.write_audiofile(temp_audio_path, codec='mp3')
+                video_clip.close()
 
-                    st.info("Transcribing audio using Gemini-1.5...")
-                    transcript = transcribe_audio(temp_audio_path)
-                    if not transcript:
-                        st.error("Could not transcribe audio.")
-                        return
+                st.info("Transcribing audio using Gemini-1.5...")
+                transcript = transcribe_audio(temp_audio_path)
+                if not transcript:
+                    st.error("Could not transcribe audio.")
+                    return
 
-                    st.info("Translating transcript to Spanish...")
-                    translated_text = translate_text(transcript, target_language="Spanish")
+                st.info("Translating transcript to Spanish...")
+                translated_text = translate_text(transcript, target_language="Spanish")
 
-                    st.info("Generating Spanish audio...")
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_spanish_audio_file:
-                        temp_spanish_audio_path = temp_spanish_audio_file.name
-                    generate_spanish_audio(translated_text, temp_spanish_audio_path)
+                st.info("Generating Spanish audio...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_spanish_audio_file:
+                    temp_spanish_audio_path = temp_spanish_audio_file.name
+                generate_spanish_audio(translated_text, temp_spanish_audio_path)
 
-                    st.info("Creating subtitles...")
-                    subtitles = create_subtitles(transcript, video_duration)
+                st.info("Creating subtitles...")
+                subtitles = create_subtitles(transcript, video_duration)
 
-                    st.info("Merging video, audio, and subtitles...")
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_output_video_file:
-                        output_video_path = temp_output_video_file.name
-                    merge_video_audio(temp_video_path, temp_spanish_audio_path, subtitles, output_video_path)
+                st.info("Merging video, audio, and subtitles...")
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_output_video_file:
+                    output_video_path = temp_output_video_file.name
+                merge_video_audio(temp_video_path_var, temp_spanish_audio_path, subtitles, output_video_path)
 
-                    st.success("Video translation completed!")
-                    st.video(output_video_path)
-                    with open(output_video_path, "rb") as video_file:
-                        st.download_button("Download Translated Video",
-                                           video_file.read(),
-                                           file_name="translated_video.mp4",
-                                           mime="video/mp4")
-                    
-                except Exception as e:
-                    st.error(f"An error occurred during processing: {str(e)}")
-                    logger.exception("Processing error")
-                finally:
-                    # Clean up temporary files
-                    for path in [temp_video_path, temp_audio_path, temp_spanish_audio_path]:
+                st.success("Video translation completed!")
+                st.video(output_video_path)
+                with open(output_video_path, "rb") as video_file:
+                    st.download_button("Download Translated Video",
+                                       video_file.read(),
+                                       file_name="translated_video.mp4",
+                                       mime="video/mp4")
+            except Exception as e:
+                st.error(f"An error occurred during processing: {str(e)}")
+                logger.exception("Processing error")
+            finally:
+                # Clean up temporary files if they were created
+                for path in [temp_video_path_var, temp_audio_path, temp_spanish_audio_path]:
+                    if path is not None and os.path.exists(path):
                         try:
-                            if os.path.exists(path):
-                                os.remove(path)
+                            os.remove(path)
                         except Exception as cleanup_e:
                             logger.error(f"Error cleaning up temporary file {path}: {cleanup_e}")
 
