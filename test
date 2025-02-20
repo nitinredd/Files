@@ -1,435 +1,226 @@
 import os
-import streamlit as st
-import tempfile
-import logging
-from io import BytesIO
+import re
 import json
 import time
+import tempfile
+import logging
+import streamlit as st
 import google.auth
-from vertexai.preview.generative_models import GenerativeModel, Image as GeminiImage, Part, HarmCategory, HarmBlockThreshold, SafetySetting
-import fitz  # PyMuPDF
-from docx import Document
-from docx.shared import Pt
-import re
 
+from moviepy.editor import VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip
+from gtts import gTTS
+import speech_recognition as sr
+
+# Import Gemini libraries (adjust if needed)
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold
+)
+
+# Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+# Set up Google credentials and initialize Gemini model
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"  # Change path as needed
 credentials, project_id = google.auth.default()
-multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21") #gemini-pro-vision #gemini-2.0-flash-thinking-exp-01-21 #gemini-2.0-flash
+multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# Model and Safety settings Required for Gemini filter 
+# Define safety settings for Gemini (as in your template)
 safety_config = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-def get_safe_extraction_prompt():
-    return """Please analyze and extract the given document content maintaining exact layout and structure without creating unnecessary tables or elements. Always stay within the document contents.
-    Use this JSON schema for format:
-        "elements": [
-            {
-                "type": "section|table|list",
-                "content": "text content",
-                "level": "heading level (1-4)",
-                "indent": "indentation spaces",
-                "table_data": {
-                    "headers": ["col1", "col2"],
-                    "rows": [["cell1", "cell2"]],
-                    "column_widths": ["30%", "70%"],
-                    "column_alignments": ["left|center|right"]
-                }
-            }
-        ]
-    
-    Rules:
-    1. Keep all formatting intact
-    2. Maintain document hierarchy and layout
-    3. Include column widths and table title for tables
-    4. Do not create tables if their structure is not clearly indicated by the document"""
-
-def safe_gemini_call(image, max_retries=3, delay=2):
-    """Make API calls with retry logic and safety filter handling"""
-    prompt = get_safe_extraction_prompt()
-    for attempt in range(max_retries):
-        try:
-            response = multimodal_model.generate_content(
-                [
-                    prompt,
-                    image
-                ],
-                safety_settings=safety_config
-            )
-            if hasattr(response, 'text') and response.text:
-                parsed_json = parse_json_response(response.text)
-                if parsed_json:
-                    return response
-            if "blocked" in str(response) or "Candidate text" in str(response):
-                raise ValueError("Content blocked by safety filters.")
-        except ValueError as ve:
-            logger.warning(f"Content blocked by safety filters (Attempt {attempt + 1}): {str(ve)}")
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-                continue
-            raise
-        except Exception as e:
-            logger.warning(f"Attempt {attempt + 1} failed: {str(e)}")
-            if attempt < max_retries - 1:
-                time.sleep(delay)
-                continue
-            raise
-    raise Exception("Failed to get valid response after maximum retries")
-
-def translate_text(text, language):
-    if not text:
-        return ""
-    prompt = f"Do a Complete Translation from {language} to English:\n{text}"
+#########################
+# Gemini Translation
+#########################
+def translate_to_spanish(text):
+    """
+    Use Gemini to translate English text to Spanish.
+    """
+    prompt = f"Translate the following English text to Spanish:\n\n{text}"
     try:
-        responses = multimodal_model.generate_content([prompt])
-        return responses.text if hasattr(responses, 'text') else ''.join([r.text for r in responses])
+        responses = multimodal_model.generate_content([prompt], safety_settings=safety_config)
+        if hasattr(responses, 'text') and responses.text:
+            translated = responses.text
+        else:
+            # In case multiple responses are returned
+            translated = ''.join([r.text for r in responses])
+        logger.debug(f"Translated text: {translated}")
+        return translated
     except Exception as e:
         logger.error(f"Translation error: {str(e)}")
         return text
 
-def translate_table_data(table_data, language):
-    """Translate table contents while preserving structure"""
-    if not table_data:
-        return table_data
-    headers = table_data.get("headers", [])
-    rows = table_data.get("rows", [])
-    if not headers or not rows:
-        logger.warning("Empty or invalid table data encountered. Filling with dummy data.")
-        if not headers:
-            headers = ["Dummy Column"]
-        if not rows:
-            rows = [["Dummy Row"]]
-    translated_data = {
-        "headers": [translate_text(header, language) for header in headers],
-        "rows": [
-            [translate_text(cell, language) for cell in row]
-            for row in rows
-        ],
-        "column_alignments": table_data.get("column_alignments", [])
-    }
-    return translated_data
-
-def extract_images_from_pdf(pdf_file):
-    images = []
-    temp_pdf_path = None
+#########################
+# Offline Speech Recognition
+#########################
+def transcribe_audio(audio_path):
+    """
+    Transcribe audio using SpeechRecognition with PocketSphinx (offline).
+    """
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_path) as source:
+        audio_data = recognizer.record(source)
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-            temp_pdf.write(pdf_file.getvalue())
-            temp_pdf_path = temp_pdf.name
-        doc = fitz.open(temp_pdf_path)
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(matrix=fitz.Matrix(3, 3), alpha=False)
-            image_bytes = pix.tobytes("png")
-            images.append(image_bytes)
-            logger.info(f"Extracted image from page {page_num}")
-        doc.close()
-        return images
-    finally:
-        if temp_pdf_path and os.path.exists(temp_pdf_path):
-            try:
-                os.unlink(temp_pdf_path)
-            except Exception as e:
-                logger.error(f"Error deleting temporary PDF file: {str(e)}")
+        transcript = recognizer.recognize_sphinx(audio_data)
+        logger.debug(f"Transcript: {transcript}")
+        return transcript
+    except sr.UnknownValueError:
+        logger.error("PocketSphinx could not understand audio")
+        return ""
+    except sr.RequestError as e:
+        logger.error(f"PocketSphinx error: {e}")
+        return ""
 
-def clean_json_string(json_string):
-    # Remove or escape invalid control characters
-    json_string = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', json_string)
-    return json_string
-
-def parse_json_response(response_text):
+#########################
+# Spanish Audio Generation
+#########################
+def generate_spanish_audio(text, output_path):
+    """
+    Generate Spanish speech from text using gTTS.
+    """
     try:
-        start = response_text.find('{')
-        end = response_text.rfind('}') + 1
-        if start >= 0 and end > start:
-            json_str = response_text[start:end]
-            json_str = clean_json_string(json_str)
-            logger.debug(f"Parsing cleaned JSON string: {json_str}")
-            return json.loads(json_str)
-    except json.JSONDecodeError as e:
-        err_pos = getattr(e, 'pos', None)
-        err_msg = getattr(e, 'msg', '')
-        logger.error(f"JSON decoding error at position {err_pos}: {err_msg}")
-        logger.debug(f"Offending JSON string: {response_text[start:end]}")
+        tts = gTTS(text=text, lang='es')
+        tts.save(output_path)
+        logger.debug(f"Spanish audio saved to {output_path}")
     except Exception as e:
-        logger.error(f"General error in parsing JSON response: {e}")
-        logger.debug(f"Offending response: {response_text}")
-    return {}
+        logger.error(f"gTTS error: {str(e)}")
 
-def parse_response(response):
-    try:
-        if isinstance(response, str):
-            text = response
-        elif hasattr(response, 'text'):
-            text = response.text
-        else:
-            text = ''.join([r.text for r in response])
-        parsed_json = parse_json_response(text)
-        valid_elements = []
-        for element in parsed_json.get('elements', []):
-            if element.get('type') == 'table':
-                table_data = element.get('table_data', {})
-                headers = table_data.get('headers', [])
-                rows = table_data.get('rows', [])
-                if headers and rows:
-                    valid_elements.append(element)
-                else:
-                    logger.warning(f"Skipping malformed table data: {table_data}")
-            else:
-                valid_elements.append(element)
-        parsed_json['elements'] = valid_elements
-        return parsed_json
-    except Exception as e:
-        logger.error(f"Error parsing response: {str(e)}")
-    return {
-        "elements": [
-            {
-                "type": "section",
-                "content": str(text),
-                "level": 1,
-                "indent": 0
-            }
-        ]
-    }
+#########################
+# Subtitle Creation
+#########################
+def create_subtitles(text, video_duration):
+    """
+    Split the English transcript into sentences and distribute them over the video duration.
+    This is an approximate method.
+    """
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    num_sentences = len(sentences)
+    if num_sentences == 0:
+        return []
+    duration_per_sentence = video_duration / num_sentences
+    subtitles = []
+    current_time = 0
+    for sentence in sentences:
+        start = current_time
+        end = current_time + duration_per_sentence
+        subtitles.append((start, end, sentence))
+        current_time = end
+    logger.debug(f"Created {len(subtitles)} subtitle segments.")
+    return subtitles
 
-def create_text_report(parsed_data):
-    text_content = ""
-    for element in parsed_data.get('elements', []):
-        element_type = element.get('type', 'section')
-        
-        try:
-            indent = int(str(element.get('indent', 0)).strip())
-        except ValueError:
-            indent = 0
-            
-        level = int(element.get('level', 1))
-        indent_str = " " * (indent * 2)
-        
-        if element_type == 'table':
-            table_data = element.get('table_data', {})
-            headers = table_data.get("headers", [])
-            rows = table_data.get("rows", [])
-            table_str = f"\n{indent_str}Table:\n"
-            if headers:
-                table_str += f"{indent_str}{' | '.join(headers)}\n"
-            for row in rows:
-                table_str += f"{indent_str}{' | '.join(row)}\n"
-            text_content += table_str
-        else:
-            content = element.get('content', '')
-            text_content += f"{indent_str}{content}\n"
-    return text_content
+#########################
+# Merge Video, Audio, and Subtitles
+#########################
+def merge_video_audio(video_path, audio_path, subtitles, output_path):
+    """
+    Replace the original video audio with the Spanish audio and overlay English subtitles.
+    """
+    video = VideoFileClip(video_path)
+    audio = AudioFileClip(audio_path)
+    # Replace audio with Spanish audio
+    video = video.set_audio(audio)
 
-def create_docx(report_text):
-    doc = Document()
-    doc.add_heading('Translation Report', level=1)
+    subtitle_clips = []
+    for start, end, text in subtitles:
+        # Create a TextClip for each subtitle segment.
+        txt_clip = TextClip(text, fontsize=24, color='white', bg_color='black',
+                            method='caption', size=(video.w, None))
+        txt_clip = txt_clip.set_position(('center', 'bottom')).set_start(start).set_duration(end - start)
+        subtitle_clips.append(txt_clip)
+    
+    final_video = CompositeVideoClip([video, *subtitle_clips])
+    final_video.write_videofile(output_path, codec='libx264', audio_codec='aac')
+    final_video.close()
+    video.close()
+    audio.close()
 
-    for element in report_text.get('elements', []):
-        logger.debug(f"Processing element: {json.dumps(element, indent=2)}")
-        indent = element.get('indent', 0)
-        level = element.get('level', 1)
-        element_type = element.get('type', 'section')
-        
-        if element_type == 'table':
-            table_data = element.get('table_data', {})
-            headers = table_data.get("headers", [])
-            rows = table_data.get("rows", [])
-
-            # Ensure both headers and rows are not empty
-            if not headers or not rows:
-                logger.warning("Table data missing headers or rows.")
-                continue
-
-            # Create table ensuring it matches the header column count
-            table = doc.add_table(rows=len(rows)+1, cols=len(headers))
-            hdr_cells = table.rows[0].cells
-
-            # Populate headers
-            for i, header in enumerate(headers):
-                if i >= len(hdr_cells):
-                    logger.warning(f"Table column index [{i}] out of range during header population.")
-                    break
-                hdr_cells[i].text = header
-
-            # Populate rows
-            for row_idx, row_data in enumerate(rows, start=1):
-                row_cells = table.rows[row_idx].cells
-                for col_idx, cell_text in enumerate(row_data):
-                    if col_idx >= len(row_cells):
-                        logger.warning(f"Table column index [{col_idx}] out of range during row population.")
-                        break
-                    row_cells[col_idx].text = cell_text
-
-            doc.add_paragraph()  # Add a space after the table
-        else:
-            content = element.get('content', '')
-            paragraph = doc.add_paragraph()
-            run = paragraph.add_run(content)
-            run.font.size = Pt(12)  # Set font size
-            
-            # Manage indentation and ensure it's within reasonable bounds
-            try:
-                indent_pt = Pt(float(indent) * 10)
-                if -2147483648 <= indent_pt <= 2147483647:
-                    paragraph.paragraph_format.left_indent = indent_pt
-                else:
-                    logger.warning(f"Indent value {indent_pt} is out of bounds, skipping indentation for this element.")
-            except ValueError:
-                logger.warning(f"Invalid indent value '{indent}' encountered, skipping indentation.")
-
-    doc_output = BytesIO()
-    doc.save(doc_output)
-    doc_output.seek(0)
-    return doc_output
-
-
-def process_document(image_data, language):
-    try:
-        response = safe_gemini_call(image_data)
-        parsed_data = parse_response(response)
-        
-        translated_data = {"elements": []}
-        for element in parsed_data.get('elements', []):
-            if element.get('type') == 'table':
-                translated_table_data = translate_table_data(element.get('table_data', {}), language)
-                translated_data['elements'].append({
-                    "type": "table",
-                    "table_data": translated_table_data,
-                    "level": element.get('level', 1),
-                    "indent": element.get('indent', 0)
-                })
-            else:
-                translated_content = translate_text(element.get('content', ''), language)
-                translated_data['elements'].append({
-                    "type": element.get('type', 'section'),
-                    "content": translated_content,
-                    "level": element.get('level', 1),
-                    "indent": element.get('indent', 0)
-                })
-
-        if not translated_data['elements']:
-            logger.warning("No elements found after processing document.")
-        
-        return translated_data
-    except Exception as e:
-        logger.error(f"Document processing error: {str(e)}")
-        raise
-
+#########################
+# Main Streamlit App
+#########################
 def main():
-    st.title("Document Translator")
+    st.title("Video Translator: English → Spanish with Subtitles")
+    st.write("Upload an English video to translate its audio to Spanish and overlay English subtitles.")
 
-    # Sidebar navigation
-    page = st.sidebar.selectbox("Choose a page:", ["Translate Document", "Translate Text"])
-
-    if page == "Translate Document":
-        translate_document_page()
-    elif page == "Translate Text":
-        translate_text_page()
-
-def translate_document_page():
-    option = st.selectbox("Select document type:", ["PDF", "Image"])
+    uploaded_video = st.file_uploader("Upload Video", type=["mp4", "mov", "avi"])
     
-    if option == "PDF":
-        uploaded_file = st.file_uploader("Upload PDF document", type="pdf")
-    else:
-        uploaded_file = st.file_uploader("Upload image", type=["png", "jpg", "jpeg"])
+    if uploaded_video is not None:
+        # Save the uploaded video to a temporary file.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video_file:
+            temp_video_file.write(uploaded_video.read())
+            temp_video_path = temp_video_file.name
+        
+        st.video(temp_video_path)
 
-    language = st.selectbox("Source language:", ["English", "Chinese", "Japanese", "Russian", "German", "Ukrainian"])
+        if st.button("Translate Video"):
+            with st.spinner("Processing video..."):
+                try:
+                    # Open the video clip and extract its duration.
+                    video_clip = VideoFileClip(temp_video_path)
+                    video_duration = video_clip.duration
+                    # Save audio to a temporary WAV file.
+                    temp_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                    temp_audio_path = temp_audio_file.name
+                    temp_audio_file.close()
+                    video_clip.audio.write_audiofile(temp_audio_path, codec='pcm_s16le')
+                    video_clip.close()
 
-    download_button_placeholder = st.empty()
-    combined_data = {"elements": []}
+                    # Transcribe the extracted audio (offline)
+                    st.info("Transcribing audio...")
+                    transcript = transcribe_audio(temp_audio_path)
+                    if not transcript:
+                        st.error("Could not transcribe audio.")
+                        return
 
-    if st.button("Translate"):
-        if uploaded_file:
-            uploaded_filename = os.path.splitext(uploaded_file.name)[0]
-            try:
-                with st.spinner('Processing document...'):
-                    if option == "PDF":
-                        images = extract_images_from_pdf(uploaded_file)
-                        if not images:
-                            st.error("Could not extract images from PDF.")
-                            return
-                        progress = st.progress(0)
-                        for idx, img_data in enumerate(images):
-                            try:
-                                image = GeminiImage.from_bytes(img_data)
-                                page_data = process_document(image, language)
-                                combined_data['elements'].extend(page_data['elements'])
-                            except Exception as e:
-                                st.error(f"An error occurred on page {idx + 1}: {str(e)}")
-                                break
-                            progress.progress((idx + 1) / len(images))
-                        logger.debug(f"Combined data before docx creation: {json.dumps(combined_data, indent=2)}")
-                        output_file = create_docx(combined_data)
-                    else:
-                        st.image(uploaded_file, caption='Original Document', use_column_width=True)
-                        image = GeminiImage.from_bytes(uploaded_file.getvalue())
-                        translated_data = process_document(image, language)
-                        combined_data['elements'].extend(translated_data['elements'])
-                        logger.debug(f"Combined data before docx creation: {json.dumps(combined_data, indent=2)}")
-                        output_file = create_docx(combined_data)
+                    # Translate the transcript from English to Spanish using Gemini.
+                    st.info("Translating transcript to Spanish...")
+                    translated_text = translate_to_spanish(transcript)
+
+                    # Generate Spanish audio using gTTS.
+                    st.info("Generating Spanish audio...")
+                    temp_spanish_audio_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                    temp_spanish_audio_path = temp_spanish_audio_file.name
+                    temp_spanish_audio_file.close()
+                    generate_spanish_audio(translated_text, temp_spanish_audio_path)
+
+                    # Create English subtitles from the original transcript.
+                    st.info("Creating subtitles...")
+                    subtitles = create_subtitles(transcript, video_duration)
+
+                    # Merge the video with the new Spanish audio and subtitles.
+                    st.info("Merging video, audio, and subtitles...")
+                    temp_output_video_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    output_video_path = temp_output_video_file.name
+                    temp_output_video_file.close()
+                    merge_video_audio(temp_video_path, temp_spanish_audio_path, subtitles, output_video_path)
+
+                    st.success("Video translation completed!")
+                    st.video(output_video_path)
+                    with open(output_video_path, "rb") as video_file:
+                        st.download_button("Download Translated Video",
+                                           video_file.read(),
+                                           file_name="translated_video.mp4",
+                                           mime="video/mp4")
                     
-                    if not output_file:
-                        st.error("Error generating the DOCX file.")
-                    else:
-                        download_button_placeholder.download_button(
-                            "Download Translated DOCX",
-                            data=output_file.getvalue(),
-                            file_name=f"{uploaded_filename}_translated.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-                logger.exception("Processing error")
-                if combined_data['elements']:
-
-                    output_file = create_docx(combined_data)
-                    download_button_placeholder.download_button(
-                        "Download Translated DOCX",
-                        data=output_file.getvalue(),
-                        file_name=f"{uploaded_filename}_translated.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    )
-        else:
-            st.error("Please upload a document to translate.")
-
-def translate_text_page():
-    st.header("Text Translator")
-
-    language = st.selectbox("Source language:", ["English", "Chinese", "Japanese", "Russian", "German", "ukrainian"])
-    input_text = st.text_area("Enter text to translate:", height=200)
-    
-    if st.button("Translate"):
-        if input_text.strip():
-            with st.spinner('Translating...'):
-                translated_text = translate_text(input_text, language)
-                st.text_area("Translated text:", value=translated_text, height=200)
-        else:
-            st.error("Please enter some text to translate.")
+                except Exception as e:
+                    st.error(f"An error occurred during processing: {str(e)}")
+                    logger.exception("Processing error")
+                finally:
+                    # Clean up temporary files
+                    for path in [temp_video_path, temp_audio_path, temp_spanish_audio_path]:
+                        try:
+                            if os.path.exists(path):
+                                os.remove(path)
+                        except Exception as cleanup_e:
+                            logger.error(f"Error cleaning up temporary file {path}: {cleanup_e}")
 
 if __name__ == "__main__":
     main()
-
