@@ -2,51 +2,96 @@ import os
 import streamlit as st
 import tempfile
 import logging
-from google import genai
+import google.auth
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    GenerationConfig,
+    Part,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold
+)
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-# Initialize the client (no location or explicit project ID is provided)
-client = genai.Client()
+# Gemini configuration exactly as per your template (no location or explicit project ID)
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
 
-st.title("Gemini Audio Transcription & Description")
-st.write("Upload an audio file to transcribe it in the format of timecode, speaker, and caption.")
+# Initialize models
+transcription_model = GenerativeModel("gemini-1.5-flash-002")
+translation_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# Upload an audio file (mp3 or wav)
+# Safety settings required for Gemini filter
+safety_config = [
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+]
+
+# Transcription prompt
+transcription_prompt = """
+Can you transcribe this interview, in the format of timecode, speaker, caption.
+Use speaker A, speaker B, etc. to identify speakers.
+"""
+
+st.title("Gemini Audio Transcription & Translation")
+st.write("Upload an audio file to obtain English captions and a Spanish translation.")
+
+# Upload audio file
 uploaded_audio = st.file_uploader("Upload Audio File", type=["mp3", "wav"])
 if uploaded_audio is not None:
-    # Save the uploaded file to a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
-        tmp_file.write(uploaded_audio.read())
-        file_path = tmp_file.name
-    st.write(f"Audio file saved locally at: {file_path}")
-
-    try:
-        # Upload the local file to Gemini using the new API method
-        myfile = client.files.upload(file=file_path)
-    except Exception as e:
-        st.error(f"Error uploading file: {e}")
-        logger.error("File upload error", exc_info=True)
-    else:
-        # Define the transcription prompt
-        prompt = (
-            "Can you transcribe this interview, in the format of timecode, speaker, caption.\n"
-            "Use speaker A, speaker B, etc. to identify speakers."
+    # Save the uploaded file locally
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio_file:
+        temp_audio_file.write(uploaded_audio.read())
+        audio_path = temp_audio_file.name
+    st.write(f"Audio file saved to: {audio_path}")
+    
+    # Create a file:// URI from the local file path
+    audio_uri = f"file://{audio_path}"
+    # Create a Part from the local file URI
+    audio_part = Part.from_uri(audio_uri, mime_type="audio/mpeg")
+    
+    # Transcription step: Generate English captions using Gemini-1.5
+    contents = [audio_part, transcription_prompt]
+    with st.spinner("Transcribing audio..."):
+        transcription_response = transcription_model.generate_content(
+            contents,
+            generation_config=GenerationConfig(audio_timestamp=True),
+            safety_settings=safety_config
         )
-        # Create the contents array with the prompt and the uploaded file
-        contents = [prompt, myfile]
-        try:
-            # Generate content using the specified Gemini model
-            response = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=contents
-            )
-            output_text = response.text
-            st.subheader("Gemini Output")
-            st.text_area("Output", output_text, height=300)
-            st.download_button("Download Output", output_text, file_name="output.txt", mime="text/plain")
-        except Exception as e:
-            st.error(f"Error generating content: {e}")
-            logger.error("Content generation error", exc_info=True)
+    english_captions = transcription_response.text
+    st.subheader("English Captions")
+    st.text_area("English Captions", english_captions, height=200)
+    st.download_button("Download English Captions", english_captions, file_name="english_captions.txt", mime="text/plain")
+    
+    # Translation step: Translate the English captions into Spanish using Gemini-2.0
+    translation_prompt = f"Translate the following English text to Spanish:\n\n{english_captions}"
+    with st.spinner("Translating to Spanish..."):
+        translation_response = translation_model.generate_content(
+            [translation_prompt],
+            safety_settings=safety_config
+        )
+    spanish_text = translation_response.text
+    st.subheader("Spanish Translation")
+    st.text_area("Spanish Translation", spanish_text, height=200)
+    st.download_button("Download Spanish Translation", spanish_text, file_name="spanish_translation.txt", mime="text/plain")
