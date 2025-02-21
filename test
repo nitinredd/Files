@@ -3,6 +3,9 @@ import tempfile
 import moviepy.editor as mpe
 import srt
 from datetime import timedelta
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
 
 def save_uploaded_file(uploaded_file, suffix):
     """Save an uploaded file to a temporary file and return the filename."""
@@ -15,62 +18,103 @@ def parse_srt(srt_path):
     """Parse an SRT file and return a list of subtitle objects."""
     with open(srt_path, "r", encoding="utf-8") as f:
         srt_content = f.read()
-    subtitles = list(srt.parse(srt_content))
+    try:
+        subtitles = list(srt.parse(srt_content))
+    except Exception as e:
+        raise ValueError(f"Error parsing SRT file: {e}")
     return subtitles
 
-def create_subtitle_clips(subtitles, video_width, video_height):
-    """Create a list of TextClips (using method='caption' to avoid ImageMagick)
-    that are positioned at the bottom center of the video."""
+def create_subtitle_image(text, max_width, font_size=24):
+    """
+    Create a PIL image (with transparent background) containing the wrapped text.
+    This uses Pillow to render text instead of relying on ImageMagick.
+    """
+    # Try to load a TrueType font; fallback to the default font if unavailable.
+    try:
+        font = ImageFont.truetype("arial.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # Estimate the maximum number of characters per line.
+    avg_char_width = font_size * 0.6
+    max_chars = int(max_width / avg_char_width)
+    wrapped_text = textwrap.fill(text, width=max_chars)
+    lines = wrapped_text.splitlines()
+
+    # Create a dummy image to calculate text size.
+    dummy_img = Image.new("RGB", (10, 10))
+    draw = ImageDraw.Draw(dummy_img)
+    line_sizes = [draw.textsize(line, font=font) for line in lines]
+    max_line_width = max(width for width, height in line_sizes)
+    total_height = sum(height for width, height in line_sizes)
+
+    # Create an image with a transparent background.
+    img = Image.new("RGBA", (max_line_width, total_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    y = 0
+    for line, (w, h) in zip(lines, line_sizes):
+        draw.text((0, y), line, font=font, fill="white")
+        y += h
+    return img
+
+def create_subtitle_clip(sub, video_width, video_height, font_size=24, margin=20):
+    """
+    Create an ImageClip for a single subtitle using a Pillow-generated image.
+    """
+    start_time = sub.start.total_seconds()
+    duration = (sub.end - sub.start).total_seconds()
+    max_width = video_width - 2 * margin
+
+    pil_img = create_subtitle_image(sub.content, max_width, font_size)
+    img_array = np.array(pil_img)
+
+    # Create an ImageClip from the numpy array.
+    clip = mpe.ImageClip(img_array, ismask=False).set_duration(duration).set_start(start_time)
+    # Position the subtitle clip at the bottom center with a margin.
+    clip = clip.set_position(lambda t: ('center', video_height - pil_img.height - margin))
+    return clip
+
+def create_subtitle_clips(subtitles, video_width, video_height, font_size=24, margin=20):
+    """Create ImageClips for all subtitle entries."""
     clips = []
-    # Set a margin for the text area
-    margin = 20
     for sub in subtitles:
-        duration = (sub.end - sub.start).total_seconds()
-        # Create a text clip using the "caption" method which renders using ffmpeg
-        txt_clip = mpe.TextClip(
-            sub.content,
-            fontsize=24,
-            color='white',
-            method='caption',  # use caption method to avoid ImageMagick
-            size=(video_width - 2*margin, None),
-            align='center'
-        )
-        # Set the start time, duration, and position (bottom center)
-        txt_clip = txt_clip.set_start(sub.start.total_seconds()) \
-                           .set_duration(duration) \
-                           .set_position(('center', video_height - txt_clip.h - margin))
-        clips.append(txt_clip)
+        try:
+            clip = create_subtitle_clip(sub, video_width, video_height, font_size, margin)
+            clips.append(clip)
+        except Exception as e:
+            st.error(f"Error creating subtitle clip for text: {sub.content}. Error: {e}")
     return clips
 
 def process_video(video_path, audio_path, srt_path, output_path="translated_video.mp4"):
+    """
+    Process the video by replacing its audio with the Spanish MP3 and burning in the subtitles.
+    """
     # Load the original video and remove its audio.
     video = mpe.VideoFileClip(video_path).without_audio()
 
     # Load the Spanish audio.
     audio = mpe.AudioFileClip(audio_path)
-    # Ensure the audio length does not exceed the video duration.
     if audio.duration > video.duration:
         audio = audio.subclip(0, video.duration)
 
-    # Parse the subtitle file.
+    # Parse the SRT file.
     subtitles = parse_srt(srt_path)
     subtitle_clips = create_subtitle_clips(subtitles, video.w, video.h)
 
-    # Composite the video with the subtitle text clips.
+    # Composite the video with the subtitle image clips.
     final_clip = mpe.CompositeVideoClip([video, *subtitle_clips])
     final_clip = final_clip.set_audio(audio)
 
     # Write the final video file.
-    # The codec "libx264" and audio codec "aac" are used by default.
     final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
     return output_path
 
 def main():
-    st.title("Video Translation Merger")
+    st.title("Video Translation Merger (Native – No External Software)")
     st.markdown("""
-    Upload your original video file, the Spanish audio (MP3), and the subtitle file (SRT).
+    Upload your original video, Spanish audio (MP3), and SRT subtitle file.
     This app will replace the original audio with your Spanish audio and burn the subtitles
-    into the video without requiring external software like ImageMagick.
+    into the video without requiring any external software like ImageMagick.
     """)
 
     video_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi"])
@@ -82,11 +126,10 @@ def main():
             st.error("Please upload all three files before processing.")
             return
 
-        # Save uploaded files to temporary locations
         with st.spinner("Saving uploaded files..."):
-            video_path = save_uploaded_file(video_file, suffix=".mp4")
-            audio_path = save_uploaded_file(audio_file, suffix=".mp3")
-            srt_path = save_uploaded_file(srt_file, suffix=".srt")
+            video_path = save_uploaded_file(video_file, ".mp4")
+            audio_path = save_uploaded_file(audio_file, ".mp3")
+            srt_path = save_uploaded_file(srt_file, ".srt")
 
         st.info("Processing video. This may take a few minutes...")
         try:
