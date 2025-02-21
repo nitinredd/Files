@@ -1,147 +1,77 @@
 import streamlit as st
+import PyPDF2
+import io
+from gtts import gTTS
 import tempfile
-import moviepy.editor as mpe
-import srt
-from datetime import timedelta
-import numpy as np
-from PIL import Image, ImageDraw, ImageFont
-import textwrap
+import os
 
-def save_uploaded_file(uploaded_file, suffix):
-    """Save an uploaded file to a temporary file and return the filename."""
-    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tfile.write(uploaded_file.read())
-    tfile.close()
-    return tfile.name
+def extract_text_from_pdf(pdf_file):
+    """Extract text from uploaded PDF file"""
+    pdf_reader = PyPDF2.PdfReader(pdf_file)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    return text
 
-def parse_srt(srt_path):
-    """Parse an SRT file and return a list of subtitle objects."""
-    with open(srt_path, "r", encoding="utf-8") as f:
-        srt_content = f.read()
+def text_to_speech(text, language='es'):
+    """Convert text to speech using gTTS"""
     try:
-        subtitles = list(srt.parse(srt_content))
+        # Create gTTS object
+        tts = gTTS(text=text, lang=language, slow=False)
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+            temp_filename = fp.name
+            # Save speech to temporary file
+            tts.save(temp_filename)
+            return temp_filename
     except Exception as e:
-        raise ValueError(f"Error parsing SRT file: {e}")
-    return subtitles
-
-def create_subtitle_image(text, max_width, font_size=24):
-    """
-    Create a PIL image (with transparent background) containing the wrapped text.
-    This uses Pillow to render text instead of relying on ImageMagick.
-    """
-    # Try to load a TrueType font; fallback to the default font if unavailable.
-    try:
-        font = ImageFont.truetype("arial.ttf", font_size)
-    except Exception:
-        font = ImageFont.load_default()
-
-    # Estimate the maximum number of characters per line.
-    avg_char_width = font_size * 0.6
-    max_chars = int(max_width / avg_char_width)
-    wrapped_text = textwrap.fill(text, width=max_chars)
-    lines = wrapped_text.splitlines()
-
-    # Create a dummy image to calculate text size.
-    dummy_img = Image.new("RGB", (10, 10))
-    draw = ImageDraw.Draw(dummy_img)
-    line_sizes = [draw.textsize(line, font=font) for line in lines]
-    max_line_width = max(width for width, height in line_sizes)
-    total_height = sum(height for width, height in line_sizes)
-
-    # Create an image with a transparent background.
-    img = Image.new("RGBA", (max_line_width, total_height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    y = 0
-    for line, (w, h) in zip(lines, line_sizes):
-        draw.text((0, y), line, font=font, fill="white")
-        y += h
-    return img
-
-def create_subtitle_clip(sub, video_width, video_height, font_size=24, margin=20):
-    """
-    Create an ImageClip for a single subtitle using a Pillow-generated image.
-    """
-    start_time = sub.start.total_seconds()
-    duration = (sub.end - sub.start).total_seconds()
-    max_width = video_width - 2 * margin
-
-    pil_img = create_subtitle_image(sub.content, max_width, font_size)
-    img_array = np.array(pil_img)
-
-    # Create an ImageClip from the numpy array.
-    clip = mpe.ImageClip(img_array, ismask=False).set_duration(duration).set_start(start_time)
-    # Position the subtitle clip at the bottom center with a margin.
-    clip = clip.set_position(lambda t: ('center', video_height - pil_img.height - margin))
-    return clip
-
-def create_subtitle_clips(subtitles, video_width, video_height, font_size=24, margin=20):
-    """Create ImageClips for all subtitle entries."""
-    clips = []
-    for sub in subtitles:
-        try:
-            clip = create_subtitle_clip(sub, video_width, video_height, font_size, margin)
-            clips.append(clip)
-        except Exception as e:
-            st.error(f"Error creating subtitle clip for text: {sub.content}. Error: {e}")
-    return clips
-
-def process_video(video_path, audio_path, srt_path, output_path="translated_video.mp4"):
-    """
-    Process the video by replacing its audio with the Spanish MP3 and burning in the subtitles.
-    """
-    # Load the original video and remove its audio.
-    video = mpe.VideoFileClip(video_path).without_audio()
-
-    # Load the Spanish audio.
-    audio = mpe.AudioFileClip(audio_path)
-    if audio.duration > video.duration:
-        audio = audio.subclip(0, video.duration)
-
-    # Parse the SRT file.
-    subtitles = parse_srt(srt_path)
-    subtitle_clips = create_subtitle_clips(subtitles, video.w, video.h)
-
-    # Composite the video with the subtitle image clips.
-    final_clip = mpe.CompositeVideoClip([video, *subtitle_clips])
-    final_clip = final_clip.set_audio(audio)
-
-    # Write the final video file.
-    final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
-    return output_path
+        st.error(f"Error in text to speech conversion: {str(e)}")
+        return None
 
 def main():
-    st.title("Video Translation Merger (Native – No External Software)")
-    st.markdown("""
-    Upload your original video, Spanish audio (MP3), and SRT subtitle file.
-    This app will replace the original audio with your Spanish audio and burn the subtitles
-    into the video without requiring any external software like ImageMagick.
-    """)
+    st.title("Spanish PDF to Speech Converter")
+    st.write("Upload a PDF file with Spanish text to convert it to speech")
 
-    video_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi"])
-    audio_file = st.file_uploader("Upload Spanish Audio (MP3)", type=["mp3"])
-    srt_file = st.file_uploader("Upload Subtitle File (SRT)", type=["srt", "txt"])
+    # File uploader
+    uploaded_file = st.file_uploader("Choose a PDF file", type=['pdf'])
 
-    if st.button("Process Video"):
-        if not (video_file and audio_file and srt_file):
-            st.error("Please upload all three files before processing.")
-            return
-
-        with st.spinner("Saving uploaded files..."):
-            video_path = save_uploaded_file(video_file, ".mp4")
-            audio_path = save_uploaded_file(audio_file, ".mp3")
-            srt_path = save_uploaded_file(srt_file, ".srt")
-
-        st.info("Processing video. This may take a few minutes...")
+    if uploaded_file is not None:
         try:
-            output_filename = process_video(video_path, audio_path, srt_path)
+            # Extract text from PDF
+            text = extract_text_from_pdf(uploaded_file)
+
+            # Display extracted text
+            st.subheader("Extracted Text")
+            st.text_area("", text, height=200)
+
+            # Convert button
+            if st.button("Convert to Speech"):
+                with st.spinner("Converting text to speech..."):
+                    # Convert text to speech
+                    audio_file = text_to_speech(text)
+
+                    if audio_file:
+                        # Read the audio file
+                        with open(audio_file, 'rb') as f:
+                            audio_bytes = f.read()
+
+                        # Create download button
+                        st.audio(audio_bytes, format='audio/mp3')
+                        
+                        # Add download button for the audio file
+                        st.download_button(
+                            label="Download Audio",
+                            data=audio_bytes,
+                            file_name="spanish_audio.mp3",
+                            mime="audio/mp3"
+                        )
+
+                        # Clean up temporary file
+                        os.unlink(audio_file)
+
         except Exception as e:
-            st.error(f"An error occurred during processing: {e}")
-            return
+            st.error(f"Error processing the PDF: {str(e)}")
 
-        st.success("Video processing complete!")
-        st.video(output_filename)
-        with open(output_filename, "rb") as f:
-            st.download_button("Download Video", f, file_name=output_filename)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
