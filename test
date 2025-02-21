@@ -4,103 +4,114 @@ import os
 from pathlib import Path
 import tempfile
 import shutil
+import contextlib
 
-def process_video_pyav(video_file, audio_file, output_dir):
-    """Replace audio in video with new audio file using PyAV"""
-    try:
-        # Create temporary directory
-        temp_dir = tempfile.mkdtemp()
-        
-        # Save uploaded files to temporary directory
-        temp_video_path = os.path.join(temp_dir, "temp_video.mp4")
-        temp_audio_path = os.path.join(temp_dir, "temp_audio.mp3")
-        
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.join(output_dir, "spanish_video.mp4")
-        
-        # Save uploaded files
-        with open(temp_video_path, "wb") as f:
-            f.write(video_file.read())
-        with open(temp_audio_path, "wb") as f:
-            f.write(audio_file.read())
+class VideoProcessor:
+    def __init__(self):
+        self.temp_dir = None
+        self.input_video = None
+        self.input_audio = None
+        self.output = None
 
-        # Open input video
-        input_video = av.open(temp_video_path)
-        input_audio = av.open(temp_audio_path)
-        
-        # Open output video
-        output = av.open(output_path, 'w')
-        
-        # Copy video stream parameters
-        in_video_stream = input_video.streams.video[0]
-        out_video_stream = output.add_stream('h264', rate=in_video_stream.rate)
-        out_video_stream.width = in_video_stream.width
-        out_video_stream.height = in_video_stream.height
-        out_video_stream.pix_fmt = 'yuv420p'
-        
-        # Copy audio stream parameters
-        in_audio_stream = input_audio.streams.audio[0]
-        out_audio_stream = output.add_stream('aac', rate=in_audio_stream.rate)
-        
-        # Get video duration
-        video_duration = float(input_video.duration * input_video.time_base)
-        
-        # Process video frames
-        for frame in input_video.decode(video=0):
-            packet = out_video_stream.encode(frame)
-            output.mux(packet)
+    def __enter__(self):
+        self.temp_dir = tempfile.mkdtemp()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
+
+    def cleanup(self):
+        """Clean up all resources"""
+        if self.input_video:
+            self.input_video.close()
+        if self.input_audio:
+            self.input_audio.close()
+        if self.output:
+            self.output.close()
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            with contextlib.suppress(Exception):
+                shutil.rmtree(self.temp_dir)
+
+    def process_video(self, video_file, audio_file, output_dir):
+        """Replace audio in video with new audio file using PyAV"""
+        try:
+            # Create temporary file paths
+            temp_video_path = os.path.join(self.temp_dir, "temp_video.mp4")
+            temp_audio_path = os.path.join(self.temp_dir, "temp_audio.mp3")
             
-        # Process audio frames and adjust duration
-        audio_frames = []
-        for frame in input_audio.decode(audio=0):
-            audio_frames.append(frame)
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "spanish_video.mp4")
             
-        # Adjust audio duration to match video
-        target_samples = int(video_duration * in_audio_stream.rate)
-        current_samples = sum(len(frame.samples) for frame in audio_frames)
-        
-        if current_samples > target_samples:
-            # Trim audio
-            samples_so_far = 0
-            adjusted_frames = []
-            for frame in audio_frames:
-                if samples_so_far + len(frame.samples) <= target_samples:
-                    adjusted_frames.append(frame)
-                    samples_so_far += len(frame.samples)
-                else:
-                    remaining = target_samples - samples_so_far
-                    if remaining > 0:
-                        frame.samples = frame.samples[:remaining]
+            # Save uploaded files using with statements
+            with open(temp_video_path, "wb") as f:
+                f.write(video_file.read())
+            with open(temp_audio_path, "wb") as f:
+                f.write(audio_file.read())
+
+            # Open input files
+            self.input_video = av.open(temp_video_path)
+            self.input_audio = av.open(temp_audio_path)
+            
+            # Open output file
+            self.output = av.open(output_path, 'w')
+            
+            # Set up video stream
+            in_video_stream = self.input_video.streams.video[0]
+            out_video_stream = self.output.add_stream('h264', rate=in_video_stream.rate)
+            out_video_stream.width = in_video_stream.width
+            out_video_stream.height = in_video_stream.height
+            out_video_stream.pix_fmt = 'yuv420p'
+            
+            # Set up audio stream
+            in_audio_stream = self.input_audio.streams.audio[0]
+            out_audio_stream = self.output.add_stream('aac', rate=in_audio_stream.rate)
+            
+            # Get video duration
+            video_duration = float(self.input_video.duration * self.input_video.time_base)
+            
+            # Process video frames
+            for frame in self.input_video.decode(video=0):
+                packet = out_video_stream.encode(frame)
+                self.output.mux(packet)
+            
+            # Process audio frames
+            audio_frames = list(self.input_audio.decode(audio=0))
+            
+            # Adjust audio duration to match video
+            target_samples = int(video_duration * in_audio_stream.rate)
+            current_samples = sum(len(frame.samples) for frame in audio_frames)
+            
+            if current_samples > target_samples:
+                samples_so_far = 0
+                adjusted_frames = []
+                for frame in audio_frames:
+                    if samples_so_far + len(frame.samples) <= target_samples:
                         adjusted_frames.append(frame)
-                    break
-            audio_frames = adjusted_frames
-        
-        # Write audio frames
-        for frame in audio_frames:
-            packet = out_audio_stream.encode(frame)
-            output.mux(packet)
+                        samples_so_far += len(frame.samples)
+                    else:
+                        remaining = target_samples - samples_so_far
+                        if remaining > 0:
+                            frame.samples = frame.samples[:remaining]
+                            adjusted_frames.append(frame)
+                        break
+                audio_frames = adjusted_frames
             
-        # Flush streams
-        for packet in out_video_stream.encode():
-            output.mux(packet)
-        for packet in out_audio_stream.encode():
-            output.mux(packet)
+            # Write audio frames
+            for frame in audio_frames:
+                packet = out_audio_stream.encode(frame)
+                self.output.mux(packet)
             
-        # Close files
-        output.close()
-        input_video.close()
-        input_audio.close()
-        
-        # Clean up temporary directory
-        shutil.rmtree(temp_dir)
-        
-        return output_path
-        
-    except Exception as e:
-        if 'temp_dir' in locals():
-            shutil.rmtree(temp_dir)
-        raise e
+            # Flush streams
+            for packet in out_video_stream.encode():
+                self.output.mux(packet)
+            for packet in out_audio_stream.encode():
+                self.output.mux(packet)
+            
+            return output_path
+            
+        except Exception as e:
+            raise e
 
 def main():
     st.title("Video Audio Replacement Tool (PyAV)")
@@ -120,21 +131,22 @@ def main():
         if st.button("Replace Audio"):
             try:
                 with st.spinner("Processing... This may take a few minutes."):
-                    # Process the video
-                    output_path = process_video_pyav(video_file, audio_file, output_dir)
-                    
-                    # Show success message with file location
-                    st.success(f"Processing complete! Video saved to: {output_path}")
-                    
-                    # Add open folder button
-                    if st.button("Open Output Folder"):
-                        try:
-                            if os.name == 'nt':  # Windows
-                                os.system(f'explorer "{os.path.dirname(output_path)}"')
-                            elif os.name == 'posix':  # macOS and Linux
-                                os.system(f'open "{os.path.dirname(output_path)}"')
-                        except Exception as e:
-                            st.warning(f"Could not open folder automatically. Please navigate to: {output_path}")
+                    # Process the video using context manager
+                    with VideoProcessor() as processor:
+                        output_path = processor.process_video(video_file, audio_file, output_dir)
+                        
+                        # Show success message with file location
+                        st.success(f"Processing complete! Video saved to: {output_path}")
+                        
+                        # Add open folder button
+                        if st.button("Open Output Folder"):
+                            try:
+                                if os.name == 'nt':  # Windows
+                                    os.system(f'explorer "{os.path.dirname(output_path)}"')
+                                elif os.name == 'posix':  # macOS and Linux
+                                    os.system(f'open "{os.path.dirname(output_path)}"')
+                            except Exception as e:
+                                st.warning(f"Could not open folder automatically. Please navigate to: {output_path}")
                     
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
@@ -146,7 +158,7 @@ def main():
     - Make sure you have write permissions for the selected directory
     - The default directory is your Videos folder
     - The output video will be named 'spanish_video.mp4'
-    - This version uses PyAV for faster processing and better memory handling
+    - Processing may take a few minutes depending on file size
     """)
 
 if __name__ == "__main__":
