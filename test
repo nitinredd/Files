@@ -1,14 +1,14 @@
 import streamlit as st
-from moviepy.editor import VideoFileClip, AudioFileClip
-import tempfile
+import av
 import os
 from pathlib import Path
+import tempfile
 import shutil
 
-def process_video(video_file, audio_file, output_dir):
-    """Replace audio in video with new audio file"""
+def process_video_pyav(video_file, audio_file, output_dir):
+    """Replace audio in video with new audio file using PyAV"""
     try:
-        # Create temporary directory for processing
+        # Create temporary directory
         temp_dir = tempfile.mkdtemp()
         
         # Save uploaded files to temporary directory
@@ -24,31 +24,73 @@ def process_video(video_file, audio_file, output_dir):
             f.write(video_file.read())
         with open(temp_audio_path, "wb") as f:
             f.write(audio_file.read())
+
+        # Open input video
+        input_video = av.open(temp_video_path)
+        input_audio = av.open(temp_audio_path)
+        
+        # Open output video
+        output = av.open(output_path, 'w')
+        
+        # Copy video stream parameters
+        in_video_stream = input_video.streams.video[0]
+        out_video_stream = output.add_stream('h264', rate=in_video_stream.rate)
+        out_video_stream.width = in_video_stream.width
+        out_video_stream.height = in_video_stream.height
+        out_video_stream.pix_fmt = 'yuv420p'
+        
+        # Copy audio stream parameters
+        in_audio_stream = input_audio.streams.audio[0]
+        out_audio_stream = output.add_stream('aac', rate=in_audio_stream.rate)
+        
+        # Get video duration
+        video_duration = float(input_video.duration * input_video.time_base)
+        
+        # Process video frames
+        for frame in input_video.decode(video=0):
+            packet = out_video_stream.encode(frame)
+            output.mux(packet)
             
-        # Load video and audio
-        video = VideoFileClip(temp_video_path)
-        new_audio = AudioFileClip(temp_audio_path)
+        # Process audio frames and adjust duration
+        audio_frames = []
+        for frame in input_audio.decode(audio=0):
+            audio_frames.append(frame)
+            
+        # Adjust audio duration to match video
+        target_samples = int(video_duration * in_audio_stream.rate)
+        current_samples = sum(len(frame.samples) for frame in audio_frames)
         
-        # If audio is longer/shorter than video, adjust it to video duration
-        if new_audio.duration != video.duration:
-            new_audio = new_audio.set_duration(video.duration)
+        if current_samples > target_samples:
+            # Trim audio
+            samples_so_far = 0
+            adjusted_frames = []
+            for frame in audio_frames:
+                if samples_so_far + len(frame.samples) <= target_samples:
+                    adjusted_frames.append(frame)
+                    samples_so_far += len(frame.samples)
+                else:
+                    remaining = target_samples - samples_so_far
+                    if remaining > 0:
+                        frame.samples = frame.samples[:remaining]
+                        adjusted_frames.append(frame)
+                    break
+            audio_frames = adjusted_frames
         
-        # Replace audio
-        final_video = video.set_audio(new_audio)
-        
-        # Write output video to user-selected directory
-        final_video.write_videofile(
-            output_path,
-            codec='libx264',
-            audio_codec='aac',
-            temp_audiofile=os.path.join(output_dir, 'temp-audio.m4a'),
-            remove_temp=True
-        )
-        
-        # Close clips to free up resources
-        video.close()
-        new_audio.close()
-        final_video.close()
+        # Write audio frames
+        for frame in audio_frames:
+            packet = out_audio_stream.encode(frame)
+            output.mux(packet)
+            
+        # Flush streams
+        for packet in out_video_stream.encode():
+            output.mux(packet)
+        for packet in out_audio_stream.encode():
+            output.mux(packet)
+            
+        # Close files
+        output.close()
+        input_video.close()
+        input_audio.close()
         
         # Clean up temporary directory
         shutil.rmtree(temp_dir)
@@ -61,7 +103,7 @@ def process_video(video_file, audio_file, output_dir):
         raise e
 
 def main():
-    st.title("Video Audio Replacement Tool")
+    st.title("Video Audio Replacement Tool (PyAV)")
     st.write("Upload a video and a Spanish audio file to replace the original audio")
     
     # File uploaders
@@ -79,7 +121,7 @@ def main():
             try:
                 with st.spinner("Processing... This may take a few minutes."):
                     # Process the video
-                    output_path = process_video(video_file, audio_file, output_dir)
+                    output_path = process_video_pyav(video_file, audio_file, output_dir)
                     
                     # Show success message with file location
                     st.success(f"Processing complete! Video saved to: {output_path}")
@@ -104,6 +146,7 @@ def main():
     - Make sure you have write permissions for the selected directory
     - The default directory is your Videos folder
     - The output video will be named 'spanish_video.mp4'
+    - This version uses PyAV for faster processing and better memory handling
     """)
 
 if __name__ == "__main__":
