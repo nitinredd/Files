@@ -1,26 +1,104 @@
-To extract English captions with timestamps from an English audio file, you need a clear and specific instruction that an AI system can follow. Assuming you’re using an AI model capable of processing audio and generating timed transcriptions (such as a speech recognition model like OpenAI’s Whisper), here’s a robust prompt you can use:
+import streamlit as st
+import tempfile
+import moviepy.editor as mpe
+import srt
+from datetime import timedelta
 
----
+def save_uploaded_file(uploaded_file, suffix):
+    """Save an uploaded file to a temporary file and return the filename."""
+    tfile = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tfile.write(uploaded_file.read())
+    tfile.close()
+    return tfile.name
 
-**Prompt:**
+def parse_srt(srt_path):
+    """Parse an SRT file and return a list of subtitle objects."""
+    with open(srt_path, "r", encoding="utf-8") as f:
+        srt_content = f.read()
+    subtitles = list(srt.parse(srt_content))
+    return subtitles
 
-"Transcribe the provided audio file into English text, including timestamps for each segment of speech. Format the output so that each caption is on a separate line, with the start time and end time in HH:MM:SS format, followed by the spoken text. For example:
+def create_subtitle_clips(subtitles, video_width, video_height):
+    """Create a list of TextClips (using method='caption' to avoid ImageMagick)
+    that are positioned at the bottom center of the video."""
+    clips = []
+    # Set a margin for the text area
+    margin = 20
+    for sub in subtitles:
+        duration = (sub.end - sub.start).total_seconds()
+        # Create a text clip using the "caption" method which renders using ffmpeg
+        txt_clip = mpe.TextClip(
+            sub.content,
+            fontsize=24,
+            color='white',
+            method='caption',  # use caption method to avoid ImageMagick
+            size=(video_width - 2*margin, None),
+            align='center'
+        )
+        # Set the start time, duration, and position (bottom center)
+        txt_clip = txt_clip.set_start(sub.start.total_seconds()) \
+                           .set_duration(duration) \
+                           .set_position(('center', video_height - txt_clip.h - margin))
+        clips.append(txt_clip)
+    return clips
 
-[00:00:00 - 00:00:02] Hello, how are you?  
-[00:00:03 - 00:00:05] I'm fine, thank you.
+def process_video(video_path, audio_path, srt_path, output_path="translated_video.mp4"):
+    # Load the original video and remove its audio.
+    video = mpe.VideoFileClip(video_path).without_audio()
 
-Please ensure that the captions are appropriately divided, with each caption covering a short segment of speech, suitable for use as subtitles."
+    # Load the Spanish audio.
+    audio = mpe.AudioFileClip(audio_path)
+    # Ensure the audio length does not exceed the video duration.
+    if audio.duration > video.duration:
+        audio = audio.subclip(0, video.duration)
 
----
+    # Parse the subtitle file.
+    subtitles = parse_srt(srt_path)
+    subtitle_clips = create_subtitle_clips(subtitles, video.w, video.h)
 
-### Why This Prompt Works:
-1. **Clarity**: It explicitly states the task (transcribe audio into English) and specifies the need for timestamps.
-2. **Format Specification**: It defines the exact output format (start time, end time, and text) using the HH:MM:SS convention, making it unambiguous.
-3. **Example**: The sample output helps the AI understand the expected structure, reducing the chance of misinterpretation.
-4. **Practicality**: Requesting "short segments of speech" aligns with typical captioning needs (e.g., subtitles), ensuring the result is usable without being overly granular (like word-by-word timestamps).
+    # Composite the video with the subtitle text clips.
+    final_clip = mpe.CompositeVideoClip([video, *subtitle_clips])
+    final_clip = final_clip.set_audio(audio)
 
-### Notes:
-- This prompt assumes the AI system can access the audio file (e.g., via an upload or attachment). If you’re using a specific platform, you might need to adjust the phrasing slightly (e.g., "the uploaded audio file").
-- If you need a specific captioning format like SRT or WebVTT, you could replace the format description with "Provide the transcription in SRT format," assuming the AI supports it.
+    # Write the final video file.
+    # The codec "libx264" and audio codec "aac" are used by default.
+    final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+    return output_path
 
-This prompt should effectively guide an capable AI system to produce the timed English captions you’re looking for!
+def main():
+    st.title("Video Translation Merger")
+    st.markdown("""
+    Upload your original video file, the Spanish audio (MP3), and the subtitle file (SRT).
+    This app will replace the original audio with your Spanish audio and burn the subtitles
+    into the video without requiring external software like ImageMagick.
+    """)
+
+    video_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi"])
+    audio_file = st.file_uploader("Upload Spanish Audio (MP3)", type=["mp3"])
+    srt_file = st.file_uploader("Upload Subtitle File (SRT)", type=["srt", "txt"])
+
+    if st.button("Process Video"):
+        if not (video_file and audio_file and srt_file):
+            st.error("Please upload all three files before processing.")
+            return
+
+        # Save uploaded files to temporary locations
+        with st.spinner("Saving uploaded files..."):
+            video_path = save_uploaded_file(video_file, suffix=".mp4")
+            audio_path = save_uploaded_file(audio_file, suffix=".mp3")
+            srt_path = save_uploaded_file(srt_file, suffix=".srt")
+
+        st.info("Processing video. This may take a few minutes...")
+        try:
+            output_filename = process_video(video_path, audio_path, srt_path)
+        except Exception as e:
+            st.error(f"An error occurred during processing: {e}")
+            return
+
+        st.success("Video processing complete!")
+        st.video(output_filename)
+        with open(output_filename, "rb") as f:
+            st.download_button("Download Video", f, file_name=output_filename)
+
+if __name__ == '__main__':
+    main()
