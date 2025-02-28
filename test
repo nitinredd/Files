@@ -1,3 +1,453 @@
-This application addresses the challenge of accurately evaluating drug dissolution profile similarity between reference and generic formulations for regulatory approval, offering an automated solution that calculates the f2 similarity factor, generates dissolution curves with error intervals, and performs compliance checks across multiple regulatory frameworks (FDA, EMA, WHO). By streamlining bioequivalence assessment through automated complex statistical calculations (including bootstrapping for confidence intervals), visualization tools for clear data interpretation, and built-in quality control validations for critical parameters, the tool significantly reduces human error while accelerating regulatory submissions for pharmaceutical developers adapting to various regional guidelines.
-###
-This application solves the critical challenge of comparing drug dissolution profiles between reference and generic formulations, automating complex statistical analyses required for regulatory approval. It streamlines bioequivalence assessment through precise calculations, visual representations, and built-in compliance checks across global regulatory frameworks, significantly reducing errors and accelerating the path to market for new medications.
+# -------------------------- ORIGINAL IMPORTS & SETUP --------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import itertools
+import warnings
+from scipy.interpolate import interp1d  # For fallback interpolation
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+
+# For demonstration, we create dummy dissolution data.
+# In practice, load your reference and test data.
+times = np.array([0, 15, 30, 45, 60, 90, 120])
+ref_dissolution = np.array([0, 25, 50, 65, 75, 85, 90])
+test_dissolution = np.array([0, 20, 45, 60, 70, 80, 88])
+reference_df = pd.DataFrame({'Time': times, 'Dissolution': ref_dissolution})
+test_df = pd.DataFrame({'Time': times, 'Dissolution': test_dissolution})
+
+# ======================== STAGE 1: Determine Candidate Time Window ========================
+def interpolate_linear(df, new_times):
+    """
+    Simple linear interpolation (used for determining the candidate window).
+    """
+    df_sorted = df.sort_values(by=df.columns[0])
+    known_times = df_sorted.iloc[:, 0].values.astype(float)
+    known_values = df_sorted.iloc[:, 1].values
+    f = interp1d(known_times, known_values, kind='linear', fill_value=(known_values[0], known_values[-1]))
+    return f(new_times)
+
+def determine_candidate_window(ref_df, test_df, fixed_min=0, fixed_max=120, step=1, initial_threshold=10):
+    """
+    Identify a candidate time window from the overall fixed range (e.g. 0-120 minutes)
+    where the absolute difference between the reference and test profiles (via linear interpolation)
+    is below the given threshold.
+    
+    If no time points satisfy the 10-unit difference, then try 20.
+    Returns (window_min, window_max). (window_min is forced to 0 due to regulatory requirements.)
+    """
+    times = np.arange(fixed_min, fixed_max + 1, step)
+    ref_vals = interpolate_linear(ref_df, times)
+    test_vals = interpolate_linear(test_df, times)
+    diff = np.abs(ref_vals - test_vals)
+    
+    valid_times = times[diff <= initial_threshold]
+    if len(valid_times) == 0:
+        print(f"No time points found within {initial_threshold}% difference; trying threshold=20.")
+        valid_times = times[diff <= 20]
+        if len(valid_times) == 0:
+            print("No candidate window found even with 20% threshold. Using full range.")
+            return fixed_min, fixed_max
+        else:
+            window_max = valid_times[-1]
+            print(f"Candidate window determined (threshold 20): {fixed_min} to {window_max}")
+            return fixed_min, window_max
+    else:
+        window_max = valid_times[-1]
+        print(f"Candidate window determined (threshold {initial_threshold}): {fixed_min} to {window_max}")
+        return fixed_min, window_max
+
+# Determine the candidate window using a fixed overall range of 0-120 minutes.
+window_min, window_max = determine_candidate_window(reference_df, test_df, fixed_min=0, fixed_max=120, step=1, initial_threshold=10)
+
+# ======================== STAGE 2: Helper & Predictive Analysis Functions ========================
+def generate_all_time_combinations(min_time, max_time, step=1):
+    """
+    Generate all possible time point sequences within the interval [min_time, max_time],
+    ensuring that 0 is fixed at the start and that there are at least 3 points.
+    """
+    times = list(range(min_time, max_time + 1, step))
+    if 0 not in times:
+        times.insert(0, 0)
+    all_combinations = []
+    for r in range(2, len(times)):
+        for combo in itertools.combinations(times[1:], r):
+            seq = [0] + list(combo)
+            all_combinations.append(sorted(seq))
+    return list(all_combinations)
+
+def interpolate_dissolution_curve(df, new_times, method='gpr'):
+    """
+    Predict dissolution values at new time points.
+    If method=='gpr', use Gaussian Process Regression (GPR) for interpolation.
+    Otherwise, fall back to linear (or cubic) interpolation.
+    """
+    df_sorted = df.sort_values(by=df.columns[0])
+    X = df_sorted.iloc[:, 0].values.reshape(-1, 1)
+    y = df_sorted.iloc[:, 1].values
+    new_times_arr = np.array(new_times).reshape(-1, 1)
+    
+    if method == 'gpr':
+        # Define kernel: constant * RBF + white noise.
+        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0, length_scale_bounds=(1e-2, 1e2)) + \
+                 WhiteKernel(noise_level=1, noise_level_bounds=(1e-5, 1e1))
+        gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+        gp.fit(X, y)
+        y_pred, sigma = gp.predict(new_times_arr, return_std=True)
+        return y_pred
+    else:
+        known_times = df_sorted.iloc[:, 0].values.astype(float)
+        known_values = y
+        if len(known_times) < 2:
+            return np.full(len(new_times), known_values[0]) if len(known_values) > 0 else np.zeros(len(new_times))
+        if method == 'cubic' and len(known_times) >= 4:
+            f = interp1d(known_times, known_values, kind='cubic', fill_value='extrapolate')
+        else:
+            f = interp1d(known_times, known_values, kind='linear', fill_value=(known_values[0], known_values[-1]))
+        return f(new_times_arr.flatten())
+
+def check_regulatory_compliance(seq, regulation, ref_means, test_means):
+    """
+    Check if a candidate sequence satisfies the selected regulatory rules.
+    Rules implemented:
+      - FDA: Any ≥85% dissolution must appear only at the final time.
+      - EMA: All time points must be below 85% and at least 4 points are required.
+      - China: All reference values must be below 85%.
+      - ASEAN: The first 3 time points for both reference and test must be below 85%.
+      - ANVISA: The first time point must be 0.
+    Returns (compliant, reasons).
+    """
+    compliant = True
+    reasons = []
+    
+    if regulation == "FDA":
+        over_85_ref = [t for t in seq if ref_means[t] >= 85]
+        over_85_test = [t for t in seq if test_means[t] >= 85]
+        if over_85_ref or over_85_test:
+            last_t = seq[-1]
+            if not (last_t in over_85_ref or last_t in over_85_test):
+                compliant = False
+                reasons.append("85%+ dissolution not at last time")
+    elif regulation == "EMA":
+        if any(ref_means[t] >= 85 or test_means[t] >= 85 for t in seq):
+            compliant = False
+            reasons.append("Dissolution ≥85% detected")
+        if len(seq) < 4:
+            compliant = False
+            reasons.append("Insufficient time points (<4)")
+    elif regulation == "China":
+        if any(ref_means[t] >= 85 for t in seq):
+            compliant = False
+            reasons.append("Reference dissolution ≥85%")
+    elif regulation == "ASEAN":
+        first_three = seq[:3] if len(seq) >= 3 else seq
+        if any(ref_means[t] >= 85 for t in first_three):
+            compliant = False
+            reasons.append("Reference ≥85% in first 3 points")
+        if any(test_means[t] >= 85 for t in first_three):
+            compliant = False
+            reasons.append("Test ≥85% in first 3 points")
+    elif regulation == "ANVISA":
+        if seq[0] != 0:
+            compliant = False
+            reasons.append("Missing 0 as first time point")
+    
+    return (compliant, reasons)
+
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, window_min, window_max, diff_threshold, interp_method='gpr'):
+    """
+    Advanced predictive analysis using recursive backtracking (branch-and-bound).
+    Candidate sequences are generated only within the interval [window_min, window_max].
+    The function prunes sequences that do not meet:
+      - A final dissolution requirement (≥80% for both profiles),
+      - Regulatory compliance,
+      - And (if diff_threshold is set) a per-time-point difference condition.
+    Returns:
+      - best_result: Candidate sequence with highest f2,
+      - results_sorted: All compliant candidate sequences (sorted by f2 descending).
+    """
+    best_result = None
+    best_f2 = -np.inf
+    results = []
+    times_list = list(range(window_min, window_max + 1))
+    
+    def search_sequence(seq, next_index):
+        nonlocal best_result, best_f2
+        if len(seq) >= 3:
+            ref_interp = interpolate_dissolution_curve(ref_df, seq, method=interp_method)
+            test_interp = interpolate_dissolution_curve(test_df, seq, method=interp_method)
+            
+            # If a diff threshold is set, ensure every time point's absolute difference is within that threshold.
+            if diff_threshold is not None:
+                if any(np.abs(np.array(ref_interp) - np.array(test_interp)) > diff_threshold):
+                    return
+            # Final time point must reach at least 80% dissolution.
+            if ref_interp[-1] < 80 or test_interp[-1] < 80:
+                return
+            
+            ref_dict = {t: val for t, val in zip(seq, ref_interp)}
+            test_dict = {t: val for t, val in zip(seq, test_interp)}
+            compliant, reasons = check_regulatory_compliance(seq, regulation, ref_dict, test_dict)
+            diff = np.array(test_interp) - np.array(ref_interp)
+            sum_sq = (diff ** 2).sum()
+            p = len(seq)
+            f2 = 100 - 25 * np.log10(1 + (sum_sq / p)) if p > 0 else 0
+            
+            candidate = {
+                "sequence": seq.copy(),
+                "f2": round(f2, 2),
+                "compliant": compliant,
+                "reasons": reasons
+            }
+            results.append(candidate)
+            if compliant and f2 > best_f2:
+                best_f2 = f2
+                best_result = candidate.copy()
+        
+        # Extend sequence.
+        for i in range(next_index, len(times_list)):
+            next_time = times_list[i]
+            if next_time <= seq[-1]:
+                continue
+            seq.append(next_time)
+            search_sequence(seq, i + 1)
+            seq.pop()
+    
+    search_sequence([0], 1)
+    results_sorted = sorted(results, key=lambda x: -x['f2'])
+    return best_result, results_sorted
+
+# ======================== MAIN MENU LOGIC ========================
+# Prompt the user to select a regulatory option.
+print("Select a regulatory option:")
+print(" 1 - FDA")
+print(" 2 - EMA")
+print(" 3 - China")
+print(" 4 - ASEAN")
+print(" 5 - ANVISA")
+reg_input = int(input("Enter the regulatory option number: "))
+regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+selected_regulation = regulation_map.get(reg_input, "FDA")  # Default to FDA if invalid
+
+# Now run the advanced candidate search under three conditions:
+# (a) Strict diff threshold (10 units),
+# (b) Relaxed diff threshold (20 units),
+# (c) No diff check.
+conditions = [
+    ("Diff threshold 10", 10),
+    ("Diff threshold 20", 20),
+    ("No diff check", None)
+]
+
+all_candidates = []
+overall_best = None
+overall_best_f2 = -np.inf
+
+print("\nCandidate window for combination search: from", window_min, "to", window_max)
+
+for cond_label, threshold in conditions:
+    print(f"\nProcessing candidates for condition: {cond_label}")
+    best_result, candidates = predictive_optimal_combinations_advanced(
+        reference_df.copy(), test_df.copy(),
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=threshold,
+        interp_method='gpr'
+    )
+    # Tag each candidate with the condition label.
+    for cand in candidates:
+        cand['condition'] = cond_label
+    all_candidates.extend(candidates)
+    
+    if best_result is not None and best_result["f2"] > overall_best_f2:
+        overall_best_f2 = best_result["f2"]
+        overall_best = best_result.copy()
+        overall_best['condition'] = cond_label
+
+# Sort all candidates by f2 descending.
+all_candidates_sorted = sorted(all_candidates, key=lambda x: -x["f2"])
+
+# ======================== OUTPUT RESULTS ========================
+print("\n=== All Compliant Candidate Sequences ===")
+if all_candidates_sorted:
+    for idx, cand in enumerate(all_candidates_sorted):
+        seq = cand['sequence']
+        f2 = cand['f2']
+        comp = "Yes" if cand['compliant'] else "No"
+        reasons = ", ".join(cand['reasons']) if cand['reasons'] else "None"
+        cond = cand.get('condition', "N/A")
+        print(f"{idx+1:3d}. Condition: {cond} | Sequence: {seq} | f2 Score: {f2} | Compliance: {comp} | Reasons: {reasons}")
+else:
+    print("No compliant candidate sequences were found under any condition.")
+
+if overall_best:
+    print("\n=== Optimal Compliant Predictive Combination ===")
+    print(f"Condition: {overall_best.get('condition','N/A')}")
+    print(f"Time Points: {overall_best['sequence']}")
+    print(f"f2 Score: {overall_best['f2']}")
+    if overall_best['reasons']:
+        print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
+    else:
+        print("Compliance: Yes")
+    
+    # Plot the GPR-predicted dissolution curves for the optimal sequence.
+    plt.figure(figsize=(12, 6))
+    plt.plot(overall_best['sequence'],
+             interpolate_dissolution_curve(reference_df, overall_best['sequence'], method='gpr'),
+             'bo-', label='Reference')
+    plt.plot(overall_best['sequence'],
+             interpolate_dissolution_curve(test_df, overall_best['sequence'], method='gpr'),
+             'r*--', label='Test')
+    plt.title(f"Optimal Predictive Dissolution Profile (f2 = {overall_best['f2']})")
+    plt.xlabel('Time (min)')
+    plt.ylabel('Dissolution (%)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+else:
+    print("No overall optimal candidate could be determined.")
+####################################################################################
+
+# -------------------------- ORIGINAL IMPORTS --------------------------
+import numpy as np
+import pandas as pd
+from scipy.stats import norm
+# ... (existing imports)
+
+# -------------------------- NEW PREDICTIVE ANALYSIS IMPORTS --------------------------
+import itertools
+from scipy.interpolate import interp1d
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
+
+# -------------------------- EXISTING FUNCTIONS --------------------------
+def R_all_Regulation(file_path):
+    # ... (existing code)
+
+# -------------------------- NEW PREDICTIVE ANALYSIS FUNCTIONS --------------------------
+def interpolate_linear(df, new_times):
+    # ... (include full function body)
+
+def determine_candidate_window(ref_df, test_df, fixed_min=0, fixed_max=120, step=1, initial_threshold=10):
+    # ... (include full function body)
+
+def generate_all_time_combinations(min_time, max_time, step=1):
+    # ... (include full function body)
+
+def interpolate_dissolution_curve(df, new_times, method='gpr'):
+    # ... (include full function body)
+
+def check_regulatory_compliance(seq, regulation, ref_means, test_means):
+    # ... (include full function body)
+
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, window_min, window_max, diff_threshold, interp_method='gpr'):
+    # ... (include full function body)
+
+# -------------------------- MAIN CODE --------------------------
+file_path = r"C:\Users\...\File2.xlsx"
+reference_df = pd.read_excel(file_path, sheet_name=0)
+test_df = pd.read_excel(file_path, sheet_name=1)
+
+# -------------------------- NEW: COMPUTE MEAN PROFILES --------------------------
+# Calculate mean dissolution profiles for reference and test
+reference_mean = reference_df.iloc[:, 1:].mean(axis=1)
+test_mean = test_df.iloc[:, 1:].mean(axis=1)
+reference_mean_df = pd.DataFrame({
+    reference_df.columns[0]: reference_df.iloc[:, 0],
+    'Dissolution': reference_mean
+})
+test_mean_df = pd.DataFrame({
+    test_df.columns[0]: test_df.iloc[:, 0],
+    'Dissolution': test_mean
+})
+
+
+# Example for FDA (input1 == 1)
+if input1 == 1:
+    # ... (existing FDA code, e.g., changed_data_both85_f2s, changed_data_both85_bca)
+
+    # -------------------------- NEW: PREDICTIVE ANALYSIS PROMPT --------------------------
+    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
+    if run_predictive.lower() == 'yes':
+        # Determine candidate window
+        window_min, window_max = determine_candidate_window(
+            reference_mean_df, test_mean_df, 
+            fixed_min=0, fixed_max=120, step=1, initial_threshold=10
+        )
+        
+        # Map regulation for predictive analysis
+        regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+        selected_regulation = regulation_map.get(input1, "FDA")
+        
+        # Run predictive analysis under different conditions
+        conditions = [("Diff threshold 10", 10), ("Diff threshold 20", 20), ("No diff check", None)]
+        all_candidates = []
+        overall_best = None
+        overall_best_f2 = -np.inf
+        
+        print("\nCandidate window for combination search: from", window_min, "to", window_max)
+        for cond_label, threshold in conditions:
+            print(f"\nProcessing candidates for condition: {cond_label}")
+            best_result, candidates = predictive_optimal_combinations_advanced(
+                reference_mean_df, test_mean_df,
+                regulation=selected_regulation,
+                window_min=window_min,
+                window_max=window_max,
+                diff_threshold=threshold,
+                interp_method='gpr'
+            )
+            # Tag each candidate with the condition label
+            for cand in candidates:
+                cand['condition'] = cond_label
+            all_candidates.extend(candidates)
+            
+            if best_result is not None and best_result["f2"] > overall_best_f2:
+                overall_best_f2 = best_result["f2"]
+                overall_best = best_result.copy()
+                overall_best['condition'] = cond_label
+        
+        # Sort all candidates by f2 descending
+        all_candidates_sorted = sorted(all_candidates, key=lambda x: -x["f2"])
+        
+        # -------------------------- STEP 5: OUTPUT RESULTS --------------------------
+        print("\n=== All Compliant Candidate Sequences ===")
+        if all_candidates_sorted:
+            for idx, cand in enumerate(all_candidates_sorted):
+                seq = cand['sequence']
+                f2 = cand['f2']
+                comp = "Yes" if cand['compliant'] else "No"
+                reasons = ", ".join(cand['reasons']) if cand['reasons'] else "None"
+                cond = cand.get('condition', "N/A")
+                print(f"{idx+1:3d}. Condition: {cond} | Sequence: {seq} | f2 Score: {f2} | Compliance: {comp} | Reasons: {reasons}")
+        else:
+            print("No compliant candidate sequences were found under any condition.")
+        
+        if overall_best:
+            print("\n=== Optimal Compliant Predictive Combination ===")
+            print(f"Condition: {overall_best.get('condition','N/A')}")
+            print(f"Time Points: {overall_best['sequence']}")
+            print(f"f2 Score: {overall_best['f2']}")
+            if overall_best['reasons']:
+                print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
+            else:
+                print("Compliance: Yes")
+            
+            # Plot the optimal dissolution curves
+            plt.figure(figsize=(12, 6))
+            plt.plot(overall_best['sequence'],
+                     interpolate_dissolution_curve(reference_mean_df, overall_best['sequence'], method='gpr'),
+                     'bo-', label='Reference')
+            plt.plot(overall_best['sequence'],
+                     interpolate_dissolution_curve(test_mean_df, overall_best['sequence'], method='gpr'),
+                     'r*--', label='Test')
+            plt.title(f"Optimal Predictive Dissolution Profile (f2 = {overall_best['f2']})")
+            plt.xlabel('Time (min)')
+            plt.ylabel('Dissolution (%)')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+        else:
+            print("No overall optimal candidate could be determined.")
+
+
