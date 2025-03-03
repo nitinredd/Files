@@ -1,98 +1,178 @@
-# -------------------------- PREDICTIVE ANALYSIS IMPORTS --------------------------
-import itertools
-from scipy.interpolate import interp1d
-from joblib import Parallel, delayed, parallel_backend
-# -------------------------- PREDICTIVE ANALYSIS FUNCTIONS --------------------------
-def interpolate_linear(df, new_times):
-    df_sorted = df.sort_values(by=df.columns[0])
-    known_times = df_sorted.iloc[:, 0].values.astype(float)
-    known_values = df_sorted.iloc[:, 1].values
-    f = interp1d(known_times, known_values, kind='linear', 
-                fill_value=(known_values[0], known_values[-1]),
-                bounds_error=False)
-    return f(new_times)
+"""
+Python Version: 3.8+
 
-def determine_candidate_window(ref_df, test_df, step=1, initial_threshold=10):
-    max_ref_time = ref_df.iloc[:, 0].max()
-    max_test_time = test_df.iloc[:, 0].max()
-    fixed_max = max(max_ref_time, max_test_time)
-    
-    times = np.arange(0, fixed_max + 1, step)
-    ref_vals = interpolate_linear(ref_df, times)
-    test_vals = interpolate_linear(test_df, times)
-    diff = np.abs(ref_vals - test_vals)
-    
-    valid_times = times[diff <= initial_threshold]
-    if len(valid_times) == 0:
-        valid_times = times[diff <= 20]
-        return (0, valid_times[-1]) if len(valid_times) > 0 else (0, fixed_max)
-    return (0, valid_times[-1])
+Requirements (requirements.txt):
+-------------------------------
+streamlit
+pandas
+langchain
+vertexai-preview      # (or the appropriate package name for Gemini)
+google-auth
+openpyxl              # for reading Excel files
+-------------------------------
+"""
 
-def predictive_optimal_combinations_fast(ref_df, test_df, regulation, window_min, window_max, diff_threshold):
-    times = np.arange(window_min, window_max + 1)
-    time_values = times[times != 0]
-    
-    # Precompute dissolution values
-    ref_interp = interpolate_linear(ref_df, times)
-    test_interp = interpolate_linear(test_df, times)
-    
-    def process_combination(combo):
-        seq = sorted([0] + list(combo))
-        if len(seq) < 3:
-            return None
-        
-        # Compliance checks
-        ref_dict = {t: ref_interp[np.where(times == t)[0][0]] for t in seq}
-        test_dict = {t: test_interp[np.where(times == t)[0][0]] for t in seq}
-        
-        # Difference threshold check
-        if diff_threshold:
-            diff = np.abs(np.array(list(test_dict.values())) - np.array(list(ref_dict.values())))
-            if np.any(diff > diff_threshold):
-                return None
-        
-        compliant, _ = check_regulatory_compliance(seq, regulation, ref_dict, test_dict)
-        if not compliant:
-            return None
-        
-        # Calculate f2
-        diff_sq = np.sum((np.array(list(test_dict.values())) - np.array(list(ref_dict.values()))) ** 2)
-        f2 = 50 + 25 * np.log10(100 / (1 + diff_sq/len(seq)))
-        return (seq, round(f2, 2))
-    
-    # Generate combinations in parallel
-    all_combos = []
-    for r in range(2, 6):
-        all_combos.extend(combinations(time_values, r))
-    
-    with parallel_backend('loky'):
-        results = Parallel(n_jobs=-1)(delayed(process_combination)(c) for c in all_combos)
-# -------------------------- PREDICTIVE ANALYSIS TRIGGER --------------------------
-run_predictive = input("\nRun predictive time optimization? (yes/no): ")
-if run_predictive.lower() == 'yes':
-    # Compute mean profiles
-    ref_mean = reference_df.iloc[:, 1:].mean(axis=1)
-    test_mean = test_df.iloc[:, 1:].mean(axis=1)
-    ref_mean_df = pd.DataFrame({'Time': reference_df.iloc[:, 0], 'Dissolution': ref_mean})
-    test_mean_df = pd.DataFrame({'Time': test_df.iloc[:, 0], 'Dissolution': test_mean})
-    
-    # Find optimal points
-    window_min, window_max = determine_candidate_window(ref_mean_df, test_mean_df)
-    best, candidates = predictive_optimal_combinations_fast(
-        ref_mean_df, test_mean_df, 
-        regulation="FDA",  # Will be overridden by user input
-        window_min=window_min,
-        window_max=window_max,
-        diff_threshold=10
+import os
+import logging
+import sqlite3
+import re
+
+import streamlit as st
+import pandas as pd
+import google.auth
+
+# -------------------------------
+# Gemini 2.0 Flash-Thinking Setup
+# -------------------------------
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+)
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+# Set up credentials for Vertex AI
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+
+# Initialize the Gemini 2.0 flash-thinking model
+gemini_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+
+# Define model safety settings (adjust enum names as required)
+safety_config = [
+    SafetySetting(
+         category=HarmCategory.UNSPECIAL,  # adjust as needed
+         threshold=HarmBlockThreshold.BLOCK_NONE
+    ),
+    SafetySetting(
+         category=HarmCategory.RANGEROUS_CONIENT,  # adjust to your actual enum name
+         threshold=HarmBlockThreshold.BLOCK_NONE
     )
+]
+
+# -------------------------------
+# Wrap Gemini as a LangChain LLM
+# -------------------------------
+from langchain.llms.base import LLM
+from typing import Optional, List
+
+class GeminiLLM(LLM):
+    """
+    A simple wrapper for Gemini 2.0 flash-thinking that conforms to the LangChain LLM interface.
+    """
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        logger.debug("Sending prompt to Gemini: %s", prompt)
+        response = gemini_model.generate(prompt, safety_config=safety_config)
+        logger.debug("Gemini response: %s", response.text)
+        return response.text
+
+    @property
+    def _identifying_params(self) -> dict:
+        return {"model": "gemini-2.0-flash-thinking-exp-01-21"}
+
+    @property
+    def _llm_type(self) -> str:
+        return "gemini"
+
+# -------------------------------
+# Function: Create an agent for a single sheet
+# -------------------------------
+from langchain.agents import create_sql_agent
+from langchain.sql_database import SQLDatabase
+
+def create_agent_for_sheet(sheet_name: str, df: pd.DataFrame, llm: LLM):
+    """
+    Given a sheet name and its DataFrame, create an in-memory SQLite database with a table 'data'
+    and return a LangChain SQL agent restricted to that table.
+    """
+    # Create an in-memory SQLite database for this sheet
+    conn = sqlite3.connect(":memory:")
+    df.to_sql("data", conn, index=False, if_exists="replace")
     
-    # Display results
-    if best:
-        print(f"\n🔍 Optimal Time Points: {best[0]}")
-        print(f"📈 Predicted f2 Score: {best[1]}")
-        print("🟢 Regulatory Compliance: Passed")
+    # Create a SQLDatabase object using the connection
+    sql_db = SQLDatabase(conn=conn)
+    
+    # Create a SQL agent; the agent will be limited to querying the table "data"
+    agent = create_sql_agent(llm=llm, database=sql_db, verbose=True)
+    return agent
+
+# -------------------------------
+# Load Embedded Excel Workbook
+# -------------------------------
+# The workbook is embedded in the code (assumed to be in the same directory)
+EXCEL_FILE = "embedded_workbook.xlsx"
+
+try:
+    # Read all sheets from the embedded Excel file
+    sheets_dict = pd.read_excel(EXCEL_FILE, sheet_name=None, engine="openpyxl")
+    st.success(f"Loaded embedded workbook with {len(sheets_dict)} sheet(s).")
+except Exception as e:
+    st.error(f"Error reading embedded Excel file: {e}")
+    sheets_dict = {}
+
+# Expected sheet names (adjust these names based on your actual workbook)
+expected_sheet_names = [
+    "child1_prod_cust_data", 
+    "child1_sku_cust_data",
+    "child2_sku_cust_data",
+    "child2_prod_cust_data",
+    "child3_prod_cust_data",
+    "child3_sku_cust_data",
+    "sheet1"
+]
+
+# Create a dictionary to store agents for each sheet (only for sheets that exist)
+agents = {}
+for sheet in expected_sheet_names:
+    if sheet in sheets_dict:
+        df = sheets_dict[sheet]
+        agents[sheet] = create_agent_for_sheet(sheet, df, GeminiLLM())
+        st.write(f"Agent created for sheet: **{sheet}** (Rows: {len(df)})")
     else:
-        print("❌ No valid combinations found")
-    
-    valid_results = [res for res in results if res is not None]
-    return (max(valid_results, key=lambda x: x[1]), valid_results) if valid_results else (None, [])
+        st.warning(f"Expected sheet '{sheet}' not found in the workbook.")
+
+# -------------------------------
+# Streamlit App Interface
+# -------------------------------
+st.set_page_config(page_title="Multi-Sheet Excel Query", layout="centered")
+st.title("Multi-Sheet Excel Query Interface")
+st.write("Enter your query below to get actionable insights from your embedded Excel workbook.")
+
+# Text input for the query (centered on the page)
+user_query = st.text_input("Your Query:", key="query_input")
+
+# Display three dynamic example prompts below the text input
+st.markdown("#### Example Prompts:")
+col1, col2, col3 = st.columns(3)
+if col1.button("Total sales by region"):
+    st.session_state.query_input = "Show me the total sales by region."
+if col2.button("Top-selling product"):
+    st.session_state.query_input = "Which product had the highest sales?"
+if col3.button("Sales trends over time"):
+    st.session_state.query_input = "What are the trends in sales over time?"
+
+# When the user clicks "Run Query", process the query across all agents
+if st.button("Run Query"):
+    if user_query.strip() == "":
+        st.error("Please enter a query.")
+    else:
+        results = {}
+        st.info("Processing query on all sheets. This may take a moment...")
+        for sheet_name, agent in agents.items():
+            try:
+                st.write(f"**Running query on sheet: {sheet_name}**")
+                result = agent.run(user_query)
+                results[sheet_name] = result
+                st.markdown(f"**Result from {sheet_name}:**")
+                st.write(result)
+            except Exception as e:
+                st.error(f"Error processing query on sheet {sheet_name}: {e}")
+
+        # Aggregated Results (display all responses)
+        st.markdown("## Aggregated Results")
+        for sheet_name, res in results.items():
+            st.markdown(f"### {sheet_name}")
+            st.write(res)
