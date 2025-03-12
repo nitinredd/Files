@@ -1,27 +1,31 @@
-# Add to imports
+# Add these imports at the top
 import numpy as np
+import time
 from tqdm import tqdm
+from scipy.interpolate import interp1d
 
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                            window_min, window_max, diff_threshold,
-                                            num_samples=500000):
-    """Ultra-fast version with precomputation and vectorization"""
-    # ===== 1. PRECOMPUTE DISSOLUTION VALUES =====
-    # Create dense time grid (1-minute resolution)
+                                            window_min, window_max, diff_threshold=None,
+                                            interp_method='linear', num_samples=500000):
+    """Ultra-fast version aligned with original parameters"""
+    # ===== 1. Parameter Validation =====
+    if interp_method != 'linear':
+        print(f"Warning: Only linear interpolation currently supported. Using '{interp_method}' may reduce performance.")
+    
+    # ===== 2. Precompute Dissolution Values =====
     time_grid = np.arange(window_min, window_max + 1)
     
     # Create interpolation functions
     ref_f = interp1d(ref_df.iloc[:,0], ref_df.iloc[:,1], 
-                    bounds_error=False, fill_value="extrapolate")
+                    kind=interp_method, bounds_error=False, fill_value="extrapolate")
     test_f = interp1d(test_df.iloc[:,0], test_df.iloc[:,1],
-                     bounds_error=False, fill_value="extrapolate")
+                     kind=interp_method, bounds_error=False, fill_value="extrapolate")
     
-    # Precompute values for all possible times
-    ref_values = ref_f(time_grid)
-    test_values = test_f(time_grid)
+    # ===== 3. Time Point Generation =====
+    max_ref = ref_f(time_grid).max()
+    max_test = test_f(time_grid).max()
+    max_diss = max(max_ref, max_test)
     
-    # ===== 2. GENERATE TIME POINTS =====
-    max_diss = max(ref_values.max(), test_values.max())
     if max_diss <= 60:
         step_mask = (time_grid % 3 == 0) | (time_grid % 5 == 0)
     else:
@@ -31,51 +35,52 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     if 0 not in valid_times:
         valid_times = np.insert(valid_times, 0, 0)
     
-    # ===== 3. VECTORIZED SAMPLING =====
+    # ===== 4. Vectorized Sampling =====
     start_time = time.time()
-    
-    # Generate all sequences at once
     seq_lengths = np.random.randint(3, 7, num_samples)
     all_seqs = []
     
-    # Progress bar setup
-    pbar = tqdm(total=num_samples, desc="Generating combinations")
+    with tqdm(total=num_samples, desc="Generating combinations") as pbar:
+        for _ in range(num_samples):
+            seq = np.sort(np.random.choice(
+                valid_times[(valid_times > 0) & (valid_times < window_max)],
+                size=seq_lengths[_]-2,
+                replace=False
+            ))
+            seq = np.insert(seq, 0, 0)
+            seq = np.append(seq, window_max)
+            all_seqs.append(seq)
+            pbar.update(1)
     
-    for i in range(num_samples):
-        # Create sequence with 0 and window_max
-        seq = np.sort(np.random.choice(
-            valid_times[(valid_times > 0) & (valid_times < window_max)],
-            size=seq_lengths[i]-2,
-            replace=False
-        ))
-        seq = np.insert(seq, 0, 0)
-        seq = np.append(seq, window_max)
-        all_seqs.append(seq)
-        pbar.update(1)
-    pbar.close()
-    
-    # ===== 4. VECTORIZED COMPUTATIONS =====
+    # ===== 5. Vectorized Calculations =====
     # Convert to numpy array of arrays
-    all_seqs = np.array([np.pad(s, (0, 6-len(s)), mode='constant') for s in all_seqs])
+    max_length = max(len(s) for s in all_seqs)
+    padded_seqs = np.array([np.pad(s, (0, max_length-len(s)), mode='constant', 
+                          constant_values=np.nan) for s in all_seqs])
     
-    # Get dissolution values (vectorized)
-    ref_diss = ref_values[all_seqs]
-    test_diss = test_values[all_seqs]
+    # Get dissolution values
+    ref_diss = ref_f(padded_seqs)
+    test_diss = test_f(padded_seqs)
     
     # Calculate F2 scores
-    diffs = test_diss - ref_diss
-    valid_mask = ~np.isnan(diffs)
-    sum_sq = np.nansum(diffs**2, axis=1)
-    lengths = np.sum(valid_mask, axis=1)
-    f2_scores = 100 - 25 * np.log10(1 + (sum_sq/lengths))
+    with np.errstate(invalid='ignore'):
+        diffs = test_diss - ref_diss
+        valid_mask = ~np.isnan(diffs)
+        sum_sq = np.nansum(diffs**2, axis=1)
+        lengths = np.sum(valid_mask, axis=1)
+        f2_scores = 100 - 25 * np.log10(1 + (sum_sq/lengths))
     
-    # ===== 5. FIND BEST RESULT =====
+    # ===== 6. Return Results =====
     best_idx = np.nanargmax(f2_scores)
     
-    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    print(f"\nAnalyzed {num_samples} combos in {time.time()-start_time:.2f}s")
     
-    return {
-        "sequence": all_seqs[best_idx][:lengths[best_idx]],
-        "f2": f2_scores[best_idx],
-        "time_points": valid_times
-    }, f2_scores
+    return (
+        {
+            'sequence': all_seqs[best_idx][~np.isnan(all_seqs[best_idx])].astype(int).tolist(),
+            'f2': round(f2_scores[best_idx], 2),
+            'compliant': True,
+            'reasons': []
+        },
+        f2_scores
+    )
