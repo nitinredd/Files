@@ -1,162 +1,64 @@
-import numpy as np
-import pandas as pd
-import time
-from tqdm import tqdm
-from scipy.interpolate import interp1d
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
-import warnings
-
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                            window_min, window_max, diff_threshold=None,
-                                            interp_method='linear', num_samples=500000):
-    """Final robust version with proper array reshaping and error handling"""
-    # ===== 1. Initialization & Validation =====
-    results = []
-    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+# In the main execution section after regulatory checks:
+run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
+if run_predictive.lower() == 'yes':
+    # Determine candidate window
+    window_min, window_max = determine_candidate_window(
+        reference_mean_df, 
+        test_mean_df,
+        step=5, 
+        initial_threshold=10
+    )
     
-    # Convert to numpy arrays and handle NaNs
-    ref_times = ref_df.iloc[:, 0].values.astype(float)
-    ref_diss = ref_df.iloc[:, 1].values.astype(float)
-    test_times = test_df.iloc[:, 0].values.astype(float)
-    test_diss = test_df.iloc[:, 1].values.astype(float)
-
-    # Remove NaN values
-    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
-    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
+    # Map regulation for predictive analysis
+    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+    selected_regulation = regulation_map.get(input1, "FDA")
     
-    # ===== 2. Interpolation Setup =====
-    if interp_method == 'gpr':
-        def safe_gp_interpolator(x, y):
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
-            valid_mask = ~np.isnan(x) & ~np.isnan(y)
-            X = x[valid_mask].reshape(-1, 1)  # Ensure 2D array
-            gp.fit(X, y[valid_mask])
-            return gp
-            
-        ref_model = safe_gp_interpolator(ref_times, ref_diss)
-        test_model = safe_gp_interpolator(test_times, test_diss)
+    # Run predictive analysis under different conditions
+    conditions = [("Diff threshold 10", 10), 
+                 ("Diff threshold 20", 20), 
+                 ("No diff check", None)]
+    
+    all_candidates = []
+    overall_best = None
+    overall_best_f2 = -np.inf
+
+    print(f"\nCandidate window for combination search: {window_min} to {window_max}")
+    
+    for cond_label, threshold in conditions:
+        print(f"\nProcessing candidates for condition: {cond_label}")
         
-        # Proper reshaping for prediction
-        def ref_interp(x):
-            return ref_model.predict(np.array(x).reshape(-1, 1))
+        # Get results for this condition
+        top_results, all_results = predictive_optimal_combinations_advanced(
+            reference_mean_df,
+            test_mean_df,
+            regulation=selected_regulation,
+            window_min=window_min,
+            window_max=window_max,
+            diff_threshold=threshold,
+            num_samples=5000
+        )
         
-        def test_interp(x):
-            return test_model.predict(np.array(x).reshape(-1, 1))
+        # Add condition label to results
+        for res in top_results:
+            res['condition'] = cond_label
+        all_candidates.extend(top_results)
+        
+        # Track overall best
+        if top_results:
+            current_best = max(top_results, key=lambda x: x['f2'])
+            if current_best['f2'] > overall_best_f2:
+                overall_best = current_best
+                overall_best_f2 = current_best['f2']
+
+    # Display final results
+    if overall_best:
+        print("\n=== Optimal Predictive Combination ===")
+        print(f"Condition: {overall_best.get('condition','N/A')}")
+        print(f"Time Points: {overall_best['sequence']}")
+        print(f"f2 Score: {overall_best['f2']}")
+        if overall_best['reasons']:
+            print(f"Compliance Issues: {', '.join(overall_best['reasons']}")
+        else:
+            print("Compliance: Yes")
     else:
-        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
-        interp_method = interp_method if interp_method in valid_methods else 'linear'
-        
-        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask], 
-                            kind=interp_method, bounds_error=False, fill_value=np.nan)
-        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
-                             kind=interp_method, bounds_error=False, fill_value=np.nan)
-
-    # ===== 3. Time Points Generation =====
-    time_grid = np.arange(window_min, window_max + 1).reshape(-1, 1)  # 2D array for GPR
-    
-    # Handle both interpolation types
-    try:
-        max_ref = np.nanmax(ref_interp(time_grid))
-        max_test = np.nanmax(test_interp(time_grid))
-    except ValueError:
-        max_ref = np.nanmax(ref_interp(time_grid.flatten()))
-        max_test = np.nanmax(test_interp(time_grid.flatten()))
-    
-    max_diss = max(max_ref, max_test)
-    
-    if max_diss <= 60:
-        valid_times = np.unique(np.concatenate([
-            np.arange(0, window_max+1, 3),
-            np.arange(0, window_max+1, 5)
-        ])).astype(int)
-    else:
-        valid_times = np.arange(0, window_max+1, 5).astype(int)
-    
-    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
-
-    # ===== 4. Combination Generation =====
-    start_time = time.time()
-    seq_lengths = np.random.randint(3, 7, num_samples)
-    
-    # Pre-allocate homogeneous array
-    all_seqs = np.full((num_samples, 6), -1, dtype=int)
-    f2_scores = np.full(num_samples, np.nan)
-    compliance_status = np.full(num_samples, False)
-    compliance_reasons = [''] * num_samples
-    
-    with tqdm(total=num_samples, desc="Processing combinations") as pbar:
-        for i in range(num_samples):
-            try:
-                # Generate valid sequence with error checking
-                available_points = valid_times[(valid_times > 0) & (valid_times < window_max)]
-                if len(available_points) < (seq_lengths[i]-2):
-                    raise ValueError("Not enough valid time points")
-                
-                mid_points = np.random.choice(
-                    available_points, 
-                    size=seq_lengths[i]-2,
-                    replace=False
-                )
-                seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
-                seq = seq.astype(int)
-                
-                # Store in homogeneous array
-                seq_len = len(seq)
-                if seq_len > 6:
-                    raise ValueError("Sequence too long")
-                all_seqs[i, :seq_len] = seq
-                
-                # Get dissolution values with proper reshaping
-                if interp_method == 'gpr':
-                    seq_2d = seq.reshape(-1, 1)  # Ensure 2D for GPR
-                    ref_vals = ref_interp(seq_2d)
-                    test_vals = test_interp(seq_2d)
-                else:
-                    ref_vals = ref_interp(seq)
-                    test_vals = test_interp(seq)
-                
-                # Validate values
-                if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
-                    raise ValueError("NaN in dissolution values")
-                
-                # Calculate F2
-                diff = test_vals - ref_vals
-                sum_sq = np.sum(diff**2)
-                p = len(seq)
-                f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
-                f2_scores[i] = f2
-                
-                # Check compliance
-                compliant, reasons = check_regulatory_compliance(
-                    seq, regulation,
-                    dict(zip(seq, ref_vals)),
-                    dict(zip(seq, test_vals))
-                )
-                compliance_status[i] = compliant
-                compliance_reasons[i] = ', '.join(reasons)
-
-            except (ValueError, IndexError) as e:
-                f2_scores[i] = np.nan
-                compliance_reasons[i] = str(e)
-                
-            pbar.update(1)
-
-    # ===== 5. Results Processing =====
-    valid_mask = ~np.isnan(f2_scores)
-    results = []
-    for i in np.where(valid_mask)[0]:
-        seq = all_seqs[i][all_seqs[i] != -1].tolist()
-        results.append({
-            'sequence': seq,
-            'f2': round(f2_scores[i], 2),
-            'compliant': compliance_status[i],
-            'reasons': compliance_reasons[i],
-            'length': len(seq)
-        })
-    
-    # Sort by descending F2 score
-    results.sort(key=lambda x: -x['f2'])
-    
-    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
-    return results[:500], results  # Return top 500 and all results
+        print("\nNo valid combinations found across all conditions")
