@@ -9,96 +9,136 @@ import warnings
 
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                             window_min, window_max, diff_threshold=None,
-                                            interp_method='linear', num_samples=1000000):
-    """Ultra-fast version processing 1M combinations in ~4s"""
-    # Convert to numpy arrays immediately
+                                            interp_method='linear', num_samples=500000):
+    """Robust final version with error handling and homogeneous arrays"""
+    # ===== 1. Initialization & Validation =====
+    results = []
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+    
+    # Ensure integer time windows
+    window_min = int(window_min)
+    window_max = int(window_max)
+    time_grid = np.arange(window_min, window_max + 1)
+    
+    # ===== 2. Interpolation Setup =====
+    # Convert to numpy arrays and handle NaNs
     ref_times = ref_df.iloc[:, 0].values.astype(float)
     ref_diss = ref_df.iloc[:, 1].values.astype(float)
     test_times = test_df.iloc[:, 0].values.astype(float)
     test_diss = test_df.iloc[:, 1].values.astype(float)
-    
-    # ===== 1. Vectorized Interpolation Setup =====
-    time_grid = np.linspace(window_min, window_max, 1000)
+
+    # Remove NaN values
+    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
+    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
     
     if interp_method == 'gpr':
-        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
-        ref_model = GaussianProcessRegressor(kernel=kernel).fit(ref_times.reshape(-1, 1), ref_diss)
-        test_model = GaussianProcessRegressor(kernel=kernel).fit(test_times.reshape(-1, 1), test_diss)
-        ref_curve = ref_model.predict(time_grid.reshape(-1, 1))
-        test_curve = test_model.predict(time_grid.reshape(-1, 1))
+        def safe_gp_interpolator(x, y):
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
+            valid_mask = ~np.isnan(x) & ~np.isnan(y)
+            gp.fit(x[valid_mask].reshape(-1, 1), y[valid_mask])
+            return gp.predict
+            
+        ref_interp = safe_gp_interpolator(ref_times, ref_diss)
+        test_interp = safe_gp_interpolator(test_times, test_diss)
     else:
-        ref_curve = interp1d(ref_times, ref_diss, kind=interp_method, 
-                           fill_value='extrapolate')(time_grid)
-        test_curve = interp1d(test_times, test_diss, kind=interp_method,
-                            fill_value='extrapolate')(time_grid)
+        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
+        interp_method = interp_method if interp_method in valid_methods else 'linear'
+        
+        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask], 
+                             kind=interp_method, bounds_error=False, fill_value=np.nan)
+        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
+                              kind=interp_method, bounds_error=False, fill_value=np.nan)
 
-    # ===== 2. Precompute All Valid Time Points =====
-    max_diss = max(np.nanmax(ref_curve), np.nanmax(test_curve))
+    # ===== 3. Time Points Generation =====
+    max_ref = np.nanmax(ref_interp(time_grid))
+    max_test = np.nanmax(test_interp(time_grid))
+    max_diss = max(max_ref, max_test)
+    
     if max_diss <= 60:
-        time_options = np.unique(np.concatenate([
+        valid_times = np.unique(np.concatenate([
             np.arange(0, window_max+1, 3),
             np.arange(0, window_max+1, 5)
-        ]))
+        ])).astype(int)
     else:
-        time_options = np.arange(0, window_max+1, 5)
+        valid_times = np.arange(0, window_max+1, 5).astype(int)
     
-    time_options = time_options[(time_options >= window_min) & (time_options <= window_max)]
-    
-    # ===== 3. Vectorized Combination Generation =====
+    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
+
+    # ===== 4. Combination Generation =====
     start_time = time.time()
-    
-    # Generate all sequences in one shot
     seq_lengths = np.random.randint(3, 7, num_samples)
+    
+    # Pre-allocate homogeneous array
     all_seqs = np.full((num_samples, 6), -1, dtype=int)
+    f2_scores = np.full(num_samples, np.nan)
+    compliance_status = np.full(num_samples, False)
+    compliance_reasons = [''] * num_samples
     
-    # Matrix operations for speed
-    mid_points = [np.random.choice(time_options[1:-1], size=sl-2, replace=False)
-                 for sl in seq_lengths]
-    all_seqs = np.array([np.sort(np.concatenate([[0], mp, [window_max]])) 
-                        for mp in mid_points])
+    with tqdm(total=num_samples, desc="Processing combinations") as pbar:
+        for i in range(num_samples):
+            try:
+                # Generate valid sequence
+                mid_points = np.random.choice(
+                    valid_times[(valid_times > 0) & (valid_times < window_max)], 
+                    size=max(1, seq_lengths[i]-2),  # Ensure at least 1 point
+                    replace=False
+                )
+                seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
+                seq = seq.astype(int)
+                
+                # Store in homogeneous array
+                seq_len = len(seq)
+                if seq_len > 6:
+                    raise ValueError("Sequence too long")
+                all_seqs[i, :seq_len] = seq
+                
+                # Get dissolution values
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    ref_vals = ref_interp(seq)
+                    test_vals = test_interp(seq)
+                
+                # Validate values
+                if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
+                    raise ValueError("NaN in dissolution values")
+                
+                # Calculate F2
+                diff = test_vals - ref_vals
+                sum_sq = np.sum(diff**2)
+                p = len(seq)
+                f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
+                f2_scores[i] = f2
+                
+                # Check compliance
+                compliant, reasons = check_regulatory_compliance(
+                    seq, regulation,
+                    dict(zip(seq, ref_vals)),
+                    dict(zip(seq, test_vals))
+                )
+                compliance_status[i] = compliant
+                compliance_reasons[i] = ', '.join(reasons)
+
+            except (ValueError, IndexError) as e:
+                f2_scores[i] = np.nan
+                compliance_reasons[i] = str(e)
+                
+            pbar.update(1)
+
+    # ===== 5. Results Processing =====
+    valid_mask = ~np.isnan(f2_scores)
+    results = []
+    for i in np.where(valid_mask)[0]:
+        seq = all_seqs[i][all_seqs[i] != -1].tolist()
+        results.append({
+            'sequence': seq,
+            'f2': round(f2_scores[i], 2),
+            'compliant': compliance_status[i],
+            'reasons': compliance_reasons[i],
+            'length': len(seq)
+        })
     
-    # ===== 4. Vectorized F2 Calculation =====
-    # Convert sequences to time grid indices
-    seq_indices = ((all_seqs - window_min) / (window_max - window_min) * 999).astype(int)
+    # Sort by descending F2 score
+    results.sort(key=lambda x: -x['f2'])
     
-    # Get dissolution values
-    ref_values = ref_curve[seq_indices]
-    test_values = test_curve[seq_indices]
-    
-    # Calculate F2 scores
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        valid = ~np.isnan(ref_values) & ~np.isnan(test_values)
-        diffs = test_values - ref_values
-        sum_sq = np.nansum(diffs**2, axis=1)
-        lengths = np.sum(valid, axis=1)
-        f2_scores = 100 - 25 * np.log10(1 + (sum_sq / lengths))
-    
-    # ===== 5. Compliance Check Optimization =====
-    # Precompute regulatory thresholds
-    last_time_idx = np.where(time_grid == window_max)[0][0]
-    ref_last = ref_curve[last_time_idx]
-    test_last = test_curve[last_time_idx]
-    
-    # Vectorized compliance check
-    if regulation == "FDA":
-        compliant_mask = ((ref_values[:, -1] >= 85) | (test_values[:, -1] >= 85)) & \
-                        ((all_seqs[:, -1] == window_max))
-    else:
-        compliant_mask = np.ones(num_samples, dtype=bool)
-    
-    # ===== 6. Results Processing =====
-    valid_scores = f2_scores[compliant_mask & ~np.isnan(f2_scores)]
-    valid_seqs = all_seqs[compliant_mask & ~np.isnan(f2_scores)]
-    
-    # Get best result
-    best_idx = np.nanargmax(valid_scores)
-    best_result = {
-        "sequence": valid_seqs[best_idx][valid_seqs[best_idx] != -1].tolist(),
-        "f2": round(valid_scores[best_idx], 2),
-        "compliant": True,
-        "reasons": []
-    }
-    
-    print(f"Processed {num_samples} combinations in {time.time()-start_time:.2f}s")
-    return best_result, valid_seqs, valid_scores
+    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    return results[:500], results  # Top 500 + all results
