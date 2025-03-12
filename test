@@ -1,238 +1,28 @@
-# Import necessary libraries
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import time
-from tqdm import tqdm
 from scipy.interpolate import interp1d
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
-import warnings
-import csv
 
-def dissolution_curve_interval(reference_df, test_df):
-    # ... (keep original implementation unchanged) ...
-
-def dissolution_curve(reference_df, test_df):
-    # ... (keep original implementation unchanged) ...
-
-def check_time_points(df):
-    # ... (keep original implementation unchanged) ...
-
-def check_same_time_points(df1, df2):
-    # ... (keep original implementation unchanged) ...
-
-def check_sample_units(df):
-    # ... (keep original implementation unchanged) ...
-
-def determine_candidate_window(ref_df, test_df, step=5, initial_threshold=10):
-    """Determine candidate window with phase-based time generation"""
-    # ... (keep previous implementation) ...
-
-def plot_optimal_profile(ref_df, test_df, best_sequence, regulation):
-    """Enhanced visualization with regulation info"""
-    plt.figure(figsize=(12, 6))
+def safe_interpolate(df, time_col=0, dissol_col=1):
+    """Create interpolator with safe extrapolation handling"""
+    times = df.iloc[:, time_col].values.astype(float)
+    dissolution = df.iloc[:, dissol_col].values.astype(float)
     
-    # Plot reference and test means
-    plt.plot(ref_df.iloc[:,0], ref_df.iloc[:,1:].mean(axis=1), 
-             'bo-', label='Reference Mean')
-    plt.plot(test_df.iloc[:,0], test_df.iloc[:,1:].mean(axis=1),
-             'r^--', label='Test Mean')
+    # Handle 0 explicitly if missing
+    if 0 not in times:
+        times = np.insert(times, 0, 0.0)
+        dissolution = np.insert(dissolution, 0, 0.0)  # Assume 0% at time 0
     
-    # Plot optimal time points
-    for t in best_sequence:
-        plt.axvline(x=t, color='g', linestyle=':', alpha=0.5)
-    
-    plt.title(f'{regulation} Optimal Profile\nTime Points: {best_sequence}')
-    plt.xlabel('Time (minutes)')
-    plt.ylabel('Dissolution (%)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('optimal_dissolution_profile.png', dpi=300)
-    plt.close()
+    return interp1d(
+        times, 
+        dissolution, 
+        bounds_error=False, 
+        fill_value=(dissolution[0], dissolution[-1])  # Extrapolate with edge values
+    )
 
-def generate_combinations(ref_df, test_df, regulation, 
-                         window_min, window_max, 
-                         num_samples=10000, top_n=500):
-    """Core combination generator with dual time steps"""
-    # Convert to numpy arrays with integer handling
-    ref_times = ref_df.iloc[:,0].values.astype(int)
-    ref_diss = ref_df.iloc[:,1].values.astype(float)
-    test_times = test_df.iloc[:,0].values.astype(int)
-    test_diss = test_df.iloc[:,1].values.astype(float)
-
-    # Create interpolators
-    ref_interp = interp1d(ref_times, ref_diss, bounds_error=False, fill_value="extrapolate")
-    test_interp = interp1d(test_times, test_diss, bounds_error=False, fill_value="extrapolate")
-
-    # Generate time points
-    time_grid = np.arange(window_min, window_max + 1)
-    max_diss = max(np.nanmax(ref_interp(time_grid)), np.nanmax(test_interp(time_grid)))
+def generate_combinations(ref_df, test_df, regulation, window_min, window_max):
+    # Create interpolators with safe handling
+    ref_interp = safe_interpolate(ref_df)
+    test_interp = safe_interpolate(test_df)
     
-    if max_diss <= 60:
-        times_3 = list(range(0, window_max+1, 3))
-        times_5 = list(range(0, window_max+1, 5))
-        valid_times = sorted(list(set(times_3 + times_5)))
-    else:
-        valid_times = list(range(0, window_max+1, 5))
-    
-    valid_times = [t for t in valid_times if window_min <= t <= window_max]
-
-    # Main processing loop
-    top_results = []
-    with tqdm(total=num_samples, desc="Generating combinations") as pbar:
-        for _ in range(num_samples):
-            try:
-                # Generate sequence with dual time steps
-                seq_length = np.random.randint(3, 7)
-                seq = sorted(
-                    [0, window_max] + 
-                    list(np.random.choice(
-                        [t for t in valid_times if t not in [0, window_max]],
-                        size=seq_length-2,
-                        replace=False
-                    ))
-                )
-                seq = [int(t) for t in seq]  # Ensure Python integers
-
-                # Calculate F2 score
-                ref_vals = ref_interp(seq)
-                test_vals = test_interp(seq)
-                diff = test_vals - ref_vals
-                sum_sq = np.nansum(diff**2)
-                f2 = 100 - 25 * np.log10(1 + (sum_sq/len(seq)))
-
-                # Check compliance
-                compliant, reasons = check_compliance(seq, regulation, ref_vals, test_vals)
-                
-                # Classify dissolution range
-                dissolution_range = "60-100%" if max_diss > 60 else "30-60%" if max_diss > 30 else "0-30%"
-
-                # Maintain top results
-                result = {
-                    'sequence': seq,
-                    'f2': round(f2, 2),
-                    'compliant': compliant,
-                    'reasons': ", ".join(reasons),
-                    'range': dissolution_range
-                }
-                
-                if len(top_results) < top_n or f2 > top_results[-1]['f2']:
-                    top_results.append(result)
-                    top_results.sort(key=lambda x: -x['f2'])
-                    top_results = top_results[:top_n]
-
-            except Exception as e:
-                continue
-            finally:
-                pbar.update(1)
-
-    return pd.DataFrame(top_results)
-
-def check_compliance(seq, regulation, ref_vals, test_vals):
-    """Enhanced regulatory compliance check"""
-    compliant = True
-    reasons = []
-    
-    # Universal checks
-    if len(seq) < 3:
-        compliant = False
-        reasons.append("Insufficient time points (<3)")
-    if seq[0] != 0:
-        compliant = False
-        reasons.append("Missing initial time point (0)")
-    
-    # FDA-specific rules
-    if regulation == "FDA":
-        if any((ref_vals >= 85) | (test_vals >= 85)):
-            if not ((ref_vals[-1] >= 85) or (test_vals[-1] >= 85)):
-                compliant = False
-                reasons.append("Final time <85% with early saturation")
-    
-    # EMA-specific rules
-    elif regulation == "EMA":
-        if len(seq) < 4:
-            compliant = False
-            reasons.append("EMA requires ≥4 time points")
-        if any(ref_vals >= 85):
-            compliant = False
-            reasons.append("Reference dissolution ≥85%")
-    
-    return compliant, reasons
-
-def generate_compliance_report(df, regulation):
-    """Generate segmented compliance report"""
-    report = []
-    
-    # Summary statistics
-    report.append(f"Regulatory Compliance Report ({regulation})")
-    report.append("="*50)
-    report.append(f"Total Combinations Analyzed: {len(df)}")
-    report.append(f"Compliant Combinations: {len(df[df['compliant']])}")
-    report.append(f"Non-compliant Combinations: {len(df[~df['compliant']])}")
-    
-    # Range-based analysis
-    for range_name in ["0-30%", "30-60%", "60-100%"]:
-        range_df = df[df['range'] == range_name]
-        report.append(f"\n{range_name} Dissolution Range:")
-        report.append(f"  Total: {len(range_df)}")
-        report.append(f"  Compliant: {len(range_df[range_df['compliant']])}")
-        
-        if len(range_df) > 0:
-            top_reasons = range_df[~range_df['compliant']]['reasons'].value_counts().head(3)
-            report.append("  Top Reasons for Non-compliance:")
-            for reason, count in top_reasons.items():
-                report.append(f"    - {reason}: {count} cases")
-    
-    # Save to file
-    with open('compliance_report.txt', 'w') as f:
-        f.write("\n".join(report))
-
-# Main execution flow
-if __name__ == "__main__":
-    # Load data
-    file_path = r"File3.xlsx"
-    reference_df = pd.read_excel(file_path, sheet_name=0)
-    test_df = pd.read_excel(file_path, sheet_name=1)
-    
-    # Run basic checks
-    print("Running Initial Checks:")
-    # ... (include original check implementations) ...
-    
-    # Predictive analysis
-    run_predictive = input("\nRun predictive combination analysis? (yes/no): ")
-    if run_predictive.lower() == 'yes':
-        # Determine candidate window
-        window_min, window_max = determine_candidate_window(reference_df, test_df)
-        
-        # Get regulation
-        regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-        regulation = regulation_map.get(int(input("Select regulation (1-5): ")), "FDA")
-        
-        # Generate combinations
-        start_time = time.time()
-        results = generate_combinations(
-            reference_df, test_df,
-            regulation=regulation,
-            window_min=window_min,
-            window_max=window_max,
-            num_samples=10000,
-            top_n=500
-        )
-        
-        # Generate outputs
-        if not results.empty:
-            # Save and report
-            results.to_csv('top_combinations.csv', index=False)
-            generate_compliance_report(results, regulation)
-            
-            # Plot best result
-            best_result = results.iloc[0]
-            plot_optimal_profile(reference_df, test_df, best_result['sequence'], regulation)
-            print(f"\nOptimal sequence: {best_result['sequence']}")
-            print(f"F2 Score: {best_result['f2']}")
-            print(f"Visualization saved to optimal_dissolution_profile.png")
-        else:
-            print("\nNo valid combinations found")
-        
-        print(f"\nAnalysis completed in {time.time()-start_time:.2f}s")
+    # Rest of your combination generation logic
+    # ...
