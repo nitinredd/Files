@@ -1,78 +1,81 @@
-# Add this at the top with other imports
-import time
+# Add to imports
+import numpy as np
+from tqdm import tqdm
 
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, window_min, window_max, diff_threshold, interp_method='gpr', num_samples=5000):
-    """Optimized version with dissolution-based time steps and timing"""
-    # ========== DISSOLUTION RANGE CHECK ==========
-    # Calculate max dissolution from both products
-    max_dissolution = max(ref_df['Dissolution'].max(), test_df['Dissolution'].max())
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
+                                            window_min, window_max, diff_threshold,
+                                            num_samples=500000):
+    """Ultra-fast version with precomputation and vectorization"""
+    # ===== 1. PRECOMPUTE DISSOLUTION VALUES =====
+    # Create dense time grid (1-minute resolution)
+    time_grid = np.arange(window_min, window_max + 1)
     
-    # ========== TIME POINT GENERATION ==========
-    start_gen = time.time()
-    if max_dissolution <= 60:  # 0-60% dissolution range
-        times_3 = list(range(0, 61, 3))
-        times_5 = list(range(0, 61, 5))
-        times_list = sorted(list(set(times_3 + times_5)))
-    else:  # >60% dissolution
-        times_list = list(range(window_min, window_max + 1, 5))
+    # Create interpolation functions
+    ref_f = interp1d(ref_df.iloc[:,0], ref_df.iloc[:,1], 
+                    bounds_error=False, fill_value="extrapolate")
+    test_f = interp1d(test_df.iloc[:,0], test_df.iloc[:,1],
+                     bounds_error=False, fill_value="extrapolate")
     
-    # Ensure 0 is included and no duplicates
-    if 0 not in times_list:
-        times_list.insert(0, 0)
+    # Precompute values for all possible times
+    ref_values = ref_f(time_grid)
+    test_values = test_f(time_grid)
+    
+    # ===== 2. GENERATE TIME POINTS =====
+    max_diss = max(ref_values.max(), test_values.max())
+    if max_diss <= 60:
+        step_mask = (time_grid % 3 == 0) | (time_grid % 5 == 0)
     else:
-        times_list = list(sorted(set(times_list)))
+        step_mask = time_grid % 5 == 0
     
-    print(f"Time points generated in {time.time()-start_gen:.2f}s")
+    valid_times = time_grid[step_mask]
+    if 0 not in valid_times:
+        valid_times = np.insert(valid_times, 0, 0)
     
-    best_result = None
-    best_f2 = -np.inf
-    results = []
+    # ===== 3. VECTORIZED SAMPLING =====
+    start_time = time.time()
     
-    # ========== RANDOM SAMPLING ==========
-    start_sampling = time.time()
-    for _ in range(num_samples):
-        # Generate random sequence (3-6 points including 0 and window_max)
-        seq_length = np.random.randint(3, 7)
-        seq = [0, window_max]
-        
-        # Add random mid-points
-        remaining_points = seq_length - 2
-        if remaining_points > 0:
-            candidates = [t for t in times_list if t not in seq]
-            if candidates:
-                mid_points = np.random.choice(candidates, 
-                                            min(remaining_points, len(candidates)), 
-                                            replace=False)
-                seq.extend(mid_points)
-        
-        seq = sorted(seq)
-        
-        # ========== REGULATORY CHECKS ==========
-        ref_interp = interpolate_dissolution_curve(ref_df, seq, interp_method)
-        test_interp = interpolate_dissolution_curve(test_df, seq, interp_method)
-        compliant, reasons = check_regulatory_compliance(seq, regulation, 
-                                                        dict(zip(seq, ref_interp)),
-                                                        dict(zip(seq, test_interp)))
-        
-        if compliant:
-            # ========== F2 CALCULATION ==========
-            diff = np.array(test_interp) - np.array(ref_interp)
-            sum_sq = (diff ** 2).sum()
-            p = len(seq)
-            f2 = 100 - 25 * np.log10(1 + (sum_sq/p)) if p > 0 else 0
-        
-            if f2 > best_f2:
-                best_f2 = f2
-                best_result = {
-                    "sequence": seq,
-                    "f2": round(f2, 2),
-                    "compliant": True,
-                    "reasons": []
-                }
+    # Generate all sequences at once
+    seq_lengths = np.random.randint(3, 7, num_samples)
+    all_seqs = []
     
-    # ========== TIMING OUTPUT ==========
-    total_time = time.time() - start_sampling
-    print(f"Analyzed {num_samples} combinations in {total_time:.2f}s")
-    print(f"Total execution time: {total_time + (time.time()-start_gen):.2f}s")
+    # Progress bar setup
+    pbar = tqdm(total=num_samples, desc="Generating combinations")
     
-    return best_result, sorted(results, key=lambda x: -x['f2'])
+    for i in range(num_samples):
+        # Create sequence with 0 and window_max
+        seq = np.sort(np.random.choice(
+            valid_times[(valid_times > 0) & (valid_times < window_max)],
+            size=seq_lengths[i]-2,
+            replace=False
+        ))
+        seq = np.insert(seq, 0, 0)
+        seq = np.append(seq, window_max)
+        all_seqs.append(seq)
+        pbar.update(1)
+    pbar.close()
+    
+    # ===== 4. VECTORIZED COMPUTATIONS =====
+    # Convert to numpy array of arrays
+    all_seqs = np.array([np.pad(s, (0, 6-len(s)), mode='constant') for s in all_seqs])
+    
+    # Get dissolution values (vectorized)
+    ref_diss = ref_values[all_seqs]
+    test_diss = test_values[all_seqs]
+    
+    # Calculate F2 scores
+    diffs = test_diss - ref_diss
+    valid_mask = ~np.isnan(diffs)
+    sum_sq = np.nansum(diffs**2, axis=1)
+    lengths = np.sum(valid_mask, axis=1)
+    f2_scores = 100 - 25 * np.log10(1 + (sum_sq/lengths))
+    
+    # ===== 5. FIND BEST RESULT =====
+    best_idx = np.nanargmax(f2_scores)
+    
+    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    
+    return {
+        "sequence": all_seqs[best_idx][:lengths[best_idx]],
+        "f2": f2_scores[best_idx],
+        "time_points": valid_times
+    }, f2_scores
