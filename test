@@ -1,34 +1,44 @@
 import numpy as np
+import pandas as pd
 import time
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
+import warnings
 
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                             window_min, window_max, diff_threshold=None,
                                             interp_method='linear', num_samples=500000):
-    """Final version with NaN handling and full compliance tracking"""
+    """Final debugged version with proper array handling"""
     # ===== 1. Setup & Validation =====
     results = []
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
     
+    # Convert DataFrame columns to numpy arrays
+    ref_times = ref_df.iloc[:, 0].values
+    ref_diss = ref_df.iloc[:, 1].values
+    test_times = test_df.iloc[:, 0].values
+    test_diss = test_df.iloc[:, 1].values
+
     # ===== 2. Interpolation Setup =====
     time_grid = np.arange(window_min, window_max + 1)
     
     if interp_method == 'gpr':
         def create_gp_model(x, y):
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-            gp.fit(x.reshape(-1, 1), y)
+            gp.fit(x.reshape(-1, 1), y)  # Explicit reshape for numpy arrays
             return gp
-        ref_model = create_gp_model(ref_df.iloc[:,0], ref_df.iloc[:,1])
-        test_model = create_gp_model(test_df.iloc[:,0], test_df.iloc[:,1])
-        ref_f = lambda x: ref_model.predict(x.reshape(-1, 1))
-        test_f = lambda x: test_model.predict(x.reshape(-1, 1))
+            
+        ref_model = create_gp_model(ref_times, ref_diss)
+        test_model = create_gp_model(test_times, test_diss)
+        
+        ref_f = lambda x: ref_model.predict(np.array(x).reshape(-1, 1))
+        test_f = lambda x: test_model.predict(np.array(x).reshape(-1, 1))
     else:
-        ref_f = interp1d(ref_df.iloc[:,0], ref_df.iloc[:,1], 
+        ref_f = interp1d(ref_times, ref_diss,
                         kind=interp_method, bounds_error=False, fill_value="extrapolate")
-        test_f = interp1d(test_df.iloc[:,0], test_df.iloc[:,1],
+        test_f = interp1d(test_times, test_diss,
                          kind=interp_method, bounds_error=False, fill_value="extrapolate")
 
     # ===== 3. Time Points Generation =====
@@ -50,8 +60,8 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     start_time = time.time()
     seq_lengths = np.random.randint(3, 7, num_samples)
     
-    # Pre-allocate arrays
-    all_seqs = np.full((num_samples, 6), -1, dtype=int)  # Using -1 as placeholder
+    # Pre-allocate numpy arrays
+    all_seqs = np.full((num_samples, 6), -1, dtype=int)
     f2_scores = np.full(num_samples, np.nan)
     compliance_status = np.full(num_samples, False)
     compliance_reasons = [[] for _ in range(num_samples)]
@@ -59,39 +69,44 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     with tqdm(total=num_samples, desc="Processing combinations") as pbar:
         for i in range(num_samples):
             # Generate valid sequence
-            mid_points = np.random.choice(
-                valid_times[(valid_times > 0) & (valid_times < window_max)], 
-                size=seq_lengths[i]-2,
-                replace=False
-            )
-            seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
-            
-            # Store sequence (pad with -1)
-            all_seqs[i, :len(seq)] = seq
-            
-            # Get dissolution values
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                ref_vals = ref_f(seq)
-                test_vals = test_f(seq)
-            
-            # Calculate F2
-            diff = test_vals - ref_vals
-            if not np.isnan(diff).any():
-                sum_sq = np.sum(diff**2)
-                p = len(seq)
-                f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
-                f2_scores[i] = f2
-                
-                # Check compliance
-                compliant, reasons = check_regulatory_compliance(
-                    seq, regulation,
-                    dict(zip(seq, ref_vals)),
-                    dict(zip(seq, test_vals))
+            try:
+                mid_points = np.random.choice(
+                    valid_times[(valid_times > 0) & (valid_times < window_max)], 
+                    size=seq_lengths[i]-2,
+                    replace=False
                 )
-                compliance_status[i] = compliant
-                compliance_reasons[i] = reasons
-            
+                seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
+                
+                # Store sequence (pad with -1)
+                all_seqs[i, :len(seq)] = seq
+                
+                # Get dissolution values
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    ref_vals = ref_f(seq)
+                    test_vals = test_f(seq)
+                
+                # Calculate F2
+                diff = test_vals - ref_vals
+                if not np.isnan(diff).any():
+                    sum_sq = np.sum(diff**2)
+                    p = len(seq)
+                    f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
+                    f2_scores[i] = f2
+                    
+                    # Check compliance
+                    compliant, reasons = check_regulatory_compliance(
+                        seq, regulation,
+                        dict(zip(seq, ref_vals)),
+                        dict(zip(seq, test_vals))
+                    )
+                    compliance_status[i] = compliant
+                    compliance_reasons[i] = reasons
+
+            except ValueError as e:
+                # Handle rare cases with insufficient valid times
+                f2_scores[i] = np.nan
+                
             pbar.update(1)
     
     # ===== 5. Format Results =====
