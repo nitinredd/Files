@@ -1,64 +1,202 @@
-# In the main execution section after regulatory checks:
-run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-if run_predictive.lower() == 'yes':
-    # Determine candidate window
-    window_min, window_max = determine_candidate_window(
-        reference_mean_df, 
-        test_mean_df,
-        step=5, 
-        initial_threshold=10
-    )
-    
-    # Map regulation for predictive analysis
-    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-    selected_regulation = regulation_map.get(input1, "FDA")
-    
-    # Run predictive analysis under different conditions
-    conditions = [("Diff threshold 10", 10), 
-                 ("Diff threshold 20", 20), 
-                 ("No diff check", None)]
-    
-    all_candidates = []
-    overall_best = None
-    overall_best_f2 = -np.inf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+from tqdm import tqdm
+from scipy.interpolate import interp1d
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
+import warnings
+import csv
 
-    print(f"\nCandidate window for combination search: {window_min} to {window_max}")
+def plot_predictive_results(ref_df, test_df, best_sequence, regulation):
+    """Plot dissolution curves with optimal time points"""
+    plt.figure(figsize=(12, 6))
     
-    for cond_label, threshold in conditions:
-        print(f"\nProcessing candidates for condition: {cond_label}")
-        
-        # Get results for this condition
-        top_results, all_results = predictive_optimal_combinations_advanced(
-            reference_mean_df,
-            test_mean_df,
-            regulation=selected_regulation,
-            window_min=window_min,
-            window_max=window_max,
-            diff_threshold=threshold,
-            num_samples=5000
-        )
-        
-        # Add condition label to results
-        for res in top_results:
-            res['condition'] = cond_label
-        all_candidates.extend(top_results)
-        
-        # Track overall best
-        if top_results:
-            current_best = max(top_results, key=lambda x: x['f2'])
-            if current_best['f2'] > overall_best_f2:
-                overall_best = current_best
-                overall_best_f2 = current_best['f2']
+    # Plot raw data
+    plt.plot(ref_df.iloc[:,0], ref_df.iloc[:,1:].mean(axis=1), 
+             'bo-', label='Reference Mean')
+    plt.plot(test_df.iloc[:,0], test_df.iloc[:,1:].mean(axis=1),
+             'r^--', label='Test Mean')
+    
+    # Plot optimal time points
+    for t in best_sequence:
+        plt.axvline(x=t, color='g', linestyle=':', alpha=0.5)
+    
+    plt.title(f'Optimal Dissolution Profile ({regulation})\nSelected Time Points: {best_sequence}')
+    plt.xlabel('Time (minutes)')
+    plt.ylabel('Dissolution (%)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('predictive_dissolution_profile.png')
+    plt.close()
 
-    # Display final results
-    if overall_best:
-        print("\n=== Optimal Predictive Combination ===")
-        print(f"Condition: {overall_best.get('condition','N/A')}")
-        print(f"Time Points: {overall_best['sequence']}")
-        print(f"f2 Score: {overall_best['f2']}")
-        if overall_best['reasons']:
-            print(f"Compliance Issues: {', '.join(overall_best['reasons']}")
-        else:
-            print("Compliance: Yes")
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
+                                            window_min, window_max, diff_threshold=None,
+                                            interp_method='linear', num_samples=10000,
+                                            output_file='combinations_results.csv'):
+    """Final robust version with visualization and dual time steps"""
+    # Initialization and validation
+    results = []
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+    
+    # Convert to numpy arrays and handle NaNs
+    ref_times = ref_df.iloc[:,0].values.astype(float)
+    ref_diss = ref_df.iloc[:,1].values.astype(float)
+    test_times = test_df.iloc[:,0].values.astype(float)
+    test_diss = test_df.iloc[:,1].values.astype(float)
+
+    # Remove NaN values
+    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
+    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
+    
+    # Interpolation setup
+    if interp_method == 'gpr':
+        # GPR implementation with proper reshaping
+        def safe_gp_interpolator(x, y):
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
+            valid_mask = ~np.isnan(x) & ~np.isnan(y)
+            X = x[valid_mask].reshape(-1, 1)
+            gp.fit(X, y[valid_mask])
+            return gp
+            
+        ref_model = safe_gp_interpolator(ref_times, ref_diss)
+        test_model = safe_gp_interpolator(test_times, test_diss)
+        
+        def ref_interp(x): return ref_model.predict(np.array(x).reshape(-1, 1))
+        def test_interp(x): return test_model.predict(np.array(x).reshape(-1, 1))
     else:
-        print("\nNo valid combinations found across all conditions")
+        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
+        interp_method = interp_method if interp_method in valid_methods else 'linear'
+        
+        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask], 
+                            kind=interp_method, bounds_error=False, fill_value="extrapolate")
+        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
+                             kind=interp_method, bounds_error=False, fill_value="extrapolate")
+
+    # Time points generation with dual steps
+    time_grid = np.arange(window_min, window_max + 1)
+    max_ref = np.nanmax(ref_interp(time_grid))
+    max_test = np.nanmax(test_interp(time_grid))
+    max_diss = max(max_ref, max_test)
+    
+    # Generate time points with 3+5 minute steps if dissolution ≤60%
+    if max_diss <= 60:
+        time_points_3 = np.arange(0, window_max+1, 3)
+        time_points_5 = np.arange(0, window_max+1, 5)
+        valid_times = np.unique(np.concatenate([time_points_3, time_points_5]))
+    else:
+        valid_times = np.arange(0, window_max+1, 5)
+    
+    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
+
+    # Main processing loop
+    start_time = time.time()
+    
+    # Prepare CSV output
+    with open(output_file, 'w', newline='') as csvfile:
+        fieldnames = ['sequence', 'f2', 'compliant', 'reasons', 'time_points']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        with tqdm(total=num_samples, desc="Generating combinations") as pbar:
+            for _ in range(num_samples):
+                try:
+                    # Generate sequence with 3/5 minute steps
+                    seq_length = np.random.randint(3, 7)
+                    seq = [0, window_max]
+                    remaining = seq_length - 2
+                    
+                    candidates = [t for t in valid_times if t not in seq]
+                    mid_points = np.random.choice(candidates, remaining, replace=False)
+                    seq = sorted([0] + mid_points.tolist() + [window_max])
+                    
+                    # Get dissolution values
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        ref_vals = ref_interp(seq)
+                        test_vals = test_interp(seq)
+                    
+                    # Calculate F2
+                    diff = test_vals - ref_vals
+                    sum_sq = np.nansum(diff**2)
+                    p = len(seq)
+                    f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
+                    
+                    # Check compliance
+                    compliant, reasons = check_regulatory_compliance(
+                        seq, regulation,
+                        dict(zip(seq, ref_vals)),
+                        dict(zip(seq, test_vals))
+                    )
+                    
+                    # Write to CSV
+                    writer.writerow({
+                        'sequence': str(seq),
+                        'f2': round(f2, 2),
+                        'compliant': compliant,
+                        'reasons': '; '.join(reasons),
+                        'time_points': len(seq)
+                    })
+                    
+                except Exception as e:
+                    # Log errors but continue processing
+                    writer.writerow({
+                        'sequence': 'ERROR',
+                        'f2': np.nan,
+                        'compliant': False,
+                        'reasons': str(e),
+                        'time_points': 0
+                    })
+                
+                pbar.update(1)
+
+    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    print(f"Results saved to {output_file}")
+    
+    # Find and plot best combination
+    df = pd.read_csv(output_file)
+    best_result = df[df['compliant'] == True].sort_values('f2', ascending=False).iloc[0]
+    
+    plot_predictive_results(ref_df, test_df, 
+                           eval(best_result['sequence']),  # Convert string to list
+                           regulation)
+    
+    return df
+
+def check_regulatory_compliance(seq, regulation, ref_values, test_values):
+    """Enhanced compliance check with detailed reasons"""
+    compliant = True
+    reasons = []
+    
+    # FDA requirements
+    if regulation == "FDA":
+        # Check if any time point >85%
+        over_85_ref = [t for t, v in ref_values.items() if v >= 85]
+        over_85_test = [t for t, v in test_values.items() if v >= 85]
+        
+        if over_85_ref or over_85_test:
+            if seq[-1] not in over_85_ref + over_85_test:
+                compliant = False
+                reasons.append("85%+ dissolution not at last time point")
+    
+    # EMA requirements
+    elif regulation == "EMA":
+        if len(seq) < 4:
+            compliant = False
+            reasons.append("EMA requires ≥4 time points")
+            
+        if any(v >= 85 for v in ref_values.values()):
+            compliant = False
+            reasons.append("Reference dissolution ≥85%")
+    
+    # Common requirements
+    if len(seq) < 3:
+        compliant = False
+        reasons.append("Minimum 3 time points required")
+        
+    if seq[0] != 0:
+        compliant = False
+        reasons.append("Missing initial time point (0)")
+    
+    return compliant, reasons
