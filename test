@@ -10,17 +10,11 @@ import warnings
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                             window_min, window_max, diff_threshold=None,
                                             interp_method='linear', num_samples=500000):
-    """Robust final version with error handling and homogeneous arrays"""
+    """Final robust version with proper array reshaping and error handling"""
     # ===== 1. Initialization & Validation =====
     results = []
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
     
-    # Ensure integer time windows
-    window_min = int(window_min)
-    window_max = int(window_max)
-    time_grid = np.arange(window_min, window_max + 1)
-    
-    # ===== 2. Interpolation Setup =====
     # Convert to numpy arrays and handle NaNs
     ref_times = ref_df.iloc[:, 0].values.astype(float)
     ref_diss = ref_df.iloc[:, 1].values.astype(float)
@@ -31,27 +25,44 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
     test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
     
+    # ===== 2. Interpolation Setup =====
     if interp_method == 'gpr':
         def safe_gp_interpolator(x, y):
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
             valid_mask = ~np.isnan(x) & ~np.isnan(y)
-            gp.fit(x[valid_mask].reshape(-1, 1), y[valid_mask])
-            return gp.predict
+            X = x[valid_mask].reshape(-1, 1)  # Ensure 2D array
+            gp.fit(X, y[valid_mask])
+            return gp
             
-        ref_interp = safe_gp_interpolator(ref_times, ref_diss)
-        test_interp = safe_gp_interpolator(test_times, test_diss)
+        ref_model = safe_gp_interpolator(ref_times, ref_diss)
+        test_model = safe_gp_interpolator(test_times, test_diss)
+        
+        # Proper reshaping for prediction
+        def ref_interp(x):
+            return ref_model.predict(np.array(x).reshape(-1, 1))
+        
+        def test_interp(x):
+            return test_model.predict(np.array(x).reshape(-1, 1))
     else:
         valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
         interp_method = interp_method if interp_method in valid_methods else 'linear'
         
         ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask], 
-                             kind=interp_method, bounds_error=False, fill_value=np.nan)
+                            kind=interp_method, bounds_error=False, fill_value=np.nan)
         test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
-                              kind=interp_method, bounds_error=False, fill_value=np.nan)
+                             kind=interp_method, bounds_error=False, fill_value=np.nan)
 
     # ===== 3. Time Points Generation =====
-    max_ref = np.nanmax(ref_interp(time_grid))
-    max_test = np.nanmax(test_interp(time_grid))
+    time_grid = np.arange(window_min, window_max + 1).reshape(-1, 1)  # 2D array for GPR
+    
+    # Handle both interpolation types
+    try:
+        max_ref = np.nanmax(ref_interp(time_grid))
+        max_test = np.nanmax(test_interp(time_grid))
+    except ValueError:
+        max_ref = np.nanmax(ref_interp(time_grid.flatten()))
+        max_test = np.nanmax(test_interp(time_grid.flatten()))
+    
     max_diss = max(max_ref, max_test)
     
     if max_diss <= 60:
@@ -77,10 +88,14 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     with tqdm(total=num_samples, desc="Processing combinations") as pbar:
         for i in range(num_samples):
             try:
-                # Generate valid sequence
+                # Generate valid sequence with error checking
+                available_points = valid_times[(valid_times > 0) & (valid_times < window_max)]
+                if len(available_points) < (seq_lengths[i]-2):
+                    raise ValueError("Not enough valid time points")
+                
                 mid_points = np.random.choice(
-                    valid_times[(valid_times > 0) & (valid_times < window_max)], 
-                    size=max(1, seq_lengths[i]-2),  # Ensure at least 1 point
+                    available_points, 
+                    size=seq_lengths[i]-2,
                     replace=False
                 )
                 seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
@@ -92,9 +107,12 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                     raise ValueError("Sequence too long")
                 all_seqs[i, :seq_len] = seq
                 
-                # Get dissolution values
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
+                # Get dissolution values with proper reshaping
+                if interp_method == 'gpr':
+                    seq_2d = seq.reshape(-1, 1)  # Ensure 2D for GPR
+                    ref_vals = ref_interp(seq_2d)
+                    test_vals = test_interp(seq_2d)
+                else:
                     ref_vals = ref_interp(seq)
                     test_vals = test_interp(seq)
                 
@@ -141,4 +159,4 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     results.sort(key=lambda x: -x['f2'])
     
     print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
-    return results[:500], results  # Top 500 + all results
+    return results[:500], results  # Return top 500 and all results
