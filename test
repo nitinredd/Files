@@ -1,32 +1,114 @@
+import numpy as np
+import time
+from tqdm import tqdm
+from scipy.interpolate import interp1d
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel, ConstantKernel as C
+
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                             window_min, window_max, diff_threshold=None,
                                             interp_method='linear', num_samples=500000):
-    """Fixed version with proper interpolation method handling"""
-    # ===== 1. Create Interpolation Functions =====
+    """Final version with NaN handling and full compliance tracking"""
+    # ===== 1. Setup & Validation =====
+    results = []
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+    
+    # ===== 2. Interpolation Setup =====
     time_grid = np.arange(window_min, window_max + 1)
     
-    # Handle different interpolation methods
     if interp_method == 'gpr':
-        # Gaussian Process Regression implementation
-        kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
-        
-        def create_gp_interpolator(x, y):
+        def create_gp_model(x, y):
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
             gp.fit(x.reshape(-1, 1), y)
-            return lambda xx: gp.predict(xx.reshape(-1, 1))
-            
-        ref_f = create_gp_interpolator(ref_df.iloc[:,0].values, ref_df.iloc[:,1].values)
-        test_f = create_gp_interpolator(test_df.iloc[:,0].values, test_df.iloc[:,1].values)
+            return gp
+        ref_model = create_gp_model(ref_df.iloc[:,0], ref_df.iloc[:,1])
+        test_model = create_gp_model(test_df.iloc[:,0], test_df.iloc[:,1])
+        ref_f = lambda x: ref_model.predict(x.reshape(-1, 1))
+        test_f = lambda x: test_model.predict(x.reshape(-1, 1))
     else:
-        # Standard scipy interpolation
-        valid_methods = ['linear', 'nearest', 'zero', 'slinear', 'quadratic', 'cubic']
-        if interp_method not in valid_methods:
-            print(f"Invalid method {interp_method}. Defaulting to linear.")
-            interp_method = 'linear'
-            
-        ref_f = interp1d(ref_df.iloc[:,0], ref_df.iloc[:,1],
+        ref_f = interp1d(ref_df.iloc[:,0], ref_df.iloc[:,1], 
                         kind=interp_method, bounds_error=False, fill_value="extrapolate")
         test_f = interp1d(test_df.iloc[:,0], test_df.iloc[:,1],
                          kind=interp_method, bounds_error=False, fill_value="extrapolate")
 
-    # Rest of the function remains the same...
+    # ===== 3. Time Points Generation =====
+    max_ref = np.nanmax(ref_f(time_grid))
+    max_test = np.nanmax(test_f(time_grid))
+    max_diss = max(max_ref, max_test)
+    
+    if max_diss <= 60:
+        valid_times = np.unique(np.concatenate([
+            np.arange(0, window_max+1, 3),
+            np.arange(0, window_max+1, 5)
+        ]))
+    else:
+        valid_times = np.arange(0, window_max+1, 5)
+    
+    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
+    
+    # ===== 4. Vectorized Processing =====
+    start_time = time.time()
+    seq_lengths = np.random.randint(3, 7, num_samples)
+    
+    # Pre-allocate arrays
+    all_seqs = np.full((num_samples, 6), -1, dtype=int)  # Using -1 as placeholder
+    f2_scores = np.full(num_samples, np.nan)
+    compliance_status = np.full(num_samples, False)
+    compliance_reasons = [[] for _ in range(num_samples)]
+    
+    with tqdm(total=num_samples, desc="Processing combinations") as pbar:
+        for i in range(num_samples):
+            # Generate valid sequence
+            mid_points = np.random.choice(
+                valid_times[(valid_times > 0) & (valid_times < window_max)], 
+                size=seq_lengths[i]-2,
+                replace=False
+            )
+            seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
+            
+            # Store sequence (pad with -1)
+            all_seqs[i, :len(seq)] = seq
+            
+            # Get dissolution values
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ref_vals = ref_f(seq)
+                test_vals = test_f(seq)
+            
+            # Calculate F2
+            diff = test_vals - ref_vals
+            if not np.isnan(diff).any():
+                sum_sq = np.sum(diff**2)
+                p = len(seq)
+                f2 = 100 - 25 * np.log10(1 + (sum_sq/p))
+                f2_scores[i] = f2
+                
+                # Check compliance
+                compliant, reasons = check_regulatory_compliance(
+                    seq, regulation,
+                    dict(zip(seq, ref_vals)),
+                    dict(zip(seq, test_vals))
+                )
+                compliance_status[i] = compliant
+                compliance_reasons[i] = reasons
+            
+            pbar.update(1)
+    
+    # ===== 5. Format Results =====
+    valid_mask = ~np.isnan(f2_scores)
+    results = []
+    for i in np.where(valid_mask)[0]:
+        seq = all_seqs[i][all_seqs[i] != -1].tolist()
+        results.append({
+            'sequence': seq,
+            'f2': round(f2_scores[i], 2),
+            'compliant': compliance_status[i],
+            'reasons': compliance_reasons[i],
+            'length': len(seq)
+        })
+    
+    # Sort by F2 score descending
+    results.sort(key=lambda x: -x['f2'])
+    
+    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    return results[:500], results  # Return top 500 and all results
