@@ -1,23 +1,78 @@
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, window_min, window_max, diff_threshold, interp_method='gpr'):
-    # ... existing code ...
+# Add this at the top with other imports
+import time
+
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, window_min, window_max, diff_threshold, interp_method='gpr', num_samples=5000):
+    """Optimized version with dissolution-based time steps and timing"""
+    # ========== DISSOLUTION RANGE CHECK ==========
+    # Calculate max dissolution from both products
+    max_dissolution = max(ref_df['Dissolution'].max(), test_df['Dissolution'].max())
     
-    # ========== MODIFIED TIME GENERATION ==========
-    if window_min == 0 and window_max == 60:
-        # Combine 3 & 5 minute steps for 0-60 window
+    # ========== TIME POINT GENERATION ==========
+    start_gen = time.time()
+    if max_dissolution <= 60:  # 0-60% dissolution range
         times_3 = list(range(0, 61, 3))
         times_5 = list(range(0, 61, 5))
         times_list = sorted(list(set(times_3 + times_5)))
-    else:
-        # 5-minute steps for other windows
+    else:  # >60% dissolution
         times_list = list(range(window_min, window_max + 1, 5))
-    # ========== END MODIFICATION ==========
-
-def search_sequence(seq, next_index):
-    # ... existing code ...
-    for i in range(next_index, len(times_list)):
-        next_time = times_list[i]
-        if next_time <= seq[-1]:
-            continue  # This maintains ordering
-        seq.append(next_time)
-        search_sequence(seq, i + 1)
-        seq.pop()
+    
+    # Ensure 0 is included and no duplicates
+    if 0 not in times_list:
+        times_list.insert(0, 0)
+    else:
+        times_list = list(sorted(set(times_list)))
+    
+    print(f"Time points generated in {time.time()-start_gen:.2f}s")
+    
+    best_result = None
+    best_f2 = -np.inf
+    results = []
+    
+    # ========== RANDOM SAMPLING ==========
+    start_sampling = time.time()
+    for _ in range(num_samples):
+        # Generate random sequence (3-6 points including 0 and window_max)
+        seq_length = np.random.randint(3, 7)
+        seq = [0, window_max]
+        
+        # Add random mid-points
+        remaining_points = seq_length - 2
+        if remaining_points > 0:
+            candidates = [t for t in times_list if t not in seq]
+            if candidates:
+                mid_points = np.random.choice(candidates, 
+                                            min(remaining_points, len(candidates)), 
+                                            replace=False)
+                seq.extend(mid_points)
+        
+        seq = sorted(seq)
+        
+        # ========== REGULATORY CHECKS ==========
+        ref_interp = interpolate_dissolution_curve(ref_df, seq, interp_method)
+        test_interp = interpolate_dissolution_curve(test_df, seq, interp_method)
+        compliant, reasons = check_regulatory_compliance(seq, regulation, 
+                                                        dict(zip(seq, ref_interp)),
+                                                        dict(zip(seq, test_interp)))
+        
+        if compliant:
+            # ========== F2 CALCULATION ==========
+            diff = np.array(test_interp) - np.array(ref_interp)
+            sum_sq = (diff ** 2).sum()
+            p = len(seq)
+            f2 = 100 - 25 * np.log10(1 + (sum_sq/p)) if p > 0 else 0
+        
+            if f2 > best_f2:
+                best_f2 = f2
+                best_result = {
+                    "sequence": seq,
+                    "f2": round(f2, 2),
+                    "compliant": True,
+                    "reasons": []
+                }
+    
+    # ========== TIMING OUTPUT ==========
+    total_time = time.time() - start_sampling
+    print(f"Analyzed {num_samples} combinations in {total_time:.2f}s")
+    print(f"Total execution time: {total_time + (time.time()-start_gen):.2f}s")
+    
+    return best_result, sorted(results, key=lambda x: -x['f2'])
