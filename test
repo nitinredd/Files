@@ -1,77 +1,118 @@
-# ======================== STAGE 2: Helper & Predictive Analysis Functions ========================
-def generate_all_time_combinations(min_time, max_time, step=1):
-    """
-    Generate all possible time point sequences within the interval [min_time, max_time],
-    ensuring that 0 is fixed at the start and that there are at least 3 points.
-    """
-    # MODIFIED: Always generate both 3 and 5 minute intervals
-    times = list(np.unique(np.concatenate([
-        np.arange(min_time, max_time + 1, 3),
-        np.arange(min_time, max_time + 1, 5)
-    ]))
-    if 0 not in times:
-        times.insert(0, 0)
-    all_combinations = []
-    for r in range(2, len(times)):
-        for combo in itertools.combinations(times[1:], r):
-            seq = [0] + list(combo)
-            all_combinations.append(sorted(seq))
-    return list(all_combinations)
-###################################################
-# Inside predictive_optimal_combinations_advanced function
-# After interpolation (around line 1220 in original code):
-
-# Add dissolution range calculation
-max_ref = np.nanmax(ref_vals)
-max_test = np.nanmax(test_vals)
-max_diss = max(max_ref, max_test)
-
-if max_diss <= 30:
-    diss_range = "0-30%"
-elif 30 < max_diss <= 60:
-    diss_range = "30-60%"
-elif 60 < max_diss <= 90:
-    diss_range = "60-90%"
-else:
-    diss_range = "90-100%"
-
-# Update results storage
-results.append({
-    'sequence': seq,
-    'f2': round(f2, 2),
-    'compliant': compliance_status[i],
-    'reasons': compliance_reasons[i],
-    'length': len(seq),
-    'diss_range': diss_range  # New field
-})
-$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
-def print_range_stats(results):
-    """New function to print dissolution range statistics"""
-    range_stats = {
-        "0-30%": {"total": 0, "compliant": 0},
-        "30-60%": {"total": 0, "compliant": 0},
-        "60-90%": {"total": 0, "compliant": 0},
-        "90-100%": {"total": 0, "compliant": 0}
-    }
+if run_predictive.lower() == 'yes':
+    # Determine candidate window
+    window_min, window_max = determine_candidate_window(
+        reference_mean_df, 
+        test_mean_df,
+        step=5,
+        initial_threshold=10
+    )
     
-    for res in results:
-        rng = res['diss_range']
-        range_stats[rng]['total'] += 1
-        if res['compliant']:
-            range_stats[rng]['compliant'] += 1
-            
-    print("\n=== Dissolution Range Statistics ===")
-    for rng, stats in range_stats.items():
-        print(f"{rng}:")
-        print(f"  Total combinations: {stats['total']}")
-        print(f"  Compliant combinations: {stats['compliant']}")
-        if stats['total'] > 0:
-            compliance_rate = stats['compliant']/stats['total']*100
-            print(f"  Compliance rate: {compliance_rate:.1f}%")
-        print()
-###############################################################################
-# Replace existing print statement with:
-print(f"{idx+1:3d}. Range: {cand['diss_range']} | Length: {cand['length']} | f2: {cand['f2']} | Compliant: {comp} | Reasons: {reasons}")
+    # Map regulation for predictive analysis
+    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+    selected_regulation = regulation_map.get(input1, "FDA")
+    
+    # Run predictive analysis under different conditions
+    conditions = [("Diff threshold 10", 10), 
+                 ("Diff threshold 20", 20), 
+                 ("No diff check", None)]
+    
+    all_candidates = []
+    overall_best = None
+    overall_best_f2 = -np.inf
 
-# Add after sorting results
-print_range_stats(all_candidates_sorted)
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using 3 & 5 minute intervals)")
+    
+    for cond_label, threshold in conditions:
+        print(f"\nProcessing candidates for condition: {cond_label}")
+        
+        # Get results for this condition
+        top_results, all_results = predictive_optimal_combinations_advanced(
+            reference_mean_df,
+            test_mean_df,
+            regulation=selected_regulation,
+            window_min=window_min,
+            window_max=window_max,
+            diff_threshold=threshold,
+            num_samples=1000000
+        )
+        
+        # Add condition label and dissolution range info
+        for res in top_results:
+            res['condition'] = cond_label
+            # Calculate dissolution range for each result
+            seq = res['sequence']
+            ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
+            test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
+            max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
+            res['diss_range'] = (
+                "0-30%" if max_diss <= 30 else
+                "30-60%" if 30 < max_diss <= 60 else
+                "60-90%" if 60 < max_diss <= 90 else
+                "90-100%"
+            )
+        all_candidates.extend(top_results)
+        
+        # Track overall best
+        if top_results:
+            current_best = max(top_results, key=lambda x: x['f2'])
+            if current_best['f2'] > overall_best_f2:
+                overall_best = current_best
+                overall_best_f2 = current_best['f2']
+
+    # New function to print range statistics
+    def print_range_stats(candidates):
+        ranges = ["0-30%", "30-60%", "60-90%", "90-100%"]
+        stats = {r: {"total": 0, "compliant": 0} for r in ranges}
+        
+        for cand in candidates:
+            rng = cand.get('diss_range', 'Unknown')
+            stats[rng]['total'] += 1
+            if cand['compliant']:
+                stats[rng]['compliant'] += 1
+                
+        print("\n=== Dissolution Range Distribution ===")
+        for rng, data in stats.items():
+            if data['total'] > 0:
+                compliance_rate = (data['compliant']/data['total'])*100
+                print(f"{rng}:")
+                print(f"  Total combinations: {data['total']}")
+                print(f"  Compliant combinations: {data['compliant']}")
+                print(f"  Compliance rate: {compliance_rate:.1f}%")
+
+    # Display final results
+    if overall_best:
+        print("\n=== Optimal Predictive Combination ===")
+        print(f"Condition: {overall_best.get('condition','N/A')}")
+        print(f"Dissolution Range: {overall_best['diss_range']}")
+        print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
+        print(f"Predicted f2 Score: {overall_best['f2']}")
+        
+        if overall_best['reasons']:
+            print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
+        else:
+            print("Regulatory Compliance: Passed")
+        
+        # Print range statistics
+        print_range_stats(all_candidates)
+        
+        # Plot results
+        plt.figure(figsize=(12, 6))
+        time_points = overall_best['sequence']
+        ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
+        test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
+        
+        plt.plot(time_points, ref_diss, 'bo-', label='Reference')
+        plt.plot(time_points, test_diss, 'r*--', label='Test')
+        plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
+        plt.xlabel('Time (min)')
+        plt.ylabel('Dissolution (%)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    else:
+        print("❌ No valid combinations found across all dissolution ranges")
+
+    # Print all candidates with range info
+    print("\n=== All Candidate Combinations ===")
+    for idx, cand in enumerate(sorted(all_candidates, key=lambda x: -x['f2'])):
+        print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
