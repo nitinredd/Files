@@ -1,354 +1,40 @@
-if input1 == 1:
-    print("According to FDA >= 85 guidelines")
-    print(" ")
-    both_85_criteria = check_both_85(reference_df, test_df)
-    either_85_criteria = check_either_85(reference_df, test_df)
+# Display final results
+if overall_best:
+    print("\n=== Optimal Predictive Combination ===")
+    print(f"Condition: {overall_best.get('condition','N/A')}")
+    print(f"Dissolution Range: {overall_best['diss_range']}")
+    print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
+    print(f"Length: {len(overall_best['sequence'])}")
+    print(f"Predicted f2 Score: {overall_best['f2']}")
 
-    print("CV check results:")
-    cv_check = check_cv(test_df) and check_cv(reference_df)
-    print("CV should be less than 20 at the first (non-zero) time point and less than 10 at the following time points for both products -", cv_check)
-    print(" ")
+    # Compute predicted dissolution percentages for the optimal sequence
+    optimal_sequence = overall_best['sequence']
+    ref_diss_pred = interpolate_dissolution_curve(reference_mean_df, optimal_sequence, method='gpr')
+    test_diss_pred = interpolate_dissolution_curve(test_mean_df, optimal_sequence, method='gpr')
 
-    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
-        reference_df = reference_df.drop(reference_df.index[0])
-        reference_df = reference_df.reset_index(drop=True)
-    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
-        test_df = test_df.drop(test_df.index[0])
-        test_df = test_df.reset_index(drop=True)
-
-    if check_same_time_points(test_df, reference_df):
-        if both_85_criteria:
-            print("\nAnalysis based on FDA Both >= 85 criteria:")
-            changed_data_both85_f2s(reference_df, test_df)
-            if not cv_check:
-                print("\nWarning: CV requirements not met. Results may not be valid for regulatory purposes.")
-            print("Loading bootstrap percentile.. & Loading BCA...")
-            changed_data_both85_bca(reference_df, test_df)
-        elif either_85_criteria:
-            print("\nAnalysis based on FDA Either >= 85 criteria:")
-            changed_data_either85_FDA_f2s(reference_df, test_df)
-            if not cv_check:
-                print("\nWarning: CV requirements not met. Results may not be valid for regulatory purposes.")
-            print("Loading bootstrap percentile.. & Loading BCA...")
-            changed_data_either85_FDA_bca(reference_df, test_df)
-        else:
-            print("\nWarning: Neither 'Both >= 85' nor 'Either >= 85' criteria are met.")
-            print("Performing f2 calculations anyway for reference:")
-            print("\nResults using Both >= 85 criteria:")
-            changed_data_both85_f2s(reference_df, test_df)
-            print("\nResults using Either >= 85 criteria:")
-            changed_data_either85_FDA_f2s(reference_df, test_df)
+    # Print the predicted dissolution percentages
+    print(f"Predicted Reference Dissolution: {ref_diss_pred}")
+    print(f"Predicted Test Dissolution: {test_diss_pred}")
+    
+    if overall_best['reasons']:
+        print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
     else:
-        print("Error: Time points between test and reference datasets do not match.")
-        print("Calculations cannot be performed.")
-
-    # Prompt for predictive analysis
-    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-    if run_predictive.lower() == 'yes':
-        # Determine candidate window
-        window_min, window_max = determine_candidate_window(
-            reference_mean_df, 
-            test_mean_df,
-            step=5,
-            initial_threshold=10
-        )
-        
-        # Map regulation for predictive analysis
-        regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-        selected_regulation = regulation_map.get(input1, "FDA")
-        
-        # Run predictive analysis under different conditions
-        conditions = [("Diff threshold 10", 10), 
-                      ("Diff threshold 20", 20), 
-                      ("No diff check", None)]
-        
-        all_candidates = []
-        overall_best = None
-        overall_best_f2 = -np.inf
-
-        print(f"\nCandidate window for combination search: {window_min} to {window_max} (using 3 & 5 minute intervals)")
-        
-        for cond_label, threshold in conditions:
-            print(f"\nProcessing candidates for condition: {cond_label}")
-            
-            # Get results for this condition
-            top_results, all_results = predictive_optimal_combinations_advanced(
-                reference_mean_df,
-                test_mean_df,
-                regulation=selected_regulation,
-                window_min=window_min,
-                window_max=window_max,
-                diff_threshold=threshold,
-                num_samples=1000000
-            )
-            
-            # Add condition label and updated dissolution range info
-            for res in top_results:
-                res['condition'] = cond_label
-                seq = res['sequence']
-                ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
-                test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
-                max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
-                res['diss_range'] = (
-                    "0-30%" if max_diss <= 30 else
-                    "30-60%" if max_diss <= 60 else
-                    "60-90%" if max_diss <= 90 else
-                    "90-120%" if max_diss <= 120 else
-                    "120%+"
-                )
-            all_candidates.extend(top_results)
-            
-            # Track overall best candidate (across conditions)
-            if top_results:
-                current_best = max(top_results, key=lambda x: x['f2'])
-                if current_best['f2'] > overall_best_f2:
-                    overall_best = current_best
-                    overall_best_f2 = current_best['f2']
-
-        # ===== Duplicate Filtering =====
-        # Remove duplicate candidate sequences (keep the candidate with the highest f2 for each unique sequence)
-        unique_candidates_dict = {}
-        for cand in all_candidates:
-            seq_tuple = tuple(cand['sequence'])
-            if seq_tuple in unique_candidates_dict:
-                if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
-                    unique_candidates_dict[seq_tuple] = cand
-            else:
-                unique_candidates_dict[seq_tuple] = cand
-        unique_candidates = list(unique_candidates_dict.values())
-        
-        # ===== Updated Statistics Function =====
-        def print_range_stats(candidates):
-            ranges = ["0-30%", "30-60%", "60-90%", "90-120%", "120%+"]
-            stats = {r: {"total": 0, "compliant": 0} for r in ranges}
-            
-            for cand in candidates:
-                rng = cand.get('diss_range', 'Unknown')
-                if rng in stats:
-                    stats[rng]['total'] += 1
-                    if cand['compliant']:
-                        stats[rng]['compliant'] += 1
-                else:
-                    stats[rng] = {"total": 1, "compliant": 1 if cand['compliant'] else 0}
-                    
-            print("\n=== Dissolution Range Distribution ===")
-            for rng, data in stats.items():
-                if data['total'] > 0:
-                    compliance_rate = (data['compliant']/data['total'])*100
-                    print(f"{rng}:")
-                    print(f"  Total combinations: {data['total']}")
-                    print(f"  Compliant combinations: {data['compliant']}")
-                    print(f"  Compliance rate: {compliance_rate:.1f}%")
-        
-        # ===== Display Final Results =====
-        if overall_best:
-            print("\n=== Optimal Predictive Combination ===")
-            print(f"Condition: {overall_best.get('condition','N/A')}")
-            print(f"Dissolution Range: {overall_best['diss_range']}")
-            print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
-            print(f"Length: {len(overall_best['sequence'])}")
-            print(f"Predicted f2 Score: {overall_best['f2']}")
-            
-            if overall_best['reasons']:
-                print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
-            else:
-                print("Regulatory Compliance: Passed")
-            
-            # Print range statistics using unique candidates
-            print_range_stats(unique_candidates)
-            
-            # Plot results
-            plt.figure(figsize=(12, 6))
-            time_points = overall_best['sequence']
-            ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
-            test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
-            
-            plt.plot(time_points, ref_diss, 'bo-', label='Reference')
-            plt.plot(time_points, test_diss, 'r*--', label='Test')
-            plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
-            plt.xlabel('Time (min)')
-            plt.ylabel('Dissolution (%)')
-            plt.legend()
-            plt.grid(True)
-            plt.show()
-        else:
-            print("❌ No valid combinations found across all dissolution ranges")
-        
-        # ===== Print All Unique Candidate Combinations =====
-        print("\n=== All Unique Candidate Combinations ===")
-        sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
-        for idx, cand in enumerate(sorted_candidates):
-            print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
-
-elif input1 == 2:
-    print("According to EMA/ICH/Canada/Australia guidelines")
-    print("CV check results:")
-    cv_check = check_cv(test_df) and check_cv(reference_df)
-    print("CV should be less than 20 at the first (non-zero) time point and less than 10 at the following time points for both products -", cv_check)
-
-    # Remove time point 0 if present
-    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
-        reference_df = reference_df.drop(reference_df.index[0])
-        reference_df = reference_df.reset_index(drop=True)
-    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
-        test_df = test_df.drop(test_df.index[0])
-        test_df = test_df.reset_index(drop=True)
-
-    # Check time points alignment
-    time_points_check = check_same_time_points(test_df, reference_df)
-    if time_points_check:
-        # Always perform f2 calculations using either > 85% criterion
-        either_85_criteria = check_either_85(reference_df, test_df)
-        if either_85_criteria:
-            print("\nAnalysis based on EMA/ICH/Canada/Australia guidelines (either > 85%):")
-            changed_data_either85_f2s(reference_df, test_df)
-            if not cv_check:
-                print("\nWarning: CV requirements not met. Results may not be valid for regulatory purposes.")
-            print("Loading bootstrap percentile.. & Loading BCA...")
-            changed_data_either85_bca(reference_df, test_df)
-        else:
-            print("\nWarning: 'Either > 85' criteria are not met.")
-            print("Performing f2 calculations anyway for reference:")
-            changed_data_either85_f2s(reference_df, test_df)
-            print("Loading bootstrap percentile.. & Loading BCA...")
-            changed_data_either85_bca(reference_df, test_df)
-    else:
-        print("Error: Time points between test and reference datasets do not match.")
-        print("Calculations cannot be performed.")
-
-    # Prompt for predictive analysis
-    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-    if run_predictive.lower() == 'yes':
-        # Determine candidate window
-        window_min, window_max = determine_candidate_window(
-            reference_mean_df, 
-            test_mean_df,
-            step=5,
-            initial_threshold=10
-        )
-        
-        # Map regulation for predictive analysis
-        regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-        selected_regulation = regulation_map.get(input1, "FDA")
-        
-        # Run predictive analysis under different conditions
-        conditions = [("Diff threshold 10", 10), 
-                      ("Diff threshold 20", 20), 
-                      ("No diff check", None)]
-        
-        all_candidates = []
-        overall_best = None
-        overall_best_f2 = -np.inf
-
-        print(f"\nCandidate window for combination search: {window_min} to {window_max} (using 3 & 5 minute intervals)")
-        
-        for cond_label, threshold in conditions:
-            print(f"\nProcessing candidates for condition: {cond_label}")
-            
-            # Get results for this condition
-            top_results, all_results = predictive_optimal_combinations_advanced(
-                reference_mean_df,
-                test_mean_df,
-                regulation=selected_regulation,
-                window_min=window_min,
-                window_max=window_max,
-                diff_threshold=threshold,
-                num_samples=1000000
-            )
-            
-            # Add condition label and updated dissolution range info
-            for res in top_results:
-                res['condition'] = cond_label
-                seq = res['sequence']
-                ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
-                test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
-                max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
-                res['diss_range'] = (
-                    "0-30%" if max_diss <= 30 else
-                    "30-60%" if max_diss <= 60 else
-                    "60-90%" if max_diss <= 90 else
-                    "90-120%" if max_diss <= 120 else
-                    "120%+"
-                )
-            all_candidates.extend(top_results)
-            
-            # Track overall best candidate (across conditions)
-            if top_results:
-                current_best = max(top_results, key=lambda x: x['f2'])
-                if current_best['f2'] > overall_best_f2:
-                    overall_best = current_best
-                    overall_best_f2 = current_best['f2']
-
-        # ===== Duplicate Filtering =====
-        unique_candidates_dict = {}
-        for cand in all_candidates:
-            seq_tuple = tuple(cand['sequence'])
-            if seq_tuple in unique_candidates_dict:
-                if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
-                    unique_candidates_dict[seq_tuple] = cand
-            else:
-                unique_candidates_dict[seq_tuple] = cand
-        unique_candidates = list(unique_candidates_dict.values())
-        
-        # ===== Updated Statistics Function =====
-        def print_range_stats(candidates):
-            ranges = ["0-30%", "30-60%", "60-90%", "90-120%", "120%+"]
-            stats = {r: {"total": 0, "compliant": 0} for r in ranges}
-            
-            for cand in candidates:
-                rng = cand.get('diss_range', 'Unknown')
-                if rng in stats:
-                    stats[rng]['total'] += 1
-                    if cand['compliant']:
-                        stats[rng]['compliant'] += 1
-                else:
-                    stats[rng] = {"total": 1, "compliant": 1 if cand['compliant'] else 0}
-                    
-            print("\n=== Dissolution Range Distribution ===")
-            for rng, data in stats.items():
-                if data['total'] > 0:
-                    compliance_rate = (data['compliant']/data['total'])*100
-                    print(f"{rng}:")
-                    print(f"  Total combinations: {data['total']}")
-                    print(f"  Compliant combinations: {data['compliant']}")
-                    print(f"  Compliance rate: {compliance_rate:.1f}%")
-        
-        # ===== Display Final Results =====
-        if overall_best:
-            print("\n=== Optimal Predictive Combination ===")
-            print(f"Condition: {overall_best.get('condition','N/A')}")
-            print(f"Dissolution Range: {overall_best['diss_range']}")
-            print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
-            print(f"Length: {len(overall_best['sequence'])}")
-            print(f"Predicted f2 Score: {overall_best['f2']}")
-            
-            if overall_best['reasons']:
-                print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
-            else:
-                print("Regulatory Compliance: Passed")
-            
-            # Print range statistics using unique candidates
-            print_range_stats(unique_candidates)
-            
-            # Plot results
-            plt.figure(figsize=(12, 6))
-            time_points = overall_best['sequence']
-            ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
-            test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
-            
-            plt.plot(time_points, ref_diss, 'bo-', label='Reference')
-            plt.plot(time_points, test_diss, 'r*--', label='Test')
-            plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
-            plt.xlabel('Time (min)')
-            plt.ylabel('Dissolution (%)')
-            plt.legend()
-            plt.grid(True)
-            plt.show()
-        else:
-            print("❌ No valid combinations found across all dissolution ranges")
-        
-        # ===== Print All Unique Candidate Combinations =====
-        print("\n=== All Unique Candidate Combinations ===")
-        sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
-        for idx, cand in enumerate(sorted_candidates):
-            print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+        print("Regulatory Compliance: Passed")
+    
+    # Print range statistics using unique candidates
+    print_range_stats(unique_candidates)
+    
+    # Plot results
+    plt.figure(figsize=(12, 6))
+    time_points = overall_best['sequence']
+    # (Re-use the computed predicted values for plotting)
+    plt.plot(time_points, ref_diss_pred, 'bo-', label='Reference')
+    plt.plot(time_points, test_diss_pred, 'r*--', label='Test')
+    plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
+    plt.xlabel('Time (min)')
+    plt.ylabel('Dissolution (%)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+else:
+    print("❌ No valid combinations found across all dissolution ranges")
