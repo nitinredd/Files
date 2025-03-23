@@ -1,53 +1,170 @@
-# Display final results
-if overall_best:
-    print("\n=== Optimal Predictive Combination ===")
-    print(f"Condition: {overall_best.get('condition', 'N/A')}")
-    print(f"Dissolution Range: {overall_best['diss_range']}")
-    print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
-    print(f"Length: {len(overall_best['sequence'])}")
-    print(f"Predicted f2 Score: {overall_best['f2']}")
+# main.py
+import streamlit as st
+import pandas as pd
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
+import ast
+import tempfile
+import os
 
-    # Compute predicted dissolution percentages for the optimal sequence
-    optimal_sequence = overall_best['sequence']
-    ref_diss_pred = interpolate_dissolution_curve(reference_mean_df, optimal_sequence, method='gpr')
-    test_diss_pred = interpolate_dissolution_curve(test_mean_df, optimal_sequence, method='gpr')
-
-    # Do not multiply by 100 if the values are already percentages.
-    # Instead, clip them to ensure they remain between 0 and 100.
-    ref_diss_pred_percent = np.clip(ref_diss_pred, 0, 100)
-    test_diss_pred_percent = np.clip(test_diss_pred, 0, 100)
-
-    # Ensure the dissolution at time zero is exactly 0, if the first time point is 0
-    if optimal_sequence[0] == 0:
-        ref_diss_pred_percent[0] = 0.0
-        test_diss_pred_percent[0] = 0.0
-
-    # Print the predicted dissolution percentages alongside the time points
-    print("\nPredicted Reference Dissolution Percentages:")
-    for t, d in zip(optimal_sequence, ref_diss_pred_percent):
-        print(f"Time {t} min: {d:.2f}%")
-
-    print("\nPredicted Test Dissolution Percentages:")
-    for t, d in zip(optimal_sequence, test_diss_pred_percent):
-        print(f"Time {t} min: {d:.2f}%")
-
-    if overall_best['reasons']:
-        print(f"\nCompliance Issues: {', '.join(overall_best['reasons'])}")
-    else:
-        print("\nRegulatory Compliance: Passed")
+# Gemini Configuration
+def configure_gemini():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+    credentials, project_id = google.auth.default()
     
-    # Print range statistics using unique candidates
-    print_range_stats(unique_candidates)
+    safety_config = [
+        SafetySetting(category=hc, threshold=HarmBlockThreshold.BLOCK_NONE)
+        for hc in HarmCategory
+    ]
     
-    # Plot results using the corrected percentages
-    plt.figure(figsize=(12, 6))
-    plt.plot(optimal_sequence, ref_diss_pred_percent, 'bo-', label='Reference')
-    plt.plot(optimal_sequence, test_diss_pred_percent, 'r*--', label='Test')
-    plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
-    plt.xlabel('Time (min)')
-    plt.ylabel('Dissolution (%)')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-else:
-    print("❌ No valid combinations found across all dissolution ranges")
+    return {
+        "flash_thinking": GenerativeModel("gemini-2.0-flash-thinking-exp-01-21"),
+        "pro_model": GenerativeModel("gemini-2.0-pro-exp-02-05"),
+        "safety": safety_config
+    }
+
+gemini_config = configure_gemini()
+
+# Predefined Prompt Templates
+PROMPT_TEMPLATES = {
+    "3-Pump Basic": """I need flow rate calculations for 3 pumps where:
+- Reaction time = ResidencetimeT1 × Reactor Volume (from Reactor Details)
+- Flow rates determined by molar ratios of:
+  1. Primary reactant (first in Pump Details)
+  2. Reagent 1 (second in Pump Details) using Equivalence1
+  3. Reagent 2 (third in Pump Details) using Equivalence2
+- Molarity = (Concentration / Molecular Weight) × 1000
+- Total flow = Reactor Volume / Residence Time
+- Pump flows = (Individual molar ratio / Total molar sum) × Total flow""",
+
+    "4-Pump Advanced": """Calculate flow rates for 4 pumps with:
+- Reaction time = (ResidenceTimeT1 + ResidenceTimeT2) × Reactor Volume
+- Pump 1: Base reactant (first in Pump Details) 
+- Pumps 2-3: Sequential reagents using Equivalence1-2
+- Pump 4: Quench flow at 1.5× total of first 3 pumps
+- Account for temperature compensation from LHS experiments""",
+
+    "Custom Setup": """Create custom flow calculations where:
+- Reaction time depends on both ResidenceTime and CatalystLoading
+- Flow rates must maintain stoichiometric ratios from LHS
+- Include safety margin of 15% on all pump flows
+- Handle unit conversions between ml/min and L/hour"""
+}
+
+def generate_flow_code(prompt, use_deepthink, pump_df, reactor_df):
+    model = gemini_config["flash_thinking"] if use_deepthink else gemini_config["pro_model"]
+    
+    full_prompt = f"""
+    STRICTLY GENERATE PYTHON CODE ONLY. Follow these requirements:
+    1. Use pandas DataFrame operations
+    2. Reference columns exactly as provided:
+       Pump Details: {list(pump_df.columns)}
+       Reactor Details: {list(reactor_df.columns)}
+    3. Follow chemical engineering best practices
+    4. Include error checking for negative values
+    5. Return DataFrame with calculated flow rates
+    
+    User Requirements:
+    {prompt}
+    """
+    
+    response = model.generate_content(
+        contents=full_prompt,
+        safety_settings=gemini_config["safety"]
+    )
+    return response.text
+
+def safe_execute(code_str, dfs):
+    namespace = {
+        "pd": pd,
+        "df_lhs": dfs["lhs"].copy(),
+        "df_pump": dfs["pump"].copy(),
+        "df_reactor": dfs["reactor"].copy()
+    }
+    
+    try:
+        tree = ast.parse(code_str)
+        exec(compile(tree, filename="<ast>", mode="exec"), namespace)
+        return namespace.get('result')
+    except Exception as e:
+        st.error(f"Execution Error: {str(e)}")
+        return None
+
+def main():
+    st.title("AutoFlow Reactor Optimizer")
+    
+    # File Upload Section
+    uploaded_files = st.file_uploader("Upload Configuration Files", 
+                                    type=["xlsx"],
+                                    accept_multiple_files=True)
+    
+    if uploaded_files:
+        # Read all sheets
+        dfs = {
+            "lhs": pd.read_excel(uploaded_files[0], sheet_name="LHS"),
+            "objectives": pd.read_excel(uploaded_files[0], sheet_name="Objectives"),
+            "pump": pd.read_excel(uploaded_files[0], sheet_name="Pump Details"),
+            "reactor": pd.read_excel(uploaded_files[0], sheet_name="Reactor Details")
+        }
+        
+        # Editable Data Preview
+        with st.expander("Edit Configuration Data", expanded=True):
+            tabs = st.tabs(["LHS Design", "Objectives", "Pump Details", "Reactor Details"])
+            with tabs[0]:
+                dfs["lhs"] = st.data_editor(dfs["lhs"])
+            with tabs[1]:
+                dfs["objectives"] = st.data_editor(dfs["objectives"])
+            with tabs[2]:
+                dfs["pump"] = st.data_editor(dfs["pump"])
+            with tabs[3]:
+                dfs["reactor"] = st.data_editor(dfs["reactor"])
+        
+        # Prompt Section
+        st.subheader("Flow Calculation Setup")
+        col1, col2 = st.columns([3,1])
+        with col1:
+            user_prompt = st.text_area("Enter your requirements:", height=150)
+        with col2:
+            use_deepthink = st.toggle("DeepThink", help="Use advanced reasoning model")
+            st.button("Example Prompts", help="View predefined templates")
+        
+        # Prompt Templates
+        with st.expander("Quick Start Templates"):
+            for name, template in PROMPT_TEMPLATES.items():
+                if st.button(name):
+                    st.session_state.current_prompt = template
+            user_prompt = st.text_area("Selected Template", 
+                                      value=st.session_state.get("current_prompt", ""),
+                                      height=200)
+        
+        # Generation and Execution
+        if st.button("Generate Flow Calculations"):
+            if user_prompt:
+                code = generate_flow_code(user_prompt, use_deepthink, 
+                                         dfs["pump"], dfs["reactor"])
+                
+                with st.expander("Generated Code", expanded=True):
+                    st.code(code)
+                
+                result = safe_execute(code, dfs)
+                if result is not None:
+                    st.success("Flow rates calculated successfully!")
+                    st.dataframe(result)
+                    
+                    # Continue with original optimization workflow
+                    st.subheader("Optimization Progress")
+                    # ... [Original optimization code here] ...
+                    
+            else:
+                st.warning("Please enter calculation requirements")
+
+if __name__ == "__main__":
+    main()
+###################
+# Instead of fixed functions:
+# result = utils.flowrate.pump3_flow_rate1(...)
+
+# Use generated code:
+result = generated_flowrate(result, df_pump, df_reactor)
+############################
+pip install streamlit pandas google-cloud-aiplatform openpyxl astor
