@@ -1,11 +1,54 @@
+# utils/optimization.py
+from summit.strategies import TSEMO, SNOBFIT
+import pandas as pd
+from summit.utils.dataset import DataSet
+from .flowrate import generated_flowrate  # Add this import
+
+def multi_tsemo(domain, lhs_exp):
+    strat_TSEMO = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
+    initial = DataSet.from_df(lhs_exp)
+    return strat_TSEMO.suggest_experiments(1, initial, use_spectral_sample=True, pop_size=100, iterations=100)
+
+def single_snobfit(domain, lhs_exp):
+    strat_SNOBFIT = SNOBFIT(domain)
+    initial = DataSet.from_df(lhs_exp)
+    return strat_SNOBFIT.suggest_experiments(1, initial)
+
+def run_optimization(domain, sor_in, nobj, df_pump, df_reactor):  # Removed pump scheme params
+    if nobj > 1:
+        sor_out = multi_tsemo(domain, sor_in)
+    else:
+        sor_out = single_snobfit(domain, sor_in)
+    
+    sor_out.columns = [col[0] for col in sor_out.columns]
+    sor_out = sor_out[sor_in.columns.tolist()]
+    sor_in = pd.concat([sor_in, sor_out], axis=0).reset_index(drop=True)
+    
+    # Dynamic flow rate call
+    result = generated_flowrate(sor_in, df_pump, df_reactor)
+    
+    result = pd.concat([result, sor_in.iloc[:,-nobj:]], axis=1).reset_index(drop=True)
+    return sor_in, result
+################################################
+# utils/flowrate.py
+import pandas as pd
+
+def generated_flowrate(df_lhs, df_pump, df_reactor):
+    """Dynamically generated function placeholder"""
+    # This will be overwritten by Gemini-generated code
+    return df_lhs.copy()
+#############################
 # main.py
 import streamlit as st
 import pandas as pd
 import vertexai
+import google.auth
 from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
 import ast
-import tempfile
 import os
+import tempfile
+from summit.utils.dataset import DataSet
+import utils.optimization, utils.domain, utils.lhs, utils.hplcread
 
 # Gemini Configuration
 def configure_gemini():
@@ -55,17 +98,18 @@ def generate_flow_code(prompt, use_deepthink, pump_df, reactor_df):
     model = gemini_config["flash_thinking"] if use_deepthink else gemini_config["pro_model"]
     
     full_prompt = f"""
-    STRICTLY GENERATE PYTHON CODE ONLY. Follow these requirements:
-    1. Use pandas DataFrame operations
-    2. Reference columns exactly as provided:
-       Pump Details: {list(pump_df.columns)}
-       Reactor Details: {list(reactor_df.columns)}
-    3. Follow chemical engineering best practices
-    4. Include error checking for negative values
-    5. Return DataFrame with calculated flow rates
+    Generate Python code for pandas DataFrame operations that:
+    1. Takes df_lhs, df_pump, df_reactor as inputs
+    2. Returns DataFrame with calculated flow rates and reaction time
+    3. Uses these columns from Pump Details: {list(pump_df.columns)}
+    4. Uses these columns from Reactor Details: {list(reactor_df.columns)}
+    5. Follows chemical engineering best practices
+    6. Includes error checking for negative values
     
     User Requirements:
     {prompt}
+    
+    Return ONLY valid Python code without explanations.
     """
     
     response = model.generate_content(
@@ -74,97 +118,191 @@ def generate_flow_code(prompt, use_deepthink, pump_df, reactor_df):
     )
     return response.text
 
-def safe_execute(code_str, dfs):
+def inject_generated_code(generated_code):
+    """Dynamically updates flowrate.py"""
+    with open("utils/flowrate.py", "w") as f:
+        f.write("import pandas as pd\n\n")
+        f.write(f"def generated_flowrate(df_lhs, df_pump, df_reactor):\n")
+        for line in generated_code.split('\n'):
+            f.write(f"    {line}\n")
+        f.write("\n    return result\n")
+
+def validate_generated_code(code):
+    """Basic code validation"""
+    required = [
+        "def generated_flowrate(",
+        "df_lhs",
+        "df_pump",
+        "df_reactor",
+        "result =",
+        "return"
+    ]
+    return all(component in code for component in required)
+
+def safe_execute(dfs):
+    """Execute generated code safely"""
     namespace = {
         "pd": pd,
         "df_lhs": dfs["lhs"].copy(),
         "df_pump": dfs["pump"].copy(),
-        "df_reactor": dfs["reactor"].copy()
+        "df_reactor": dfs["reactor"].copy(),
+        "__builtins__": {}
     }
     
     try:
-        tree = ast.parse(code_str)
-        exec(compile(tree, filename="<ast>", mode="exec"), namespace)
-        return namespace.get('result')
+        with open("utils/flowrate.py", "r") as f:
+            code = f.read()
+        exec(code, namespace)
+        result = namespace['generated_flowrate'](
+            dfs["lhs"], dfs["pump"], dfs["reactor"]
+        )
+        return result
     except Exception as e:
         st.error(f"Execution Error: {str(e)}")
         return None
 
 def main():
-    st.title("AutoFlow Reactor Optimizer")
+    st.set_page_config(page_title="AutoFlow Reactor Optimizer", layout="wide")
+    st.title("🔬 AutoFlow Reactor Optimizer")
     
+    # Initialize session state
+    if "dfs" not in st.session_state:
+        st.session_state.dfs = {}
+
     # File Upload Section
-    uploaded_files = st.file_uploader("Upload Configuration Files", 
-                                    type=["xlsx"],
-                                    accept_multiple_files=True)
-    
-    if uploaded_files:
-        # Read all sheets
-        dfs = {
-            "lhs": pd.read_excel(uploaded_files[0], sheet_name="LHS"),
-            "objectives": pd.read_excel(uploaded_files[0], sheet_name="Objectives"),
-            "pump": pd.read_excel(uploaded_files[0], sheet_name="Pump Details"),
-            "reactor": pd.read_excel(uploaded_files[0], sheet_name="Reactor Details")
-        }
+    with st.expander("📤 Upload Configuration Files", expanded=True):
+        uploaded_file = st.file_uploader(
+            "Upload Master Excel File", 
+            type=["xlsx"],
+            help="Should contain LHS, Objectives, Pump Details, and Reactor Details sheets"
+        )
         
-        # Editable Data Preview
-        with st.expander("Edit Configuration Data", expanded=True):
+        if uploaded_file:
+            st.session_state.dfs = {
+                "lhs": pd.read_excel(uploaded_file, sheet_name="LHS"),
+                "objectives": pd.read_excel(uploaded_file, sheet_name="Objectives"),
+                "pump": pd.read_excel(uploaded_file, sheet_name="Pump Details"),
+                "reactor": pd.read_excel(uploaded_file, sheet_name="Reactor Details")
+            }
+
+    # Data Editing Section
+    if st.session_state.dfs:
+        with st.expander("✏️ Edit Configuration Data", expanded=True):
             tabs = st.tabs(["LHS Design", "Objectives", "Pump Details", "Reactor Details"])
             with tabs[0]:
-                dfs["lhs"] = st.data_editor(dfs["lhs"])
+                st.session_state.dfs["lhs"] = st.data_editor(st.session_state.dfs["lhs"])
             with tabs[1]:
-                dfs["objectives"] = st.data_editor(dfs["objectives"])
+                st.session_state.dfs["objectives"] = st.data_editor(st.session_state.dfs["objectives"])
             with tabs[2]:
-                dfs["pump"] = st.data_editor(dfs["pump"])
+                st.session_state.dfs["pump"] = st.data_editor(st.session_state.dfs["pump"])
             with tabs[3]:
-                dfs["reactor"] = st.data_editor(dfs["reactor"])
-        
-        # Prompt Section
-        st.subheader("Flow Calculation Setup")
-        col1, col2 = st.columns([3,1])
-        with col1:
-            user_prompt = st.text_area("Enter your requirements:", height=150)
-        with col2:
-            use_deepthink = st.toggle("DeepThink", help="Use advanced reasoning model")
-            st.button("Example Prompts", help="View predefined templates")
-        
-        # Prompt Templates
-        with st.expander("Quick Start Templates"):
-            for name, template in PROMPT_TEMPLATES.items():
-                if st.button(name):
-                    st.session_state.current_prompt = template
-            user_prompt = st.text_area("Selected Template", 
-                                      value=st.session_state.get("current_prompt", ""),
-                                      height=200)
-        
-        # Generation and Execution
-        if st.button("Generate Flow Calculations"):
-            if user_prompt:
-                code = generate_flow_code(user_prompt, use_deepthink, 
-                                         dfs["pump"], dfs["reactor"])
+                st.session_state.dfs["reactor"] = st.data_editor(st.session_state.dfs["reactor"])
+
+        # Flow Calculation Setup
+        st.divider()
+        with st.container():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.subheader("🧪 Flow Rate Configuration")
+                user_prompt = st.text_area(
+                    "Enter your flow calculation requirements:",
+                    height=150,
+                    help="Describe your pump flow calculations in natural language"
+                )
                 
-                with st.expander("Generated Code", expanded=True):
-                    st.code(code)
-                
-                result = safe_execute(code, dfs)
-                if result is not None:
-                    st.success("Flow rates calculated successfully!")
-                    st.dataframe(result)
-                    
-                    # Continue with original optimization workflow
-                    st.subheader("Optimization Progress")
-                    # ... [Original optimization code here] ...
-                    
-            else:
-                st.warning("Please enter calculation requirements")
+                # Template Selection
+                with st.expander("🚀 Quick Start Templates"):
+                    selected_template = st.selectbox(
+                        "Choose a template",
+                        list(PROMPT_TEMPLATES.keys())
+                    )
+                    user_prompt = st.text_area(
+                        "Selected Template",
+                        value=PROMPT_TEMPLATES[selected_template],
+                        height=200
+                    )
+
+            with col2:
+                st.subheader("⚙️ Settings")
+                use_deepthink = st.toggle(
+                    "DeepThink Analysis",
+                    help="Use advanced reasoning model for complex calculations"
+                )
+                st.session_state.nexp = st.number_input(
+                    "Number of LHS Experiments",
+                    min_value=5, 
+                    value=10
+                )
+                st.session_state.nobj = st.number_input(
+                    "Number of Objectives", 
+                    min_value=1, 
+                    max_value=3, 
+                    value=2
+                )
+
+            # Generate Flow Calculations
+            if st.button("⚡ Generate Flow Calculations", use_container_width=True):
+                if user_prompt:
+                    with st.spinner("Generating optimal flow calculations..."):
+                        try:
+                            # Generate and validate code
+                            code = generate_flow_code(
+                                user_prompt,
+                                use_deepthink,
+                                st.session_state.dfs["pump"],
+                                st.session_state.dfs["reactor"]
+                            )
+                            
+                            if validate_generated_code(code):
+                                inject_generated_code(code)
+                                st.success("Code validated and injected successfully!")
+                            else:
+                                st.error("Invalid code structure generated")
+                                st.stop()
+
+                            # Execute and display results
+                            with st.expander("📄 Generated Code", expanded=False):
+                                st.code(code)
+                            
+                            result = safe_execute(st.session_state.dfs)
+                            if result is not None:
+                                st.session_state.flow_results = result
+                                st.success("✅ Flow rates calculated successfully!")
+                                st.dataframe(result.head())
+
+                                # Proceed to optimization
+                                st.divider()
+                                st.subheader("📈 Optimization Progress")
+                                domain = utils.domain.create_domain_X(st.session_state.dfs["lhs"])
+                                domain = utils.domain.create_domain_y(domain, st.session_state.dfs["objectives"])
+                                
+                                progress_bar = st.progress(0)
+                                status_text = st.empty()
+                                
+                                for i in range(st.session_state.nobj):
+                                    status_text.text(f"Running Optimization Cycle {i+1}/{st.session_state.nobj}")
+                                    progress_bar.progress((i+1)/st.session_state.nobj)
+                                    
+                                    # Run optimization with dynamic flowrate
+                                    sor_in, result = utils.optimization.run_optimization(
+                                        domain,
+                                        st.session_state.flow_results,
+                                        st.session_state.nobj,
+                                        st.session_state.dfs["pump"],
+                                        st.session_state.dfs["reactor"]
+                                    )
+                                    
+                                    # Update and display results
+                                    st.session_state.flow_results = pd.concat([st.session_state.flow_results, sor_in])
+                                    st.dataframe(sor_in)
+                                
+                                st.balloons()
+                                st.success("Optimization Complete!")
+
+                        except Exception as e:
+                            st.error(f"Error in optimization process: {str(e)}")
+                else:
+                    st.warning("Please enter calculation requirements")
 
 if __name__ == "__main__":
     main()
-###################
-# Instead of fixed functions:
-# result = utils.flowrate.pump3_flow_rate1(...)
-
-# Use generated code:
-result = generated_flowrate(result, df_pump, df_reactor)
-############################
-pip install streamlit pandas google-cloud-aiplatform openpyxl astor
