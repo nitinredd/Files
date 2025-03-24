@@ -53,61 +53,62 @@ PROMPT_TEMPLATES = {
 }
 
 # ---------------------------------------
-# Gemini Code Generation Functions
+# Two-step Code Generation Functions
 # ---------------------------------------
 def generate_flow_code(prompt, use_deepthink, pump_df, reactor_df):
+    """
+    Two-step generation:
+      1. Generate pseudocode skeleton.
+      2. Refine skeleton into production-ready code.
+    """
     model = gemini_config["flash_thinking"] if use_deepthink else gemini_config["pro_model"]
-    full_prompt = f"""
-Generate Python code for pandas DataFrame operations that:
-1. Takes df_lhs, df_pump, df_reactor as inputs.
-2. Returns a DataFrame with calculated flow rates and reaction time.
-3. Uses these columns from Pump Details: {list(pump_df.columns)}
-4. Uses these columns from Reactor Details: {list(reactor_df.columns)}
-5. Follows chemical engineering best practices.
-6. Includes error checking for negative values.
-
-User Requirements:
-{prompt}
-
-Return ONLY valid Python code without explanations.
+    
+    # Step 1: Generate a pseudocode skeleton.
+    skeleton_prompt = f"""
+You are to generate a pseudocode (not production code) for a Python function that calculates flow rates.
+The function must have the signature:
+    def generated_flowrate(df_lhs, df_pump, df_reactor):
+It should:
+ - Take in three pandas DataFrames: df_lhs, df_pump, and df_reactor.
+ - Calculate a new column 'Reaction time' as df_lhs['ResidencetimeT1'] multiplied by the first value of the 4th column in df_reactor.
+ - Calculate example flow rates for Pump 1, Pump 2, and Pump 3 (or more if needed) using simple arithmetic on the data.
+ - Perform error checking (e.g., ensure no negative values).
+ - Finally, return a DataFrame named 'result' containing all the calculated columns.
+Return only pseudocode (explain steps in plain language) without actual Python syntax.
 """
-    response = model.generate_content(contents=full_prompt, safety_settings=gemini_config["safety"])
-    return response.text
+    skeleton = model.generate_content(contents=skeleton_prompt, safety_settings=gemini_config["safety"]).text
+    st.info("Generated pseudocode skeleton:")
+    st.code(skeleton, language="plaintext")
+    
+    # Step 2: Refine the pseudocode into production-ready code.
+    refine_prompt = f"""
+You are an expert Python developer. Convert the following pseudocode into a production-ready Python function.
+The final code must have exactly the signature:
+
+def generated_flowrate(df_lhs, df_pump, df_reactor):
+
+and be fully functional.
+The code must use 4-space indentation, include proper error checking, and ensure a final return statement returning a pandas DataFrame variable named 'result'.
+
+Pseudocode:
+{skeleton}
+
+Return ONLY the Python code.
+"""
+    final_code = model.generate_content(contents=refine_prompt, safety_settings=gemini_config["safety"]).text
+    return final_code
 
 def validate_generated_code(code):
-    # A very simple check: does it define the function and include a return statement?
+    # Validate that code defines the function and contains a 'return' statement.
     if "def generated_flowrate(" in code and "return" in code:
         return True
     return False
 
-def inject_generated_code(generated_code):
-    # Write the generated code into utils/flowrate.py. This overwrites the file.
+def inject_generated_code_full(code):
+    """Writes the complete function definition into utils/flowrate.py."""
     with open("utils/flowrate.py", "w") as f:
         f.write("import pandas as pd\n\n")
-        f.write("def generated_flowrate(df_lhs, df_pump, df_reactor):\n")
-        for line in generated_code.splitlines():
-            # Make sure to indent each line
-            f.write(f"    {line}\n")
-        f.write("\n    return result\n")
-
-def fallback_generated_code():
-    # A fallback working version in case generated code is invalid.
-    fallback = """
-try:
-    df_result = df_lhs.copy()
-    # Calculate reaction time using 'ResidencetimeT1' and first cell of Reactor Details column 3 (adjust indexing as needed)
-    rt = df_reactor.iloc[0, 3] if not df_reactor.empty else 1
-    df_result['Reaction time'] = df_result['ResidencetimeT1'] * rt
-    # Example calculations for pump flow rates (adjust logic as needed)
-    df_result['Flow rate of Pump 1'] = df_result['Reaction time'] / 2
-    df_result['Flow rate of Pump 2'] = df_result['Reaction time'] / 3
-    df_result['Flow rate of Pump 3'] = df_result['Reaction time'] / 4
-    result = df_result
-except Exception as e:
-    result = df_lhs.copy()
-    result['Error'] = str(e)
-"""
-    return fallback
+        f.write(code)
 
 def safe_execute(dfs):
     namespace = {
@@ -134,7 +135,7 @@ def main():
     st.set_page_config(page_title="Automated Flowrate & Optimization", layout="wide")
     st.title("Automated Flowrate & Optimization via Gemini")
     
-    # Initialize session_state variables
+    # Initialize session state variables if not already present
     if "query_input" not in st.session_state:
         st.session_state.query_input = ""
     if "dfs" not in st.session_state:
@@ -235,14 +236,12 @@ def main():
             try:
                 code = generate_flow_code(st.session_state.query_input, deepthink, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
                 if validate_generated_code(code):
-                    inject_generated_code(code)
+                    inject_generated_code_full(code)
                     st.success("Flowrate code generated and injected successfully!")
                     st.code(code, language="python")
                 else:
-                    st.error("Generated code structure is invalid. Using fallback code.")
-                    fallback = fallback_generated_code()
-                    inject_generated_code(fallback)
-                    st.code(fallback, language="python")
+                    st.error("Generated code did not pass validation. Please refine your query and try again.")
+                    st.stop()
             except Exception as e:
                 st.error(f"Error generating code: {str(e)}")
                 st.stop()
