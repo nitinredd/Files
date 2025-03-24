@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import json
 import vertexai
 import google.auth
 import os
@@ -13,7 +14,7 @@ from vertexai.preview.generative_models import GenerativeModel, HarmCategory, Ha
 # Vertex AI / Gemini Configuration
 # ---------------------------------------
 def configure_gemini():
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"  # adjust path as needed
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"  # adjust as needed
     credentials, project_id = google.auth.default()
     safety_config = [SafetySetting(category=hc, threshold=HarmBlockThreshold.BLOCK_NONE) for hc in HarmCategory]
     return {
@@ -28,124 +29,99 @@ gemini_config = configure_gemini()
 # Predefined Prompt Templates
 # ---------------------------------------
 PROMPT_TEMPLATES = {
-    "3-Pump Basic": """I need flow rate calculations for 3 pumps where:
-- Reaction time = ResidencetimeT1 × Reactor Volume (from Reactor Details)
-- Flow rates determined by molar ratios of:
-  1. Primary reactant (first in Pump Details)
-  2. Reagent 1 (second in Pump Details) using Equivalence1
-  3. Reagent 2 (third in Pump Details) using Equivalence2
-- Molarity = (Concentration / Molecular Weight) × 1000
-- Total flow = Reactor Volume / Residence Time
-- Pump flows = (Individual molar ratio / Total molar sum) × Total flow""",
+    "3-Pump Basic": """Reaction Scheme: KSM+R1+R2 -> P
+Calculate flow rates using:
+- Reaction time = ResidencetimeT1 * Reactor Volume (from Reactor Details, first row, 4th column)
+- Flow rate of Pump 1: use primary reactant (from Pump Details, first reagent)
+- Flow rate of Pump 2: use reagent 1 (from Pump Details, second reagent)
+- Flow rate of Pump 3: use reagent 2 (from Pump Details, third reagent)
+
+Return the result as a JSON array of objects, each corresponding to one row of the LHS data.  
+Each object should include all columns from the LHS sheet plus the computed 'Reaction time', 'Flow rate of Pump 1', 'Flow rate of Pump 2', and 'Flow rate of Pump 3'.""",
     
-    "4-Pump Advanced": """Calculate flow rates for 4 pumps with:
-- Reaction time = (ResidenceTimeT1 + ResidenceTimeT2) × Reactor Volume
-- Pump 1: Base reactant (first in Pump Details)
-- Pumps 2-3: Sequential reagents using Equivalence1-2
-- Pump 4: Quench flow at 1.5× total of first 3 pumps
-- Account for temperature compensation from LHS experiments""",
+    "4-Pump Advanced": """Reaction Scheme: KSM+R1->I1+R2->I2+QD->P  
+Calculate flow rates using:
+- Reaction time = (ResidenceTimeT1 + ResidenceTimeT2) * Reactor Volume
+- Pump flows for Pumps 1-4 calculated with the established formulas for 4-pump systems.
+
+Return the result as a JSON array of objects (with additional columns for pump flows and reaction time).""",
     
-    "Custom Setup": """Create custom flow calculations where:
-- Reaction time depends on both ResidenceTime and CatalystLoading
-- Flow rates must maintain stoichiometric ratios from LHS
-- Include safety margin of 15% on all pump flows
-- Handle unit conversions between ml/min and L/hour"""
+    "Custom Setup": """Create a custom flow rate calculation where:
+- Reaction time depends on both ResidencetimeT1 and CatalystLoading.
+- Flow rates are computed to maintain stoichiometric ratios (using provided equivalences).
+- Include a safety margin of 15% on all flows.
+- Handle unit conversions between ml/min and L/hour.
+
+Return the final results as a JSON array of objects, one for each LHS row, including the computed 'Reaction time' and flow rates for each pump."""
 }
 
 # ---------------------------------------
-# Two-step Code Generation Functions
+# Autonomous Reasoning for Flowrate Calculation
 # ---------------------------------------
-def generate_flow_code(prompt, use_deepthink, pump_df, reactor_df):
+def calculate_flowrates_with_agent(query, use_deepthink, dfs):
     """
-    Two-step generation:
-      1. Generate pseudocode skeleton.
-      2. Refine skeleton into production-ready code.
+    Given the user's natural language query (or formula) and the uploaded Excel data
+    (converted to JSON), this function asks the Gemini agent to calculate the flow rates.
+    The agent is instructed to return a JSON array (one object per row in the LHS DataFrame)
+    containing all original LHS columns plus the computed values.
     """
     model = gemini_config["flash_thinking"] if use_deepthink else gemini_config["pro_model"]
     
-    # Step 1: Generate a pseudocode skeleton.
-    skeleton_prompt = f"""
-You are to generate a pseudocode (not production code) for a Python function that calculates flow rates.
-The function must have the signature:
-    def generated_flowrate(df_lhs, df_pump, df_reactor):
-It should:
- - Take in three pandas DataFrames: df_lhs, df_pump, and df_reactor.
- - Calculate a new column 'Reaction time' as df_lhs['ResidencetimeT1'] multiplied by the first value of the 4th column in df_reactor.
- - Calculate example flow rates for Pump 1, Pump 2, and Pump 3 (or more if needed) using simple arithmetic on the data.
- - Perform error checking (e.g., ensure no negative values).
- - Finally, return a DataFrame named 'result' containing all the calculated columns.
-Return only pseudocode (explain steps in plain language) without actual Python syntax.
-"""
-    skeleton = model.generate_content(contents=skeleton_prompt, safety_settings=gemini_config["safety"]).text
-    st.info("Generated pseudocode skeleton:")
-    st.code(skeleton, language="plaintext")
+    # Convert the relevant DataFrames to JSON strings.
+    pump_json = dfs["pump"].to_json(orient="records")
+    reactor_json = dfs["reactor"].to_json(orient="records")
+    lhs_json = dfs["lhs"].to_json(orient="records")
     
-    # Step 2: Refine the pseudocode into production-ready code.
-    refine_prompt = f"""
-You are an expert Python developer. Convert the following pseudocode into a production-ready Python function.
-The final code must have exactly the signature:
+    prompt = f"""
+You are an expert chemical engineer. 
+You are given the following data as JSON strings:
+Pump Details: {pump_json}
+Reactor Details: {reactor_json}
+LHS Data: {lhs_json}
 
-def generated_flowrate(df_lhs, df_pump, df_reactor):
+The reaction scheme and calculation requirements are described as follows:
+{query}
 
-and be fully functional.
-The code must use 4-space indentation, include proper error checking, and ensure a final return statement returning a pandas DataFrame variable named 'result'.
+Using the formulas:
+- Reaction time = ResidencetimeT1 multiplied by the Reactor Volume from Reactor Details (use first row, 4th column).
+- For pump flow rates, follow the established formulas for the selected reaction scheme (e.g., for 3-pump scheme: 
+   Flow rate of Pump 1, Pump 2, and Pump 3 calculated based on molar ratios and equivalences).
 
-Pseudocode:
-{skeleton}
-
-Return ONLY the Python code.
+Return only a JSON array of objects, where each object corresponds to one row of the LHS data,
+and includes all original LHS fields plus the computed fields: 'Reaction time', 'Flow rate of Pump 1', 
+'Flow rate of Pump 2', and 'Flow rate of Pump 3'. Do not include any explanation.
 """
-    final_code = model.generate_content(contents=refine_prompt, safety_settings=gemini_config["safety"]).text
-    return final_code
+    response = model.generate_content(contents=prompt, safety_settings=gemini_config["safety"])
+    return response.text
 
-def validate_generated_code(code):
-    # Validate that code defines the function and contains a 'return' statement.
-    if "def generated_flowrate(" in code and "return" in code:
-        return True
-    return False
-
-def inject_generated_code_full(code):
-    """Writes the complete function definition into utils/flowrate.py."""
-    with open("utils/flowrate.py", "w") as f:
-        f.write("import pandas as pd\n\n")
-        f.write(code)
-
-def safe_execute(dfs):
-    namespace = {
-        "pd": pd,
-        "df_lhs": dfs["lhs"].copy(),
-        "df_pump": dfs["pump"].copy(),
-        "df_reactor": dfs["reactor"].copy(),
-        "__builtins__": {}
-    }
+def parse_flowrates(response_text):
     try:
-        with open("utils/flowrate.py", "r") as f:
-            code = f.read()
-        exec(code, namespace)
-        result = namespace['generated_flowrate'](dfs["lhs"], dfs["pump"], dfs["reactor"])
-        return result
+        # Attempt to parse the agent's response as JSON.
+        result_list = json.loads(response_text)
+        return pd.DataFrame(result_list)
     except Exception as e:
-        st.error(f"Execution Error: {str(e)}")
+        st.error(f"Error parsing JSON output from Gemini: {str(e)}")
         return None
 
 # ---------------------------------------
-# Main App: Chat-like Single Page UI
+# Main App: Single Page Autonomous UI
 # ---------------------------------------
 def main():
-    st.set_page_config(page_title="Automated Flowrate & Optimization", layout="wide")
-    st.title("Automated Flowrate & Optimization via Gemini")
+    st.set_page_config(page_title="Autonomous Flowrate & Optimization", layout="wide")
+    st.title("Autonomous Flowrate & Optimization via Gemini")
     
-    # Initialize session state variables if not already present
+    # Initialize session state variables
     if "query_input" not in st.session_state:
         st.session_state.query_input = ""
     if "dfs" not in st.session_state:
         st.session_state.dfs = {}
     if "inputs" not in st.session_state:
         st.session_state.inputs = {}
-    
-    # --- Chat Input ---
+
+    # --- Chat Input (Query) ---
     st.markdown("### Your Query:")
-    st.session_state.query_input = st.text_area("Type your flow calculation query here...", value=st.session_state.query_input, height=100)
+    st.session_state.query_input = st.text_area("Enter your reaction scheme or calculation requirements here...", 
+                                                 value=st.session_state.query_input, height=100)
     
     col1, col2, col3 = st.columns([1, 1, 1])
     with col1:
@@ -232,28 +208,21 @@ def main():
     
     # --- When the Send button is clicked ---
     if send_button and st.session_state.query_input and st.session_state.dfs:
-        with st.spinner("Generating flow rate calculation code via Gemini..."):
-            try:
-                code = generate_flow_code(st.session_state.query_input, deepthink, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
-                if validate_generated_code(code):
-                    inject_generated_code_full(code)
-                    st.success("Flowrate code generated and injected successfully!")
-                    st.code(code, language="python")
-                else:
-                    st.error("Generated code did not pass validation. Please refine your query and try again.")
-                    st.stop()
-            except Exception as e:
-                st.error(f"Error generating code: {str(e)}")
-                st.stop()
-            
-            flow_results = safe_execute(st.session_state.dfs)
-            if flow_results is None:
-                st.error("Flowrate calculation failed.")
+        with st.spinner("Calculating flow rates via Gemini..."):
+            # Use the autonomous reasoning agent to compute flow rates directly.
+            agent_response = calculate_flowrates_with_agent(st.session_state.query_input, deepthink, st.session_state.dfs)
+            st.info("Gemini response:")
+            st.text(agent_response)
+            flow_df = parse_flowrates(agent_response)
+            if flow_df is None:
+                st.error("Failed to calculate flow rates using the agent.")
                 st.stop()
             st.success("Flow rates calculated successfully!")
-            st.dataframe(flow_results.head())
+            st.dataframe(flow_df.head())
         
-        # Continue with original workflow
+        # ----------------------------------
+        # Continue with Original Workflow
+        # ----------------------------------
         st.info("Initializing domain and performing LHS design...")
         domain = utils.domain.create_domain_X(st.session_state.dfs["lhs"])
         domain = utils.domain.create_domain_y(domain, st.session_state.dfs["objectives"])
@@ -262,7 +231,8 @@ def main():
         lhs_exp.to_excel(save_path)
         st.success(f"LHS results saved at {save_path}")
         
-        st.info("Calculating pump flowrates...")
+        st.info("Calculating pump flowrates using the established formulas...")
+        # For the pump flowrates, we call our already–implemented functions.
         if st.session_state.inputs["npump"] == 3 and st.session_state.inputs["rscheme"] == 1:
             lhs_pump = utils.flowrate.pump3_flow_rate1(lhs_exp, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
         elif st.session_state.inputs["npump"] == 3 and st.session_state.inputs["rscheme"] == 2:
@@ -308,7 +278,7 @@ def main():
         
         # Optimization Step (SOR)
         st.info("Running optimization (SOR)...")
-        sor_in = flow_results[flow_results.columns.drop(list(flow_results.filter(regex='Flow rate')))]
+        sor_in = flow_df[flow_df.columns.drop(list(flow_df.filter(regex='Flow rate')))]
         if "Reaction time" in sor_in.columns:
             sor_in = sor_in.drop(columns={"Reaction time"})
         sor_in, opt_result = utils.optimization.run_optimization(
@@ -364,3 +334,50 @@ if __name__ == "__main__":
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
     main()
+########################################
+You are an expert chemical engineer. You are given three JSON strings representing data from an Excel file:
+
+1. LHS Data (a JSON array): Each object represents one row from the "LHS" sheet and includes at least the keys "ResidencetimeT1", "Equivalence1", and "Equivalence2".
+2. Pump Details (a JSON array): 
+   - The 0th element contains:
+       - "Concentration of reagent (g/ml)" for the primary reagent,
+       - "Molecular weight (g/mol)" for the primary reagent.
+   - The 1st element contains:
+       - "Concentration of reagent (g/ml)" and "Molecular weight (g/mol)" for reagent 1.
+   - The 2nd element contains:
+       - "Concentration of reagent (g/ml)" and "Molecular weight (g/mol)" for reagent 2.
+3. Reactor Details (a JSON array): 
+   - The value at row index 1, column 0 is called ReactorFactor.
+   - (The Reactor Volume is at row index 3, column 0, but is not used in this calculation.)
+
+For each row in the LHS Data, calculate a new field "Flow rate of Pump 1" using the following formula:
+
+   Flow rate of Pump 1 = 
+      ( ( ReactorFactor / [ResidencetimeT1] ) *
+         ( ( 1 / ( (Concentration0 / MolecularWeight0) * 1000 ) ) /
+           ( ( 1 / ( (Concentration0 / MolecularWeight0) * 1000 ) ) +
+             ( Equivalence1 / ( (Concentration1 / MolecularWeight1) * 1000 ) ) +
+             ( Equivalence2 / ( (Concentration2 / MolecularWeight2) * 1000 ) )
+           )
+         )
+      )[0]
+
+Where:
+- [ResidencetimeT1] is the value from the "ResidencetimeT1" key of the current LHS row.
+- ReactorFactor is the value from Reactor Details at row index 1, column 0.
+- Concentration0 and MolecularWeight0 are from the 0th element of Pump Details.
+- Equivalence1 and Equivalence2 come from the current LHS row (from keys "Equivalence1" and "Equivalence2").
+- Concentration1 and MolecularWeight1 come from the 1st element of Pump Details.
+- Concentration2 and MolecularWeight2 come from the 2nd element of Pump Details.
+- The division by 1000 converts units appropriately.
+- The [0] at the end indicates that the final result should be a single numeric value.
+
+Return the final results as a JSON array of objects. Each object should correspond to one row of the LHS Data and include all its original fields plus the new field "Flow rate of Pump 1" holding the computed value.
+
+Here are the JSON strings (replace the placeholders with your actual JSON data):
+
+LHS Data: <INSERT LHS JSON HERE>  
+Pump Details: <INSERT Pump Details JSON HERE>  
+Reactor Details: <INSERT Reactor Details JSON HERE>
+
+Please compute the values and return only the JSON array of results.
