@@ -1,3 +1,134 @@
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
+                                             window_min, window_max, diff_threshold=None,
+                                             interp_method='gpr', n_iter=100):
+    """
+    New strategy:
+      - The candidate window is divided into fixed segments.
+        For example, if window_min=0 and window_max=60, segments are:
+            [0,10], [10,20], [20,30], [30,40], [40,50], [50,60].
+      - From each segment, at least two time points are selected from the union
+        of 3- and 5-minute intervals.
+      - Endpoints (window_min and window_max) are ensured.
+      - This stratified sampling is repeated n_iter times.
+      - For each candidate, predicted dissolution values are computed via interpolation,
+        and the f2 similarity metric is calculated.
+      - The candidate with the best (or acceptable) f2 is returned (along with a list of all candidates).
+    """
+    import random
+    results = []
+    # Define union of valid time points between window_min and window_max
+    valid_times = np.unique(np.concatenate([
+        np.arange(window_min, window_max+1, 3),
+        np.arange(window_min, window_max+1, 5)
+    ]))
+    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
+    
+    # Define segment boundaries – here fixed segments of 10 minutes
+    segments = [(window_min, window_min+10),
+                (window_min+10, window_min+20),
+                (window_min+20, window_min+30),
+                (window_min+30, window_min+40),
+                (window_min+40, window_min+50),
+                (window_min+50, window_max)]
+    
+    # Setup interpolation (GPR or alternative)
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+    ref_times = ref_df.iloc[:, 0].values.astype(float)
+    ref_diss = ref_df.iloc[:, 1].values.astype(float)
+    test_times = test_df.iloc[:, 0].values.astype(float)
+    test_diss = test_df.iloc[:, 1].values.astype(float)
+    
+    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
+    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
+    
+    if interp_method == 'gpr':
+        def safe_gp_interpolator(x, y):
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
+            valid_mask = ~np.isnan(x) & ~np.isnan(y)
+            X = x[valid_mask].reshape(-1, 1)
+            gp.fit(X, y[valid_mask])
+            return gp
+        ref_model = safe_gp_interpolator(ref_times, ref_diss)
+        test_model = safe_gp_interpolator(test_times, test_diss)
+        def ref_interp(x):
+            return ref_model.predict(np.array(x).reshape(-1, 1))
+        def test_interp(x):
+            return test_model.predict(np.array(x).reshape(-1, 1))
+    else:
+        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
+        interp_method = interp_method if interp_method in valid_methods else 'linear'
+        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask],
+                              kind=interp_method, bounds_error=False, fill_value=np.nan)
+        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
+                               kind=interp_method, bounds_error=False, fill_value=np.nan)
+    
+    # Run stratified sampling for n_iter iterations
+    for i in range(n_iter):
+        candidate = []
+        # Ensure endpoints are included
+        candidate.append(window_min)
+        candidate.append(window_max)
+        # For each segment, choose at least 2 points (if available)
+        for seg in segments:
+            seg_start, seg_end = seg
+            seg_times = [t for t in valid_times if seg_start < t < seg_end]
+            if len(seg_times) >= 2:
+                candidate.extend(random.sample(seg_times, 2))
+            elif len(seg_times) > 0:
+                candidate.extend(seg_times)
+        candidate = sorted(set(candidate))  # remove duplicates and sort
+        
+        # Compute predicted dissolution percentages for candidate time points
+        if interp_method == 'gpr':
+            candidate_array = np.array(candidate).reshape(-1, 1)
+            ref_vals = ref_interp(candidate_array)
+            test_vals = test_interp(candidate_array)
+        else:
+            ref_vals = ref_interp(candidate)
+            test_vals = test_interp(candidate)
+        
+        # Skip candidate if NaNs present
+        if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
+            continue
+        
+        # Compute f2 similarity metric
+        diff = test_vals - ref_vals
+        p_val = len(candidate)
+        f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
+        
+        # For diversity, we check that each segment has at least one point (besides endpoints)
+        diverse = True
+        for seg in segments:
+            seg_start, seg_end = seg
+            # Candidate points that lie strictly within the segment
+            points_in_seg = [t for t in candidate if seg_start < t < seg_end]
+            if len(points_in_seg) < 1:
+                diverse = False
+                break
+        
+        # Regulatory compliance check – assumed external function
+        compliant, reasons = check_regulatory_compliance(
+            candidate, regulation,
+            dict(zip(candidate, ref_vals.flatten().tolist())),
+            dict(zip(candidate, test_vals.flatten().tolist()))
+        )
+        
+        results.append({
+            'sequence': candidate,
+            'f2': round(f2, 2),
+            'compliant': compliant,
+            'reasons': reasons,
+            'length': len(candidate),
+            'diverse': diverse,
+            'ref_vals': ref_vals.flatten().tolist(),
+            'test_vals': test_vals.flatten().tolist()
+        })
+    
+    # Sort candidates by f2 descending
+    results.sort(key=lambda x: -x['f2'])
+    # Return the best candidate (or all, as needed)
+    return results, results
+##############################
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
