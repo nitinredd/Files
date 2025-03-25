@@ -7,24 +7,54 @@ from scipy.interpolate import interp1d
 import itertools
 import matplotlib.pyplot as plt
 
+def generate_all_time_combinations(min_time, max_time):
+    """
+    Generate all possible candidate sequences from the union of time points 
+    with 3- and 5-minute intervals, ensuring that the candidate includes
+    the endpoints (min_time and max_time) and has at least 3 time points.
+    """
+    # Create union of 3- and 5-minute intervals
+    times = np.unique(np.concatenate([
+        np.arange(min_time, max_time+1, 3),
+        np.arange(min_time, max_time+1, 5)
+    ])).tolist()
+    # Ensure endpoints are present
+    if min_time not in times:
+        times.insert(0, min_time)
+    if max_time not in times:
+        times.append(max_time)
+    times = sorted(times)
+    
+    all_combos = []
+    n = len(times)
+    # Generate combinations of all possible lengths (from 3 to n)
+    for r in range(3, n+1):
+        for combo in itertools.combinations(times, r):
+            # Candidate must start at min_time and end at max_time
+            if combo[0] == min_time and combo[-1] == max_time:
+                all_combos.append(list(combo))
+    return all_combos
+
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
-                                             interp_method='linear', num_samples=1000000):
+                                             interp_method='gpr'):
     """
-    This function generates candidate time point sequences via stochastic sampling,
-    interpolates dissolution values using Gaussian Process Regression or other methods,
-    calculates the f2 similarity metric for each candidate, and flags those that are 'diverse'
-    (i.e. spanning early, mid, and late segments of the time window).
+    Generates candidate sequences by exhaustively (or near-exhaustively) exploring all
+    combinations of time points within the candidate window (using union of 3- and 5-min intervals).
+    Each candidate sequence is evaluated for predicted dissolution percentages,
+    its f2 similarity metric is computed, and a 'diverse' flag is set if the sequence
+    covers the entire window (i.e. has at least one time point in early, mid, and late segments).
     """
     results = []
+    # Define interpolation kernel for GPR
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
     
-    # Convert input data to numpy arrays
+    # Convert input dissolution data to numpy arrays
     ref_times = ref_df.iloc[:, 0].values.astype(float)
     ref_diss = ref_df.iloc[:, 1].values.astype(float)
     test_times = test_df.iloc[:, 0].values.astype(float)
     test_diss = test_df.iloc[:, 1].values.astype(float)
-
+    
     ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
     test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
     
@@ -46,120 +76,74 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         def test_interp(x):
             return test_model.predict(np.array(x).reshape(-1, 1))
     else:
+        # Use other interpolation methods if needed
         valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
         interp_method = interp_method if interp_method in valid_methods else 'linear'
         ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask],
                               kind=interp_method, bounds_error=False, fill_value=np.nan)
         test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
                                kind=interp_method, bounds_error=False, fill_value=np.nan)
-
-    # ----- Time Points Generation -----
-    time_grid = np.arange(window_min, window_max + 1).reshape(-1, 1)
-    try:
-        max_ref = np.nanmax(ref_interp(time_grid))
-        max_test = np.nanmax(test_interp(time_grid))
-    except ValueError:
-        max_ref = np.nanmax(ref_interp(time_grid.flatten()))
-        max_test = np.nanmax(test_interp(time_grid.flatten()))
-    max_diss = max(max_ref, max_test)
-
-    # Always include both 3- and 5-minute intervals
-    valid_times = np.unique(np.concatenate([
-        np.arange(0, window_max+1, 3),
-        np.arange(0, window_max+1, 5)
-    ])).astype(int)
-    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
-
-    # ----- Combination Generation -----
-    start_time = time.time()
-    seq_lengths = np.random.randint(3, 7, num_samples)  # candidate sequence lengths (including endpoints)
     
-    all_seqs = np.full((num_samples, 6), -1, dtype=int)
-    f2_scores = np.full(num_samples, np.nan)
-    compliance_status = np.full(num_samples, False)
-    compliance_reasons = [''] * num_samples
-    diversity_flags = np.full(num_samples, False)  # flag whether candidate covers full time range
-
-    with tqdm(total=num_samples, desc="Processing combinations") as pbar:
-        for i in range(num_samples):
-            try:
-                available_points = valid_times[(valid_times > window_min) & (valid_times < window_max)]
-                if len(available_points) < (seq_lengths[i]-2):
-                    raise ValueError("Not enough valid time points")
-                
-                # Generate candidate sequence: always include window_min and window_max
-                mid_points = np.random.choice(available_points, size=seq_lengths[i]-2, replace=False)
-                seq = np.sort(np.concatenate([[window_min], mid_points, [window_max]]))
-                seq = seq.astype(int)
-                seq_len = len(seq)
-                if seq_len > 6:
-                    raise ValueError("Sequence too long")
-                all_seqs[i, :seq_len] = seq
-                
-                # Get predicted dissolution values at candidate time points
-                if interp_method == 'gpr':
-                    seq_2d = seq.reshape(-1, 1)
-                    ref_vals = ref_interp(seq_2d)
-                    test_vals = test_interp(seq_2d)
-                else:
-                    ref_vals = ref_interp(seq)
-                    test_vals = test_interp(seq)
-                
-                if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
-                    raise ValueError("NaN in dissolution values")
-                
-                # ----- Diversity Check -----
-                # We want candidate sequences that cover the entire time window.
-                # Define three segments: early, mid, late.
-                early_threshold = window_min + (window_max - window_min) / 3.0
-                mid_threshold   = window_min + 2*(window_max - window_min) / 3.0
-                # Exclude endpoints for diversity check:
-                has_early = np.any((seq > window_min) & (seq < early_threshold))
-                has_mid   = np.any((seq >= early_threshold) & (seq < mid_threshold))
-                has_late  = np.any((seq >= mid_threshold) & (seq < window_max))
-                diverse = has_early and has_mid and has_late
-                diversity_flags[i] = diverse
-                # ---------------------------
-                
-                # Calculate f2 similarity metric
-                diff = test_vals - ref_vals
-                p_val = len(seq)
-                f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2)/p_val))
-                f2_scores[i] = f2
-                
-                # Check regulatory compliance (external function)
-                compliant, reasons = check_regulatory_compliance(
-                    seq, regulation,
-                    dict(zip(seq, ref_vals)),
-                    dict(zip(seq, test_vals))
-                )
-                compliance_status[i] = compliant
-                compliance_reasons[i] = ', '.join(reasons)
-            except (ValueError, IndexError) as e:
-                f2_scores[i] = np.nan
-                compliance_reasons[i] = str(e)
-            pbar.update(1)
+    # ----- Generate All Candidate Sequences -----
+    all_candidates = generate_all_time_combinations(window_min, window_max)
+    print(f"Generated {len(all_candidates)} candidate sequences.")
     
-    valid_mask = ~np.isnan(f2_scores)
-    results = []
-    for i in np.where(valid_mask)[0]:
-        seq = all_seqs[i][all_seqs[i] != -1].tolist()
+    # Define diversity segments (early, mid, late)
+    early_bound = window_min + (window_max - window_min) / 3.0
+    mid_bound   = window_min + 2*(window_max - window_min) / 3.0
+    
+    # Evaluate each candidate sequence
+    for seq in tqdm(all_candidates, desc="Evaluating candidates"):
+        # Interpolate dissolution values for this candidate sequence
+        if interp_method == 'gpr':
+            seq_array = np.array(seq).reshape(-1, 1)
+            ref_vals = ref_interp(seq_array)
+            test_vals = test_interp(seq_array)
+        else:
+            ref_vals = ref_interp(seq)
+            test_vals = test_interp(seq)
+        
+        # Skip if any NaN values are present
+        if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
+            continue
+        
+        # Calculate f2 similarity metric
+        diff = test_vals - ref_vals
+        p_val = len(seq)
+        f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2)/p_val))
+        
+        # Diversity check: candidate is "diverse" if it has at least one time point (besides endpoints)
+        # in each segment: early (window_min, early_bound), mid [early_bound, mid_bound), late [mid_bound, window_max)
+        has_early = any(t > window_min and t < early_bound for t in seq)
+        has_mid   = any(t >= early_bound and t < mid_bound for t in seq)
+        has_late  = any(t >= mid_bound and t < window_max for t in seq)
+        diverse = has_early and has_mid and has_late
+        
+        # Regulatory compliance check (external function)
+        compliant, reasons = check_regulatory_compliance(
+            seq, regulation,
+            dict(zip(seq, ref_vals)),
+            dict(zip(seq, test_vals))
+        )
+        
         results.append({
             'sequence': seq,
-            'f2': round(f2_scores[i], 2),
-            'compliant': compliance_status[i],
-            'reasons': compliance_reasons[i],
+            'f2': round(f2, 2),
+            'compliant': compliant,
+            'reasons': reasons,
             'length': len(seq),
-            'diverse': bool(diversity_flags[i])
+            'diverse': diverse,
+            'ref_vals': ref_vals.flatten().tolist(),
+            'test_vals': test_vals.flatten().tolist()
         })
     
+    # Sort results by f2 (descending)
     results.sort(key=lambda x: -x['f2'])
-    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
-    return results[:500], results
+    return results, results  # returning all results
 
 # --------------------- Main Predictive Analysis Block ---------------------
 if run_predictive.lower() == 'yes':
-    # Determine candidate window
+    # Determine candidate window (from your existing function)
     window_min, window_max = determine_candidate_window(
         reference_mean_df, 
         test_mean_df,
@@ -171,53 +155,23 @@ if run_predictive.lower() == 'yes':
     regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
     selected_regulation = regulation_map.get(input1, "FDA")
     
-    # Run predictive analysis under different conditions
-    conditions = [("Diff threshold 10", 10), ("Diff threshold 20", 20), ("No diff check", None)]
+    # We use a single condition here since the idea is to cover all candidate time points.
+    # (If you wish to try multiple diff thresholds, you can loop as before.)
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using union of 3 & 5 minute intervals)")
     
-    all_candidates = []
-    overall_best = None
-    overall_best_f2 = -np.inf
-
-    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using 3 & 5 minute intervals)")
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='gpr'
+    )
     
-    for cond_label, threshold in conditions:
-        print(f"\nProcessing candidates for condition: {cond_label}")
-        top_results, all_results = predictive_optimal_combinations_advanced(
-            reference_mean_df,
-            test_mean_df,
-            regulation=selected_regulation,
-            window_min=window_min,
-            window_max=window_max,
-            diff_threshold=threshold,
-            num_samples=1000000
-        )
-        
-        # Add condition label and update dissolution range info for each candidate
-        for res in top_results:
-            res['condition'] = cond_label
-            seq = res['sequence']
-            ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
-            test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
-            max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
-            res['diss_range'] = (
-                "0-30%" if max_diss <= 30 else
-                "30-60%" if max_diss <= 60 else
-                "60-90%" if max_diss <= 90 else
-                "90-120%" if max_diss <= 120 else
-                "120%+"
-            )
-        all_candidates.extend(top_results)
-        
-        if top_results:
-            # Among candidates from this condition, choose the one with highest f2
-            current_best = max(top_results, key=lambda x: x['f2'])
-            if current_best['f2'] > overall_best_f2:
-                overall_best = current_best
-                overall_best_f2 = current_best['f2']
-
-    # ===== Duplicate Filtering =====
+    # Filter unique candidates based on sequence (if needed)
     unique_candidates_dict = {}
-    for cand in all_candidates:
+    for cand in results:
         seq_tuple = tuple(cand['sequence'])
         if seq_tuple in unique_candidates_dict:
             if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
@@ -246,43 +200,29 @@ if run_predictive.lower() == 'yes':
                 print(f"  Compliant combinations: {data['compliant']}")
                 print(f"  Compliance rate: {compliance_rate:.1f}%")
     
-    # ===== Display Final Results =====
-    # Prefer a candidate that is 'diverse' if available
+    # Prefer a candidate that is diverse; if none, choose the one with the highest f2.
     diverse_candidates = [cand for cand in unique_candidates if cand['diverse']]
     if diverse_candidates:
         overall_best = max(diverse_candidates, key=lambda x: x['f2'])
     elif unique_candidates:
         overall_best = max(unique_candidates, key=lambda x: x['f2'])
-        print("\nNo candidate met the diversity criteria; displaying the candidate with the highest f2 among available combinations.")
+        print("\nNo candidate met the ideal diversity criteria; displaying candidate with highest f2.")
+    else:
+        overall_best = None
     
     if overall_best:
         print("\n=== Optimal Predictive Combination ===")
         print(f"Condition: {overall_best.get('condition','N/A')}")
-        print(f"Dissolution Range: {overall_best['diss_range']}")
+        print(f"Diverse Combination: {overall_best['diverse']}")
         print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
         print(f"Length: {len(overall_best['sequence'])}")
         print(f"Predicted f2 Score: {overall_best['f2']}")
-        print(f"Diverse Combination: {overall_best['diverse']}")
-        
-        # Compute predicted dissolution percentages for the optimal sequence
-        optimal_sequence = overall_best['sequence']
-        ref_diss_pred = interpolate_dissolution_curve(reference_mean_df, optimal_sequence, method='gpr')
-        test_diss_pred = interpolate_dissolution_curve(test_mean_df, optimal_sequence, method='gpr')
-        
-        # Values should already be in percentage form; clip if needed
-        ref_diss_pred = np.clip(ref_diss_pred, 0, 100)
-        test_diss_pred = np.clip(test_diss_pred, 0, 100)
-        if optimal_sequence[0] == 0:
-            ref_diss_pred[0] = 0.0
-            test_diss_pred[0] = 0.0
-        
         print("\nPredicted Reference Dissolution Percentages:")
-        for t, d in zip(optimal_sequence, ref_diss_pred):
+        for t, d in zip(overall_best['sequence'], overall_best['ref_vals']):
             print(f"Time {t} min: {d:.2f}%")
         print("\nPredicted Test Dissolution Percentages:")
-        for t, d in zip(optimal_sequence, test_diss_pred):
+        for t, d in zip(overall_best['sequence'], overall_best['test_vals']):
             print(f"Time {t} min: {d:.2f}%")
-        
         if overall_best['reasons']:
             print(f"\nCompliance Issues: {', '.join(overall_best['reasons'])}")
         else:
@@ -290,21 +230,21 @@ if run_predictive.lower() == 'yes':
         
         print_range_stats(unique_candidates)
         
-        # Plot the results
+        # Plot results
         plt.figure(figsize=(12, 6))
-        plt.plot(optimal_sequence, ref_diss_pred, 'bo-', label='Reference')
-        plt.plot(optimal_sequence, test_diss_pred, 'r*--', label='Test')
-        plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
+        plt.plot(overall_best['sequence'], overall_best['ref_vals'], 'bo-', label='Reference')
+        plt.plot(overall_best['sequence'], overall_best['test_vals'], 'r*--', label='Test')
+        plt.title(f"Optimal Profile: (f2 = {overall_best['f2']})")
         plt.xlabel('Time (min)')
         plt.ylabel('Dissolution (%)')
         plt.legend()
         plt.grid(True)
         plt.show()
     else:
-        print("No optimal candidate selected based on the criteria.")
+        print("No candidate sequences were generated.")
     
     print("\n=== All Unique Candidate Combinations ===")
     sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
     for idx, cand in enumerate(sorted_candidates):
-        print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']} | Diverse: {cand['diverse']}")
-#####################
+        print(f"{idx+1:3d}. {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']} | Diverse: {cand['diverse']}")
+###############################3
