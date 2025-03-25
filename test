@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
                                              interp_method='linear', num_samples=1000000):
-    """Final robust version with proper array reshaping, error handling, and full dissolution range coverage"""
+    """Final robust version with proper array reshaping, error handling, and ensuring diversity of coverage across dissolution ranges"""
     results = []
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
     
@@ -65,13 +65,13 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
 
     # ===== 4. Combination Generation =====
     start_time = time.time()
-    seq_lengths = np.random.randint(3, 7, num_samples)  # Change upper bound if longer sequences are desired.
+    seq_lengths = np.random.randint(3, 7, num_samples)  # Adjust upper bound as needed.
     
-    # Pre-allocate arrays for candidates
     all_seqs = np.full((num_samples, 6), -1, dtype=int)
     f2_scores = np.full(num_samples, np.nan)
     compliance_status = np.full(num_samples, False)
     compliance_reasons = [''] * num_samples
+    diversity_flags = np.full(num_samples, False)  # New array to store diversity flag
     
     with tqdm(total=num_samples, desc="Processing combinations") as pbar:
         for i in range(num_samples):
@@ -89,7 +89,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                     raise ValueError("Sequence too long")
                 all_seqs[i, :seq_len] = seq
                 
-                # Get dissolution values via interpolation
+                # Get dissolution values using interpolation
                 if interp_method == 'gpr':
                     seq_2d = seq.reshape(-1, 1)
                     ref_vals = ref_interp(seq_2d)
@@ -98,18 +98,18 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                     ref_vals = ref_interp(seq)
                     test_vals = test_interp(seq)
                 
-                # Validate values
                 if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
                     raise ValueError("NaN in dissolution values")
                 
-                # ---- NEW: Enforce coverage of dissolution ranges on reference values ----
-                # Require at least 2 points in each range: 0-30%, 30-60%, 60-90%
+                # --- Diversity Check: Ensure candidate covers full dissolution range ---
+                # Count how many predicted reference dissolution values fall within:
+                # 0-30%, 30-60%, and 60-90%.
                 num_0_30 = np.sum((ref_vals >= 0) & (ref_vals <= 30))
                 num_30_60 = np.sum((ref_vals > 30) & (ref_vals <= 60))
                 num_60_90 = np.sum((ref_vals > 60) & (ref_vals <= 90))
-                if num_0_30 < 2 or num_30_60 < 2 or num_60_90 < 2:
-                    raise ValueError("Candidate does not meet required dissolution range coverage criteria")
-                # ---------------------------------------------------------------------------
+                diverse = (num_0_30 >= 2) and (num_30_60 >= 2) and (num_60_90 >= 2)
+                diversity_flags[i] = diverse
+                # -------------------------------------------------------------------------
                 
                 # Calculate f2 similarity metric
                 diff = test_vals - ref_vals
@@ -117,7 +117,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                 f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2)/p_val))
                 f2_scores[i] = f2
                 
-                # Check regulatory compliance (external function)
+                # Regulatory compliance check (external function)
                 compliant, reasons = check_regulatory_compliance(
                     seq, regulation,
                     dict(zip(seq, ref_vals)),
@@ -129,7 +129,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                 f2_scores[i] = np.nan
                 compliance_reasons[i] = str(e)
             pbar.update(1)
-
+    
     valid_mask = ~np.isnan(f2_scores)
     results = []
     for i in np.where(valid_mask)[0]:
@@ -139,7 +139,8 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
             'f2': round(f2_scores[i], 2),
             'compliant': compliance_status[i],
             'reasons': compliance_reasons[i],
-            'length': len(seq)
+            'length': len(seq),
+            'diverse': bool(diversity_flags[i])
         })
     
     results.sort(key=lambda x: -x['f2'])
@@ -236,6 +237,11 @@ if run_predictive.lower() == 'yes':
                 print(f"  Compliance rate: {compliance_rate:.1f}%")
     
     # ===== Display Final Results =====
+    if overall_best is None and len(unique_candidates) > 0:
+        overall_best = sorted(unique_candidates, key=lambda x: -x['f2'])[0]
+        print("\nNo candidate met all desired diversity criteria.")
+        print("Displaying the candidate with the highest f2 score from the available combinations.")
+    
     if overall_best:
         print("\n=== Optimal Predictive Combination ===")
         print(f"Condition: {overall_best.get('condition','N/A')}")
@@ -243,13 +249,14 @@ if run_predictive.lower() == 'yes':
         print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
         print(f"Length: {len(overall_best['sequence'])}")
         print(f"Predicted f2 Score: {overall_best['f2']}")
+        print(f"Diverse Combination: {overall_best['diverse']}")
         
         # Compute predicted dissolution percentages for the optimal sequence
         optimal_sequence = overall_best['sequence']
         ref_diss_pred = interpolate_dissolution_curve(reference_mean_df, optimal_sequence, method='gpr')
         test_diss_pred = interpolate_dissolution_curve(test_mean_df, optimal_sequence, method='gpr')
         
-        # Clip predicted values between 0 and 100
+        # Do not multiply by 100 if values are already percentages; clip between 0 and 100
         ref_diss_pred = np.clip(ref_diss_pred, 0, 100)
         test_diss_pred = np.clip(test_diss_pred, 0, 100)
         if optimal_sequence[0] == 0:
@@ -270,7 +277,7 @@ if run_predictive.lower() == 'yes':
         
         print_range_stats(unique_candidates)
         
-        # Plot the results
+        # Plot the results using the computed percentages
         plt.figure(figsize=(12, 6))
         plt.plot(optimal_sequence, ref_diss_pred, 'bo-', label='Reference')
         plt.plot(optimal_sequence, test_diss_pred, 'r*--', label='Test')
@@ -281,9 +288,9 @@ if run_predictive.lower() == 'yes':
         plt.grid(True)
         plt.show()
     else:
-        print("❌ No valid combinations found across all dissolution ranges")
+        print("No optimal candidate selected based on the criteria.")
     
     print("\n=== All Unique Candidate Combinations ===")
     sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
     for idx, cand in enumerate(sorted_candidates):
-        print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+        print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']} | Diverse: {cand['diverse']}")
