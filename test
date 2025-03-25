@@ -1,16 +1,25 @@
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
-                                             interp_method='gpr'):
+                                             interp_method='gpr', points_per_stratum=None):
     """
-    New approach to maximize diversity:
-      - Compute valid times from the union of 3- and 5-minute intervals between window_min and window_max.
-      - Use GPR interpolation (on the reference dataset) to predict dissolution percentages at each valid time.
-      - Define dissolution strata (e.g., 0-30%, 30-60%, 60-90%, 90-100%).
-      - For each stratum, take all valid times that fall within that predicted dissolution range.
-      - The candidate sequence is the union of these times plus the endpoints.
-      - Then compute the predicted dissolution (for reference and test), f2 metric, and check regulatory compliance.
+    New approach based on dissolution-based stratification:
+      - Compute valid time points from the union of 3- and 5-minute intervals.
+      - Use GPR interpolation on the reference data to predict dissolution percentages
+        at each valid time.
+      - The user explicitly provides a dictionary (points_per_stratum) specifying how many
+        time points are required for each dissolution stratum (e.g., {(0,30):2, (30,60):2, (60,90):2, (90,100):2}).
+      - For each stratum, the function selects that many time points (if available) whose predicted
+        dissolution values fall within the stratum.
+      - The candidate sequence is the union of all these points along with the endpoints.
+      - Finally, the candidate’s predicted dissolution percentages (for both reference and test) are computed,
+        the f2 similarity metric is calculated, and regulatory compliance is checked.
     """
+    import random
     import numpy as np
+
+    # Default: require 2 points per stratum if not provided.
+    if points_per_stratum is None:
+        points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
     # Step 1: Determine valid time points
     valid_times = np.unique(np.concatenate([
@@ -19,10 +28,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     ]))
     valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
     
-    # Step 2: Define dissolution strata (in percent)
-    strata = [(0,30), (30,60), (60,90), (90,100)]
-    
-    # Step 3: Setup interpolation using GPR
+    # Step 2: Setup interpolation using GPR
     from sklearn.gaussian_process import GaussianProcessRegressor
     from sklearn.gaussian_process.kernels import ConstantKernel as C, RBF, WhiteKernel
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
@@ -57,28 +63,30 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
                                kind=interp_method, bounds_error=False, fill_value=np.nan)
     
-    # Step 4: Precompute predicted dissolution percentages for each valid time (using reference curve)
+    # Step 3: Precompute predicted dissolution percentages for each valid time (using reference curve)
     all_valid_pred = {}
     for t in valid_times:
         pred = ref_interp(np.array([t]).reshape(-1,1))
         # Force dissolution at window_min to be 0%
         all_valid_pred[t] = 0.0 if t == window_min else float(pred[0])
     
-    # Step 5: For each stratum, select all valid times whose predicted dissolution falls in that bin.
+    # Step 4: For each stratum, select the required number of points (if available)
     candidate = set()
-    for (low, high) in strata:
+    for (low, high), req in points_per_stratum.items():
         times_in_stratum = [t for t in valid_times if low <= all_valid_pred[t] < high]
-        # To enforce diversity, require at least two points if available.
-        if len(times_in_stratum) >= 2:
-            candidate.update(times_in_stratum)
-        elif len(times_in_stratum) > 0:
-            candidate.update(times_in_stratum)
+        if len(times_in_stratum) >= req:
+            # Randomly sample the required number
+            selected = random.sample(times_in_stratum, req)
+        else:
+            selected = times_in_stratum  # use all available if not enough
+        candidate.update(selected)
+    
     # Always include endpoints
     candidate.add(window_min)
     candidate.add(window_max)
     candidate = sorted(candidate)
     
-    # Step 6: Compute predicted dissolution percentages for the candidate sequence
+    # Step 5: Compute predicted dissolution percentages for the candidate sequence
     if interp_method == 'gpr':
         candidate_array = np.array(candidate).reshape(-1, 1)
         ref_vals = ref_interp(candidate_array)
@@ -92,16 +100,17 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         ref_vals[0] = 0.0
         test_vals[0] = 0.0
     
-    # Step 7: Compute f2 similarity metric
+    # Step 6: Compute f2 similarity metric
     diff = test_vals - ref_vals
     p_val = len(candidate)
     f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
     
-    # Diversity flag: check that in each stratum there are at least two points (if available in valid_times)
+    # Step 7: Diversity flag – candidate is considered diverse if each stratum (from points_per_stratum)
+    # provided at least the required number of points (if available in valid_times)
     diverse = True
-    for (low, high) in strata:
+    for (low, high), req in points_per_stratum.items():
         points = [t for t in candidate if low <= all_valid_pred[t] < high]
-        if len(points) < 2:
+        if len(points) < req:
             diverse = False
             break
     
@@ -112,7 +121,6 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         dict(zip(candidate, test_vals.flatten().tolist()))
     )
     
-    # Build result dictionary
     result = {
         'sequence': candidate,
         'f2': round(f2, 2),
@@ -123,10 +131,8 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'ref_vals': ref_vals.flatten().tolist(),
         'test_vals': test_vals.flatten().tolist()
     }
-    
-    # Return a list with this one candidate (since this approach yields one "most diverse" candidate)
     return [result], [result]
-#########################################
+#############################################################
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
@@ -142,6 +148,11 @@ if run_predictive.lower() == 'yes':
     
     print(f"\nCandidate window for combination search: {window_min} to {window_max} (using stratification based on predicted dissolution percentages)")
     
+    # Let the user specify how many points per stratum.
+    # For example, user may want 2 points for each of the strata: 0-30, 30-60, 60-90, and 90-100.
+    # This can be adjusted as needed.
+    user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
+    
     # Run predictive analysis using the new dissolution-based stratification approach.
     results, all_results = predictive_optimal_combinations_advanced(
         reference_mean_df,
@@ -150,14 +161,14 @@ if run_predictive.lower() == 'yes':
         window_min=window_min,
         window_max=window_max,
         diff_threshold=None,
-        interp_method='gpr'
+        interp_method='gpr',
+        points_per_stratum=user_points_per_stratum
     )
     
-    # For consistency, convert candidate time points to standard Python ints.
+    # Convert candidate time points to standard Python ints.
     for cand in results:
         cand['sequence'] = [int(t) for t in cand['sequence']]
     
-    # Since this approach generates one candidate, set overall_best accordingly.
     overall_best = results[0] if results else None
     
     if overall_best:
@@ -174,13 +185,12 @@ if run_predictive.lower() == 'yes':
         else:
             print("Regulatory Compliance: Passed")
         
-        # Plot the predicted dissolution curves for the optimal candidate
+        # Plot predicted dissolution curves for the optimal candidate
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
         time_points = overall_best['sequence']
         ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
         test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
-        # Force dissolution at time window_min to be 0%
         if time_points[0] == window_min:
             ref_diss[0] = 0.0
             test_diss[0] = 0.0
@@ -193,7 +203,6 @@ if run_predictive.lower() == 'yes':
         plt.grid(True)
         plt.show()
         
-        # Print predicted dissolution percentages
         print("\nPredicted Reference Dissolution Percentages:")
         for t, d in zip(time_points, ref_diss):
             print(f"Time {t} min: {d:.2f}%")
@@ -203,7 +212,6 @@ if run_predictive.lower() == 'yes':
     else:
         print("❌ No candidate sequence was generated.")
     
-    # (Optional) Print all unique candidate combinations if multiple were generated.
     print("\n=== All Candidate Combination (Diverse) ===")
     for idx, cand in enumerate(results):
         seq_print = [int(t) for t in cand['sequence']]
