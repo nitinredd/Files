@@ -1,383 +1,289 @@
-import streamlit as st
-import pandas as pd
-import json
-import vertexai
-import google.auth
-import os
-import tempfile
-import warnings
+import numpy as np
+import time
+from tqdm import tqdm
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel as C, RBF, WhiteKernel
+from scipy.interpolate import interp1d
+import itertools
+import matplotlib.pyplot as plt
 
-import utils.optimization, utils.domain, utils.lhs, utils.hplcread, utils.flowrate
-from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-
-# ---------------------------------------
-# Vertex AI / Gemini Configuration
-# ---------------------------------------
-def configure_gemini():
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"  # adjust as needed
-    credentials, project_id = google.auth.default()
-    safety_config = [SafetySetting(category=hc, threshold=HarmBlockThreshold.BLOCK_NONE) for hc in HarmCategory]
-    return {
-        "flash_thinking": GenerativeModel("gemini-2.0-flash-thinking-exp-01-21"),
-        "pro_model": GenerativeModel("gemini-2.0-pro-exp-02-05"),
-        "safety": safety_config
-    }
-
-gemini_config = configure_gemini()
-
-# ---------------------------------------
-# Predefined Prompt Templates
-# ---------------------------------------
-PROMPT_TEMPLATES = {
-    "3-Pump Basic": """Reaction Scheme: KSM+R1+R2 -> P
-Calculate flow rates using:
-- Reaction time = ResidencetimeT1 * Reactor Volume (from Reactor Details, first row, 4th column)
-- Flow rate of Pump 1: use primary reactant (from Pump Details, first reagent)
-- Flow rate of Pump 2: use reagent 1 (from Pump Details, second reagent)
-- Flow rate of Pump 3: use reagent 2 (from Pump Details, third reagent)
-
-Return the result as a JSON array of objects, each corresponding to one row of the LHS data.  
-Each object should include all columns from the LHS sheet plus the computed 'Reaction time', 'Flow rate of Pump 1', 'Flow rate of Pump 2', and 'Flow rate of Pump 3'.""",
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
+                                             window_min, window_max, diff_threshold=None,
+                                             interp_method='linear', num_samples=1000000):
+    """Final robust version with proper array reshaping, error handling, and full dissolution range coverage"""
+    results = []
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
     
-    "4-Pump Advanced": """Reaction Scheme: KSM+R1->I1+R2->I2+QD->P  
-Calculate flow rates using:
-- Reaction time = (ResidenceTimeT1 + ResidenceTimeT2) * Reactor Volume
-- Pump flows for Pumps 1-4 calculated with the established formulas for 4-pump systems.
+    # Convert to numpy arrays and handle NaNs
+    ref_times = ref_df.iloc[:, 0].values.astype(float)
+    ref_diss = ref_df.iloc[:, 1].values.astype(float)
+    test_times = test_df.iloc[:, 0].values.astype(float)
+    test_diss = test_df.iloc[:, 1].values.astype(float)
 
-Return the result as a JSON array of objects (with additional columns for pump flows and reaction time).""",
+    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
+    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
     
-    "Custom Setup": """Create a custom flow rate calculation where:
-- Reaction time depends on both ResidencetimeT1 and CatalystLoading.
-- Flow rates are computed to maintain stoichiometric ratios (using provided equivalences).
-- Include a safety margin of 15% on all flows.
-- Handle unit conversions between ml/min and L/hour.
+    # ===== 2. Interpolation Setup =====
+    if interp_method == 'gpr':
+        def safe_gp_interpolator(x, y):
+            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
+            valid_mask = ~np.isnan(x) & ~np.isnan(y)
+            X = x[valid_mask].reshape(-1, 1)
+            gp.fit(X, y[valid_mask])
+            return gp
+        
+        ref_model = safe_gp_interpolator(ref_times, ref_diss)
+        test_model = safe_gp_interpolator(test_times, test_diss)
+        
+        def ref_interp(x):
+            return ref_model.predict(np.array(x).reshape(-1, 1))
+        
+        def test_interp(x):
+            return test_model.predict(np.array(x).reshape(-1, 1))
+    else:
+        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
+        interp_method = interp_method if interp_method in valid_methods else 'linear'
+        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask], kind=interp_method, bounds_error=False, fill_value=np.nan)
+        test_interp = interp1d(test_times[test_mask], test_diss[test_mask], kind=interp_method, bounds_error=False, fill_value=np.nan)
 
-Return the final results as a JSON array of objects, one for each LHS row, including the computed 'Reaction time' and flow rates for each pump."""
-}
-
-# ---------------------------------------
-# Autonomous Reasoning for Flowrate Calculation
-# ---------------------------------------
-def calculate_flowrates_with_agent(query, use_deepthink, dfs):
-    """
-    Given the user's natural language query (or formula) and the uploaded Excel data
-    (converted to JSON), this function asks the Gemini agent to calculate the flow rates.
-    The agent is instructed to return a JSON array (one object per row in the LHS DataFrame)
-    containing all original LHS columns plus the computed values.
-    """
-    model = gemini_config["flash_thinking"] if use_deepthink else gemini_config["pro_model"]
-    
-    # Convert the relevant DataFrames to JSON strings.
-    pump_json = dfs["pump"].to_json(orient="records")
-    reactor_json = dfs["reactor"].to_json(orient="records")
-    lhs_json = dfs["lhs"].to_json(orient="records")
-    
-    prompt = f"""
-You are an expert chemical engineer. 
-You are given the following data as JSON strings:
-Pump Details: {pump_json}
-Reactor Details: {reactor_json}
-LHS Data: {lhs_json}
-
-The reaction scheme and calculation requirements are described as follows:
-{query}
-
-Using the formulas:
-- Reaction time = ResidencetimeT1 multiplied by the Reactor Volume from Reactor Details (use first row, 4th column).
-- For pump flow rates, follow the established formulas for the selected reaction scheme (e.g., for 3-pump scheme: 
-   Flow rate of Pump 1, Pump 2, and Pump 3 calculated based on molar ratios and equivalences).
-
-Return only a JSON array of objects, where each object corresponds to one row of the LHS data,
-and includes all original LHS fields plus the computed fields: 'Reaction time', 'Flow rate of Pump 1', 
-'Flow rate of Pump 2', and 'Flow rate of Pump 3'. Do not include any explanation.
-"""
-    response = model.generate_content(contents=prompt, safety_settings=gemini_config["safety"])
-    return response.text
-
-def parse_flowrates(response_text):
+    # ===== 3. Time Points Generation =====
+    time_grid = np.arange(window_min, window_max + 1).reshape(-1, 1)
     try:
-        # Attempt to parse the agent's response as JSON.
-        result_list = json.loads(response_text)
-        return pd.DataFrame(result_list)
-    except Exception as e:
-        st.error(f"Error parsing JSON output from Gemini: {str(e)}")
-        return None
+        max_ref = np.nanmax(ref_interp(time_grid))
+        max_test = np.nanmax(test_interp(time_grid))
+    except ValueError:
+        max_ref = np.nanmax(ref_interp(time_grid.flatten()))
+        max_test = np.nanmax(test_interp(time_grid.flatten()))
+    max_diss = max(max_ref, max_test)
 
-# ---------------------------------------
-# Main App: Single Page Autonomous UI
-# ---------------------------------------
-def main():
-    st.set_page_config(page_title="Autonomous Flowrate & Optimization", layout="wide")
-    st.title("Autonomous Flowrate & Optimization via Gemini")
-    
-    # Initialize session state variables
-    if "query_input" not in st.session_state:
-        st.session_state.query_input = ""
-    if "dfs" not in st.session_state:
-        st.session_state.dfs = {}
-    if "inputs" not in st.session_state:
-        st.session_state.inputs = {}
+    # Always include both 3- and 5-minute intervals
+    valid_times = np.unique(np.concatenate([
+        np.arange(0, window_max+1, 3),
+        np.arange(0, window_max+1, 5)
+    ])).astype(int)
+    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
 
-    # --- Chat Input (Query) ---
-    st.markdown("### Your Query:")
-    st.session_state.query_input = st.text_area("Enter your reaction scheme or calculation requirements here...", 
-                                                 value=st.session_state.query_input, height=100)
+    # ===== 4. Combination Generation =====
+    start_time = time.time()
+    seq_lengths = np.random.randint(3, 7, num_samples)  # Change upper bound if longer sequences are desired.
     
-    col1, col2, col3 = st.columns([1, 1, 1])
-    with col1:
-        uploaded_file = st.file_uploader("📤 Upload Excel File", type=["xlsx"], key="excel_upload")
-    with col2:
-        deepthink = st.checkbox("Deepthink", value=False)
-    with col3:
-        send_button = st.button("Send")
+    # Pre-allocate arrays for candidates
+    all_seqs = np.full((num_samples, 6), -1, dtype=int)
+    f2_scores = np.full(num_samples, np.nan)
+    compliance_status = np.full(num_samples, False)
+    compliance_reasons = [''] * num_samples
     
-    # --- Prompt Template Buttons ---
-    st.markdown("#### Prompt Templates")
-    temp_cols = st.columns(len(PROMPT_TEMPLATES))
-    for idx, (title, text) in enumerate(PROMPT_TEMPLATES.items()):
-        if temp_cols[idx].button(title):
-            st.session_state.query_input = text
-    
-    # --- Process Excel File Upload and Show Data/Inputs ---
-    if uploaded_file:
-        try:
-            st.session_state.dfs = {
-                "lhs": pd.read_excel(uploaded_file, sheet_name="LHS"),
-                "objectives": pd.read_excel(uploaded_file, sheet_name="Objectives"),
-                "pump": pd.read_excel(uploaded_file, sheet_name="Pump Details"),
-                "reactor": pd.read_excel(uploaded_file, sheet_name="Reactor Details")
-            }
-            st.success("Excel file loaded successfully!")
-            with st.expander("Review & Edit Excel Data and Input Parameters", expanded=True):
-                st.markdown("#### Excel Data Editing")
-                st.session_state.dfs["lhs"] = st.data_editor(st.session_state.dfs["lhs"], key="lhs_editor")
-                st.session_state.dfs["objectives"] = st.data_editor(st.session_state.dfs["objectives"], key="objectives_editor")
-                st.session_state.dfs["pump"] = st.data_editor(st.session_state.dfs["pump"], key="pump_editor")
-                st.session_state.dfs["reactor"] = st.data_editor(st.session_state.dfs["reactor"], key="reactor_editor")
+    with tqdm(total=num_samples, desc="Processing combinations") as pbar:
+        for i in range(num_samples):
+            try:
+                available_points = valid_times[(valid_times > 0) & (valid_times < window_max)]
+                if len(available_points) < (seq_lengths[i]-2):
+                    raise ValueError("Not enough valid time points")
                 
-                st.markdown("#### Input Parameters")
-                colA, colB, colC = st.columns(3)
-                with colA:
-                    nexp = st.number_input("Number of LHS Experiments", min_value=1, value=10, step=1)
-                with colB:
-                    nobj = st.number_input("Number of Objectives", min_value=1, value=2, step=1)
-                with colC:
-                    nsor = st.number_input("Number of SOR Iterations", min_value=1, value=3, step=1)
+                mid_points = np.random.choice(available_points, size=seq_lengths[i]-2, replace=False)
+                seq = np.sort(np.concatenate([[0], mid_points, [window_max]]))
+                seq = seq.astype(int)
                 
-                colP1, colP2 = st.columns(2)
-                with colP1:
-                    npump = st.selectbox("Number of Pumps", options=[3, 4])
-                with colP2:
-                    rscheme = st.selectbox("Reaction Scheme Identifier", options=[1, 2])
+                seq_len = len(seq)
+                if seq_len > 6:
+                    raise ValueError("Sequence too long")
+                all_seqs[i, :seq_len] = seq
                 
-                st.markdown("#### HPLC Parameters")
-                colH1, colH2 = st.columns(2)
-                with colH1:
-                    YminRT = st.number_input("Min RT for Purity (Yield)", value=2.0, format="%.2f")
-                    YmaxRT = st.number_input("Max RT for Purity (Yield)", value=2.35, format="%.2f")
-                    n_imp = st.number_input("Number of Impurities", min_value=0, value=1)
-                    IminRT_list = []
-                    ImaxRT_list = []
-                    if n_imp > 0:
-                        for i in range(int(n_imp)):
-                            Imin = st.number_input(f"Min RT for Impurity {i+1}", value=1.3, format="%.2f", key=f"Imin_{i}")
-                            Imax = st.number_input(f"Max RT for Impurity {i+1}", value=1.98, format="%.2f", key=f"Imax_{i}")
-                            IminRT_list.append(Imin)
-                            ImaxRT_list.append(Imax)
-                with colH2:
-                    minRTISO = st.number_input("Min RT for Standard", value=3.9, format="%.2f")
-                    maxRTISO = st.number_input("Max RT for Standard", value=4.2, format="%.2f")
-                    hplc_folder = st.text_input("Enter HPLC folder path", value="")
+                # Get dissolution values via interpolation
+                if interp_method == 'gpr':
+                    seq_2d = seq.reshape(-1, 1)
+                    ref_vals = ref_interp(seq_2d)
+                    test_vals = test_interp(seq_2d)
+                else:
+                    ref_vals = ref_interp(seq)
+                    test_vals = test_interp(seq)
                 
-                st.session_state.inputs = {
-                    "nexp": nexp,
-                    "nobj": nobj,
-                    "nsor": nsor,
-                    "npump": npump,
-                    "rscheme": rscheme,
-                    "YminRT": YminRT,
-                    "YmaxRT": YmaxRT,
-                    "IminRT_list": IminRT_list,
-                    "ImaxRT_list": ImaxRT_list,
-                    "minRTISO": minRTISO,
-                    "maxRTISO": maxRTISO,
-                    "hplc_folder": hplc_folder
-                }
-        except Exception as e:
-            st.error(f"Error processing Excel file: {str(e)}")
-    
-    # --- When the Send button is clicked ---
-    if send_button and st.session_state.query_input and st.session_state.dfs:
-        with st.spinner("Calculating flow rates via Gemini..."):
-            # Use the autonomous reasoning agent to compute flow rates directly.
-            agent_response = calculate_flowrates_with_agent(st.session_state.query_input, deepthink, st.session_state.dfs)
-            st.info("Gemini response:")
-            st.text(agent_response)
-            flow_df = parse_flowrates(agent_response)
-            if flow_df is None:
-                st.error("Failed to calculate flow rates using the agent.")
-                st.stop()
-            st.success("Flow rates calculated successfully!")
-            st.dataframe(flow_df.head())
-        
-        # ----------------------------------
-        # Continue with Original Workflow
-        # ----------------------------------
-        st.info("Initializing domain and performing LHS design...")
-        domain = utils.domain.create_domain_X(st.session_state.dfs["lhs"])
-        domain = utils.domain.create_domain_y(domain, st.session_state.dfs["objectives"])
-        lhs_exp = utils.lhs.LHSDesign(st.session_state.inputs["nexp"], domain, st.session_state.inputs["nobj"])
-        save_path = os.path.join(tempfile.gettempdir(), "SOR_result.xlsx")
-        lhs_exp.to_excel(save_path)
-        st.success(f"LHS results saved at {save_path}")
-        
-        st.info("Calculating pump flowrates using the established formulas...")
-        # For the pump flowrates, we call our already–implemented functions.
-        if st.session_state.inputs["npump"] == 3 and st.session_state.inputs["rscheme"] == 1:
-            lhs_pump = utils.flowrate.pump3_flow_rate1(lhs_exp, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
-        elif st.session_state.inputs["npump"] == 3 and st.session_state.inputs["rscheme"] == 2:
-            lhs_pump = utils.flowrate.pump3_flow_rate2(lhs_exp, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
-        elif st.session_state.inputs["npump"] == 4 and st.session_state.inputs["rscheme"] == 1:
-            lhs_pump = utils.flowrate.pump4_flow_rate1(lhs_exp, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
-        elif st.session_state.inputs["npump"] == 4 and st.session_state.inputs["rscheme"] == 2:
-            lhs_pump = utils.flowrate.pump4_flow_rate2(lhs_exp, st.session_state.dfs["pump"], st.session_state.dfs["reactor"])
-        else:
-            st.error("Invalid pump configuration.")
-            st.stop()
-        lhs_pump.to_excel(save_path)
-        st.success("Pump flowrates calculated and saved!")
-        
-        # HPLC Data Reading
-        if st.session_state.inputs["hplc_folder"]:
-            st.info("Reading HPLC data from folder...")
-            monitor_generator = utils.hplcread.monitor_folder_creation1_csv(
-                lhs_pump,
-                st.session_state.inputs["hplc_folder"],
-                st.session_state.inputs["nobj"],
-                st.session_state.inputs["YminRT"],
-                st.session_state.inputs["YmaxRT"],
-                st.session_state.inputs["IminRT_list"],
-                st.session_state.inputs["ImaxRT_list"],
-                st.session_state.inputs["minRTISO"],
-                st.session_state.inputs["maxRTISO"]
-            )
-            i = 1
-            while i <= st.session_state.inputs["nexp"]:
-                try:
-                    result = next(monitor_generator)
-                    if result is not None:
-                        result.to_excel(save_path)
-                        st.write(f"HPLC results read for experiment {i}")
-                        i += 1
-                except StopIteration:
-                    st.warning("HPLC data generator stopped early.")
-                    break
-            st.success("HPLC data read and saved!")
-        else:
-            st.warning("No HPLC folder provided, skipping HPLC data read.")
-        
-        # Optimization Step (SOR)
-        st.info("Running optimization (SOR)...")
-        sor_in = flow_df[flow_df.columns.drop(list(flow_df.filter(regex='Flow rate')))]
-        if "Reaction time" in sor_in.columns:
-            sor_in = sor_in.drop(columns={"Reaction time"})
-        sor_in, opt_result = utils.optimization.run_optimization(
-            domain,
-            sor_in,
-            st.session_state.inputs["nobj"],
-            st.session_state.inputs["npump"],
-            st.session_state.inputs["rscheme"],
-            lhs_exp,
-            st.session_state.dfs["pump"],
-            st.session_state.dfs["reactor"]
-        )
-        combined_results = sor_in.copy()
-        st.dataframe(sor_in)
-        for i in range(1, st.session_state.inputs["nsor"]):
-            st.info(f"Optimization iteration {i+1} of {st.session_state.inputs['nsor']}")
-            opt_result.to_excel(save_path)
-            if st.session_state.inputs["hplc_folder"]:
-                monitor_generator1 = utils.hplcread.monitor_folder_creation1_csv(
-                    sor_in,
-                    st.session_state.inputs["hplc_folder"],
-                    st.session_state.inputs["nobj"],
-                    st.session_state.inputs["YminRT"],
-                    st.session_state.inputs["YmaxRT"],
-                    st.session_state.inputs["IminRT_list"],
-                    st.session_state.inputs["ImaxRT_list"],
-                    st.session_state.inputs["minRTISO"],
-                    st.session_state.inputs["maxRTISO"],
-                    use_dataframe_last_idx=True
+                # Validate values
+                if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
+                    raise ValueError("NaN in dissolution values")
+                
+                # ---- NEW: Enforce coverage of dissolution ranges on reference values ----
+                # Require at least 2 points in each range: 0-30%, 30-60%, 60-90%
+                num_0_30 = np.sum((ref_vals >= 0) & (ref_vals <= 30))
+                num_30_60 = np.sum((ref_vals > 30) & (ref_vals <= 60))
+                num_60_90 = np.sum((ref_vals > 60) & (ref_vals <= 90))
+                if num_0_30 < 2 or num_30_60 < 2 or num_60_90 < 2:
+                    raise ValueError("Candidate does not meet required dissolution range coverage criteria")
+                # ---------------------------------------------------------------------------
+                
+                # Calculate f2 similarity metric
+                diff = test_vals - ref_vals
+                p_val = len(seq)
+                f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2)/p_val))
+                f2_scores[i] = f2
+                
+                # Check regulatory compliance (external function)
+                compliant, reasons = check_regulatory_compliance(
+                    seq, regulation,
+                    dict(zip(seq, ref_vals)),
+                    dict(zip(seq, test_vals))
                 )
-                try:
-                    sor_in = next(monitor_generator1)
-                except StopIteration:
-                    st.warning("HPLC data generator for optimization stopped early.")
-                    break
-            sor_in, opt_result = utils.optimization.run_optimization(
-                domain,
-                sor_in,
-                st.session_state.inputs["nobj"],
-                st.session_state.inputs["npump"],
-                st.session_state.inputs["rscheme"],
-                lhs_exp,
-                st.session_state.dfs["pump"],
-                st.session_state.dfs["reactor"]
+                compliance_status[i] = compliant
+                compliance_reasons[i] = ', '.join(reasons)
+            except (ValueError, IndexError) as e:
+                f2_scores[i] = np.nan
+                compliance_reasons[i] = str(e)
+            pbar.update(1)
+
+    valid_mask = ~np.isnan(f2_scores)
+    results = []
+    for i in np.where(valid_mask)[0]:
+        seq = all_seqs[i][all_seqs[i] != -1].tolist()
+        results.append({
+            'sequence': seq,
+            'f2': round(f2_scores[i], 2),
+            'compliant': compliance_status[i],
+            'reasons': compliance_reasons[i],
+            'length': len(seq)
+        })
+    
+    results.sort(key=lambda x: -x['f2'])
+    
+    print(f"\nProcessed {num_samples} combinations in {time.time()-start_time:.2f}s")
+    return results[:500], results
+
+# --------------------- Main Predictive Analysis Block ---------------------
+if run_predictive.lower() == 'yes':
+    # Determine candidate window
+    window_min, window_max = determine_candidate_window(
+        reference_mean_df, 
+        test_mean_df,
+        step=5,
+        initial_threshold=10
+    )
+    
+    # Map regulation for predictive analysis
+    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+    selected_regulation = regulation_map.get(input1, "FDA")
+    
+    # Run predictive analysis under different conditions
+    conditions = [("Diff threshold 10", 10), ("Diff threshold 20", 20), ("No diff check", None)]
+    
+    all_candidates = []
+    overall_best = None
+    overall_best_f2 = -np.inf
+
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using 3 & 5 minute intervals)")
+    
+    for cond_label, threshold in conditions:
+        print(f"\nProcessing candidates for condition: {cond_label}")
+        top_results, all_results = predictive_optimal_combinations_advanced(
+            reference_mean_df,
+            test_mean_df,
+            regulation=selected_regulation,
+            window_min=window_min,
+            window_max=window_max,
+            diff_threshold=threshold,
+            num_samples=1000000
+        )
+        
+        # Add condition label and updated dissolution range info to each candidate
+        for res in top_results:
+            res['condition'] = cond_label
+            seq = res['sequence']
+            ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
+            test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
+            max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
+            res['diss_range'] = (
+                "0-30%" if max_diss <= 30 else
+                "30-60%" if max_diss <= 60 else
+                "60-90%" if max_diss <= 90 else
+                "90-120%" if max_diss <= 120 else
+                "120%+"
             )
-            combined_results = pd.concat([combined_results, sor_in])
-            st.dataframe(sor_in)
-        st.success("Optimization Complete!")
-        st.balloons()
-        st.info(f"Final results saved at {save_path}")
+        all_candidates.extend(top_results)
+        
+        if top_results:
+            current_best = max(top_results, key=lambda x: x['f2'])
+            if current_best['f2'] > overall_best_f2:
+                overall_best = current_best
+                overall_best_f2 = current_best['f2']
 
-if __name__ == "__main__":
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-    main()
-########################################
-You are an expert chemical engineer. You are given three JSON strings representing data from an Excel file:
-
-1. LHS Data (a JSON array): Each object represents one row from the "LHS" sheet and includes at least the keys "ResidencetimeT1", "Equivalence1", and "Equivalence2".
-2. Pump Details (a JSON array): 
-   - The 0th element contains:
-       - "Concentration of reagent (g/ml)" for the primary reagent,
-       - "Molecular weight (g/mol)" for the primary reagent.
-   - The 1st element contains:
-       - "Concentration of reagent (g/ml)" and "Molecular weight (g/mol)" for reagent 1.
-   - The 2nd element contains:
-       - "Concentration of reagent (g/ml)" and "Molecular weight (g/mol)" for reagent 2.
-3. Reactor Details (a JSON array): 
-   - The value at row index 1, column 0 is called ReactorFactor.
-   - (The Reactor Volume is at row index 3, column 0, but is not used in this calculation.)
-
-For each row in the LHS Data, calculate a new field "Flow rate of Pump 1" using the following formula:
-
-   Flow rate of Pump 1 = 
-      ( ( ReactorFactor / [ResidencetimeT1] ) *
-         ( ( 1 / ( (Concentration0 / MolecularWeight0) * 1000 ) ) /
-           ( ( 1 / ( (Concentration0 / MolecularWeight0) * 1000 ) ) +
-             ( Equivalence1 / ( (Concentration1 / MolecularWeight1) * 1000 ) ) +
-             ( Equivalence2 / ( (Concentration2 / MolecularWeight2) * 1000 ) )
-           )
-         )
-      )[0]
-
-Where:
-- [ResidencetimeT1] is the value from the "ResidencetimeT1" key of the current LHS row.
-- ReactorFactor is the value from Reactor Details at row index 1, column 0.
-- Concentration0 and MolecularWeight0 are from the 0th element of Pump Details.
-- Equivalence1 and Equivalence2 come from the current LHS row (from keys "Equivalence1" and "Equivalence2").
-- Concentration1 and MolecularWeight1 come from the 1st element of Pump Details.
-- Concentration2 and MolecularWeight2 come from the 2nd element of Pump Details.
-- The division by 1000 converts units appropriately.
-- The [0] at the end indicates that the final result should be a single numeric value.
-
-Return the final results as a JSON array of objects. Each object should correspond to one row of the LHS Data and include all its original fields plus the new field "Flow rate of Pump 1" holding the computed value.
-
-Here are the JSON strings (replace the placeholders with your actual JSON data):
-
-LHS Data: <INSERT LHS JSON HERE>  
-Pump Details: <INSERT Pump Details JSON HERE>  
-Reactor Details: <INSERT Reactor Details JSON HERE>
-
-Please compute the values and return only the JSON array of results.
+    # ===== Duplicate Filtering =====
+    unique_candidates_dict = {}
+    for cand in all_candidates:
+        seq_tuple = tuple(cand['sequence'])
+        if seq_tuple in unique_candidates_dict:
+            if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
+                unique_candidates_dict[seq_tuple] = cand
+        else:
+            unique_candidates_dict[seq_tuple] = cand
+    unique_candidates = list(unique_candidates_dict.values())
+    
+    def print_range_stats(candidates):
+        ranges = ["0-30%", "30-60%", "60-90%", "90-120%", "120%+"]
+        stats = {r: {"total": 0, "compliant": 0} for r in ranges}
+        for cand in candidates:
+            rng = cand.get('diss_range', 'Unknown')
+            if rng in stats:
+                stats[rng]['total'] += 1
+                if cand['compliant']:
+                    stats[rng]['compliant'] += 1
+            else:
+                stats[rng] = {"total": 1, "compliant": 1 if cand['compliant'] else 0}
+        print("\n=== Dissolution Range Distribution ===")
+        for rng, data in stats.items():
+            if data['total'] > 0:
+                compliance_rate = (data['compliant']/data['total'])*100
+                print(f"{rng}:")
+                print(f"  Total combinations: {data['total']}")
+                print(f"  Compliant combinations: {data['compliant']}")
+                print(f"  Compliance rate: {compliance_rate:.1f}%")
+    
+    # ===== Display Final Results =====
+    if overall_best:
+        print("\n=== Optimal Predictive Combination ===")
+        print(f"Condition: {overall_best.get('condition','N/A')}")
+        print(f"Dissolution Range: {overall_best['diss_range']}")
+        print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
+        print(f"Length: {len(overall_best['sequence'])}")
+        print(f"Predicted f2 Score: {overall_best['f2']}")
+        
+        # Compute predicted dissolution percentages for the optimal sequence
+        optimal_sequence = overall_best['sequence']
+        ref_diss_pred = interpolate_dissolution_curve(reference_mean_df, optimal_sequence, method='gpr')
+        test_diss_pred = interpolate_dissolution_curve(test_mean_df, optimal_sequence, method='gpr')
+        
+        # Clip predicted values between 0 and 100
+        ref_diss_pred = np.clip(ref_diss_pred, 0, 100)
+        test_diss_pred = np.clip(test_diss_pred, 0, 100)
+        if optimal_sequence[0] == 0:
+            ref_diss_pred[0] = 0.0
+            test_diss_pred[0] = 0.0
+        
+        print("\nPredicted Reference Dissolution Percentages:")
+        for t, d in zip(optimal_sequence, ref_diss_pred):
+            print(f"Time {t} min: {d:.2f}%")
+        print("\nPredicted Test Dissolution Percentages:")
+        for t, d in zip(optimal_sequence, test_diss_pred):
+            print(f"Time {t} min: {d:.2f}%")
+        
+        if overall_best['reasons']:
+            print(f"\nCompliance Issues: {', '.join(overall_best['reasons'])}")
+        else:
+            print("\nRegulatory Compliance: Passed")
+        
+        print_range_stats(unique_candidates)
+        
+        # Plot the results
+        plt.figure(figsize=(12, 6))
+        plt.plot(optimal_sequence, ref_diss_pred, 'bo-', label='Reference')
+        plt.plot(optimal_sequence, test_diss_pred, 'r*--', label='Test')
+        plt.title(f"Optimal Profile: {overall_best['diss_range']} Dissolution (f2 = {overall_best['f2']})")
+        plt.xlabel('Time (min)')
+        plt.ylabel('Dissolution (%)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+    else:
+        print("❌ No valid combinations found across all dissolution ranges")
+    
+    print("\n=== All Unique Candidate Combinations ===")
+    sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
+    for idx, cand in enumerate(sorted_candidates):
+        print(f"{idx+1:3d}. {cand['diss_range']} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
