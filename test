@@ -1,134 +1,3 @@
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                             window_min, window_max, diff_threshold=None,
-                                             interp_method='gpr', n_iter=100):
-    """
-    New strategy:
-      - The candidate window is divided into fixed segments.
-        For example, if window_min=0 and window_max=60, segments are:
-            [0,10], [10,20], [20,30], [30,40], [40,50], [50,60].
-      - From each segment, at least two time points are selected from the union
-        of 3- and 5-minute intervals.
-      - Endpoints (window_min and window_max) are ensured.
-      - This stratified sampling is repeated n_iter times.
-      - For each candidate, predicted dissolution values are computed via interpolation,
-        and the f2 similarity metric is calculated.
-      - The candidate with the best (or acceptable) f2 is returned (along with a list of all candidates).
-    """
-    import random
-    results = []
-    # Define union of valid time points between window_min and window_max
-    valid_times = np.unique(np.concatenate([
-        np.arange(window_min, window_max+1, 3),
-        np.arange(window_min, window_max+1, 5)
-    ]))
-    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
-    
-    # Define segment boundaries – here fixed segments of 10 minutes
-    segments = [(window_min, window_min+10),
-                (window_min+10, window_min+20),
-                (window_min+20, window_min+30),
-                (window_min+30, window_min+40),
-                (window_min+40, window_min+50),
-                (window_min+50, window_max)]
-    
-    # Setup interpolation (GPR or alternative)
-    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
-    ref_times = ref_df.iloc[:, 0].values.astype(float)
-    ref_diss = ref_df.iloc[:, 1].values.astype(float)
-    test_times = test_df.iloc[:, 0].values.astype(float)
-    test_diss = test_df.iloc[:, 1].values.astype(float)
-    
-    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
-    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
-    
-    if interp_method == 'gpr':
-        def safe_gp_interpolator(x, y):
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
-            valid_mask = ~np.isnan(x) & ~np.isnan(y)
-            X = x[valid_mask].reshape(-1, 1)
-            gp.fit(X, y[valid_mask])
-            return gp
-        ref_model = safe_gp_interpolator(ref_times, ref_diss)
-        test_model = safe_gp_interpolator(test_times, test_diss)
-        def ref_interp(x):
-            return ref_model.predict(np.array(x).reshape(-1, 1))
-        def test_interp(x):
-            return test_model.predict(np.array(x).reshape(-1, 1))
-    else:
-        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
-        interp_method = interp_method if interp_method in valid_methods else 'linear'
-        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask],
-                              kind=interp_method, bounds_error=False, fill_value=np.nan)
-        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
-                               kind=interp_method, bounds_error=False, fill_value=np.nan)
-    
-    # Run stratified sampling for n_iter iterations
-    for i in range(n_iter):
-        candidate = []
-        # Ensure endpoints are included
-        candidate.append(window_min)
-        candidate.append(window_max)
-        # For each segment, choose at least 2 points (if available)
-        for seg in segments:
-            seg_start, seg_end = seg
-            seg_times = [t for t in valid_times if seg_start < t < seg_end]
-            if len(seg_times) >= 2:
-                candidate.extend(random.sample(seg_times, 2))
-            elif len(seg_times) > 0:
-                candidate.extend(seg_times)
-        candidate = sorted(set(candidate))  # remove duplicates and sort
-        
-        # Compute predicted dissolution percentages for candidate time points
-        if interp_method == 'gpr':
-            candidate_array = np.array(candidate).reshape(-1, 1)
-            ref_vals = ref_interp(candidate_array)
-            test_vals = test_interp(candidate_array)
-        else:
-            ref_vals = ref_interp(candidate)
-            test_vals = test_interp(candidate)
-        
-        # Skip candidate if NaNs present
-        if np.isnan(ref_vals).any() or np.isnan(test_vals).any():
-            continue
-        
-        # Compute f2 similarity metric
-        diff = test_vals - ref_vals
-        p_val = len(candidate)
-        f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
-        
-        # For diversity, we check that each segment has at least one point (besides endpoints)
-        diverse = True
-        for seg in segments:
-            seg_start, seg_end = seg
-            # Candidate points that lie strictly within the segment
-            points_in_seg = [t for t in candidate if seg_start < t < seg_end]
-            if len(points_in_seg) < 1:
-                diverse = False
-                break
-        
-        # Regulatory compliance check – assumed external function
-        compliant, reasons = check_regulatory_compliance(
-            candidate, regulation,
-            dict(zip(candidate, ref_vals.flatten().tolist())),
-            dict(zip(candidate, test_vals.flatten().tolist()))
-        )
-        
-        results.append({
-            'sequence': candidate,
-            'f2': round(f2, 2),
-            'compliant': compliant,
-            'reasons': reasons,
-            'length': len(candidate),
-            'diverse': diverse,
-            'ref_vals': ref_vals.flatten().tolist(),
-            'test_vals': test_vals.flatten().tolist()
-        })
-    
-    # Sort candidates by f2 descending
-    results.sort(key=lambda x: -x['f2'])
-    # Return the best candidate (or all, as needed)
-    return results, results
-##############################
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
@@ -145,7 +14,7 @@ if run_predictive.lower() == 'yes':
     print(f"\nCandidate window for combination search: {window_min} to {window_max} (using stratified sampling across segments)")
     
     # Run predictive analysis using the new stratified sampling approach.
-    # Here we use, for example, 100 iterations.
+    # For example, use 100 iterations.
     results, all_results = predictive_optimal_combinations_advanced(
         reference_mean_df,
         test_mean_df,
@@ -157,10 +26,10 @@ if run_predictive.lower() == 'yes':
         n_iter=100
     )
     
-    # Filter unique candidates (by sequence) if needed.
+    # Filter unique candidates (by sequence)
     unique_candidates_dict = {}
     for cand in results:
-        seq_tuple = tuple(cand['sequence'])
+        seq_tuple = tuple(int(t) for t in cand['sequence'])  # convert np.int64 to int
         if seq_tuple in unique_candidates_dict:
             if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
                 unique_candidates_dict[seq_tuple] = cand
@@ -182,13 +51,13 @@ if run_predictive.lower() == 'yes':
         print("\n=== Dissolution Range Distribution ===")
         for rng, data in stats.items():
             if data['total'] > 0:
-                compliance_rate = (data['compliant']/data['total'])*100
+                compliance_rate = (data['compliant'] / data['total']) * 100
                 print(f"{rng}:")
                 print(f"  Total combinations: {data['total']}")
                 print(f"  Compliant combinations: {data['compliant']}")
                 print(f"  Compliance rate: {compliance_rate:.1f}%")
     
-    # Choose the candidate with highest f2 among those that are diverse.
+    # Choose candidate with highest f2 among diverse candidates if available.
     diverse_candidates = [cand for cand in unique_candidates if cand['diverse']]
     if diverse_candidates:
         overall_best = max(diverse_candidates, key=lambda x: x['f2'])
@@ -199,6 +68,8 @@ if run_predictive.lower() == 'yes':
         overall_best = None
     
     if overall_best:
+        # Convert time points to Python ints for printing
+        overall_best['sequence'] = [int(t) for t in overall_best['sequence']]
         print("\n=== Optimal Predictive Combination ===")
         print(f"Condition: {overall_best.get('condition','N/A')}")
         print(f"Dissolution Range: {overall_best.get('diss_range','N/A')}")
@@ -219,6 +90,10 @@ if run_predictive.lower() == 'yes':
         time_points = overall_best['sequence']
         ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
         test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
+        # Force dissolution at time 0 to be 0%
+        if time_points[0] == window_min:
+            ref_diss[0] = 0.0
+            test_diss[0] = 0.0
         plt.plot(time_points, ref_diss, 'bo-', label='Reference')
         plt.plot(time_points, test_diss, 'r*--', label='Test')
         plt.title(f"Optimal Profile: {overall_best.get('diss_range','N/A')} Dissolution (f2 = {overall_best['f2']})")
@@ -228,7 +103,7 @@ if run_predictive.lower() == 'yes':
         plt.grid(True)
         plt.show()
         
-        # Print predicted dissolution percentages
+        # Print the predicted dissolution percentages for each time point
         print("\nPredicted Reference Dissolution Percentages:")
         for t, d in zip(time_points, ref_diss):
             print(f"Time {t} min: {d:.2f}%")
@@ -241,5 +116,6 @@ if run_predictive.lower() == 'yes':
     print("\n=== All Unique Candidate Combinations ===")
     sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
     for idx, cand in enumerate(sorted_candidates):
-        print(f"{idx+1:3d}. {cand.get('diss_range','N/A')} | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
-############33
+        # Convert time points to standard ints for printing.
+        seq_print = [int(t) for t in cand['sequence']]
+        print(f"{idx+1:3d}. {cand.get('diss_range','N/A')} | Points: {seq_print} | Length: {len(seq_print)} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
