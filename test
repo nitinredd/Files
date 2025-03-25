@@ -1,7 +1,7 @@
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
-        reference_mean_df, 
+        reference_mean_df,
         test_mean_df,
         step=5,
         initial_threshold=10
@@ -11,70 +11,24 @@ if run_predictive.lower() == 'yes':
     regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
     selected_regulation = regulation_map.get(input1, "FDA")
     
-    # Run predictive analysis under different conditions
-    conditions = [("Diff threshold 10", 10), 
-                  ("Diff threshold 20", 20), 
-                  ("No diff check", None)]
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using stratified sampling across segments)")
     
-    all_candidates = []
-    overall_best = None
-    overall_best_f2 = -np.inf
-
-    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using union of 3 & 5 minute intervals)")
+    # Run predictive analysis using the new stratified sampling approach.
+    # Here we use, for example, 100 iterations.
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='gpr',
+        n_iter=100
+    )
     
-    for cond_label, threshold in conditions:
-        print(f"\nProcessing candidates for condition: {cond_label}")
-        
-        # Get results for this condition
-        top_results, all_results = predictive_optimal_combinations_advanced(
-            reference_mean_df,
-            test_mean_df,
-            regulation=selected_regulation,
-            window_min=window_min,
-            window_max=window_max,
-            diff_threshold=threshold,
-            num_samples=1000000
-        )
-        
-        # Add condition label and update dissolution range info for each candidate
-        for res in top_results:
-            res['condition'] = cond_label
-            seq = res['sequence']
-            ref_vals = interpolate_dissolution_curve(reference_mean_df, seq, method='gpr')
-            test_vals = interpolate_dissolution_curve(test_mean_df, seq, method='gpr')
-            max_diss = max(np.nanmax(ref_vals), np.nanmax(test_vals))
-            res['diss_range'] = (
-                "0-30%" if max_diss <= 30 else
-                "30-60%" if max_diss <= 60 else
-                "60-90%" if max_diss <= 90 else
-                "90-120%" if max_diss <= 120 else
-                "120%+"
-            )
-            # Diversity check: candidate is diverse if it has at least one time point (besides endpoints)
-            # in each segment: early (window_min, early_bound), mid [early_bound, mid_bound), late [mid_bound, window_max)
-            early_bound = window_min + (window_max - window_min) / 3.0
-            mid_bound   = window_min + 2*(window_max - window_min) / 3.0
-            has_early = any(t > window_min and t < early_bound for t in seq)
-            has_mid   = any(t >= early_bound and t < mid_bound for t in seq)
-            has_late  = any(t >= mid_bound and t < window_max for t in seq)
-            diverse = has_early and has_mid and has_late
-            res['diverse'] = diverse
-        all_candidates.extend(top_results)
-        
-        # Track overall best candidate (across conditions)
-        for cand in top_results:
-            if cand.get('diverse', False) and cand['f2'] > overall_best_f2:
-                overall_best = cand
-                overall_best_f2 = cand['f2']
-        # Fallback: if none of the candidates are diverse, choose highest f2 overall
-        if overall_best is None and top_results:
-            current_best = max(top_results, key=lambda x: x['f2'])
-            overall_best = current_best
-            overall_best_f2 = current_best['f2']
-
-    # ===== Duplicate Filtering =====
+    # Filter unique candidates (by sequence) if needed.
     unique_candidates_dict = {}
-    for cand in all_candidates:
+    for cand in results:
         seq_tuple = tuple(cand['sequence'])
         if seq_tuple in unique_candidates_dict:
             if cand['f2'] > unique_candidates_dict[seq_tuple]['f2']:
@@ -103,12 +57,21 @@ if run_predictive.lower() == 'yes':
                 print(f"  Compliant combinations: {data['compliant']}")
                 print(f"  Compliance rate: {compliance_rate:.1f}%")
     
-    # ===== Display Final Results =====
+    # Choose the candidate with highest f2 among those that are diverse.
+    diverse_candidates = [cand for cand in unique_candidates if cand['diverse']]
+    if diverse_candidates:
+        overall_best = max(diverse_candidates, key=lambda x: x['f2'])
+    elif unique_candidates:
+        overall_best = max(unique_candidates, key=lambda x: x['f2'])
+        print("\nNo candidate met the ideal diversity criteria; displaying candidate with highest f2.")
+    else:
+        overall_best = None
+    
     if overall_best:
         print("\n=== Optimal Predictive Combination ===")
         print(f"Condition: {overall_best.get('condition','N/A')}")
         print(f"Dissolution Range: {overall_best.get('diss_range','N/A')}")
-        print(f"Time Points (3/5 min intervals): {overall_best['sequence']}")
+        print(f"Time Points (stratified): {overall_best['sequence']}")
         print(f"Length: {len(overall_best['sequence'])}")
         print(f"Predicted f2 Score: {overall_best['f2']}")
         print(f"Diverse Combination: {overall_best.get('diverse', False)}")
@@ -120,7 +83,7 @@ if run_predictive.lower() == 'yes':
         
         print_range_stats(unique_candidates)
         
-        # Plot results and show predicted dissolution percentages
+        # Plot the optimal candidate's predicted dissolution curves
         plt.figure(figsize=(12, 6))
         time_points = overall_best['sequence']
         ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
@@ -134,7 +97,7 @@ if run_predictive.lower() == 'yes':
         plt.grid(True)
         plt.show()
         
-        # Print the predicted dissolution percentages for each time point
+        # Print predicted dissolution percentages
         print("\nPredicted Reference Dissolution Percentages:")
         for t, d in zip(time_points, ref_diss):
             print(f"Time {t} min: {d:.2f}%")
@@ -142,7 +105,7 @@ if run_predictive.lower() == 'yes':
         for t, d in zip(time_points, test_diss):
             print(f"Time {t} min: {d:.2f}%")
     else:
-        print("❌ No valid combinations found across all dissolution ranges")
+        print("❌ No candidate sequences were generated.")
     
     print("\n=== All Unique Candidate Combinations ===")
     sorted_candidates = sorted(unique_candidates, key=lambda x: -x['f2'])
