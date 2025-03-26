@@ -1,218 +1,103 @@
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                             window_min, window_max, diff_threshold=None,
-                                             interp_method='gpr', points_per_stratum=None):
+def check_regulatory_compliance(seq, regulation, ref_means, test_means):
     """
-    New approach based on dissolution-based stratification:
-      - Compute valid time points from the union of 3- and 5-minute intervals.
-      - Use GPR interpolation on the reference data to predict dissolution percentages
-        at each valid time.
-      - The user explicitly provides a dictionary (points_per_stratum) specifying how many
-        time points are required for each dissolution stratum (e.g., {(0,30):2, (30,60):2, (60,90):2, (90,100):2}).
-      - For each stratum, the function selects that many time points (if available) whose predicted
-        dissolution values fall within the stratum.
-      - The candidate sequence is the union of all these points along with the endpoints.
-      - Finally, the candidate’s predicted dissolution percentages (for both reference and test) are computed,
-        the f2 similarity metric is calculated, and regulatory compliance is checked.
+    Check if a candidate sequence satisfies the selected regulatory rules.
+    Revised rules:
+      - FDA:
+          * For each of reference and test, exactly one time point must have dissolution ≥85%.
+      - EMA:
+          * Across reference or test, at most one time point may be ≥85%.
+          * At least 4 time points are required.
+      - China:
+          * For the reference, exactly one time point must be "around 85%" (i.e. between 84 and 86)
+            and all other time points must be below 85%.
+      - ASEAN:
+          * There must be at least 3 time points collected before 15 minutes.
+          * At the 15-minute time point (if present), the reference dissolution should be close to 80%
+            (here defined as between 75 and 85).
+          * Across both reference and test, only one time point in the full profile may be ≥85%.
+      - ANVISA:
+          * The collection must have at least 5 time points.
+          * The first time point must be 0.
+          * Across reference and test, only one time point may be ≥85%.
+          * For f2 calculation, use the first 3 time points (excluding the 0 time point);
+            these “earlier time points” should be around 40% (here defined as between 35 and 45).
+    Returns a tuple (compliant, reasons) where compliant is a boolean and reasons is a list of strings.
     """
-    import random
-    import numpy as np
-
-    # Default: require 2 points per stratum if not provided.
-    if points_per_stratum is None:
-        points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
+    compliant = True
+    reasons = []
     
-    # Step 1: Determine valid time points
-    valid_times = np.unique(np.concatenate([
-        np.arange(window_min, window_max+1, 3),
-        np.arange(window_min, window_max+1, 5)
-    ]))
-    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
+    if regulation == "FDA":
+        # Count time points with ≥85% dissolution for both reference and test separately.
+        ref_count = sum(1 for t in seq if ref_means[t] >= 85)
+        test_count = sum(1 for t in seq if test_means[t] >= 85)
+        if ref_count != 1:
+            compliant = False
+            reasons.append(f"Reference must have exactly one time point ≥85% (found {ref_count}).")
+        if test_count != 1:
+            compliant = False
+            reasons.append(f"Test must have exactly one time point ≥85% (found {test_count}).")
     
-    # Step 2: Setup interpolation using GPR
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel as C, RBF, WhiteKernel
-    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
+    elif regulation == "EMA":
+        # Combined count: only one time point overall may be ≥85%
+        combined_count = sum(1 for t in seq if ref_means[t] >= 85 or test_means[t] >= 85)
+        if combined_count > 1:
+            compliant = False
+            reasons.append("More than one time point ≥85% detected across reference/test.")
+        if len(seq) < 4:
+            compliant = False
+            reasons.append("Insufficient time points (<4).")
     
-    ref_times = ref_df.iloc[:, 0].values.astype(float)
-    ref_diss = ref_df.iloc[:, 1].values.astype(float)
-    test_times = test_df.iloc[:, 0].values.astype(float)
-    test_diss = test_df.iloc[:, 1].values.astype(float)
+    elif regulation == "China":
+        # For reference: exactly one time point must be around 85% (between 84 and 86) 
+        # and all others must be below 85%.
+        around_85 = [t for t in seq if 84 <= ref_means[t] <= 86]
+        above_85 = [t for t in seq if ref_means[t] > 85]
+        if len(around_85) != 1:
+            compliant = False
+            reasons.append(f"Reference must have exactly one time point around 85% (found {len(around_85)}).")
+        # Even if one time point is around 85, any other time point ≥85 is not allowed.
+        if len(above_85) - len(around_85) > 0:
+            compliant = False
+            reasons.append("Other reference time points above 85% detected.")
     
-    ref_mask = ~np.isnan(ref_times) & ~np.isnan(ref_diss)
-    test_mask = ~np.isnan(test_times) & ~np.isnan(test_diss)
+    elif regulation == "ASEAN":
+        # At least 3 time points must be before 15 minutes.
+        before_15 = [t for t in seq if t < 15]
+        if len(before_15) < 3:
+            compliant = False
+            reasons.append("Fewer than 3 time points collected before 15 minutes.")
+        # At the 15-minute time point, reference should be close to 80% (between 75 and 85) if present.
+        if 15 in seq:
+            if not (75 <= ref_means[15] <= 85):
+                compliant = False
+                reasons.append("At 15 minutes, reference dissolution is not close to 80%.")
+        # Combined count for any dissolution ≥85% (both reference and test) must be only one.
+        combined_count = sum(1 for t in seq if ref_means[t] >= 85 or test_means[t] >= 85)
+        if combined_count != 1:
+            compliant = False
+            reasons.append(f"ASEAN profile must have exactly one time point ≥85% (found {combined_count}).")
     
-    if interp_method == 'gpr':
-        def safe_gp_interpolator(x, y):
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
-            valid_mask = ~np.isnan(x) & ~np.isnan(y)
-            X = x[valid_mask].reshape(-1, 1)
-            gp.fit(X, y[valid_mask])
-            return gp
-        ref_model = safe_gp_interpolator(ref_times, ref_diss)
-        test_model = safe_gp_interpolator(test_times, test_diss)
-        def ref_interp(x):
-            return ref_model.predict(np.array(x).reshape(-1, 1))
-        def test_interp(x):
-            return test_model.predict(np.array(x).reshape(-1, 1))
-    else:
-        from scipy.interpolate import interp1d
-        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
-        interp_method = interp_method if interp_method in valid_methods else 'linear'
-        ref_interp = interp1d(ref_times[ref_mask], ref_diss[ref_mask],
-                              kind=interp_method, bounds_error=False, fill_value=np.nan)
-        test_interp = interp1d(test_times[test_mask], test_diss[test_mask],
-                               kind=interp_method, bounds_error=False, fill_value=np.nan)
+    elif regulation == "ANVISA":
+        # Must have at least 5 time points.
+        if len(seq) < 5:
+            compliant = False
+            reasons.append("Less than 5 time points collected.")
+        # The first time point must be 0.
+        if seq[0] != 0:
+            compliant = False
+            reasons.append("The first time point must be 0.")
+        # Combined count for any dissolution ≥85% (both reference and test) must be only one.
+        combined_count = sum(1 for t in seq if ref_means[t] >= 85 or test_means[t] >= 85)
+        if combined_count != 1:
+            compliant = False
+            reasons.append(f"ANVISA profile must have exactly one time point ≥85% (found {combined_count}).")
+        # For f2 calculation, use the first 3 time points (excluding the 0 time point);
+        # these early time points should be around 40% (between 35 and 45).
+        nonzero_points = [t for t in seq if t != 0]
+        early_points = nonzero_points[:3]
+        for t in early_points:
+            if not (35 <= ref_means[t] <= 45 and 35 <= test_means[t] <= 45):
+                compliant = False
+                reasons.append(f"Early time point at t={t} not around 40% for both reference and test.")
     
-    # Step 3: Precompute predicted dissolution percentages for each valid time (using reference curve)
-    all_valid_pred = {}
-    for t in valid_times:
-        pred = ref_interp(np.array([t]).reshape(-1,1))
-        # Force dissolution at window_min to be 0%
-        all_valid_pred[t] = 0.0 if t == window_min else float(pred[0])
-    
-    # Step 4: For each stratum, select the required number of points (if available)
-    candidate = set()
-    for (low, high), req in points_per_stratum.items():
-        times_in_stratum = [t for t in valid_times if low <= all_valid_pred[t] < high]
-        if len(times_in_stratum) >= req:
-            # Randomly sample the required number
-            selected = random.sample(times_in_stratum, req)
-        else:
-            selected = times_in_stratum  # use all available if not enough
-        candidate.update(selected)
-    
-    # Always include endpoints
-    candidate.add(window_min)
-    candidate.add(window_max)
-    candidate = sorted(candidate)
-    
-    # Step 5: Compute predicted dissolution percentages for the candidate sequence
-    if interp_method == 'gpr':
-        candidate_array = np.array(candidate).reshape(-1, 1)
-        ref_vals = ref_interp(candidate_array)
-        test_vals = test_interp(candidate_array)
-    else:
-        ref_vals = ref_interp(candidate)
-        test_vals = test_interp(candidate)
-    
-    # Force dissolution at window_min to be 0%
-    if candidate[0] == window_min:
-        ref_vals[0] = 0.0
-        test_vals[0] = 0.0
-    
-    # Step 6: Compute f2 similarity metric
-    diff = test_vals - ref_vals
-    p_val = len(candidate)
-    f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
-    
-    # Step 7: Diversity flag – candidate is considered diverse if each stratum (from points_per_stratum)
-    # provided at least the required number of points (if available in valid_times)
-    diverse = True
-    for (low, high), req in points_per_stratum.items():
-        points = [t for t in candidate if low <= all_valid_pred[t] < high]
-        if len(points) < req:
-            diverse = False
-            break
-    
-    # Regulatory compliance check (assumed external function)
-    compliant, reasons = check_regulatory_compliance(
-        candidate, regulation,
-        dict(zip(candidate, ref_vals.flatten().tolist())),
-        dict(zip(candidate, test_vals.flatten().tolist()))
-    )
-    
-    result = {
-        'sequence': candidate,
-        'f2': round(f2, 2),
-        'compliant': compliant,
-        'reasons': reasons,
-        'length': len(candidate),
-        'diverse': diverse,
-        'ref_vals': ref_vals.flatten().tolist(),
-        'test_vals': test_vals.flatten().tolist()
-    }
-    return [result], [result]
-#############################################################
-if run_predictive.lower() == 'yes':
-    # Determine candidate window
-    window_min, window_max = determine_candidate_window(
-        reference_mean_df,
-        test_mean_df,
-        step=5,
-        initial_threshold=10
-    )
-    
-    # Map regulation for predictive analysis
-    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-    selected_regulation = regulation_map.get(input1, "FDA")
-    
-    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using stratification based on predicted dissolution percentages)")
-    
-    # Let the user specify how many points per stratum.
-    # For example, user may want 2 points for each of the strata: 0-30, 30-60, 60-90, and 90-100.
-    # This can be adjusted as needed.
-    user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
-    
-    # Run predictive analysis using the new dissolution-based stratification approach.
-    results, all_results = predictive_optimal_combinations_advanced(
-        reference_mean_df,
-        test_mean_df,
-        regulation=selected_regulation,
-        window_min=window_min,
-        window_max=window_max,
-        diff_threshold=None,
-        interp_method='gpr',
-        points_per_stratum=user_points_per_stratum
-    )
-    
-    # Convert candidate time points to standard Python ints.
-    for cand in results:
-        cand['sequence'] = [int(t) for t in cand['sequence']]
-    
-    overall_best = results[0] if results else None
-    
-    if overall_best:
-        print("\n=== Optimal Predictive Combination ===")
-        print(f"Condition: {overall_best.get('condition','N/A')}")
-        print(f"Dissolution Range: {overall_best.get('diss_range','N/A')}")
-        print(f"Time Points (diverse candidate): {overall_best['sequence']}")
-        print(f"Length: {len(overall_best['sequence'])}")
-        print(f"Predicted f2 Score: {overall_best['f2']}")
-        print(f"Diverse Combination: {overall_best.get('diverse', False)}")
-        
-        if overall_best['reasons']:
-            print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
-        else:
-            print("Regulatory Compliance: Passed")
-        
-        # Plot predicted dissolution curves for the optimal candidate
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(12, 6))
-        time_points = overall_best['sequence']
-        ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
-        test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
-        if time_points[0] == window_min:
-            ref_diss[0] = 0.0
-            test_diss[0] = 0.0
-        plt.plot(time_points, ref_diss, 'bo-', label='Reference')
-        plt.plot(time_points, test_diss, 'r*--', label='Test')
-        plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
-        plt.xlabel('Time (min)')
-        plt.ylabel('Dissolution (%)')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        
-        print("\nPredicted Reference Dissolution Percentages:")
-        for t, d in zip(time_points, ref_diss):
-            print(f"Time {t} min: {d:.2f}%")
-        print("\nPredicted Test Dissolution Percentages:")
-        for t, d in zip(time_points, test_diss):
-            print(f"Time {t} min: {d:.2f}%")
-    else:
-        print("❌ No candidate sequence was generated.")
-    
-    print("\n=== All Candidate Combination (Diverse) ===")
-    for idx, cand in enumerate(results):
-        seq_print = [int(t) for t in cand['sequence']]
-        print(f"{idx+1:3d}. {cand.get('diss_range','N/A')} | Points: {seq_print} | Length: {len(seq_print)} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+    return (compliant, reasons)
