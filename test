@@ -3,9 +3,9 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                                              interp_method='gpr', points_per_stratum=None):
     """
     New approach based on dissolution-based stratification with user-specified points per stratum,
-    plus an extra filtering step that ensures that among interior candidate points with predicted 
-    reference dissolution >80%, only one is retained (the one with the lowest value above 80%).
-    The endpoint (window_max) is not forced.
+    plus an extra filtering step: do not force inclusion of the endpoint and ensure that among interior 
+    candidate points (excluding the starting point) with predicted reference AND test dissolution >80%, 
+    only one is retained (the one with the smallest predicted value above 80% from the reference curve).
     """
     import random
     import numpy as np
@@ -14,14 +14,14 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     if points_per_stratum is None:
         points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
-    # Step 1: Determine valid time points from the union of 3- and 5-minute intervals.
+    # Step 1: Determine valid time points from union of 3- and 5-minute intervals.
     valid_times = np.unique(np.concatenate([
         np.arange(window_min, window_max+1, 3),
         np.arange(window_min, window_max+1, 5)
     ]))
     valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
     
-    # Step 2: Setup dissolution strata from points_per_stratum keys.
+    # Step 2: Setup the dissolution strata (from points_per_stratum keys).
     strata = list(points_per_stratum.keys())
     
     # Step 3: Setup interpolation using GPR.
@@ -62,7 +62,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     # Step 4: Precompute predicted dissolution percentages (reference) for each valid time.
     all_valid_pred = {}
     for t in valid_times:
-        pred = ref_interp(np.array([t]).reshape(-1,1))
+        pred = ref_interp(np.array([t]).reshape(-1, 1))
         all_valid_pred[t] = 0.0 if t == window_min else float(pred[0])
     
     # Step 5: For each stratum, randomly select the required number of points.
@@ -80,27 +80,25 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     candidate = sorted(candidate)
     
     # --- Extra Filtering Step ---
-    # Among interior points (excluding the first), allow at most one with predicted dissolution >80%.
+    # Compute both reference and test predicted dissolution for candidate points.
     candidate_array = np.array(candidate).reshape(-1, 1)
-    pred_vals = ref_interp(candidate_array).flatten()
-    interior_idx = list(range(1, len(candidate)))  # Exclude first element (window_min)
-    # Identify all interior indices with predicted reference dissolution >80%.
-    indices_above_80 = [i for i in interior_idx if pred_vals[i] > 80]
+    ref_pred_vals = ref_interp(candidate_array).flatten()
+    test_pred_vals = test_interp(candidate_array).flatten()
+    # Exclude the starting point (index 0)
+    interior_idx = list(range(1, len(candidate)))
+    # Find indices where both ref and test predictions are above 80.
+    indices_above_80 = [i for i in interior_idx if (ref_pred_vals[i] > 80 and test_pred_vals[i] > 80)]
     if len(indices_above_80) > 1:
-        # Choose the index with the smallest predicted value above 80.
-        keep_idx = min(indices_above_80, key=lambda i: pred_vals[i])
+        # Choose the one with the smallest reference predicted value among those above 80.
+        keep_idx = min(indices_above_80, key=lambda i: ref_pred_vals[i])
         candidate_filtered = [candidate[0]]
         for i in interior_idx:
             if i in indices_above_80 and i != keep_idx:
                 continue
             candidate_filtered.append(candidate[i])
-        # If filtering removes all interior points, revert.
-        if len(candidate_filtered) < 2:
-            candidate = candidate  # no change
-        else:
-            candidate = sorted(candidate_filtered)
+        candidate = sorted(candidate_filtered)
     
-    # Step 6: Compute predicted dissolution percentages for the candidate sequence.
+    # Step 6: Compute predicted dissolution percentages for candidate.
     if interp_method == 'gpr':
         candidate_array = np.array(candidate).reshape(-1, 1)
         ref_vals = ref_interp(candidate_array)
@@ -118,7 +116,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     p_val = len(candidate)
     f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
     
-    # Step 8: Diversity flag – candidate is diverse if each stratum has at least the required number of points.
+    # Step 8: Diversity flag: candidate is diverse if each stratum has at least the required number.
     diverse = True
     for (low, high), req in points_per_stratum.items():
         pts = [t for t in candidate if low <= all_valid_pred[t] < high]
@@ -144,3 +142,85 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'test_vals': test_vals.flatten().tolist()
     }
     return [result], [result]
+##################################
+if run_predictive.lower() == 'yes':
+    # Determine candidate window
+    window_min, window_max = determine_candidate_window(
+        reference_mean_df,
+        test_mean_df,
+        step=5,
+        initial_threshold=10
+    )
+    
+    # Map regulation for predictive analysis
+    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+    selected_regulation = regulation_map.get(input1, "FDA")
+    
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using stratification based on predicted dissolution percentages)")
+    
+    # Let the user specify the number of points per stratum.
+    user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
+    
+    # Run predictive analysis using the updated approach.
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='gpr',
+        points_per_stratum=user_points_per_stratum
+    )
+    
+    # Convert candidate time points to standard Python ints.
+    for cand in results:
+        cand['sequence'] = [int(t) for t in cand['sequence']]
+    
+    overall_best = results[0] if results else None
+    
+    if overall_best:
+        print("\n=== Optimal Predictive Combination ===")
+        print(f"Condition: {overall_best.get('condition','N/A')}")
+        print(f"Dissolution Range: {overall_best.get('diss_range','N/A')}")
+        print(f"Time Points (diverse candidate): {overall_best['sequence']}")
+        print(f"Length: {len(overall_best['sequence'])}")
+        print(f"Predicted f2 Score: {overall_best['f2']}")
+        print(f"Diverse Combination: {overall_best.get('diverse', False)}")
+        
+        if overall_best['reasons']:
+            print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
+        else:
+            print("Regulatory Compliance: Passed")
+        
+        # Plot predicted dissolution curves for the optimal candidate.
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 6))
+        time_points = overall_best['sequence']
+        ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
+        test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
+        if time_points[0] == window_min:
+            ref_diss[0] = 0.0
+            test_diss[0] = 0.0
+        plt.plot(time_points, ref_diss, 'bo-', label='Reference')
+        plt.plot(time_points, test_diss, 'r*--', label='Test')
+        plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
+        plt.xlabel('Time (min)')
+        plt.ylabel('Dissolution (%)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        
+        print("\nPredicted Reference Dissolution Percentages:")
+        for t, d in zip(time_points, ref_diss):
+            print(f"Time {t} min: {d:.2f}%")
+        print("\nPredicted Test Dissolution Percentages:")
+        for t, d in zip(time_points, test_diss):
+            print(f"Time {t} min: {d:.2f}%")
+    else:
+        print("❌ No candidate sequence was generated.")
+    
+    print("\n=== All Candidate Combination (Diverse) ===")
+    for idx, cand in enumerate(results):
+        seq_print = [int(t) for t in cand['sequence']]
+        print(f"{idx+1:3d}. {cand.get('diss_range','N/A')} | Points: {seq_print} | Length: {len(seq_print)} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
