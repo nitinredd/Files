@@ -3,9 +3,9 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                                              interp_method='gpr', points_per_stratum=None):
     """
     New approach based on dissolution-based stratification with user-specified points per stratum,
-    plus an extra filtering step: do not force inclusion of the endpoint and ensure that among interior 
-    candidate points (excluding the starting point) with predicted reference AND test dissolution >80%, 
-    only one is retained (the one with the smallest predicted value above 80% from the reference curve).
+    plus a final pruning step that ensures that among interior candidate points with predicted 
+    reference AND test dissolution >80%, only one is retained (the one with the smallest reference value above 80%).
+    The starting point (window_min) is always included; the endpoint is not forced.
     """
     import random
     import numpy as np
@@ -21,7 +21,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     ]))
     valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
     
-    # Step 2: Setup the dissolution strata (from points_per_stratum keys).
+    # Step 2: Setup the dissolution strata from points_per_stratum keys.
     strata = list(points_per_stratum.keys())
     
     # Step 3: Setup interpolation using GPR.
@@ -59,7 +59,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         test_interp = interp1d(test_times_arr[test_mask], test_diss[test_mask],
                                kind=interp_method, bounds_error=False, fill_value=np.nan)
     
-    # Step 4: Precompute predicted dissolution percentages (reference) for each valid time.
+    # Step 4: Precompute predicted dissolution percentages (using reference curve) for each valid time.
     all_valid_pred = {}
     for t in valid_times:
         pred = ref_interp(np.array([t]).reshape(-1, 1))
@@ -79,26 +79,29 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     candidate.add(window_min)
     candidate = sorted(candidate)
     
-    # --- Extra Filtering Step ---
-    # Compute both reference and test predicted dissolution for candidate points.
+    # --- Final Pruning Step ---
+    # Compute predicted dissolution for candidate points.
     candidate_array = np.array(candidate).reshape(-1, 1)
     ref_pred_vals = ref_interp(candidate_array).flatten()
     test_pred_vals = test_interp(candidate_array).flatten()
-    # Exclude the starting point (index 0)
+    # Define interior indices (exclude the first element)
     interior_idx = list(range(1, len(candidate)))
-    # Find indices where both ref and test predictions are above 80.
+    # Identify interior indices where BOTH reference and test predictions are above 80.
     indices_above_80 = [i for i in interior_idx if (ref_pred_vals[i] > 80 and test_pred_vals[i] > 80)]
     if len(indices_above_80) > 1:
-        # Choose the one with the smallest reference predicted value among those above 80.
+        # Select the one with the smallest reference predicted value among these.
         keep_idx = min(indices_above_80, key=lambda i: ref_pred_vals[i])
-        candidate_filtered = [candidate[0]]
+        # Build a new candidate: keep first, then only the chosen index from those above 80, and all indices not in that set.
+        candidate_pruned = [candidate[0]]
         for i in interior_idx:
             if i in indices_above_80 and i != keep_idx:
                 continue
-            candidate_filtered.append(candidate[i])
-        candidate = sorted(candidate_filtered)
+            candidate_pruned.append(candidate[i])
+        # Ensure we still have at least 2 points; if not, revert.
+        if len(candidate_pruned) >= 2:
+            candidate = sorted(candidate_pruned)
     
-    # Step 6: Compute predicted dissolution percentages for candidate.
+    # Step 6: Compute predicted dissolution percentages for the (pruned) candidate sequence.
     if interp_method == 'gpr':
         candidate_array = np.array(candidate).reshape(-1, 1)
         ref_vals = ref_interp(candidate_array)
@@ -116,7 +119,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     p_val = len(candidate)
     f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
     
-    # Step 8: Diversity flag: candidate is diverse if each stratum has at least the required number.
+    # Step 8: Diversity flag – candidate is diverse if each stratum has at least the required number.
     diverse = True
     for (low, high), req in points_per_stratum.items():
         pts = [t for t in candidate if low <= all_valid_pred[t] < high]
@@ -142,7 +145,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'test_vals': test_vals.flatten().tolist()
     }
     return [result], [result]
-##################################
+######################################################################3
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
