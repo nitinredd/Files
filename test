@@ -1,33 +1,38 @@
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
-                                             interp_method='gpr', points_per_stratum=None):
+                                             interp_method='gpr', points_per_stratum=None, n_iter=50):
     """
-    Deterministic approach based on dissolution-based stratification:
-      - Computes valid time points from the union of 3- and 5-minute intervals.
+    Balanced approach based on dissolution-based stratification:
+      - Determines valid time points from the union of 3- and 5-minute intervals.
       - Uses GPR interpolation on the reference data to predict dissolution percentages.
-      - For each dissolution stratum (user-specified in points_per_stratum), selects the required
-        number of time points (deterministically: the lowest ones in sorted order).
-      - The candidate sequence is the union of these points plus the starting point (window_min).
-      - An extra filtering step ensures that among interior points with predicted reference dissolution >80%,
-        only one is retained (the one with the lowest predicted value above 80%).
-      - The candidate's predicted dissolution percentages are computed, the f2 similarity metric is calculated,
-        and regulatory compliance is checked.
-      - This function returns a single candidate (in a list) that is reproducible.
+      - For each dissolution stratum (specified in points_per_stratum), it randomly samples 
+        the required number of time points (if available) from that stratum.
+      - This random sampling is repeated for n_iter iterations.
+      - In each iteration, the candidate sequence is formed as the union of the sampled points 
+        plus the starting point (window_min); the endpoint is not forced.
+      - An extra filtering step ensures that among interior points with predicted reference dissolution 
+        >80%, only one is retained (the one with the smallest value above 80%).
+      - The f2 similarity metric is computed for each candidate.
+      - Finally, the candidate with the highest f2 (that also meets the diversity criteria) is returned.
     """
+    import random
     import numpy as np
-    
-    # Default: require 2 points per stratum if not provided.
+
+    # If not provided, default: require 2 points per stratum.
     if points_per_stratum is None:
         points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
-    # Step 1: Determine valid time points from union of 3- and 5-minute intervals.
+    best_candidate = None
+    best_f2 = -np.inf
+
+    # Step 1: Determine valid time points (union of 3- and 5-minute intervals)
     valid_times = np.unique(np.concatenate([
         np.arange(window_min, window_max+1, 3),
         np.arange(window_min, window_max+1, 5)
     ]))
     valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
     
-    # Step 2: Define the dissolution strata (from points_per_stratum keys)
+    # Step 2: Setup dissolution strata from points_per_stratum keys.
     strata = list(points_per_stratum.keys())
     
     # Step 3: Setup interpolation using GPR.
@@ -65,86 +70,94 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         test_interp = interp1d(test_times_arr[test_mask], test_diss[test_mask],
                                kind=interp_method, bounds_error=False, fill_value=np.nan)
     
-    # Step 4: Precompute predicted dissolution percentages for each valid time (using the reference curve)
+    # Step 4: Precompute predicted dissolution percentages for each valid time (using reference curve)
     all_valid_pred = {}
     for t in valid_times:
         pred = ref_interp(np.array([t]).reshape(-1,1))
         all_valid_pred[t] = 0.0 if t == window_min else float(pred[0])
     
-    # Step 5: For each stratum, deterministically select the required number of points.
-    candidate = set()
-    for (low, high), req in points_per_stratum.items():
-        times_in_stratum = sorted([t for t in valid_times if low <= all_valid_pred[t] < high])
-        # If available, take the first 'req' points; otherwise, take all.
-        selected = times_in_stratum[:req] if len(times_in_stratum) >= req else times_in_stratum
-        candidate.update(selected)
-    
-    # Also include the starting point (window_min); we do NOT force the endpoint.
-    candidate.add(window_min)
-    candidate = sorted(candidate)
-    
-    # Step 6: Extra Filtering Step:
-    # Among interior points (excluding the first), ensure that at most one has predicted reference dissolution >80%.
-    candidate_array = np.array(candidate).reshape(-1, 1)
-    pred_vals = ref_interp(candidate_array).flatten()
-    # Consider interior indices (exclude the first element)
-    interior_idx = list(range(1, len(candidate)))
-    indices_above_80 = [i for i in interior_idx if pred_vals[i] > 80]
-    if len(indices_above_80) > 1:
-        # Choose the one with the smallest predicted value above 80.
-        keep_idx = min(indices_above_80, key=lambda i: pred_vals[i])
-        candidate_filtered = [candidate[0]]
-        for i in interior_idx:
-            if i in indices_above_80 and i != keep_idx:
-                continue
-            candidate_filtered.append(candidate[i])
-        candidate = sorted(candidate_filtered)
-    
-    # Step 7: Compute predicted dissolution percentages for candidate sequence.
-    if interp_method == 'gpr':
+    # Repeat candidate generation n_iter times.
+    for _ in range(n_iter):
+        candidate = set()
+        candidate.add(window_min)  # Always include start
+        
+        # For each stratum, randomly sample the required number from available valid times.
+        for (low, high), req in points_per_stratum.items():
+            times_in_stratum = sorted([t for t in valid_times if low <= all_valid_pred[t] < high])
+            if len(times_in_stratum) >= req:
+                selected = random.sample(times_in_stratum, req)
+            else:
+                selected = times_in_stratum
+            candidate.update(selected)
+        candidate = sorted(candidate)
+        
+        # Extra Filtering Step: Among interior points (excluding the first), allow at most one with predicted >80%.
         candidate_array = np.array(candidate).reshape(-1, 1)
-        ref_vals = ref_interp(candidate_array)
-        test_vals = test_interp(candidate_array)
+        pred_vals = ref_interp(candidate_array).flatten()
+        interior_idx = list(range(1, len(candidate)))  # Exclude first element (window_min)
+        indices_above_80 = [i for i in interior_idx if pred_vals[i] > 80]
+        if len(indices_above_80) > 1:
+            # Keep the one with the smallest predicted value above 80.
+            keep_idx = min(indices_above_80, key=lambda i: pred_vals[i])
+            candidate_filtered = [candidate[0]]
+            for i in interior_idx:
+                if i in indices_above_80 and i != keep_idx:
+                    continue
+                candidate_filtered.append(candidate[i])
+            candidate = sorted(candidate_filtered)
+        
+        # Compute predicted dissolution percentages for candidate sequence.
+        if interp_method == 'gpr':
+            candidate_array = np.array(candidate).reshape(-1, 1)
+            ref_vals = ref_interp(candidate_array)
+            test_vals = test_interp(candidate_array)
+        else:
+            ref_vals = ref_interp(candidate)
+            test_vals = test_interp(candidate)
+        
+        if candidate[0] == window_min:
+            ref_vals[0] = 0.0
+            test_vals[0] = 0.0
+        
+        # Compute f2 similarity metric.
+        diff = test_vals - ref_vals
+        p_val = len(candidate)
+        f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
+        
+        # Diversity flag: candidate is diverse if each stratum has at least the required number.
+        diverse = True
+        for (low, high), req in points_per_stratum.items():
+            pts = [t for t in candidate if low <= all_valid_pred[t] < high]
+            if len(pts) < req:
+                diverse = False
+                break
+        
+        # Regulatory compliance check (assumed external function)
+        compliant, reasons = check_regulatory_compliance(
+            candidate, regulation,
+            dict(zip(candidate, ref_vals.flatten().tolist())),
+            dict(zip(candidate, test_vals.flatten().tolist()))
+        )
+        
+        # Update best candidate if this one has a higher f2.
+        if f2 > best_f2 and compliant:
+            best_f2 = f2
+            best_candidate = {
+                'sequence': candidate,
+                'f2': round(f2, 2),
+                'compliant': compliant,
+                'reasons': reasons,
+                'length': len(candidate),
+                'diverse': diverse,
+                'ref_vals': ref_vals.flatten().tolist(),
+                'test_vals': test_vals.flatten().tolist()
+            }
+    
+    if best_candidate is None:
+        return [], []
     else:
-        ref_vals = ref_interp(candidate)
-        test_vals = test_interp(candidate)
-    
-    if candidate[0] == window_min:
-        ref_vals[0] = 0.0
-        test_vals[0] = 0.0
-    
-    # Step 8: Compute f2 similarity metric.
-    diff = test_vals - ref_vals
-    p_val = len(candidate)
-    f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
-    
-    # Step 9: Set diversity flag – candidate is considered diverse if each stratum provided at least the required number of points.
-    diverse = True
-    for (low, high), req in points_per_stratum.items():
-        pts = [t for t in candidate if low <= all_valid_pred[t] < high]
-        if len(pts) < req:
-            diverse = False
-            break
-    
-    # Regulatory compliance check (assumed external function)
-    compliant, reasons = check_regulatory_compliance(
-        candidate, regulation,
-        dict(zip(candidate, ref_vals.flatten().tolist())),
-        dict(zip(candidate, test_vals.flatten().tolist()))
-    )
-    
-    result = {
-        'sequence': candidate,
-        'f2': round(f2, 2),
-        'compliant': compliant,
-        'reasons': reasons,
-        'length': len(candidate),
-        'diverse': diverse,
-        'ref_vals': ref_vals.flatten().tolist(),
-        'test_vals': test_vals.flatten().tolist()
-    }
-    return [result], [result]
-########################################
+        return [best_candidate], [best_candidate]
+###########################
 if run_predictive.lower() == 'yes':
     # Determine candidate window
     window_min, window_max = determine_candidate_window(
@@ -163,7 +176,7 @@ if run_predictive.lower() == 'yes':
     # Let the user specify the number of points per stratum.
     user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
-    # Run predictive analysis using the new dissolution-based stratification approach.
+    # Run predictive analysis using the new balanced approach with n_iter iterations.
     results, all_results = predictive_optimal_combinations_advanced(
         reference_mean_df,
         test_mean_df,
@@ -172,7 +185,8 @@ if run_predictive.lower() == 'yes':
         window_max=window_max,
         diff_threshold=None,
         interp_method='gpr',
-        points_per_stratum=user_points_per_stratum
+        points_per_stratum=user_points_per_stratum,
+        n_iter=50
     )
     
     # Convert candidate time points to standard Python ints.
