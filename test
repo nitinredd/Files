@@ -1,67 +1,115 @@
+import numpy as np
+from scipy.interpolate import interp1d
+from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
+from sklearn.gaussian_process import GaussianProcessRegressor
+import itertools
+
+def interpolate_linear(df, new_times):
+    """
+    Simple linear interpolation (used for determining the candidate window
+    and for candidate selection).
+    """
+    df_sorted = df.sort_values(by=df.columns[0])
+    known_times = df_sorted.iloc[:, 0].values.astype(float)
+    known_values = df_sorted.iloc[:, 1].values.astype(float)
+    f = interp1d(known_times, known_values, kind='linear', 
+                 fill_value=(known_values[0], known_values[-1]), bounds_error=False)
+    return f(new_times)
+
+def determine_candidate_window(ref_df, test_df, step=1, initial_threshold=10):
+    """
+    Identify candidate window based on the actual time range in the data.
+    """
+    max_ref_time = ref_df.iloc[:, 0].max()
+    max_test_time = test_df.iloc[:, 0].max()
+    fixed_max = max(max_ref_time, max_test_time)
+    fixed_min = 0
+
+    times = np.arange(fixed_min, fixed_max + 1, step)
+    ref_vals = interpolate_linear(ref_df, times)
+    test_vals = interpolate_linear(test_df, times)
+    diff = np.abs(ref_vals - test_vals)
+    
+    valid_times = times[diff <= initial_threshold]
+    if len(valid_times) == 0:
+        print(f"No time points found within {initial_threshold}% difference; trying threshold=20.")
+        valid_times = times[diff <= 20]
+        if len(valid_times) == 0:
+            print("No candidate window found even with 20% threshold. Using full range.")
+            return fixed_min, fixed_max
+        else:
+            window_max = valid_times[-1]
+            print(f"Candidate window determined (threshold 20): {fixed_min} to {window_max}")
+            return fixed_min, window_max
+    else:
+        window_max = valid_times[-1]
+        print(f"Candidate window determined (threshold {initial_threshold}): {fixed_min} to {window_max}")
+        return fixed_min, window_max
+
+def interpolate_dissolution_curve(df, new_times, method='linear'):
+    """
+    Predict dissolution values at new time points, using linear interpolation.
+    """
+    df_sorted = df.sort_values(by=df.columns[0])
+    known_times = df_sorted.iloc[:, 0].values.astype(float)
+    known_values = df_sorted.iloc[:, 1].values.astype(float)
+    
+    new_times_clamped = np.clip(new_times, known_times.min(), known_times.max())
+    f = interp1d(known_times, known_values, kind='linear', 
+                 fill_value=(known_values[0], known_values[-1]), bounds_error=False)
+    return f(new_times_clamped)
+###############################
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
-                                             interp_method='gpr', points_per_stratum=None):
+                                             interp_method='linear', points_per_stratum=None):
     """
-    Deterministic selection of candidate time points as follows:
-      - Use only times from the grid of 3- and 5-minute increments.
-      - Split the candidate window into three dissolution strata (based on predicted reference values):
-            * 0-30: select exactly 2 candidate times (deterministically, as the minimum and maximum time in the stratum)
-            * 30-60: select exactly 2 candidate times
-            * 60-90: select exactly 2 candidate times, with the additional rule that at least one candidate in 60-90 must
-                     have both reference and test predictions >=80%.
-      - The final candidate combination is the union of these selections (totaling 6 points).
-      - For FDA mode, append one extra candidate: the first time (after the last candidate) where both predictions are >=85%,
-        yielding 7 points.
-      - Compute f2:
-            f2 = 50 * log10(100 / (1 + sqrt(mean((test - ref)^2))))
-      (No fallback mechanism is included; errors are raised if constraints are not met.)
+    Deterministic selection of candidate time points using linear interpolation.
+    
+    Steps:
+      1. Use only times from the grid of 3- and 5-minute increments within [window_min, window_max].
+      2. Compute predicted dissolution values (using linear interpolation) for reference and test.
+      3. Split the valid times into three strata based on predicted reference values:
+           - 0-30: select exactly 2 candidate times (the minimum and maximum time among those with ref in [0,30))
+           - 30-60: select exactly 2 candidate times (minimum and maximum for ref in [30,60))
+           - 60-90: select exactly 2 candidate times (minimum and maximum for ref in [60,90))
+         For the 60–90 stratum, require that at least one candidate has both ref and test >=80%.
+      4. The final candidate combination (non‑FDA) is the union of these selections (total 6 points).
+      5. For FDA mode, append one extra candidate—the first valid time after the last candidate where both predicted values are >=85%—to yield 7 points.
+      6. Compute f2:
+             f2 = 50 * log10(100 / (1 + sqrt(mean((test - ref)^2))))
+         (Using the linear predictions; no fallback is used.)
+    
+    Raises an error if any stratum lacks sufficient eligible times or if the 60–90 constraint is not met.
     """
     import numpy as np
     import math
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-
-    # 1. Build the valid time grid (3- and 5-minute increments)
+    
+    # 1. Build valid time grid (only 3- and 5-minute increments)
     valid_times = np.sort(np.unique(np.concatenate([
         np.arange(window_min, window_max+1, 3),
         np.arange(window_min, window_max+1, 5)
     ])))
     
-    # 2. Build GP models.
-    kernel = ConstantKernel(1.0) * RBF(length_scale=10.0) + WhiteKernel()
-    ref_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
-    test_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+    # 2. Compute predicted dissolution values using linear interpolation.
+    all_ref_pred = interpolate_linear(ref_df, valid_times)
+    all_test_pred = interpolate_linear(test_df, valid_times)
     
-    ref_clean = ref_df.dropna()
-    test_clean = test_df.dropna()
-    ref_model.fit(ref_clean.iloc[:, 0].values.reshape(-1, 1), 
-                  ref_clean.iloc[:, 1].values.astype(float))
-    test_model.fit(test_clean.iloc[:, 0].values.reshape(-1, 1), 
-                   test_clean.iloc[:, 1].values.astype(float))
-    
-    # 3. Prediction function.
-    def predict_diss(model, times):
-        return model.predict(np.array(times).reshape(-1, 1)).flatten()
-    
-    # Precompute predictions on valid_times.
-    all_ref_pred = predict_diss(ref_model, valid_times)
-    all_test_pred = predict_diss(test_model, valid_times)
-    
-    # 4. Define the dissolution strata based on predicted reference values.
+    # 3. Define dissolution strata (by reference predictions).
     strata = {
         "0-30": (0, 30),
         "30-60": (30, 60),
         "60-90": (60, 90)
     }
-    required_points = 2  # exactly two points per stratum
+    required_points = 2  # exactly two candidate times per stratum
     
     def eligible_times_for_stratum(stratum_range):
         low, high = stratum_range
-        # Only consider times from the valid grid.
+        # Use linear predictions (all_ref_pred) for each valid time.
         return [t for t, pred in zip(valid_times, all_ref_pred) if low <= pred < high]
     
-    # 5. For each stratum, select exactly two candidate times deterministically.
     candidate = []
+    
+    # 4. For each stratum, select exactly two candidate times deterministically.
     for key in ["0-30", "30-60", "60-90"]:
         eligible = eligible_times_for_stratum(strata[key])
         if len(eligible) < required_points:
@@ -72,11 +120,11 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     
     candidate = sorted(list(set(candidate)))
     
-    # (Now candidate should have exactly 6 points; if duplicates occur, that is an error.)
+    # We expect candidate to have exactly 6 points.
     if len(candidate) != 6:
         raise ValueError(f"Final candidate count ({len(candidate)}) is not equal to 6 as required.")
     
-    # 6. Enforce the 60-90 stratum rule: at least one candidate in the 60-90 stratum must have both ref and test >=80%.
+    # 5. Enforce the 60-90 stratum rule:
     eligible_60_90 = eligible_times_for_stratum(strata["60-90"])
     cand_60_90 = [t for t in candidate if t in eligible_60_90]
     has_80 = False
@@ -88,7 +136,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     if not has_80:
         raise ValueError("No candidate in the 60-90 stratum meets the >=80% threshold for both curves.")
     
-    # 7. For FDA mode: Append one extra candidate—the first time (after the last candidate) with both >=85%.
+    # 6. For FDA mode, append an extra candidate.
     if regulation == "FDA":
         expected_count = 7
         last_candidate = candidate[-1]
@@ -109,23 +157,26 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         if len(candidate) != 6:
             raise ValueError(f"Non-FDA candidate count ({len(candidate)}) is not equal to 6.")
     
-    # 8. Compute f2.
-    ref_vals = predict_diss(ref_model, candidate)
-    test_vals = predict_diss(test_model, candidate)
-    # (No forced zero here because we are not automatically adding the starting time.)
+    # 7. Compute f2 using linear interpolation predictions.
+    # (Force the starting time to 0% if it is the first candidate.)
+    ref_vals = np.array([float(val) for val in interpolate_linear(ref_df, candidate)])
+    test_vals = np.array([float(val) for val in interpolate_linear(test_df, candidate)])
+    if candidate[0] == window_min:
+        ref_vals[0] = 0.0
+        test_vals[0] = 0.0
     diff = test_vals - ref_vals
     f2 = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diff**2))))
     
     result = {
         'sequence': candidate,
         'f2': round(f2, 2),
-        'compliant': True,   # Assume regulatory compliance passes; adjust if needed.
+        'compliant': True,
         'reasons': [],
         'ref_vals': ref_vals.tolist(),
         'test_vals': test_vals.tolist()
     }
     return [result], [result]
-#################333
+######################################
 if run_predictive.lower() == 'yes':
     # Determine candidate window using the helper function.
     window_min, window_max = determine_candidate_window(
@@ -141,7 +192,7 @@ if run_predictive.lower() == 'yes':
     
     print(f"\nCandidate window for combination search: {window_min} to {window_max}")
     
-    # Run the deterministic predictive analysis.
+    # Run deterministic predictive analysis.
     results, all_results = predictive_optimal_combinations_advanced(
         reference_mean_df,
         test_mean_df,
@@ -149,7 +200,7 @@ if run_predictive.lower() == 'yes':
         window_min=window_min,
         window_max=window_max,
         diff_threshold=None,
-        interp_method='gpr',
+        interp_method='linear',
         points_per_stratum=None
     )
     
@@ -173,8 +224,8 @@ if run_predictive.lower() == 'yes':
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
         time_points = overall_best['sequence']
-        ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(time_points), method='gpr')
-        test_diss = interpolate_dissolution_curve(test_mean_df, np.array(time_points), method='gpr')
+        ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(time_points), method='linear')
+        test_diss = interpolate_dissolution_curve(test_mean_df, np.array(time_points), method='linear')
         plt.plot(time_points, ref_diss, 'bo-', label='Reference')
         plt.plot(time_points, test_diss, 'r*--', label='Test')
         plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
