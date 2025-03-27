@@ -4,14 +4,13 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     """
     Hybrid stratification that returns a single best combination based on f2.
     
-    - Only considers times in 3- and 5-minute increments.
-    - For normal conditions, selects exactly 2 points from each dissolution stratum:
-         0-30, 30-60, 60-90  => total 6 points.
-      In the 60-90 stratum, if both points exceed 80% (for both ref and test), 
-      only the earlier one is kept.
-    - For FDA, after the above 6 points, an extra point is added: the first time after
-      the last candidate that yields both ref and test >=85%.
-    - The function runs multiple iterations (e.g. 100) and returns the combination with the best f2.
+    - Uses times only in 3- and 5-minute increments.
+    - For normal mode, tries to select 2 points per dissolution stratum: 0-30, 30-60, 60-90.
+      In the 60-90 stratum, if both chosen points exceed 80% (for both ref and test), only the earlier is kept.
+    - For FDA mode, after the above points an extra point is added: the first time after the last candidate
+      where both ref and test are >=85%.
+    - Instead of strictly requiring 6 (or 7) points, any candidate with at least 3 points is accepted.
+    - Runs multiple iterations (e.g. 100) and returns the combination with the best f2.
     """
     import numpy as np
     import random
@@ -30,10 +29,9 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     ref_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
     test_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
     
-    # Clean data
+    # Clean data and fit models
     ref_clean = ref_df.dropna()
     test_clean = test_df.dropna()
-    
     ref_model.fit(ref_clean.iloc[:, 0].values.reshape(-1, 1), ref_clean.iloc[:, 1].values)
     test_model.fit(test_clean.iloc[:, 0].values.reshape(-1, 1), test_clean.iloc[:, 1].values)
     
@@ -45,22 +43,20 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     all_ref_pred = predict_diss(ref_model, valid_times)
     all_test_pred = predict_diss(test_model, valid_times)
     
-    # Define strata based on predicted reference dissolution values
-    # (The assumption here is that the reference curve defines the strata.)
+    # --- Define dissolution strata (based on reference predictions) ---
     strata = {
         "0-30": (0, 30),
         "30-60": (30, 60),
         "60-90": (60, 90)
     }
-    # We require 2 points per stratum (except possibly the 60-90 stratum which may drop one if both >80)
     points_per_stratum_req = 2
 
-    # Function to get eligible times (from valid_times) for a given stratum
+    # Get eligible times for a given stratum
     def eligible_times_for_stratum(stratum_range):
         low, high = stratum_range
         return [t for t, pred in zip(valid_times, all_ref_pred) if low <= pred < high]
     
-    # Function to compute f2 for a given candidate combination
+    # Function to compute f2 for a candidate combination
     def compute_f2(candidate):
         ref_vals = predict_diss(ref_model, candidate)
         test_vals = predict_diss(test_model, candidate)
@@ -75,71 +71,69 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     best_candidate = None
     best_ref_vals = None
     best_test_vals = None
-    
-    iterations = 100  # number of random iterations to try
-    
+    iterations = 100  # number of random iterations
+
     for _ in range(iterations):
         candidate = []
-        # For each stratum, randomly select exactly 2 points from eligible times.
+        # For each stratum, try to choose 2 points randomly from eligible times.
         for key, rng in strata.items():
             eligible = eligible_times_for_stratum(rng)
             if len(eligible) >= points_per_stratum_req:
                 chosen = sorted(random.sample(eligible, points_per_stratum_req))
             else:
                 chosen = sorted(eligible)
-            # For 60-90, if both chosen points are above 80 (for both ref and test), keep only the earlier one.
+            # For 60-90, if exactly two are chosen and both have ref and test >=80, keep only the earlier one.
             if key == "60-90" and len(chosen) == 2:
-                idx1 = int(np.where(valid_times == chosen[0])[0][0])
-                idx2 = int(np.where(valid_times == chosen[1])[0][0])
+                idx1 = np.where(valid_times == chosen[0])[0][0]
+                idx2 = np.where(valid_times == chosen[1])[0][0]
                 if (all_ref_pred[idx1] >= 80 and all_test_pred[idx1] >= 80 and
                     all_ref_pred[idx2] >= 80 and all_test_pred[idx2] >= 80):
                     chosen = [chosen[0]]
             candidate.extend(chosen)
         
-        candidate = sorted(list(set(candidate)))
-        # Ensure window_min is included
+        candidate = sorted(candidate)
+        # Ensure the starting time is included.
         if window_min not in candidate:
             candidate.insert(0, window_min)
         
-        # If regulation is FDA, then add an extra point:
-        # Search for the first time (after the last candidate) where both ref and test are >=85.
+        # For FDA, add an extra point: first time after last candidate with both ref and test >=85.
         if regulation == "FDA":
             last_candidate = candidate[-1]
-            # Look at times in valid_times that are > last_candidate
             post_times = [t for t in valid_times if t > last_candidate]
             extra_point = None
             for t in post_times:
-                idx = int(np.where(valid_times == t)[0][0])
+                idx = np.where(valid_times == t)[0][0]
                 if all_ref_pred[idx] >= 85 and all_test_pred[idx] >= 85:
                     extra_point = t
                     break
-            if extra_point is not None:
+            if extra_point is not None and extra_point not in candidate:
                 candidate.append(extra_point)
-                candidate = sorted(list(set(candidate)))
+                candidate = sorted(candidate)
         
-        # We expect normal mode to have 6 points and FDA mode to have 7 points.
-        # If candidate count is not as expected, skip this iteration.
-        expected_count = 6 if regulation != "FDA" else 7
-        if len(candidate) != expected_count:
+        # Accept the candidate if it has at least 3 points.
+        if len(candidate) < 3:
             continue
         
-        # Compute f2
+        # Compute f2.
         f2 = compute_f2(candidate)
         if f2 > best_f2:
             best_f2 = f2
-            best_candidate = candidate
+            best_candidate = candidate.copy()
             best_ref_vals = predict_diss(ref_model, candidate)
             best_test_vals = predict_diss(test_model, candidate)
-            # Force starting point to 0
             if best_candidate[0] == window_min:
                 best_ref_vals[0] = 0.0
                 best_test_vals[0] = 0.0
 
-    # If no candidate found in iterations, return empty result.
+    # If no candidate was found in iterations, use a fallback: use all valid times in the window.
     if best_candidate is None:
-        return [], []
-
-    # Regulatory compliance check (assumed defined elsewhere)
+        best_candidate = [t for t in valid_times if window_min <= t <= window_max]
+        best_candidate = sorted(best_candidate)
+        best_ref_vals = predict_diss(ref_model, best_candidate)
+        best_test_vals = predict_diss(test_model, best_candidate)
+        best_f2 = compute_f2(best_candidate)
+    
+    # Regulatory compliance check (assumed to be defined elsewhere)
     compliant, reasons = check_regulatory_compliance(
         best_candidate, regulation,
         dict(zip(best_candidate, best_ref_vals)),
@@ -154,9 +148,8 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'ref_vals': best_ref_vals.tolist(),
         'test_vals': best_test_vals.tolist()
     }
-    
     return [result], [result]
-###########################################
+########################3
 if run_predictive.lower() == 'yes':
     # Determine candidate window (assumes determine_candidate_window is defined elsewhere)
     window_min, window_max = determine_candidate_window(
@@ -172,8 +165,7 @@ if run_predictive.lower() == 'yes':
     
     print(f"\nCandidate window for combination search: {window_min} to {window_max}")
     
-    # Although the original block allowed specifying points per stratum,
-    # this hybrid approach uses fixed stratification (6 points for normal, 7 for FDA).
+    # This hybrid approach uses fixed stratification (6 points for normal, 7 for FDA).
     user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2}  # FDA extra point handled separately
     
     # Run predictive analysis using the updated approach.
