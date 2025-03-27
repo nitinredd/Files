@@ -2,24 +2,24 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                                              window_min, window_max, diff_threshold=None,
                                              interp_method='gpr', points_per_stratum=None):
     """
-    New approach based on dissolution-based stratification with user-specified points per stratum,
-    plus a final pruning step that ensures only one point where both reference and test dissolution >80%.
+    Stratified dissolution-based sampling with strict pruning for points >80% and regulatory adjustments.
     """
     import random
     import numpy as np
 
+    # Default points per stratum
     if points_per_stratum is None:
         points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
+    # Generate valid time points (3-, 5-, and 1-minute intervals)
     valid_times = np.unique(np.concatenate([
         np.arange(window_min, window_max+1, 3),
-        np.arange(window_min, window_max+1, 5)
+        np.arange(window_min, window_max+1, 5),
+        np.arange(window_min, window_max+1, 1)
     ]))
     valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
     
-    strata = list(points_per_stratum.keys())
-    
-    # Setup interpolation
+    # Setup interpolation models
     from sklearn.gaussian_process import GaussianProcessRegressor
     from sklearn.gaussian_process.kernels import ConstantKernel as C, RBF, WhiteKernel
     kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
@@ -32,6 +32,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     ref_mask = ~np.isnan(ref_times_arr) & ~np.isnan(ref_diss)
     test_mask = ~np.isnan(test_times_arr) & ~np.isnan(test_diss)
     
+    # Interpolation setup
     if interp_method == 'gpr':
         def safe_gp_interpolator(x, y):
             gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
@@ -41,29 +42,32 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
             return gp
         ref_model = safe_gp_interpolator(ref_times_arr, ref_diss)
         test_model = safe_gp_interpolator(test_times_arr, test_diss)
-        def ref_interp(x):
-            return ref_model.predict(np.array(x).reshape(-1, 1))
-        def test_interp(x):
-            return test_model.predict(np.array(x).reshape(-1, 1))
+        def ref_interp(x): return ref_model.predict(np.array(x).reshape(-1, 1))
+        def test_interp(x): return test_model.predict(np.array(x).reshape(-1, 1))
     else:
         from scipy.interpolate import interp1d
-        valid_methods = ['linear', 'nearest', 'slinear', 'quadratic', 'cubic']
-        interp_method = interp_method if interp_method in valid_methods else 'linear'
-        ref_interp = interp1d(ref_times_arr[ref_mask], ref_diss[ref_mask],
-                              kind=interp_method, bounds_error=False, fill_value=np.nan)
-        test_interp = interp1d(test_times_arr[test_mask], test_diss[test_mask],
-                               kind=interp_method, bounds_error=False, fill_value=np.nan)
+        interp_method = 'linear' if interp_method not in ['linear', 'nearest', 'slinear', 'quadratic', 'cubic'] else interp_method
+        ref_interp = interp1d(ref_times_arr[ref_mask], ref_diss[ref_mask], kind=interp_method, bounds_error=False, fill_value=np.nan)
+        test_interp = interp1d(test_times_arr[test_mask], test_diss[test_mask], kind=interp_method, bounds_error=False, fill_value=np.nan)
     
     # Precompute reference predictions for valid times
-    all_valid_pred = {}
-    for t in valid_times:
-        pred = ref_interp(np.array([t]).reshape(-1, 1))
-        all_valid_pred[t] = 0.0 if t == window_min else float(pred[0])
+    all_valid_pred = {t: ref_interp(t)[0] if t != window_min else 0.0 for t in valid_times}
     
-    # Stratified sampling
+    # Stratified sampling with fallback to adjacent strata
     candidate = set()
-    for (low, high), req in points_per_stratum.items():
+    strata = sorted(points_per_stratum.keys(), key=lambda x: x[0])
+    for stratum in strata:
+        low, high = stratum
+        req = points_per_stratum[stratum]
         times_in_stratum = [t for t in valid_times if low <= all_valid_pred[t] < high]
+        
+        # If insufficient points, expand to adjacent strata
+        if len(times_in_stratum) < req:
+            expanded_low = max(0, low - 15)
+            expanded_high = high + 15
+            expanded_times = [t for t in valid_times if expanded_low <= all_valid_pred[t] < expanded_high]
+            times_in_stratum = list(set(expanded_times))  # Avoid duplicates
+        
         if len(times_in_stratum) >= req:
             selected = random.sample(times_in_stratum, req)
         else:
@@ -73,62 +77,64 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     candidate.add(window_min)
     candidate = sorted(candidate)
     
-    # Enhanced Pruning Step
+    # Strict pruning for points >80%
     candidate_array = np.array(candidate).reshape(-1, 1)
     ref_pred_vals = ref_interp(candidate_array).flatten()
     test_pred_vals = test_interp(candidate_array).flatten()
     
-    # Identify all candidate points where both >80% (excluding window_min)
-    above_80_indices = [i for i in range(1, len(candidate)) 
-                       if ref_pred_vals[i] > 80 and test_pred_vals[i] > 80]
+    # Identify points where both >80% (exclude window_min)
+    above_80 = [i for i in range(1, len(candidate)) if ref_pred_vals[i] > 80 and test_pred_vals[i] > 80]
+    if len(above_80) > 1:
+        # Keep the earliest point
+        keep_idx = min(above_80, key=lambda x: candidate[x])
+        candidate = [candidate[0]] + [c for idx, c in enumerate(candidate[1:]) if idx == keep_idx or not (ref_pred_vals[idx+1] > 80 and test_pred_vals[idx+1] > 80)]
     
-    if len(above_80_indices) > 1:
-        # Select the point with smallest reference value
-        keep_idx = min(above_80_indices, key=lambda i: ref_pred_vals[i])
-        # Remove other points above 80%
-        candidate_pruned = [candidate[0]] + [candidate[i] for i in range(1, len(candidate)) 
-                                           if i == keep_idx or 
-                                           not (ref_pred_vals[i] > 80 and test_pred_vals[i] > 80)]
-        candidate = sorted(candidate_pruned)
+    # FDA-specific: Ensure last point has both >=85%
+    if regulation == "FDA":
+        last_time = candidate[-1]
+        last_ref = ref_interp(last_time)[0]
+        last_test = test_interp(last_time)[0]
+        if last_ref < 85 or last_test < 85:
+            # Search forward from last_time to window_max
+            search_times = [t for t in valid_times if t > last_time]
+            for t in search_times:
+                r = ref_interp(t)[0]
+                te = test_interp(t)[0]
+                if r >= 85 and te >= 85:
+                    candidate.append(t)
+                    break
+            else:
+                # Fallback: add window_max
+                candidate.append(window_max)
+        candidate = sorted(list(set(candidate)))  # Remove duplicates
     
-    # Ensure at most one point above 80% remains
-    above_80_count = sum(1 for i in range(1, len(candidate)) 
-                        if ref_pred_vals[i] > 80 and test_pred_vals[i] > 80)
-    if above_80_count > 1:
-        # Fallback: retain the earliest point
-        above_80_times = [candidate[i] for i in range(1, len(candidate)) 
-                         if ref_pred_vals[i] > 80 and test_pred_vals[i] > 80]
-        earliest = min(above_80_times)
-        candidate = [c for c in candidate if c == earliest or c == window_min 
-                    or not (ref_interp(c)[0] > 80 and test_interp(c)[0] > 80)]
-        candidate = sorted(candidate)
-    
-    # Final interpolation for results
+    # Final predictions and F2 calculation
     candidate_array = np.array(candidate).reshape(-1, 1)
-    ref_vals = ref_interp(candidate_array)
-    test_vals = test_interp(candidate_array)
-    
+    ref_vals = ref_interp(candidate_array).flatten()
+    test_vals = test_interp(candidate_array).flatten()
     if candidate[0] == window_min:
         ref_vals[0] = 0.0
         test_vals[0] = 0.0
     
-    # Calculate f2
+    # Calculate F2
     diff = test_vals - ref_vals
     p_val = len(candidate)
-    f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
+    f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val)
     
     # Check diversity
     diverse = True
-    for (low, high), req in points_per_stratum.items():
+    for stratum in points_per_stratum:
+        low, high = stratum
         pts = [t for t in candidate if low <= all_valid_pred[t] < high]
-        if len(pts) < req:
+        if len(pts) < points_per_stratum[stratum]:
             diverse = False
             break
     
+    # Regulatory compliance
     compliant, reasons = check_regulatory_compliance(
         candidate, regulation,
-        dict(zip(candidate, ref_vals.flatten().tolist())),
-        dict(zip(candidate, test_vals.flatten().tolist()))
+        {t: ref_vals[i] for i, t in enumerate(candidate)},
+        {t: test_vals[i] for i, t in enumerate(candidate)}
     )
     
     result = {
@@ -138,7 +144,49 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'reasons': reasons,
         'length': len(candidate),
         'diverse': diverse,
-        'ref_vals': ref_vals.flatten().tolist(),
-        'test_vals': test_vals.flatten().tolist()
+        'ref_vals': ref_vals.tolist(),
+        'test_vals': test_vals.tolist()
     }
     return [result], [result]
+####################################
+if run_predictive.lower() == 'yes':
+    # Determine candidate window
+    window_min, window_max = determine_candidate_window(
+        reference_mean_df, test_mean_df, step=5, initial_threshold=10
+    )
+    
+    # Map regulation
+    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+    selected_regulation = regulation_map.get(input1, "FDA")
+    
+    print(f"\nCandidate window: {window_min} to {window_max}")
+    
+    # Adjust points per stratum for FDA to include an extra point if needed
+    user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
+    
+    # Run predictive analysis
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df, test_mean_df, selected_regulation,
+        window_min, window_max, interp_method='gpr',
+        points_per_stratum=user_points_per_stratum
+    )
+    
+    # Convert time points to integers
+    for cand in results:
+        cand['sequence'] = [int(t) for t in cand['sequence']]
+    
+    overall_best = results[0] if results else None
+    
+    if overall_best:
+        print("\n=== Optimal Predictive Combination ===")
+        print(f"Time Points: {overall_best['sequence']}")
+        print(f"Length: {len(overall_best['sequence']}")
+        print(f"Predicted f2: {overall_best['f2']}")
+        print(f"Compliant: {overall_best['compliant']}")
+        if overall_best['reasons']:
+            print(f"Issues: {', '.join(overall_best['reasons'])}")
+        
+        # Plotting code remains the same
+        # ...
+    else:
+        print("No valid candidates generated.")
