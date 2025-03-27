@@ -3,10 +3,11 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
                                              interp_method='gpr', points_per_stratum=None):
     """
     Hybrid stratification: Ensures 2 points per 10-min time window AND 2 points per dissolution stratum,
-    with aggressive pruning of points >80% and FDA-specific final candidate enforcement.
+    with aggressive pruning so that only one candidate (the first) that crosses 80% is retained.
     
-    For FDA, the candidate list is truncated at the first occurrence (after the start) where both
-    predicted dissolution values are >=85%, so that no later points are included.
+    The valid time grid is restricted to only 3- and 5-minute increments.
+    For FDA (or similar), once a candidate time point with both predicted dissolution values >=80%
+    is encountered (after the starting point), no further time points are added.
     """
     import numpy as np
     import random
@@ -21,9 +22,12 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     diss_strata = [(0, 30), (30, 60), (60, 90), (90, 101)]
     points_per_diss_stratum = 2
 
-    # --- Generate base time grid (1-minute resolution) ---
-    valid_times = np.arange(window_min, window_max + 1, 1)
-
+    # --- Generate base time grid (only 3- and 5-minute increments) ---
+    valid_times = np.sort(np.unique(np.concatenate([
+        np.arange(window_min, window_max+1, 3),
+        np.arange(window_min, window_max+1, 5)
+    ])))
+    
     # --- Enhanced interpolation setup ---
     kernel = ConstantKernel(1.0) * RBF(length_scale=10.0) + WhiteKernel()
     ref_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
@@ -62,59 +66,39 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         else:
             diss_candidates.extend(valid_in_stratum)
 
-    # --- Combine candidates (union of time and dissolution selections) ---
+    # --- Combine candidates (union of time-based and dissolution-based selections) ---
     candidate = sorted(list(set(time_candidates + diss_candidates)))
 
-    # Force initial time point into candidate list
+    # Force initial time point into candidate list if missing
     if window_min not in candidate:
         candidate.insert(0, window_min)
 
-    # --- Aggressive pruning for candidates with both predictions >80% ---
+    # --- Aggressive pruning: Stop at the first candidate (after start) that crosses 80% ---
     pruned_candidate = [candidate[0]]  # always include the starting point
-    already_high = False  # flag to ensure only one candidate with both >80% is added
     for t in candidate[1:]:
         idx = int(np.where(valid_times == t)[0][0])
-        ref_p = all_ref_pred[idx]
-        test_p = all_test_pred[idx]
-        if ref_p > 80 and test_p > 80:
-            if not already_high:
-                pruned_candidate.append(t)
-                already_high = True
-            # Skip further points with both >80%
-        else:
-            pruned_candidate.append(t)
-    candidate = sorted(list(set(pruned_candidate)))
+        ref_val = all_ref_pred[idx]
+        test_val = all_test_pred[idx]
+        pruned_candidate.append(t)
+        # Once we find a candidate with both predictions >=80%, break out.
+        if ref_val >= 80 and test_val >= 80:
+            break
+    candidate = sorted(pruned_candidate)
 
-    # --- FDA compliance: Truncate candidate list at the first occurrence where both predictions >=85%
-    if regulation == "FDA":
-        truncated = []
-        # Always include the starting point
-        truncated.append(candidate[0])
-        for t in candidate[1:]:
-            idx = int(np.where(valid_times == t)[0][0])
-            ref_p = all_ref_pred[idx]
-            test_p = all_test_pred[idx]
-            truncated.append(t)
-            # Once we reach a candidate meeting >=85% for both, break (stop further points)
-            if ref_p >= 85 and test_p >= 85:
-                break
-        candidate = sorted(list(set(truncated)))
-    
-    # --- Final predictions ---
-    candidate = sorted(candidate)
+    # --- Final predictions for the candidate times ---
     ref_vals = predict_diss(ref_model, candidate)
     test_vals = predict_diss(test_model, candidate)
 
-    # Force the initial point (window_min) to be 0% for both curves
+    # Force the starting point to 0% dissolution
     if candidate[0] == window_min:
         ref_vals[0] = 0.0
         test_vals[0] = 0.0
 
-    # --- Calculate f2 ---
+    # --- Calculate f2 (using the provided formula) ---
     diff = test_vals - ref_vals
     f2 = 50 * np.log10(100 / (1 + np.sqrt(np.mean(diff ** 2))))
 
-    # --- Regulatory compliance check (assumed defined elsewhere) ---
+    # --- Regulatory compliance check (assumed to be defined elsewhere) ---
     compliant, reasons = check_regulatory_compliance(candidate, regulation,
                                                      dict(zip(candidate, ref_vals)),
                                                      dict(zip(candidate, test_vals)))
@@ -127,7 +111,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'ref_vals': ref_vals.tolist(),
         'test_vals': test_vals.tolist()
     }], []
-#############################
+####################################
 if run_predictive.lower() == 'yes':
     # Determine candidate window (assumes determine_candidate_window is defined elsewhere)
     window_min, window_max = determine_candidate_window(
@@ -143,8 +127,8 @@ if run_predictive.lower() == 'yes':
     
     print(f"\nCandidate window for combination search: {window_min} to {window_max} (using hybrid stratification)")
     
-    # Although the original block allowed user to specify points per stratum,
-    # this hybrid approach uses fixed dual stratification, so we ignore user_points_per_stratum.
+    # Although the original block allowed specifying points per stratum,
+    # this hybrid approach uses fixed dual stratification so we ignore the provided points_per_stratum.
     user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
     # Run predictive analysis using the updated hybrid approach.
