@@ -1,187 +1,165 @@
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                             window_min, window_max, 
-                                             time_range_points, 
-                                             diff_threshold=None,
-                                             interp_method='gpr'):
+                                             window_min, window_max, diff_threshold=None,
+                                             interp_method='gpr', points_per_stratum=None):
     """
-    Stratified dissolution-based sampling with strict pruning using user-defined time ranges.
+    Hybrid stratification: Ensures 2 points per 10-min time window AND 2 points per dissolution stratum,
+    with aggressive pruning of points >80% and FDA-specific final candidate enforcement.
     
-    Parameters:
-      ref_df, test_df: DataFrames where the first column is time and the second is dissolution percentage.
-      regulation: regulatory guideline (e.g. "FDA")
-      window_min, window_max: overall time window boundaries.
-      time_range_points: dict with keys as (start, end) time ranges and values as number of desired points.
-      diff_threshold: (optional) difference threshold parameter.
-      interp_method: interpolation method to use ('gpr' uses GaussianProcessRegressor).
-    
-    Returns:
-      Two lists containing the result dictionary.
+    For FDA, the candidate list is truncated at the first occurrence (after the start) where both
+    predicted dissolution values are >=85%, so that no later points are included.
     """
-    import random
     import numpy as np
-
-    # Generate valid time points using a mix of intervals
-    valid_times = np.unique(np.concatenate([
-        np.arange(window_min, window_max+1, 3),
-        np.arange(window_min, window_max+1, 5),
-        np.arange(window_min, window_max+1, 1)
-    ]))
-    valid_times = valid_times[(valid_times >= window_min) & (valid_times <= window_max)]
-    
-    # Setup interpolation models
+    import random
     from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel as C, RBF, WhiteKernel
-    kernel = C(1.0, (1e-3, 1e3)) * RBF(length_scale=10.0) + WhiteKernel()
-    
-    # Extract time and dissolution data
-    ref_times_arr = ref_df.iloc[:, 0].values.astype(float)
-    ref_diss = ref_df.iloc[:, 1].values.astype(float)
-    test_times_arr = test_df.iloc[:, 0].values.astype(float)
-    test_diss = test_df.iloc[:, 1].values.astype(float)
-    
-    # Remove NaN entries
-    ref_mask = ~np.isnan(ref_times_arr) & ~np.isnan(ref_diss)
-    test_mask = ~np.isnan(test_times_arr) & ~np.isnan(test_diss)
-    
-    # Interpolation setup
-    if interp_method == 'gpr':
-        def safe_gp_interpolator(x, y):
-            from sklearn.gaussian_process import GaussianProcessRegressor
-            gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=3)
-            valid = ~np.isnan(x) & ~np.isnan(y)
-            X = x[valid].reshape(-1, 1)
-            gp.fit(X, y[valid])
-            return gp
-        ref_model = safe_gp_interpolator(ref_times_arr, ref_diss)
-        test_model = safe_gp_interpolator(test_times_arr, test_diss)
-        def ref_interp(x): 
-            return ref_model.predict(np.array(x).reshape(-1, 1))
-        def test_interp(x): 
-            return test_model.predict(np.array(x).reshape(-1, 1))
-    else:
-        from scipy.interpolate import interp1d
-        kind = interp_method if interp_method in ['linear', 'nearest', 'slinear', 'quadratic', 'cubic'] else 'linear'
-        ref_interp = interp1d(ref_times_arr[ref_mask], ref_diss[ref_mask], kind=kind, bounds_error=False, fill_value=np.nan)
-        test_interp = interp1d(test_times_arr[test_mask], test_diss[test_mask], kind=kind, bounds_error=False, fill_value=np.nan)
-    
-    # Build candidate points from user-defined time ranges
-    candidate = set()
-    diversity = True  # Will check if each time range meets the required count
-    # For each provided time range, select candidate points from valid_times that lie within that range.
-    for t_range, req in time_range_points.items():
-        t_low, t_high = t_range
-        times_in_range = [t for t in valid_times if t_low <= t < t_high]
-        if len(times_in_range) < req:
-            diversity = False
-            selected = times_in_range  # not enough points – take all available
-        else:
-            selected = random.sample(times_in_range, req)
-        candidate.update(selected)
-    
-    # Ensure that window_min is included
-    candidate.add(window_min)
-    candidate = sorted(candidate)
-    
-    # Compute predictions for candidate times
-    candidate_array = np.array(candidate).reshape(-1, 1)
-    ref_pred_vals = ref_interp(candidate_array).flatten()
-    test_pred_vals = test_interp(candidate_array).flatten()
-    
-    # Strict pruning: for candidates (except window_min) that are both >80%, keep only the earliest one.
-    above_80_indices = [i for i in range(1, len(candidate))
-                        if ref_pred_vals[i] > 80 and test_pred_vals[i] > 80]
-    if len(above_80_indices) > 1:
-        keep_idx = min(above_80_indices, key=lambda i: candidate[i])
-        new_candidate = [candidate[0]]  # always keep the window_min
-        for i in range(1, len(candidate)):
-            if i == keep_idx or not (ref_pred_vals[i] > 80 and test_pred_vals[i] > 80):
-                new_candidate.append(candidate[i])
-        candidate = sorted(set(new_candidate))
-        candidate_array = np.array(candidate).reshape(-1, 1)
-        ref_pred_vals = ref_interp(candidate_array).flatten()
-        test_pred_vals = test_interp(candidate_array).flatten()
-    
-    # FDA-specific rule: ensure last candidate has both predictions >=85%
-    if regulation == "FDA":
-        last_time = candidate[-1]
-        last_ref = ref_interp(last_time)[0]
-        last_test = test_interp(last_time)[0]
-        if last_ref < 85 or last_test < 85:
-            # Look for the next valid time in valid_times that meets criteria
-            search_times = [t for t in valid_times if t > last_time]
-            found = False
-            for t in search_times:
-                r = ref_interp(t)[0]
-                te = test_interp(t)[0]
-                if r >= 85 and te >= 85:
-                    candidate.append(t)
-                    found = True
-                    break
-            if not found:
-                candidate.append(window_max)
-            candidate = sorted(set(candidate))
-            candidate_array = np.array(candidate).reshape(-1, 1)
-            ref_pred_vals = ref_interp(candidate_array).flatten()
-            test_pred_vals = test_interp(candidate_array).flatten()
-    
-    # Force the first candidate (window_min) to be 0% dissolution for both curves
-    if candidate[0] == window_min:
-        ref_pred_vals[0] = 0.0
-        test_pred_vals[0] = 0.0
+    from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
 
-    # Calculate F2 value
-    diff = test_pred_vals - ref_pred_vals
-    p_val = len(candidate)
-    # Using the given F2 formula: (adjust parenthesis as needed)
-    f2 = 100 - 25 * np.log10(1 + (np.sum(diff**2) / p_val))
+    # --- Dual stratification parameters ---
+    # Time-based stratification: 2 points per 10-minute window (e.g., 0-10, 10-20, …)
+    time_strata = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]
+    points_per_time_stratum = 2  
+    # Dissolution-based stratification: 2 points per dissolution range (e.g., 0-30%, 30-60%, etc.)
+    diss_strata = [(0, 30), (30, 60), (60, 90), (90, 101)]
+    points_per_diss_stratum = 2
+
+    # --- Generate base time grid (1-minute resolution) ---
+    valid_times = np.arange(window_min, window_max + 1, 1)
+
+    # --- Enhanced interpolation setup ---
+    kernel = ConstantKernel(1.0) * RBF(length_scale=10.0) + WhiteKernel()
+    ref_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+    test_model = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5)
+
+    # --- Clean and fit data ---
+    ref_clean = ref_df.dropna()
+    test_clean = test_df.dropna()
+    ref_model.fit(ref_clean.iloc[:, 0].values.reshape(-1, 1), ref_clean.iloc[:, 1].values)
+    test_model.fit(test_clean.iloc[:, 0].values.reshape(-1, 1), test_clean.iloc[:, 1].values)
+
+    # --- Prediction function ---
+    def predict_diss(model, times):
+        return model.predict(np.array(times).reshape(-1, 1)).flatten()
+
+    # Precompute predictions for all valid times
+    all_ref_pred = predict_diss(ref_model, valid_times)
+    all_test_pred = predict_diss(test_model, valid_times)
+
+    # --- Time-based stratification ---
+    time_candidates = []
+    for t_low, t_high in time_strata:
+        in_window = [t for t in valid_times if t_low <= t < t_high]
+        if len(in_window) >= points_per_time_stratum:
+            time_candidates.extend(random.sample(list(in_window), points_per_time_stratum))
+        else:
+            time_candidates.extend(in_window)
+
+    # --- Dissolution-based stratification ---
+    diss_candidates = []
+    for d_low, d_high in diss_strata:
+        valid_in_stratum = [t for t, ref in zip(valid_times, all_ref_pred)
+                            if d_low <= ref < d_high]
+        if len(valid_in_stratum) >= points_per_diss_stratum:
+            diss_candidates.extend(random.sample(list(valid_in_stratum), points_per_diss_stratum))
+        else:
+            diss_candidates.extend(valid_in_stratum)
+
+    # --- Combine candidates (union of time and dissolution selections) ---
+    candidate = sorted(list(set(time_candidates + diss_candidates)))
+
+    # Force initial time point into candidate list
+    if window_min not in candidate:
+        candidate.insert(0, window_min)
+
+    # --- Aggressive pruning for candidates with both predictions >80% ---
+    pruned_candidate = [candidate[0]]  # always include the starting point
+    already_high = False  # flag to ensure only one candidate with both >80% is added
+    for t in candidate[1:]:
+        idx = int(np.where(valid_times == t)[0][0])
+        ref_p = all_ref_pred[idx]
+        test_p = all_test_pred[idx]
+        if ref_p > 80 and test_p > 80:
+            if not already_high:
+                pruned_candidate.append(t)
+                already_high = True
+            # Skip further points with both >80%
+        else:
+            pruned_candidate.append(t)
+    candidate = sorted(list(set(pruned_candidate)))
+
+    # --- FDA compliance: Truncate candidate list at the first occurrence where both predictions >=85%
+    if regulation == "FDA":
+        truncated = []
+        # Always include the starting point
+        truncated.append(candidate[0])
+        for t in candidate[1:]:
+            idx = int(np.where(valid_times == t)[0][0])
+            ref_p = all_ref_pred[idx]
+            test_p = all_test_pred[idx]
+            truncated.append(t)
+            # Once we reach a candidate meeting >=85% for both, break (stop further points)
+            if ref_p >= 85 and test_p >= 85:
+                break
+        candidate = sorted(list(set(truncated)))
     
-    # Regulatory compliance check (assume check_regulatory_compliance is defined)
-    compliant, reasons = check_regulatory_compliance(
-        candidate, regulation,
-        {t: ref_pred_vals[i] for i, t in enumerate(candidate)},
-        {t: test_pred_vals[i] for i, t in enumerate(candidate)}
-    )
+    # --- Final predictions ---
+    candidate = sorted(candidate)
+    ref_vals = predict_diss(ref_model, candidate)
+    test_vals = predict_diss(test_model, candidate)
+
+    # Force the initial point (window_min) to be 0% for both curves
+    if candidate[0] == window_min:
+        ref_vals[0] = 0.0
+        test_vals[0] = 0.0
+
+    # --- Calculate f2 ---
+    diff = test_vals - ref_vals
+    f2 = 50 * np.log10(100 / (1 + np.sqrt(np.mean(diff ** 2))))
+
+    # --- Regulatory compliance check (assumed defined elsewhere) ---
+    compliant, reasons = check_regulatory_compliance(candidate, regulation,
+                                                     dict(zip(candidate, ref_vals)),
+                                                     dict(zip(candidate, test_vals)))
     
-    result = {
+    return [{
         'sequence': candidate,
         'f2': round(f2, 2),
         'compliant': compliant,
         'reasons': reasons,
-        'length': len(candidate),
-        'diverse': diversity,
-        'ref_vals': ref_pred_vals.tolist(),
-        'test_vals': test_pred_vals.tolist()
-    }
-    return [result], [result]
-
-
-####################################
-# Updated run_predictive block using time-based stratification
-
+        'ref_vals': ref_vals.tolist(),
+        'test_vals': test_vals.tolist()
+    }], []
+#############################
 if run_predictive.lower() == 'yes':
     # Determine candidate window (assumes determine_candidate_window is defined elsewhere)
     window_min, window_max = determine_candidate_window(
-        reference_mean_df, test_mean_df, step=5, initial_threshold=10
+        reference_mean_df,
+        test_mean_df,
+        step=5,
+        initial_threshold=10
     )
     
-    # Map regulation from input
+    # Map regulation for predictive analysis
     regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
     selected_regulation = regulation_map.get(input1, "FDA")
     
-    print(f"\nCandidate window: {window_min} to {window_max}")
+    print(f"\nCandidate window for combination search: {window_min} to {window_max} (using hybrid stratification)")
     
-    # Define desired time ranges and the required number of points in each interval.
-    # For example, (0-10):2, (10-20):2, (20-30):2, (40-50):2.
-    time_range_points = {(0, 10): 2, (10, 20): 2, (20, 30): 2, (40, 50): 2}
+    # Although the original block allowed user to specify points per stratum,
+    # this hybrid approach uses fixed dual stratification, so we ignore user_points_per_stratum.
+    user_points_per_stratum = {(0, 30): 2, (30, 60): 2, (60, 90): 2, (90, 100): 2}
     
-    # Run predictive analysis using the updated time-based stratification.
+    # Run predictive analysis using the updated hybrid approach.
     results, all_results = predictive_optimal_combinations_advanced(
-        reference_mean_df, test_mean_df, selected_regulation,
-        window_min, window_max, time_range_points,
-        interp_method='gpr'
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='gpr',
+        points_per_stratum=user_points_per_stratum  # not used in the new function
     )
     
-    # Convert time points to integers for clarity
+    # Convert candidate time points to standard Python ints.
     for cand in results:
         cand['sequence'] = [int(t) for t in cand['sequence']]
     
@@ -189,12 +167,46 @@ if run_predictive.lower() == 'yes':
     
     if overall_best:
         print("\n=== Optimal Predictive Combination ===")
-        print(f"Time Points: {overall_best['sequence']}")
-        print(f"Number of Points: {overall_best['length']}")
-        print(f"Predicted F2: {overall_best['f2']}")
-        print(f"Compliant: {overall_best['compliant']}")
+        print(f"Condition: {overall_best.get('condition','N/A')}")
+        print(f"Dissolution Range: {overall_best.get('diss_range','N/A')}")
+        print(f"Time Points (diverse candidate): {overall_best['sequence']}")
+        print(f"Length: {len(overall_best['sequence'])}")
+        print(f"Predicted f2 Score: {overall_best['f2']}")
+        print(f"Diverse Combination: {overall_best.get('diverse', 'N/A')}")
+        
         if overall_best['reasons']:
-            print(f"Issues: {', '.join(overall_best['reasons'])}")
-        # (Optional: Insert plotting code here)
+            print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
+        else:
+            print("Regulatory Compliance: Passed")
+        
+        # Plot predicted dissolution curves for the optimal candidate.
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(12, 6))
+        time_points = overall_best['sequence']
+        ref_diss = interpolate_dissolution_curve(reference_mean_df, time_points, method='gpr')
+        test_diss = interpolate_dissolution_curve(test_mean_df, time_points, method='gpr')
+        if time_points[0] == window_min:
+            ref_diss[0] = 0.0
+            test_diss[0] = 0.0
+        plt.plot(time_points, ref_diss, 'bo-', label='Reference')
+        plt.plot(time_points, test_diss, 'r*--', label='Test')
+        plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
+        plt.xlabel('Time (min)')
+        plt.ylabel('Dissolution (%)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+        
+        print("\nPredicted Reference Dissolution Percentages:")
+        for t, d in zip(time_points, ref_diss):
+            print(f"Time {t} min: {d:.2f}%")
+        print("\nPredicted Test Dissolution Percentages:")
+        for t, d in zip(time_points, test_diss):
+            print(f"Time {t} min: {d:.2f}%")
     else:
-        print("No valid candidates generated.")
+        print("❌ No candidate sequence was generated.")
+    
+    print("\n=== All Candidate Combination (Diverse) ===")
+    for idx, cand in enumerate(results):
+        seq_print = [int(t) for t in cand['sequence']]
+        print(f"{idx+1:3d}. {cand.get('diss_range','N/A')} | Points: {seq_print} | Length: {len(seq_print)} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
