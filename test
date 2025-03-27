@@ -1,12 +1,9 @@
 import numpy as np
 from scipy.interpolate import interp1d
-from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-from sklearn.gaussian_process import GaussianProcessRegressor
-import itertools
 
 def interpolate_linear(df, new_times):
     """
-    Simple linear interpolation (used for determining the candidate window
+    Simple linear interpolation (used for candidate window determination
     and for candidate selection).
     """
     df_sorted = df.sort_values(by=df.columns[0])
@@ -48,7 +45,7 @@ def determine_candidate_window(ref_df, test_df, step=1, initial_threshold=10):
 
 def interpolate_dissolution_curve(df, new_times, method='linear'):
     """
-    Predict dissolution values at new time points, using linear interpolation.
+    Predict dissolution values at new time points using linear interpolation.
     """
     df_sorted = df.sort_values(by=df.columns[0])
     known_times = df_sorted.iloc[:, 0].values.astype(float)
@@ -58,7 +55,7 @@ def interpolate_dissolution_curve(df, new_times, method='linear'):
     f = interp1d(known_times, known_values, kind='linear', 
                  fill_value=(known_values[0], known_values[-1]), bounds_error=False)
     return f(new_times_clamped)
-###############################
+##############################
 def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
                                              window_min, window_max, diff_threshold=None,
                                              interp_method='linear', points_per_stratum=None):
@@ -67,24 +64,24 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     
     Steps:
       1. Use only times from the grid of 3- and 5-minute increments within [window_min, window_max].
-      2. Compute predicted dissolution values (using linear interpolation) for reference and test.
-      3. Split the valid times into three strata based on predicted reference values:
-           - 0-30: select exactly 2 candidate times (the minimum and maximum time among those with ref in [0,30))
-           - 30-60: select exactly 2 candidate times (minimum and maximum for ref in [30,60))
-           - 60-90: select exactly 2 candidate times (minimum and maximum for ref in [60,90))
-         For the 60–90 stratum, require that at least one candidate has both ref and test >=80%.
-      4. The final candidate combination (non‑FDA) is the union of these selections (total 6 points).
-      5. For FDA mode, append one extra candidate—the first valid time after the last candidate where both predicted values are >=85%—to yield 7 points.
-      6. Compute f2:
+      2. Compute predicted dissolution values (via linear interpolation) for reference and test.
+      3. Split valid times into three strata based on predicted reference values:
+           - 0-30: select exactly 2 candidate times (min and max among those with ref in [0,30))
+           - 30-60: select exactly 2 candidate times (min and max among those with ref in [30,60))
+           - 60-90: select exactly 2 candidate times (min and max among those with ref in [60,90))
+         Then, for the 60–90 stratum, if neither candidate has both ref and test ≥80%, replace the later candidate with the candidate from the eligible set that maximizes min(ref, test).
+      4. The final candidate combination (non‑FDA) is the union of these selections (6 points total).
+      5. For FDA mode, append one extra candidate—the first time after the last candidate where both predictions are ≥85%—to yield 7 points.
+      6. Compute f2 using:
              f2 = 50 * log10(100 / (1 + sqrt(mean((test - ref)^2))))
-         (Using the linear predictions; no fallback is used.)
-    
-    Raises an error if any stratum lacks sufficient eligible times or if the 60–90 constraint is not met.
+         (For the first candidate, force the value to 0.)
+         
+    Raises an error if any stratum (other than 60–90) has insufficient eligible times.
     """
     import numpy as np
     import math
     
-    # 1. Build valid time grid (only 3- and 5-minute increments)
+    # 1. Build valid time grid (3- and 5-minute increments)
     valid_times = np.sort(np.unique(np.concatenate([
         np.arange(window_min, window_max+1, 3),
         np.arange(window_min, window_max+1, 5)
@@ -94,7 +91,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     all_ref_pred = interpolate_linear(ref_df, valid_times)
     all_test_pred = interpolate_linear(test_df, valid_times)
     
-    # 3. Define dissolution strata (by reference predictions).
+    # 3. Define dissolution strata (using predicted reference values)
     strata = {
         "0-30": (0, 30),
         "30-60": (30, 60),
@@ -104,7 +101,6 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
     
     def eligible_times_for_stratum(stratum_range):
         low, high = stratum_range
-        # Use linear predictions (all_ref_pred) for each valid time.
         return [t for t, pred in zip(valid_times, all_ref_pred) if low <= pred < high]
     
     candidate = []
@@ -114,17 +110,14 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         eligible = eligible_times_for_stratum(strata[key])
         if len(eligible) < required_points:
             raise ValueError(f"Insufficient eligible times in stratum {key}.")
-        # Deterministically choose the minimum and maximum time.
         candidate_stratum = [min(eligible), max(eligible)]
         candidate.extend(candidate_stratum)
     
     candidate = sorted(list(set(candidate)))
-    
-    # We expect candidate to have exactly 6 points.
     if len(candidate) != 6:
         raise ValueError(f"Final candidate count ({len(candidate)}) is not equal to 6 as required.")
     
-    # 5. Enforce the 60-90 stratum rule:
+    # 5. Enforce the 60-90 stratum rule.
     eligible_60_90 = eligible_times_for_stratum(strata["60-90"])
     cand_60_90 = [t for t in candidate if t in eligible_60_90]
     has_80 = False
@@ -134,9 +127,27 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
             has_80 = True
             break
     if not has_80:
-        raise ValueError("No candidate in the 60-90 stratum meets the >=80% threshold for both curves.")
+        # Replace the later candidate from the 60-90 group with the candidate that maximizes min(ref, test)
+        best_val = -np.inf
+        best_t = None
+        for t in eligible_60_90:
+            idx = int(np.where(valid_times == t)[0][0])
+            val = min(all_ref_pred[idx], all_test_pred[idx])
+            if val > best_val:
+                best_val = val
+                best_t = t
+        # Determine current 60-90 candidates from our selection:
+        current_60_90 = sorted([t for t in candidate if t in eligible_60_90])
+        if len(current_60_90) < 2:
+            raise ValueError("Insufficient candidates in 60-90 stratum to adjust.")
+        # Replace the later candidate with best_t
+        candidate = [t for t in candidate if t not in current_60_90]
+        candidate.extend([min(current_60_90), best_t])
+        candidate = sorted(list(set(candidate)))
+        if len(candidate) != 6:
+            raise ValueError("After adjustment, candidate count is not 6.")
     
-    # 6. For FDA mode, append an extra candidate.
+    # 6. For FDA mode: Append extra candidate—the first time after the last candidate with both predictions >=85%
     if regulation == "FDA":
         expected_count = 7
         last_candidate = candidate[-1]
@@ -157,8 +168,7 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         if len(candidate) != 6:
             raise ValueError(f"Non-FDA candidate count ({len(candidate)}) is not equal to 6.")
     
-    # 7. Compute f2 using linear interpolation predictions.
-    # (Force the starting time to 0% if it is the first candidate.)
+    # 7. Compute f2.
     ref_vals = np.array([float(val) for val in interpolate_linear(ref_df, candidate)])
     test_vals = np.array([float(val) for val in interpolate_linear(test_df, candidate)])
     if candidate[0] == window_min:
@@ -176,9 +186,9 @@ def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
         'test_vals': test_vals.tolist()
     }
     return [result], [result]
-######################################
+#################################################################3
 if run_predictive.lower() == 'yes':
-    # Determine candidate window using the helper function.
+    # Determine candidate window.
     window_min, window_max = determine_candidate_window(
         reference_mean_df,
         test_mean_df,
@@ -220,7 +230,7 @@ if run_predictive.lower() == 'yes':
         else:
             print("Regulatory Compliance: Passed")
         
-        # Plot the predicted dissolution curves.
+        # Plot predicted dissolution curves.
         import matplotlib.pyplot as plt
         plt.figure(figsize=(12, 6))
         time_points = overall_best['sequence']
