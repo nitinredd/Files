@@ -1,222 +1,207 @@
-def predictive_optimal_combinations_advanced(ref_df, test_df, regulation, 
-                                             window_min, window_max, diff_threshold=None,
-                                             interp_method='linear', points_per_stratum=None):
-    """
-    Deterministic selection of candidate time points using linear interpolation.
-    
-    Steps:
-      1. Build a valid time grid from the union of 3- and 5-minute increments within [window_min, window_max].
-      2. Compute predicted dissolution values (via linear interpolation) for both reference and test.
-      3. Fix the starting time (window_min) as the first candidate.
-      4. Split the remaining valid times into three strata based on predicted reference values:
-           - 0-30: select exactly 2 candidate times (excluding the starting time)
-           - 30-60: select exactly 2 candidate times (min and max among those with ref in [30,60))
-           - 60-90: select exactly 2 candidate times (min and max among those with ref in [60,90))
-         For the 60–90 stratum, if neither candidate has both ref and test ≥80%, replace the later candidate
-         with the candidate (from eligible times) that maximizes min(ref, test).
-      5. For non‑FDA mode, the final candidate combination will have 1 + 2 + 2 + 2 = 7 points.
-      6. For FDA mode, append one extra candidate—the first valid time (after the last candidate) where both
-         predictions are ≥85%—yielding 8 points.
-      7. Compute f2 using:
-             f2 = 50 * log10(100 / (1 + sqrt(mean((test - ref)^2))))
-         (The prediction at the starting time is forced to 0.)
-         
-    Raises an error if any stratum (other than 60–90, which is adjusted) lacks sufficient eligible times.
-    """
-    import numpy as np
-    import math
-    
-    # 1. Build valid time grid (only 3- and 5-minute increments)
-    valid_times = np.sort(np.unique(np.concatenate([
-        np.arange(window_min, window_max+1, 3),
-        np.arange(window_min, window_max+1, 5)
-    ])))
-    
-    # 2. Compute predicted dissolution values using linear interpolation.
-    all_ref_pred = interpolate_linear(ref_df, valid_times)
-    all_test_pred = interpolate_linear(test_df, valid_times)
-    
-    # 3. Fix the starting time.
-    fixed_start = window_min  # typically 0
-    
-    # 4. Define dissolution strata (using predicted reference values).
-    strata = {
-        "0-30": (0, 30),
-        "30-60": (30, 60),
-        "60-90": (60, 90)
-    }
-    required_points = 2  # exactly two candidate times per stratum (excluding the fixed starting time)
-    
-    # For 0-30, we exclude the fixed starting time.
-    def eligible_times_for_stratum(stratum_range, exclude_start=False):
-        low, high = stratum_range
-        if exclude_start:
-            return [t for t, pred in zip(valid_times, all_ref_pred) if t != fixed_start and low <= pred < high]
-        else:
-            return [t for t, pred in zip(valid_times, all_ref_pred) if low <= pred < high]
-    
-    candidate = []
-    
-    # 5. For each stratum, select exactly two candidate times deterministically.
-    # For the 0-30 stratum, exclude the fixed starting time.
-    for key in ["0-30", "30-60", "60-90"]:
-        if key == "0-30":
-            eligible = eligible_times_for_stratum(strata[key], exclude_start=True)
-        else:
-            eligible = eligible_times_for_stratum(strata[key])
-        if len(eligible) < required_points:
-            raise ValueError(f"Insufficient eligible times in stratum {key}.")
-        # Deterministically choose the minimum and maximum eligible time.
-        candidate_stratum = [min(eligible), max(eligible)]
-        candidate.extend(candidate_stratum)
-    
-    candidate = sorted(list(set(candidate)))
-    # Now, add the fixed starting time at the beginning.
-    if fixed_start not in candidate:
-        candidate.insert(0, fixed_start)
-    
-    # For non-FDA mode, we expect candidate count = 1 + 2 + 2 + 2 = 7.
-    if regulation != "FDA" and len(candidate) != 7:
-        raise ValueError(f"Final candidate count ({len(candidate)}) is not equal to 7 as required for non-FDA mode.")
-    
-    # 6. Enforce the 60-90 stratum rule:
-    eligible_60_90 = eligible_times_for_stratum(strata["60-90"])
-    cand_60_90 = [t for t in candidate if t in eligible_60_90]
-    has_80 = False
-    for t in cand_60_90:
-        idx = int(np.where(valid_times == t)[0][0])
-        if all_ref_pred[idx] >= 80 and all_test_pred[idx] >= 80:
-            has_80 = True
-            break
-    if not has_80:
-        # Replace the later candidate from the 60-90 group with the candidate that maximizes min(ref, test)
-        best_val = -np.inf
-        best_t = None
-        for t in eligible_60_90:
-            idx = int(np.where(valid_times == t)[0][0])
-            val = min(all_ref_pred[idx], all_test_pred[idx])
-            if val > best_val:
-                best_val = val
-                best_t = t
-        current_60_90 = sorted([t for t in candidate if t in eligible_60_90])
-        if len(current_60_90) < 2:
-            raise ValueError("Insufficient candidates in 60-90 stratum to adjust.")
-        # Replace the later candidate with best_t.
-        candidate = [t for t in candidate if t not in current_60_90]
-        candidate.extend([min(current_60_90), best_t])
-        candidate = sorted(list(set(candidate)))
-        if len(candidate) != 7:
-            raise ValueError("After adjustment, candidate count is not 7 for non-FDA mode.")
-    
-    # 7. For FDA mode: Append one extra candidate—the first valid time after the last candidate with both predictions ≥85%.
-    if regulation == "FDA":
-        expected_count = 8
-        last_candidate = candidate[-1]
-        post_times = [t for t in valid_times if t > last_candidate]
-        extra_point = None
-        for t in post_times:
-            idx = int(np.where(valid_times == t)[0][0])
-            if all_ref_pred[idx] >= 85 and all_test_pred[idx] >= 85:
-                extra_point = t
-                break
-        if extra_point is None:
-            raise ValueError("No valid extra candidate found for FDA mode.")
-        candidate.append(extra_point)
-        candidate = sorted(list(set(candidate)))
-        if len(candidate) != expected_count:
-            raise ValueError(f"Final candidate count ({len(candidate)}) does not equal expected count ({expected_count}) for FDA mode.")
-    else:
-        if len(candidate) != 7:
-            raise ValueError(f"Non-FDA candidate count ({len(candidate)}) is not equal to 7.")
-    
-    # 8. Compute f2.
-    # Use linear interpolation predictions at the candidate times.
-    ref_vals = np.array([float(val) for val in interpolate_linear(ref_df, candidate)])
-    test_vals = np.array([float(val) for val in interpolate_linear(test_df, candidate)])
-    if candidate[0] == fixed_start:
-        ref_vals[0] = 0.0
-        test_vals[0] = 0.0
-    diff = test_vals - ref_vals
-    f2 = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diff**2))))
-    
-    result = {
-        'sequence': candidate,
-        'f2': round(f2, 2),
-        'compliant': True,
-        'reasons': [],
-        'ref_vals': ref_vals.tolist(),
-        'test_vals': test_vals.tolist()
-    }
-    return [result], [result]
-####################################################
-if run_predictive.lower() == 'yes':
-    # Determine candidate window.
-    window_min, window_max = determine_candidate_window(
-        reference_mean_df,
-        test_mean_df,
-        step=5,
-        initial_threshold=10
-    )
-    
-    # Map regulation input.
-    regulation_map = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-    selected_regulation = regulation_map.get(input1, "FDA")
-    
-    print(f"\nCandidate window for combination search: {window_min} to {window_max}")
-    
-    # Run deterministic predictive analysis.
-    results, all_results = predictive_optimal_combinations_advanced(
-        reference_mean_df,
-        test_mean_df,
-        regulation=selected_regulation,
-        window_min=window_min,
-        window_max=window_max,
-        diff_threshold=None,
-        interp_method='linear',
-        points_per_stratum=None
-    )
-    
-    # Convert candidate time points to integers.
-    for cand in results:
-        cand['sequence'] = [int(t) for t in cand['sequence']]
-    
-    overall_best = results[0] if results else None
-    
-    if overall_best:
-        print("\n=== Optimal Predictive Combination ===")
-        print(f"Time Points (best candidate): {overall_best['sequence']}")
-        print(f"Length: {len(overall_best['sequence'])}")
-        print(f"Predicted f2 Score: {overall_best['f2']}")
-        if overall_best['reasons']:
-            print(f"Compliance Issues: {', '.join(overall_best['reasons'])}")
-        else:
-            print("Regulatory Compliance: Passed")
-        
-        # Plot predicted dissolution curves.
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(12, 6))
-        time_points = overall_best['sequence']
-        ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(time_points), method='linear')
-        test_diss = interpolate_dissolution_curve(test_mean_df, np.array(time_points), method='linear')
-        plt.plot(time_points, ref_diss, 'bo-', label='Reference')
-        plt.plot(time_points, test_diss, 'r*--', label='Test')
-        plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
-        plt.xlabel('Time (min)')
-        plt.ylabel('Dissolution (%)')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        
-        print("\nPredicted Reference Dissolution Percentages:")
-        for t, d in zip(time_points, ref_diss):
-            print(f"Time {t} min: {d:.2f}%")
-        print("\nPredicted Test Dissolution Percentages:")
-        for t, d in zip(time_points, test_diss):
-            print(f"Time {t} min: {d:.2f}%")
-    else:
-        print("❌ No candidate sequence was generated.")
-    
-    print("\n=== All Candidate Combination (Diverse) ===")
-    for idx, cand in enumerate(results):
-        seq_print = [int(t) for t in cand['sequence']]
-        print(f"{idx+1:3d}. | Points: {seq_print} | Length: {len(seq_print)} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+1. Input Format: How You Prefer to Provide Your Requirements
+You can submit your calculation request in either plain English or structured Excel format:
+
+Option 1: Plain English Input (Natural Language)
+
+Example Query:
+"Calculate the flow rates for a 3-pump system using reactor volume from cell B2 and residence time T1, while considering molar ratios from 'Concentration of reagent (g/ml)' and 'Molecular weight (g/mol)' in the Pump Details sheet."
+The system will parse this request, extract the necessary variables, and generate a validated Python script for flowrate computation.
+Option 2: Excel-Based Input
+
+You can upload an Excel sheet where each parameter is clearly defined in predefined columns.
+This format allows the system to extract numerical values and directly compute flowrates without additional interpretation.
+2. Standardized Excel Template Format
+To ensure accuracy, please provide input in the following structured format when using Excel:
+
+Sheet 1: Reactor Details
+
+Reactor Name	Volume (ml)	Residence Time (T1)	Temperature (°C)	Pressure (bar)
+Reactor 1	250	30	25	1.5
+Sheet 2: Pump Details
+
+Pump No.	Reagent Name	Concentration (g/ml)	Molecular Weight (g/mol)	Equivalence
+Pump 1	Reagent A	0.8	180	1.2
+Pump 2	Reagent B	0.5	150	0.9
+Pump 3	Reagent C	0.6	160	1.1
+This structure enables our agents to extract values and apply them in the correct formula.
+
+3. Flowrate Calculation & Parameter Mapping
+The formula used for Pump 1 Flowrate (as an example) is:
+
+F
+l
+o
+w
+r
+a
+t
+e
+P
+u
+m
+p
+1
+=
+(
+R
+e
+a
+c
+t
+o
+r
+V
+o
+l
+u
+m
+e
+/
+R
+e
+s
+i
+d
+e
+n
+c
+e
+T
+i
+m
+e
+)
+(
+1
+(
+C
+1
+M
+W
+1
+)
+×
+1000
++
+E
+q
+u
+i
+v
+a
+l
+e
+n
+c
+e
+1
+(
+C
+2
+M
+W
+2
+)
+×
+1000
++
+E
+q
+u
+i
+v
+a
+l
+e
+n
+c
+e
+2
+(
+C
+3
+M
+W
+3
+)
+×
+1000
+)
+Flowrate 
+Pump1
+​	
+ = 
+( 
+( 
+MW 
+1
+​	
+ 
+C 
+1
+​	
+ 
+​	
+ )×1000
+1
+​	
+ + 
+( 
+MW 
+2
+​	
+ 
+C 
+2
+​	
+ 
+​	
+ )×1000
+Equivalence 
+1
+​	
+ 
+​	
+ + 
+( 
+MW 
+3
+​	
+ 
+C 
+3
+​	
+ 
+​	
+ )×1000
+Equivalence 
+2
+​	
+ 
+​	
+ )
+(ReactorVolume/ResidenceTime)
+​	
+ 
+Where:
+
+Reactor Volume is from Sheet 1 (e.g., 250 ml)
+Residence Time (T1) is from Sheet 1 (e.g., 30 min)
+C₁, C₂, C₃ are reagent concentrations from Pump Details
+MW₁, MW₂, MW₃ are molecular weights from Pump Details
+Equivalence values correspond to each reagent
+The system will automatically extract, validate, and compute the correct flowrate values based on these mappings.
+
+4. Optimization & Additional Calculations
+If you need flowrate optimization (e.g., to minimize reagent waste or maximize yield), please specify any constraints in your request.
+Additional outputs, such as pressure drop, reaction yield predictions, or mass balance verification, can be enabled based on your experimental requirements.
+Next Steps
+Confirm Your Preferred Input Format: Do you prefer plain English queries, Excel-based input, or both?
+Review & Customize the Excel Template: Let us know if you need modifications based on your lab practices.
+Specify Any Optimization Goals: If optimization is required, please provide details on constraints and objectives.
+Our goal is to deliver a fully autonomous, accurate, and optimized flowrate calculation system tailored to your needs. Looking forward to your feedback!
+
+Best regards,
+[Your Name]
+[Your Position]
+[Your Contact Information]
