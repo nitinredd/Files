@@ -1,46 +1,78 @@
 import numpy as np
 
-def calculate_f2_either85(reference_df, test_df):
+def calculate_f2_either85(reference_df, test_df, alpha=0.05):
     """
-    1. Keeps time 0.
-    2. Finds the first non‑zero timepoint where either mean(reference) or mean(test) > 85%.
-    3. Trims both DataFrames to include rows [0 .. that timepoint].
-    4. Computes f2 on the trimmed means via:
-           f2 = 100 - 25 * log10(1 + (1/p)*sum((test_mean - ref_mean)^2))
-    Returns: (f2, trimmed_times, ref_means, test_means)
+    1. Keep time 0.
+    2. Find the first non‑zero timepoint where either mean(reference) or mean(test) > 85%.
+    3. Trim both DataFrames to include rows [0 .. that timepoint].
+    4. Compute:
+         - f2 (conventional)
+         - exp_f2 (expected)
+    5. Bootstrap (1-alpha)% CIs of the means at each timepoint.
+    Returns:
+       f2           : conventional f2
+       exp_f2       : expected f2
+       times        : trimmed time array
+       ref_mean     : trimmed reference means
+       test_mean    : trimmed test means
+       ref_ci_lower : reference lower CI band
+       ref_ci_upper : reference upper CI band
+       test_ci_lower: test lower CI band
+       test_ci_upper: test upper CI band
     """
-    # 1) Extract times and mean dissolution %
-    times      = reference_df.iloc[:, 0].astype(float).values
-    ref_means  = reference_df.iloc[:, 1:].mean(axis=1).values
-    test_means = test_df.iloc[:,      1:].mean(axis=1).values
+    # 1) times & means
+    times     = reference_df.iloc[:, 0].astype(float).values
+    ref_mean  = reference_df.iloc[:, 1:].mean(axis=1).values
+    test_mean = test_df.iloc[:, 1:].mean(axis=1).values
 
-    # 2) Find first index AFTER time=0 where either mean > 85%
-    exceed_idx = None
-    for i in range(1, len(times)):
-        if ref_means[i] > 85 or test_means[i] > 85:
-            exceed_idx = i
-            break
-    if exceed_idx is None:
-        raise ValueError("Neither reference nor test mean exceeds 85% at any non‑zero timepoint.")
+    # 2) find cutoff
+    cutoff = next((i for i in range(1, len(times))
+                   if ref_mean[i] > 85 or test_mean[i] > 85),
+                  None)
+    if cutoff is None:
+        raise ValueError("Neither profile exceeds 85% at any non‑zero timepoint.")
 
-    # 3) Trim to [0 .. exceed_idx]
-    trimmed_times = times[:exceed_idx+1]
-    trimmed_ref   = ref_means[:exceed_idx+1].copy()
-    trimmed_test  = test_means[:exceed_idx+1].copy()
+    # 3) trim
+    t = times[:cutoff+1]
+    r = ref_mean[:cutoff+1].copy()
+    u = test_mean[:cutoff+1].copy()
+    if t[0] == 0:
+        r[0] = 0.0
+        u[0] = 0.0
 
-    # Force 0% at t=0
-    if trimmed_times[0] == 0:
-        trimmed_ref[0]  = 0.0
-        trimmed_test[0] = 0.0
-
-    # 4) Compute f2 using original formula
-    diff   = trimmed_test - trimmed_ref
+    # 4a) conventional f2
+    diff   = u - r
     p      = len(diff)
     sum_sq = np.sum(diff**2)
     f2     = 100 - 25 * np.log10(1 + sum_sq / p)
 
-    return f2, trimmed_times, trimmed_ref, trimmed_test
-###################
+    # 4b) expected f2 (simple variance‐based adjustment)
+    var_ref  = reference_df.iloc[:,1:].var(axis=1, ddof=1).values[:p]
+    var_test = test_df.iloc[:,1:].var(axis=1, ddof=1).values[:p]
+    avg_var  = np.mean(var_ref + var_test)
+    exp_f2   = 100 - 25 * np.log10(1 + (sum_sq + p * avg_var) / p)
+
+    # 5) bootstrap CIs
+    def bootstrap_ci(mat):
+        B      = 1000
+        n_time = mat.shape[0]
+        lb, ub = np.empty(n_time), np.empty(n_time)
+        for i in range(n_time):
+            vals   = mat[i, :]
+            boots  = np.random.choice(vals, size=(B, len(vals)), replace=True).mean(axis=1)
+            lb[i], ub[i] = np.percentile(boots, [100*alpha/2, 100*(1-alpha/2)])
+        return lb, ub
+
+    ref_ci_l, ref_ci_u = bootstrap_ci(reference_df.iloc[:cutoff+1,1:].values)
+    tst_ci_l, tst_ci_u = bootstrap_ci(test_df.iloc[:cutoff+1,1:].values)
+
+    return (f2, exp_f2,
+            t, r, u,
+            ref_ci_l, ref_ci_u,
+            tst_ci_l, tst_ci_u)
+######################################
+import matplotlib.pyplot as plt
+
 elif input1 == 2:
     print("According to EMA/ICH/Canada/Australia guidelines")
 
@@ -52,25 +84,43 @@ elif input1 == 2:
     if not check_same_time_points(test_df, reference_df):
         print("Error: Time points between test and reference do not match.")
     else:
-        # 3) Perform the either>85%–based f2 calculation
+        # 3) Compute both f2s and plot
         print("\nAnalysis based on ‘either >85%’ dissolution criterion:")
         try:
-            f2_value, times, ref_vals, test_vals = calculate_f2_either85(reference_df, test_df)
+            (f2_conv, f2_exp,
+             times, r_mean, t_mean,
+             r_lb, r_ub, t_lb, t_ub) = calculate_f2_either85(reference_df, test_df)
 
-            # Clean up for printing
-            times_py = [float(t) for t in times]
-            ref_py   = [round(float(v),2) for v in ref_vals]
-            test_py  = [round(float(v),2) for v in test_vals]
-
-            print(f"Trimmed times: {times_py}")
-            print(f"Reference means (%): {ref_py}")
-            print(f"Test means      (%): {test_py}")
-            print(f"Calculated f2 (either>85% rule): {f2_value:.2f}")
+            # Print both
+            print(f"Conventional f2: {f2_conv:.2f}")
+            print(f"Expected    f2: {f2_exp:.2f}")
 
             if not cv_check:
                 print("\nWarning: CV requirements not met; interpret with caution.")
-            print("\nNow computing bootstrap percentile & BCA intervals…")
-            changed_data_either85_bca(reference_df, test_df)
+
+            # Plot 1: without intervals
+            plt.figure(figsize=(6,4))
+            plt.plot(times, r_mean, marker='o', label="Reference")
+            plt.plot(times, t_mean, marker='s', label="Test")
+            plt.xlabel("Time")
+            plt.ylabel("Mean % Dissolved")
+            plt.title("Dissolution Profile (no intervals)")
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+            # Plot 2: with 95% CI bands
+            plt.figure(figsize=(6,4))
+            plt.plot(times, r_mean, marker='o', label="Reference")
+            plt.fill_between(times, r_lb, r_ub, alpha=0.3)
+            plt.plot(times, t_mean, marker='s', label="Test")
+            plt.fill_between(times, t_lb, t_ub, alpha=0.3)
+            plt.xlabel("Time")
+            plt.ylabel("Mean % Dissolved")
+            plt.title("Dissolution Profile (95% CI bands)")
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
 
         except ValueError as e:
             print("❌", e)
