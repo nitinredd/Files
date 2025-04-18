@@ -2,45 +2,55 @@ import numpy as np
 
 def calculate_f2_china(reference_df, test_df):
     """
-    China guideline:
-      - Drop time = 0
-      - Reference mean must have exactly one timepoint >85%, all others ≤85%
-      - Compute conventional and expected f2 on the remaining points
+    China guideline (updated):
+      - Drop time = 0 if present
+      - Find the first timepoint where reference mean >85%
+      - Trim both DataFrames to include rows [0 .. that timepoint]
+      - Compute conventional f2 and expected f2 on the trimmed means
     Returns:
       f2_conv, exp_f2, trimmed_ref_df, trimmed_test_df
     """
-    # 1) Drop time=0 if present
-    ref = reference_df.copy().reset_index(drop=True)
-    tst = test_df.copy().reset_index(drop=True)
-    if float(ref.iloc[0,0]) == 0.0:
+    # 1) Copy & drop time zero
+    ref = reference_df.reset_index(drop=True).copy()
+    tst = test_df.reset_index(drop=True).copy()
+    if float(ref.iloc[0, 0]) == 0.0:
         ref = ref.drop(0).reset_index(drop=True)
         tst = tst.drop(0).reset_index(drop=True)
 
-    # 2) Compute means
-    ref_means  = ref.iloc[:,1:].mean(axis=1).values
-    test_means = tst.iloc[:,1:].mean(axis=1).values
+    # 2) Extract times & means
+    times     = ref.iloc[:, 0].astype(float).values
+    ref_mean  = ref.iloc[:, 1:].mean(axis=1).values
+    test_mean = tst.iloc[:, 1:].mean(axis=1).values
 
-    # 3) Check exactly one ref >85%
-    count_above = np.sum(ref_means > 85)
-    if count_above != 1:
-        raise ValueError(
-            f"Reference profile must have exactly one timepoint >85% (found {count_above})."
-        )
+    # 3) Find first index where reference >85%
+    cutoff = next((i for i, m in enumerate(ref_mean) if m > 85), None)
+    if cutoff is None:
+        raise ValueError("Reference profile never exceeds 85%.")
 
-    # 4a) conventional f2 on ALL remaining points
-    diff    = test_means - ref_means
+    # 4) Trim both frames to [0..cutoff]
+    trimmed_ref_df  = ref.iloc[:cutoff+1].copy()
+    trimmed_test_df = tst.iloc[:cutoff+1].copy()
+
+    # Force 0% at t=0
+    if float(trimmed_ref_df.iloc[0, 0]) == 0.0:
+        trimmed_ref_df.iloc[0, 1:]  = 0.0
+        trimmed_test_df.iloc[0, 1:] = 0.0
+
+    # 5a) Conventional f2
+    diff    = (trimmed_test_df.iloc[:,1:].mean(axis=1).values
+             - trimmed_ref_df.iloc[:,1:].mean(axis=1).values)
     p       = len(diff)
     sum_sq  = np.sum(diff**2)
     f2_conv = 100 - 25 * np.log10(1 + sum_sq / p)
 
-    # 4b) expected f2
-    var_ref   = ref.iloc[:,1:].var(axis=1, ddof=1).values
-    var_test  = tst.iloc[:,1:].var(axis=1, ddof=1).values
+    # 5b) Expected f2 (variance‑adjusted)
+    var_ref   = trimmed_ref_df.iloc[:,1:].var(axis=1, ddof=1).values
+    var_test  = trimmed_test_df.iloc[:,1:].var(axis=1, ddof=1).values
     avg_var   = np.mean(var_ref + var_test)
     exp_f2    = 100 - 25 * np.log10(1 + (sum_sq + p * avg_var) / p)
 
-    return f2_conv, exp_f2, ref, tst
-##############################################
+    return f2_conv, exp_f2, trimmed_ref_df, trimmed_test_df
+#################################
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
@@ -50,35 +60,36 @@ elif input1 == 3:
     cv_check = check_cv(test_df) and check_cv(reference_df)
     print("CV <20 at first non-zero, <10 thereafter:", cv_check)
 
-    # Time alignment check (after time0 will be dropped inside calculate)
+    # Time‐point alignment
     if not check_same_time_points(reference_df, test_df):
         print("Error: Time points between test and reference do not match.")
     else:
         print("\nAnalysis based on China’s single‑85% rule:")
         try:
+            # Compute f2s & get trimmed DataFrames
             f2_conv, f2_exp, ref_trim, test_trim = calculate_f2_china(reference_df, test_df)
 
-            # Print f2 results
+            # Print results
             print(f"Conventional f2: {f2_conv:.2f}")
             print(f"Expected    f2: {f2_exp:.2f}")
             if not cv_check:
                 print("\nWarning: CV requirements not met; interpret with caution.")
 
             # --- Graph 1: Simple dissolution curves ---
-            times      = ref_trim.iloc[:,0].astype(float)
-            r_means    = ref_trim.iloc[:,1:].mean(axis=1)
-            t_means    = test_trim.iloc[:,1:].mean(axis=1)
+            times   = ref_trim.iloc[:, 0].astype(float)
+            r_mean  = ref_trim.iloc[:, 1:].mean(axis=1)
+            t_mean  = test_trim.iloc[:, 1:].mean(axis=1)
 
-            plt.figure(figsize=(12,6))
-            plt.plot(times, r_means, marker='o', linestyle='-',  label='Reference')
-            plt.plot(times, t_means, marker='o', linestyle='--', label='Test')
+            plt.figure(figsize=(12, 6))
+            plt.plot(times, r_mean,  marker='o', linestyle='-',  label='Reference')
+            plt.plot(times, t_mean,  marker='o', linestyle='--', label='Test')
             plt.xlabel('Time')
             plt.ylabel('Dissolution (%)')
             plt.title('Dissolution Curves')
             plt.grid(True)
             ax = plt.gca()
             ax.yaxis.set_major_locator(MaxNLocator(integer=True, prune='lower'))
-            ax.set_yticks(range(0,101,5))
+            ax.set_yticks(range(0, 101, 5))
             plt.legend(loc='lower right')
             plt.tight_layout()
             plt.savefig('china_dissolution_curves.png', dpi=300)
@@ -91,17 +102,24 @@ elif input1 == 3:
             t_min = test_trim.iloc[:,1:].min(axis=1)
             t_max = test_trim.iloc[:,1:].max(axis=1)
 
-            plt.figure(figsize=(12,6))
+            plt.figure(figsize=(12, 6))
+            # Reference
             plt.errorbar(
-                times, r_means,
-                yerr=[r_means - r_min, r_max - r_means],
-                fmt='o-', label='Reference Mean'
+                times,
+                r_mean,
+                yerr=[r_mean - r_min, r_max - r_mean],
+                fmt='o-',
+                label='Reference Mean'
             )
+            # Test
             plt.errorbar(
-                times, t_means,
-                yerr=[t_means - t_min, t_max - t_means],
-                fmt='s--', label='Test Mean'
+                times,
+                t_mean,
+                yerr=[t_mean - t_min, t_max - t_mean],
+                fmt='s--',
+                label='Test Mean'
             )
+            # Horizontal caps
             for t, mn, mx in zip(times, r_min, r_max):
                 plt.hlines([mn, mx], t-0.2, t+0.2, linestyles='--', alpha=0.5)
             for t, mn, mx in zip(times, t_min, t_max):
@@ -113,7 +131,7 @@ elif input1 == 3:
             plt.grid(True)
             ax = plt.gca()
             ax.yaxis.set_major_locator(MaxNLocator(integer=True, prune='lower'))
-            ax.set_yticks(range(0,101,5))
+            ax.set_yticks(range(0, 101, 5))
             plt.legend(loc='lower right')
             plt.tight_layout()
             plt.savefig('china_dissolution_curves_with_intervals.png', dpi=300)
@@ -122,4 +140,4 @@ elif input1 == 3:
 
         except ValueError as e:
             print("❌", e)
-            print("Cannot perform f2 calculation.")
+            print("Cannot perform China‑rule f2 calculation.")
