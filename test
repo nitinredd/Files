@@ -1,1 +1,63 @@
-##################
+import numpy as np
+
+def f2_factor(ref_means: np.ndarray, test_means: np.ndarray) -> float:
+    """
+    Traditional similarity factor f2:
+      f2 = 100 - 25 * log10( 1 + (1/P) * sum((test_means - ref_means)**2) )
+    """
+    if ref_means.shape != test_means.shape:
+        raise ValueError("ref_means and test_means must have the same shape")
+    mse = np.mean((test_means - ref_means) ** 2)  # (1/P) * sum(diff^2)
+    return 100 - 25 * np.log10(1 + mse)
+
+
+def calculate_f2_fda(reference_df, test_df):
+    """
+    FDA ≥ 85% rule:
+      - Keep time = 0
+      - Find the first timepoint (after t=0) where both reference AND test mean > 85%
+      - Trim both DataFrames to include rows [0 .. that timepoint]
+      - Compute:
+          * f2_conv = conventional f2
+          * exp_f2  = expected f2 (variance‑adjusted)
+    Returns:
+      f2_conv, exp_f2, trimmed_ref_df, trimmed_test_df
+    """
+    # 1) Extract times & per-time means
+    times     = reference_df.iloc[:, 0].astype(float).values
+    ref_mean  = reference_df.iloc[:, 1:].mean(axis=1).values
+    test_mean = test_df.iloc[:, 1:].mean(axis=1).values
+
+    # 2) Find first simultaneous >85% (after t=0)
+    cutoff = next(
+        (i for i in range(1, len(times))
+         if ref_mean[i] > 85 and test_mean[i] > 85),
+        None
+    )
+    if cutoff is None:
+        raise ValueError("No timepoint found where both profiles exceed 85% simultaneously.")
+
+    # 3) Trim both DataFrames to [0..cutoff]
+    trimmed_ref_df  = reference_df.iloc[:cutoff+1].copy()
+    trimmed_test_df = test_df.iloc[:cutoff+1].copy()
+
+    # 4) Force zero at t=0
+    if float(trimmed_ref_df.iloc[0, 0]) == 0.0:
+        trimmed_ref_df.iloc[0, 1:]  = 0.0
+        trimmed_test_df.iloc[0, 1:] = 0.0
+
+    # 5) Compute trimmed means & variances arrays
+    ref_means_arr  = trimmed_ref_df.iloc[:, 1:].mean(axis=1).values
+    test_means_arr = trimmed_test_df.iloc[:, 1:].mean(axis=1).values
+    var_ref        = trimmed_ref_df.iloc[:, 1:].var(axis=1, ddof=1).values
+    var_test       = trimmed_test_df.iloc[:, 1:].var(axis=1, ddof=1).values
+
+    # 6a) Conventional f2 via helper
+    f2_conv = f2_factor(ref_means_arr, test_means_arr)
+
+    # 6b) Expected f2 = 100 - 25*log10(1 + MSE + avg_variance)
+    mse     = np.mean((test_means_arr - ref_means_arr) ** 2)
+    avg_var = np.mean(var_ref + var_test)
+    exp_f2  = 100 - 25 * np.log10(1 + mse + avg_var)
+
+    return f2_conv, exp_f2, trimmed_ref_df, trimmed_test_df
