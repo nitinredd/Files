@@ -1,148 +1,38 @@
 import numpy as np
-import math
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
-def predictive_optimal_combinations_fractional(ref_df, test_df, regulation,
-                                               window_min, window_max,
-                                               step_hours=0.25,
-                                               interp_method='linear'):
-    """
-    Fallback for hour‐based data: builds a fine grid (¼ h increments),
-    forces exactly two picks per dissolution‐percent stratum (0–30, 30–60, 60–90),
-    always includes the start time (window_min), and then appends one extra
-    FDA/ANVISA‐ or EMA/China/ASEAN‐style point above 85%.
-    Excludes the t=window_min point from the f2 calculation (but keeps it in the sequence).
-    """
-    # 1. Build fine time grid
-    valid_times   = np.arange(window_min, window_max + 1e-8, step_hours)
-    # 2. Interpolate both curves
-    all_ref_pred  = np.array(interpolate_linear(ref_df,  valid_times), dtype=float)
-    all_test_pred = np.array(interpolate_linear(test_df, valid_times), dtype=float)
+# (Assume predictive_optimal_combinations_fractional is defined as above)
 
-    fixed_start = window_min
-
-    # 3. Strata definitions (dissolution %)
-    strata = {
-        "0-30":  (0, 30),
-        "30-60": (30, 60),
-        "60-90": (60, 90),
-    }
-
-    def picks_for_stratum(low, high, exclude_start=False):
-        # eligible times whose ref_pred in [low, high)
-        mask = (all_ref_pred >= low) & (all_ref_pred < high)
-        if exclude_start:
-            mask &= (valid_times != fixed_start)
-        times = valid_times[mask]
-        if len(times) >= 2:
-            return [times.min(), times.max()]
-        elif len(times) == 1:
-            t0 = times[0]
-            mid = (low + high) / 2
-            # find other time whose ref_pred is closest to the mid‐point
-            diffs = np.abs(all_ref_pred - mid)
-            # exclude t0 (and fixed_start if needed)
-            diffs[np.where(valid_times == t0)[0][0]] = np.inf
-            if exclude_start:
-                idx0 = np.where(valid_times == fixed_start)[0][0]
-                diffs[idx0] = np.inf
-            t1 = valid_times[np.argmin(diffs)]
-            return sorted([t0, t1])
-        else:
-            # no direct hits → pick time nearest low and time nearest high
-            diffs_low  = np.abs(all_ref_pred - low)
-            diffs_high = np.abs(all_ref_pred - (high - 1e-6))
-            if exclude_start:
-                idx0 = np.where(valid_times == fixed_start)[0][0]
-                diffs_low[idx0] = np.inf
-                diffs_high[idx0] = np.inf
-            t_low  = valid_times[np.argmin(diffs_low)]
-            t_high = valid_times[np.argmin(diffs_high)]
-            return sorted([t_low, t_high])
-
-    # 4. Gather candidates
-    candidate = [fixed_start]
-    for name, (low, high) in strata.items():
-        picks = picks_for_stratum(low, high, exclude_start=(name == "0-30"))
-        candidate.extend(picks)
-
-    candidate = sorted(set(candidate))
-
-    # 5. Append one extra point > last candidate:
-    last = candidate[-1]
-    post = valid_times[valid_times > last]
-    extra = None
-    if regulation in ("FDA", "ANVISA"):
-        # need both ≥85%
-        for t in post:
-            idx = np.where(valid_times == t)[0][0]
-            if all_ref_pred[idx] >= 85 and all_test_pred[idx] >= 85:
-                extra = t
-                break
-    else:
-        # EMA/China/ASEAN: need either ref or test ≥85%
-        for t in post:
-            idx = np.where(valid_times == t)[0][0]
-            if all_ref_pred[idx] >= 85 or all_test_pred[idx] >= 85:
-                extra = t
-                break
-    if extra is not None:
-        candidate.append(extra)
-        candidate = sorted(set(candidate))
-
-    # 6. Compute f2, excluding the fixed_start point
-    seq = np.array(candidate, dtype=float)
-    ref_vals  = np.array(interpolate_linear(ref_df,  seq), dtype=float)
-    test_vals = np.array(interpolate_linear(test_df, seq), dtype=float)
-    # force both 0 at t = fixed_start
-    if seq[0] == fixed_start:
-        ref_vals[0]  = 0.0
-        test_vals[0] = 0.0
-    # exclude the first element from the error calculation
-    diffs = test_vals[1:] - ref_vals[1:]
-    mse   = np.mean(diffs ** 2)
-    f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
-
-    return [{
-        'sequence':   [float(t) for t in seq],
-        'f2':         round(f2, 2),
-        'compliant':  True,
-        'reasons':    [],
-        'ref_vals':   ref_vals.tolist(),
-        'test_vals':  test_vals.tolist()
-    }], None
-#############################33
 if input1 == 1:
     print("According to FDA ≥ 85% guidelines\n")
 
-    # 1) Check criteria & CV
+    # 1) Criteria & CV
     both_85 = check_both_85(reference_df, test_df)
     print("Both ≥ 85% criterion met:   ", both_85)
 
     cv_check = check_cv(test_df) and check_cv(reference_df)
     print("\nCV <20 at first non-zero, <10 thereafter:", cv_check, "\n")
 
-    # (0) Drop t=0 rows
+    # (0) Drop zero‐time rows
     reference_df = reference_df[reference_df.iloc[:, 0] != 0].reset_index(drop=True)
     test_df      = test_df[test_df.iloc[:, 0] != 0].reset_index(drop=True)
 
-    # 2) Verify alignment
+    # 2) Verify time alignment
     if not check_same_time_points(reference_df, test_df):
-        print("Error: Time points between test and reference do not match.")
-        print("Calculations cannot be performed.")
+        print("Error: Time points do not match. Cannot proceed.")
     else:
         try:
-            # 3) FDA f2 & trimming
+            # 3) Conventional FDA f2 & trimming
             f2_conv, f2_exp, ref_trim, test_trim = calculate_f2_fda(reference_df, test_df)
-            # 4) Print trimmed means...
-            # [your existing code for trimmed means & plots here]
+            # [existing printing + plotting code here…]
         except ValueError as e:
             print("❌", e)
             print("Cannot perform FDA-rule f2 calculation.")
 
-    # 5) Predictive analysis?
+    # 4) Predictive optimal‐combo?
     run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
     if run_predictive.lower() == 'yes':
-        # Determine window
         window_min, window_max = determine_candidate_window(
             reference_mean_df, test_mean_df, step=5, initial_threshold=10
         )
@@ -150,7 +40,7 @@ if input1 == 1:
         selected_regulation = regulation_map.get(input1, "FDA")
         print(f"\nCandidate window for combination search: {window_min} to {window_max}\n")
 
-        # Try original; fall back on our fractional grid
+        # Try integer‐grid first, then fallback
         try:
             results, _ = predictive_optimal_combinations_advanced(
                 reference_mean_df,
@@ -176,7 +66,7 @@ if input1 == 1:
                 interp_method = 'linear'
             )
 
-        # Normalize sequence: ints stay ints, others floats
+        # Normalize sequence (ints vs floats)
         for cand in results:
             cand['sequence'] = [
                 int(t) if float(t).is_integer() else t
@@ -184,39 +74,34 @@ if input1 == 1:
             ]
 
         best = results[0]
-        if best:
-            print("=== Optimal Predictive Combination ===")
-            print(f"Time Points (best candidate): {best['sequence']}")
-            print(f"Length: {len(best['sequence'])}")
-            print(f"Predicted f2 Score: {best['f2']}")
+        print("=== Optimal Predictive Combination ===")
+        print(f"Time Points: {best['sequence']}")
+        print(f"Predicted f2 Score: {best['f2']}")
 
-            # Plot the predicted curves
-            import matplotlib.pyplot as plt
-            seq = best['sequence']
-            ref_diss  = interpolate_dissolution_curve(reference_mean_df, np.array(seq), method='linear')
-            test_diss = interpolate_dissolution_curve(test_mean_df,      np.array(seq), method='linear')
+        # Plot predicted dissolution
+        seq = best['sequence']
+        ref_diss  = interpolate_dissolution_curve(reference_mean_df, np.array(seq), method='linear')
+        test_diss = interpolate_dissolution_curve(test_mean_df,      np.array(seq), method='linear')
 
-            plt.figure(figsize=(12, 6))
-            plt.plot(seq, ref_diss,  'bo-', label='Reference')
-            plt.plot(seq, test_diss, 'r*--', label='Test')
-            plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {best['f2']})")
-            plt.xlabel('Time (h)')
-            plt.ylabel('Dissolution (%)')
-            plt.legend()
-            plt.grid(True)
-            plt.show()
+        plt.figure(figsize=(12, 6))
+        plt.plot(seq, ref_diss,  'bo-', label='Reference')
+        plt.plot(seq, test_diss, 'r*--', label='Test')
+        plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {best['f2']})")
+        plt.xlabel('Time (h)')
+        plt.ylabel('Dissolution (%)')
+        plt.grid(True)
+        plt.legend()
+        plt.gca().yaxis.set_major_locator(MaxNLocator(integer=True, prune='lower'))
+        plt.show()
 
-            # Show percentages
-            print("\nPredicted Reference Dissolution (%):")
-            for t, d in zip(seq, ref_diss):
-                print(f"  {t} h: {d:.2f}%")
-            print("\nPredicted Test Dissolution (%):")
-            for t, d in zip(seq, test_diss):
-                print(f"  {t} h: {d:.2f}%")
-        else:
-            print("❌ No candidate sequence was generated.")
+        # Show table of predicted values
+        print("\nPredicted Reference Dissolution (%):")
+        for t, d in zip(seq, ref_diss):
+            print(f"  {t} h: {d:.2f}%")
+        print("\nPredicted Test Dissolution (%):")
+        for t, d in zip(seq, test_diss):
+            print(f"  {t} h: {d:.2f}%")
 
-        # List all candidates
         print("\n=== All Candidate Combinations ===")
         for i, cand in enumerate(results, 1):
             print(f"{i:2d}. Points: {cand['sequence']} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
