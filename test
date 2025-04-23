@@ -1,117 +1,84 @@
-if input1 == 1:
-    print("According to FDA ≥ 85% guidelines\n")
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
 
-    # 1) Check criteria & CV
-    both_85   = check_both_85(reference_df, test_df)
-    print("Both ≥ 85% criterion met:   ", both_85)
+def predictive_optimal_combinations_advanced(ref_df, test_df, regulation,
+                                             window_min, window_max,
+                                             grid_step=0.1):
+    # 1) Fine grid
+    times_fine = np.arange(window_min, window_max+1e-9, grid_step)
 
-    cv_check = check_cv(test_df) and check_cv(reference_df)
-    print("\nCV <20 at first non-zero, <10 thereafter:", cv_check, "\n")
+    # 2) Mean curves & interpolators
+    raw_t      = ref_df.iloc[:, 0].astype(float).values
+    ref_mean   = ref_df.iloc[:, 1:].mean(axis=1).values
+    test_mean  = test_df.iloc[:, 1:].mean(axis=1).values
 
-    # (0) Drop timepoint zero
-    reference_df = reference_df[reference_df.iloc[:, 0] != 0].reset_index(drop=True)
-    test_df      = test_df[test_df.iloc[:, 0] != 0].reset_index(drop=True)
+    ref_intp   = interp1d(raw_t, ref_mean,  kind='linear',
+                          bounds_error=False, fill_value='extrapolate')
+    test_intp  = interp1d(raw_t, test_mean, kind='linear',
+                          bounds_error=False, fill_value='extrapolate')
 
-    # 2) Verify time alignment
-    if not check_same_time_points(reference_df, test_df):
-        print("Error: Time points between test and reference do not match.")
-        print("Calculations cannot be performed.")
-    else:
-        try:
-            # 3) Compute FDA f2s & trimmed data
-            f2_conv, f2_exp, ref_trim, test_trim = calculate_f2_fda(reference_df, test_df)
+    full_ref   = ref_intp(times_fine)
+    full_test  = test_intp(times_fine)
 
-            # 4) Show trimmed times & means
-            times      = ref_trim.iloc[:, 0].astype(float).tolist()
-            ref_means  = ref_trim.iloc[:, 1:].mean(axis=1).round(2).tolist()
-            test_means = test_trim.iloc[:, 1:].mean(axis=1).round(2).tolist()
+    # 3) Conventional f2 (exclude t=0)
+    nz = times_fine > window_min
+    d_full = full_test[nz] - full_ref[nz]
+    p_full = len(d_full)
+    f2_full = 100 - 25 * np.log10(1 + np.sum(d_full**2) / p_full)
 
-            print("Trimmed times:        ", times)
-            print("Reference means (%):  ", ref_means)
-            print("Test means      (%):  ", test_means, "\n")
+    # 4) Strata (0–30, 30–60, 60–90)
+    strata = [(0,30), (30,60), (60,90)]
+    preds  = [window_min]  # always include start
 
-            # 5) Print f2 results
-            print(f"Conventional f2: {f2_conv:.2f}")
-            print(f"Expected     f2: {f2_exp:.2f}")
-            if not cv_check:
-                print("\nWarning: CV requirements not met; interpret with caution.")
+    for low, high in strata:
+        # times where ref in [low, high)
+        mask = (full_ref >= low) & (full_ref < high)
+        td   = times_fine[mask]
+        if len(td) < 2:
+            raise ValueError(f"Not enough points in {low}–{high}% stratum.")
+        # pick earliest & latest
+        preds += [float(td.min()), float(td.max())]
 
-            # Graphs omitted for brevity...
-        except ValueError as e:
-            print("❌", e)
-            print("Cannot perform FDA-rule f2 calculation.")
+    # 5) 85% rule
+    if regulation in ("FDA", "ANVISA"):
+        t85 = float(np.interp(85, full_ref, times_fine))
+    else:  # EMA, China, ASEAN
+        t85r = float(np.interp(85, full_ref,  times_fine))
+        t85t = float(np.interp(85, full_test, times_fine))
+        t85  = min(t85r, t85t)
+    preds.append(t85)
 
-    # 6) Predictive optimal combination
-    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-    if run_predictive.lower() == 'yes':
-        window_min, window_max = determine_candidate_window(
-            reference_mean_df,
-            test_mean_df,
-            step=5,
-            initial_threshold=10
-        )
-        regulation_map     = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
-        selected_regulation = regulation_map.get(input1, "FDA")
-        print(f"\nCandidate window for combination search: {window_min} to {window_max}\n")
+    preds = sorted(set(preds))
 
-        # Try original integer‐grid; on failure, fall back to fractional‐grid
-        try:
-            results, _ = predictive_optimal_combinations_advanced(
-                reference_mean_df,
-                test_mean_df,
-                regulation         = selected_regulation,
-                window_min         = window_min,
-                window_max         = window_max,
-                diff_threshold     = None,
-                interp_method      = 'linear',
-                points_per_stratum = None
-            )
-            print("✅ Used original integer‐grid function\n")
-        except ValueError as e:
-            print(f"⚠️ Original function failed: {e}")
-            print("   Falling back to fractional‐grid version (0.25 h increments)...\n")
-            results, _ = predictive_optimal_combinations_fractional(
-                reference_mean_df,
-                test_mean_df,
-                regulation    = selected_regulation,
-                window_min    = window_min,
-                window_max    = window_max,
-                step_hours    = 0.25,
-                interp_method = 'linear'
-            )
+    # 6) Predicted f2 (exclude t=0)
+    ref_pred  = ref_intp(preds)
+    test_pred = test_intp(preds)
+    if preds[0] == window_min:
+        ref_pred[0]  = 0.0
+        test_pred[0] = 0.0
 
-        # Normalize sequence: ints as ints, floats otherwise
-        for cand in results:
-            cand['sequence'] = [
-                int(t) if float(t).is_integer() else t
-                for t in cand['sequence']
-            ]
+    dp = test_pred[1:] - ref_pred[1:]
+    pp = len(dp)
+    f2_pred = 100 - 25 * np.log10(1 + np.sum(dp**2) / pp)
 
-        overall_best = results[0] if results else None
-        if overall_best:
-            print("=== Optimal Predictive Combination ===")
-            print(f"Time Points (best candidate): {overall_best['sequence']}")
-            print(f"Length: {len(overall_best['sequence'])}")
-            print(f"Predicted f2 Score: {overall_best['f2']}")
-            print("Regulatory Compliance:", "Passed" if not overall_best['reasons'] else ", ".join(overall_best['reasons']))
+    # 7) Plot
+    plt.figure(figsize=(8,5))
+    plt.plot(times_fine, full_ref,  'b-',  label='Ref Full')
+    plt.plot(times_fine, full_test, 'r--', label='Test Full')
+    plt.plot(preds,       ref_pred,  'ko-', label='Ref Selected')
+    plt.plot(preds,       test_pred, 'ms--',label='Test Selected')
+    plt.axvline(preds[-1], color='gray', linestyle=':')
+    plt.title(f"f2_full={f2_full:.1f}, f2_pred={f2_pred:.1f}")
+    plt.xlabel("Time")
+    plt.ylabel("Dissolution %")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
-            # Plot predicted dissolution curves
-            import matplotlib.pyplot as plt
-            time_points = overall_best['sequence']
-            ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(time_points), method='linear')
-            test_diss = interpolate_dissolution_curve(test_mean_df,      np.array(time_points), method='linear')
-            plt.figure(figsize=(12, 6))
-            plt.plot(time_points, ref_diss, 'bo-', label='Reference')
-            plt.plot(time_points, test_diss, 'r*--', label='Test')
-            plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
-            plt.xlabel('Time (h)')
-            plt.ylabel('Dissolution (%)')
-            plt.legend()
-            plt.grid(True)
-            plt.show()
-        else:
-            print("❌ No candidate sequence was generated.")
-
-        print("\n=== All Candidate Combination (Diverse) ===")
-        for idx, cand in enumerate(results):
-            print(f"{idx+1:3d}. | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+    return {
+        'predicted_times': preds,
+        'f2_full': round(f2_full,2),
+        'f2_pred': round(f2_pred,2)
+    }
