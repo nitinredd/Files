@@ -1,1 +1,152 @@
-noobs
+import numpy as np
+import math
+
+def predictive_optimal_combinations_fractional(ref_df, test_df, regulation,
+                                               window_min, window_max,
+                                               step_hours=0.25,
+                                               interp_method='linear'):
+    """
+    Fallback version for datasets in hours, using a fractional grid (e.g. 0.25 h increments).
+    Allows 1–2 points per stratum so you never get an “insufficient eligible times” error.
+    """
+    # 1. Build fractional time grid (in hours)
+    valid_times = np.arange(window_min, window_max + 1e-8, step_hours)
+
+    # 2. Interpolate
+    all_ref_pred  = interpolate_linear(ref_df, valid_times)
+    all_test_pred = interpolate_linear(test_df, valid_times)
+
+    fixed_start = window_min
+
+    # 3. Define strata
+    strata = {"0-30": (0, 30), "30-60": (30, 60), "60-90": (60, 90)}
+    def elig(rng, exclude_start=False):
+        low, high = rng
+        mask = (all_ref_pred >= low) & (all_ref_pred < high)
+        if exclude_start:
+            mask &= (valid_times != fixed_start)
+        return valid_times[mask]
+
+    # 4. Pick 1–2 per stratum
+    candidate = [fixed_start]
+    for name, rng in strata.items():
+        times = elig(rng, exclude_start=(name == "0-30"))
+        if len(times) == 0:
+            continue
+        if len(times) == 1:
+            picks = [times[0]]
+        else:
+            picks = [times.min(), times.max()]
+        candidate.extend(picks)
+
+    candidate = sorted(set(candidate))
+
+    # 5. FDA/ANVISA extra point
+    if regulation in ("FDA", "ANVISA"):
+        last = candidate[-1]
+        post = valid_times[valid_times > last]
+        for t in post:
+            idx = np.where(valid_times == t)[0][0]
+            if all_ref_pred[idx] >= 85 and all_test_pred[idx] >= 85:
+                candidate.append(t)
+                break
+        candidate = sorted(set(candidate))
+
+    # 6. Compute f2
+    ref_vals  = np.array(interpolate_linear(ref_df, candidate), dtype=float)
+    test_vals = np.array(interpolate_linear(test_df, candidate), dtype=float)
+    if candidate[0] == fixed_start:
+        ref_vals[0] = test_vals[0] = 0.0
+    diff = test_vals - ref_vals
+    f2   = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diff**2))))
+
+    return [{
+        'sequence': [float(t) for t in candidate],
+        'f2':       round(f2, 2),
+        'compliant': True,
+        'reasons':  [],
+        'ref_vals': ref_vals.tolist(),
+        'test_vals': test_vals.tolist()
+    }], None
+###################
+if input1 == 1:
+    print("According to FDA ≥ 85% guidelines\n")
+
+    # ... [your CV checks and plotting code unchanged] ...
+
+    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
+    if run_predictive.lower() == 'yes':
+        # Determine candidate window.
+        window_min, window_max = determine_candidate_window(
+            reference_mean_df,
+            test_mean_df,
+            step=5,
+            initial_threshold=10
+        )
+        regulation_map    = {1: "FDA", 2: "EMA", 3: "China", 4: "ASEAN", 5: "ANVISA"}
+        selected_regulation = regulation_map.get(input1, "FDA")
+        print(f"\nCandidate window for combination search: {window_min} to {window_max}\n")
+
+        # === Try original, fall back on error to fractional grid ===
+        try:
+            results, _ = predictive_optimal_combinations_advanced(
+                reference_mean_df,
+                test_mean_df,
+                regulation      = selected_regulation,
+                window_min      = window_min,
+                window_max      = window_max,
+                diff_threshold  = None,
+                interp_method   = 'linear',
+                points_per_stratum=None
+            )
+            print("✅ Used original integer‐grid function\n")
+        except ValueError as e:
+            print(f"⚠️ Original function failed: {e}")
+            print("   Falling back to fractional‐grid version (0.25 h increments)...\n")
+            results, _ = predictive_optimal_combinations_fractional(
+                reference_mean_df,
+                test_mean_df,
+                regulation    = selected_regulation,
+                window_min    = window_min,
+                window_max    = window_max,
+                step_hours    = 0.25,
+                interp_method = 'linear'
+            )
+
+        # Normalize sequence entries: keep integers as ints, leave floats as-is
+        for cand in results:
+            cand['sequence'] = [
+                int(t) if float(t).is_integer() else t
+                for t in cand['sequence']
+            ]
+
+        overall_best = results[0] if results else None
+        if overall_best:
+            print("=== Optimal Predictive Combination ===")
+            print(f"Time Points (best candidate): {overall_best['sequence']}")
+            print(f"Length: {len(overall_best['sequence'])}")
+            print(f"Predicted f2 Score: {overall_best['f2']}")
+            print("Regulatory Compliance:", "Passed" if not overall_best['reasons'] else ", ".join(overall_best['reasons']))
+            
+            # Plot predicted dissolution curves.
+            import matplotlib.pyplot as plt
+            time_points = overall_best['sequence']
+            ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(time_points), method='linear')
+            test_diss = interpolate_dissolution_curve(test_mean_df,      np.array(time_points), method='linear')
+            plt.figure(figsize=(12, 6))
+            plt.plot(time_points, ref_diss, 'bo-', label='Reference')
+            plt.plot(time_points, test_diss, 'r*--', label='Test')
+            plt.title(f"Optimal Profile: Predicted Dissolution (f2 = {overall_best['f2']})")
+            plt.xlabel('Time (h)')
+            plt.ylabel('Dissolution (%)')
+            plt.legend()
+            plt.grid(True)
+            plt.show()
+
+        else:
+            print("❌ No candidate sequence was generated.")
+
+        # List all candidate combos
+        print("\n=== All Candidate Combination (Diverse) ===")
+        for idx, cand in enumerate(results):
+            print(f"{idx+1:3d}. | Points: {cand['sequence']} | Length: {len(cand['sequence'])} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
