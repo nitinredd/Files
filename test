@@ -3,66 +3,74 @@ import math
 import pandas as pd
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution profile with precision control"""
+    """Calculate validated mean profile with precision control"""
     times = df.iloc[:, 0].astype(float).values.round(2)
     values = df.iloc[:, 1:].astype(float)
     means = values.mean(axis=1).round(2)
     return pd.DataFrame({'Time': times, 'Mean': means})
 
 def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """Create validated monotonic profile with edge handling"""
-    grid = np.round(np.arange(0, window_max + step, step), 2)
+    """Create validated monotonic profile with original time preservation"""
+    grid = np.unique(np.concatenate([
+        np.arange(0, window_max + step, step),
+        times
+    ])).round(2)
     interp = np.interp(grid, times, means, left=0.0, right=means[-1])
     return np.maximum.accumulate(interp), grid
 
-def select_optimized_points(ref, test, grid):
-    """Select points meeting criteria while maximizing F2 potential"""
+def select_bracket_points(ref, test, grid):
+    """Select points with strict progression and bracket coverage"""
     brackets = [(0, 30), (30, 60), (60, 80)]
     selected = [0]  # Always include 0h
     last_ref = 0.0
     
-    for low, high in brackets:
+    for bidx, (low, high) in enumerate(brackets):
+        # Find candidates in current bracket with >=7% progression
         candidates = []
-        
-        # Find all points in current bracket
         for i in range(len(grid)):
-            current_ref = ref[i]
-            if low <= current_ref < high:
-                if current_ref - last_ref >= 7:
-                    candidates.append(i)
+            if low <= ref[i] < high and (ref[i] - last_ref) >= 7:
+                candidates.append(i)
         
-        # Select up to 2 best F2 candidates
+        # Select up to 2 best F2 candidates (most similar)
         if candidates:
-            # Sort by test-ref similarity (ascending differences)
+            # Sort by test-ref similarity
             candidates.sort(key=lambda x: abs(test[x] - ref[x]))
             
-            # Take best 1-2 candidates maintaining progression
-            for cand in candidates[:2]:
-                if ref[cand] > last_ref:
+            # Take best candidates maintaining progression
+            taken = 0
+            for cand in candidates:
+                if ref[cand] > last_ref and taken < 2:
                     selected.append(cand)
                     last_ref = ref[cand]
+                    taken += 1
         
-        # Ensure at least one point per bracket
-        if not any(ref[i] >= low for i in selected):
+        # Ensure at least 1 point per bracket
+        if not any(low <= ref[i] < high for i in selected):
             for i in range(len(grid)):
                 if low <= ref[i] < high:
-                    selected.append(i)
-                    last_ref = ref[i]
-                    break
+                    if ref[i] - last_ref >= 7 or bidx == 0:
+                        selected.append(i)
+                        last_ref = ref[i]
+                        break
     
     return sorted(list(set(selected)))
 
 def find_85_point(ref, test, grid, regulation):
-    """Find regulation-specific 85% dissolution point"""
+    """Regulation-specific 85% point detection"""
     for i in range(len(grid)):
-        ref_ok = ref[i] >= 85
-        test_ok = test[i] >= 85
-        
-        if regulation in ("FDA", "ANVISA") and ref_ok and test_ok:
+        if regulation in ("FDA", "ANVISA") and ref[i] >= 85 and test[i] >= 85:
             return i
-        elif regulation not in ("FDA", "ANVISA") and (ref_ok or test_ok):
+        elif regulation not in ("FDA", "ANVISA") and (ref[i] >= 85 or test[i] >= 85):
             return i
     return None
+
+def validate_progression(selected, ref, grid, min_diff=7):
+    """Ensure strict 7% progression between consecutive points"""
+    filtered = [selected[0]]
+    for i in selected[1:]:
+        if ref[i] - ref[filtered[-1]] >= min_diff:
+            filtered.append(i)
+    return filtered
 
 def predictive_optimal_combinations_monotonic(reference_df, test_df,
                                             regulation, window_max=12,
@@ -71,37 +79,38 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
     ref_mean = calculate_mean_profile(reference_df)
     test_mean = calculate_mean_profile(test_df)
 
-    # Create monotonic profiles
+    # Create monotonic profiles with original time preservation
     ref_prof, grid = create_monotonic_profile(
-        ref_mean['Time'].values, 
-        ref_mean['Mean'].values,
+        ref_mean.Time.values, 
+        ref_mean.Mean.values,
         step_hours,
         window_max
     )
     test_prof, _ = create_monotonic_profile(
-        test_mean['Time'].values,
-        test_mean['Mean'].values,
+        test_mean.Time.values,
+        test_mean.Mean.values,
         step_hours,
         window_max
     )
 
-    # Select optimized points
-    selected = select_optimized_points(ref_prof, test_prof, grid)
+    # Select optimized points with bracket coverage
+    selected = select_bracket_points(ref_prof, test_prof, grid)
     
-    # Add 85% point
+    # Add regulation-specific 85% point
     eighty_five = find_85_point(ref_prof, test_prof, grid, regulation)
     if eighty_five is not None and eighty_five not in selected:
         selected.append(eighty_five)
     
-    # Finalize selection
+    # Final validation and sorting
     selected = sorted(np.unique(selected))
+    selected = validate_progression(selected, ref_prof, grid)
     
-    # Convert to native Python types
+    # Convert to native types
     times = [float(grid[i]) for i in selected]
     ref_vals = [float(ref_prof[i]) for i in selected]
     test_vals = [float(test_prof[i]) for i in selected]
 
-    # Clean time formatting
+    # Format output
     clean_times = []
     for t in times:
         if t.is_integer():
