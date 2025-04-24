@@ -1,77 +1,61 @@
 import numpy as np
 import math
 
-def predictive_optimal_combinations_final(reference_mean_df, test_mean_df, regulation,
-                                          window_max, step_hours=0.25):
+def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
+                                               regulation, window_max,
+                                               step_hours=0.25):
     """
-    - Strata: 0–30%, 30–60%, 60–85%
-    - FDA/ANVISA extra: first time ≥85% on both curves
-    - EMA/China/ASEAN extra: first time ≥85% on either curve
+    Picks based on dissolution-percentage targets:
+    - Always includes t=0 (0%).
+    - Brackets: 0–30, 30–60, 60–90 %.
+    - Two targets per bracket at 1/3 and 2/3 of bracket.
+    - Finds grid points whose reference predictions are closest.
+    - Appends one extra: FDA/ANVISA needs both ≥85%, others need either ≥85%.
+    - Computes f2 excluding the 0-h point.
     """
-    # 1) Extract and prepend (0,0)
+    # 1) Extract time & dissolution arrays
     t_ref  = reference_mean_df.iloc[:,0].astype(float).values
     d_ref  = reference_mean_df.iloc[:,1].astype(float).values
     t_test = test_mean_df.iloc[:,0].astype(float).values
     d_test = test_mean_df.iloc[:,1].astype(float).values
 
+    # 2) Ensure (0,0) is included
     if t_ref[0] != 0.0:
         t_ref  = np.insert(t_ref,  0, 0.0); d_ref  = np.insert(d_ref,  0, 0.0)
         t_test = np.insert(t_test, 0, 0.0); d_test = np.insert(d_test, 0, 0.0)
 
-    # 2) Build fine grid
-    grid     = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred  = np.interp(grid, t_ref,  d_ref)
-    test_pred = np.interp(grid, t_test, d_test)
+    # 3) Build fine grid
+    grid      = np.arange(0.0, window_max + 1e-8, step_hours)
+    ref_pred   = np.interp(grid, t_ref,  d_ref)
+    test_pred  = np.interp(grid, t_test, d_test)
 
-    # 3) Always include index 0 (t=0)
+    # 4) Initialize sequence with t=0 index
     seq_idxs = [0]
-    picked   = {0}
 
-    # 4) Two picks per bracket
-    for low, high in [(0,30), (30,60), (60,85)]:
-        idxs = [i for i,p in enumerate(ref_pred) if p >= low and p < high]
-        idxs = [i for i in idxs if i not in picked]
+    # 5) Two percentage-based picks per bracket
+    for low, high in [(0,30), (30,60), (60,90)]:
+        t1 = low + (high - low) / 3
+        t2 = low + 2*(high - low) / 3
+        i1 = int(np.argmin(np.abs(ref_pred - t1)))
+        i2 = int(np.argmin(np.abs(ref_pred - t2)))
+        seq_idxs.extend([i1, i2])
 
-        if len(idxs) >= 2:
-            picks = [idxs[0], idxs[-1]]
-        elif len(idxs) == 1:
-            i0 = idxs[0]
-            mid = (low + high) / 2
-            dists = [(abs(ref_pred[j] - mid), j)
-                     for j in range(len(grid)) if j != i0]
-            i1 = min(dists, key=lambda x: x[0])[1]
-            picks = sorted([i0, i1])
-        else:
-            low_d  = [(abs(ref_pred[j] - low),  j) for j in range(len(grid))]
-            high_d = [(abs(ref_pred[j] - (high - 1e-6)), j) for j in range(len(grid))]
-            i_low  = min(low_d,  key=lambda x: x[0])[1]
-            i_high = min(high_d, key=lambda x: x[0])[1]
-            picks = sorted({i_low, i_high})
+    # 6) Deduplicate & sort
+    seq_idxs = sorted(dict.fromkeys(seq_idxs))
 
-        for i in picks:
-            if i not in picked:
-                seq_idxs.append(i)
-                picked.add(i)
-
-    seq_idxs = sorted(seq_idxs)
-
-    # 5) Regulatory extra ≥85%
+    # 7) One regulatory extra ≥85%
     last = seq_idxs[-1]
     post = list(range(last+1, len(grid)))
     extra_i = None
-
-    if regulation in ("FDA", "ANVISA"):
+    if regulation in ("FDA","ANVISA"):
         for i in post:
             if ref_pred[i] >= 85 and test_pred[i] >= 85:
-                extra_i = i
-                break
+                extra_i = i; break
     else:
         for i in post:
             if ref_pred[i] >= 85 or test_pred[i] >= 85:
-                extra_i = i
-                break
-
-    # fallback if none found
+                extra_i = i; break
+    # fallback
     if extra_i is None:
         best_v, best_i = -1, None
         for i in post:
@@ -84,13 +68,14 @@ def predictive_optimal_combinations_final(reference_mean_df, test_mean_df, regul
         seq_idxs.append(extra_i)
         seq_idxs = sorted(seq_idxs)
 
-    # 6) Build sequences & compute f2 (excluding t=0)
-    seq       = [float(grid[i])      for i in seq_idxs]
-    ref_vals  = [float(ref_pred[i])  for i in seq_idxs]
+    # 8) Build final sequences & compute f2
+    seq       = [float(grid[i]) for i in seq_idxs]
+    ref_vals  = [float(ref_pred[i]) for i in seq_idxs]
     test_vals = [float(test_pred[i]) for i in seq_idxs]
+    # enforce 0%
     ref_vals[0]  = 0.0
     test_vals[0] = 0.0
-
+    # compute f2 (excluding 0)
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
     mse   = np.mean(diffs**2)
     f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
@@ -103,39 +88,38 @@ def predictive_optimal_combinations_final(reference_mean_df, test_mean_df, regul
         'ref_vals':  ref_vals,
         'test_vals': test_vals
     }], None
-##################################################3
-if input1 == 1:
-    print("According to FDA ≥ 85% guidelines\n")
 
-    # … [your existing CV checks, conventional f2, plotting] …
+# === Updated wrapper in your if input1==1 block ===
 
-    run_pred = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-    if run_pred.lower() == 'yes':
-        window_min, window_max = determine_candidate_window(
-            reference_mean_df, test_mean_df, step=5, initial_threshold=10
-        )
-        regulation_map     = {1:"FDA",2:"EMA",3:"China",4:"ASEAN",5:"ANVISA"}
-        selected_regulation = regulation_map.get(input1, "FDA")
-        print(f"\nCandidate window: {window_min} to {window_max}\n")
+# ... inside `if input1 == 1:` after computing window_min/window_max ...
+try:
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='linear',
+        points_per_stratum=None
+    )
+    print("✅ Used original predictive_optimal_combinations_advanced\n")
+except ValueError as e:
+    print(f"⚠️ Original function failed: {e}")
+    print("   Falling back to percent-targeted predictive function...\n")
+    results, _ = predictive_optimal_combinations_by_percent(
+        reference_mean_df,
+        test_mean_df,
+        selected_regulation,
+        window_max,
+        step_hours=0.25
+    )
 
-        results, _ = predictive_optimal_combinations_final(
-            reference_mean_df,
-            test_mean_df,
-            selected_regulation,
-            window_max,
-            step_hours=0.25
-        )
+# Normalize int/float
+for cand in results:
+    cand['sequence'] = [
+        int(t) if float(t).is_integer() else t
+        for t in cand['sequence']
+    ]
 
-        # Normalize types
-        for cand in results:
-            cand['sequence'] = [
-                int(t) if float(t).is_integer() else t
-                for t in cand['sequence']
-            ]
-
-        best = results[0]
-        print("=== Optimal Predictive Combination ===")
-        print(f"Time Points: {best['sequence']}")
-        print(f"Predicted f2 Score: {best['f2']}")
-
-        # … [plotting and printing best['ref_vals'], best['test_vals']] …
+# Then proceed to plot and print `results` as before
