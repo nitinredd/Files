@@ -3,61 +3,45 @@ import numpy as np
 import math
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution profile."""
     times = df.iloc[:, 0].astype(float).values
-    values = df.iloc[:, 1:].astype(float)
-    return pd.DataFrame({
-        'Time': times,
-        'Mean': values.mean(axis=1)
-    })
+    vals  = df.iloc[:, 1:].astype(float)
+    return pd.DataFrame({'Time': times, 'Mean': vals.mean(axis=1)})
 
 def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """Interpolate onto a uniform grid and enforce monotonicity."""
+    """Returns (profile, grid)."""
     grid = np.arange(0, window_max + step, step)
     prof = np.interp(grid, times, means, left=0.0, right=means[-1])
     return np.maximum.accumulate(prof), grid
 
-def select_bracket_points_v3(ref, test, grid, brackets, max_points=2):
-    """
-    For each dissolution bracket [L,U):
-      1. Find all indices where L ≤ ref < U
-      2. If none, find first idx where ref ≥ L (fallback)
-      3. From those indices pick:
-         a) the earliest
-         b) the one with smallest |test–ref|
-      4. Cap at max_points
-    """
-    selected = set()
-    # always include t=0
-    selected.add(0)
+def select_bracket_points_v5(ref, test, grid, brackets, max_per=2):
+    selected = set([0])  # always include t=0
 
     for L, U in brackets:
-        # 1. eligible
+        # eligible: ref in [L, U)
         idxs = np.where((ref >= L) & (ref < U))[0].tolist()
-        # 2. fallback if empty
+        # fallback: first ref ≥ L
         if not idxs:
-            fallback = np.where(ref >= L)[0]
-            if fallback.size:
-                idxs = [int(fallback[0])]
+            idxs = np.where(ref >= L)[0].tolist()
         if not idxs:
-            # truly no data even beyond L; skip bracket
-            continue
+            continue  # nothing even ≥ L
 
-        # 3a) earliest
-        picks = {idxs[0]}
-        # 3b) minimal error
+        picks = []
+        # always take the earliest
+        picks.append(idxs[0])
+        # if there's a second, pick the one with minimal |ref-test|
         if len(idxs) > 1:
             diffs = np.abs(test[idxs] - ref[idxs])
             best = idxs[int(np.argmin(diffs))]
-            picks.add(best)
-        # 4) cap per bracket
-        for i in sorted(picks)[:max_points]:
-            selected.add(i)
+            if best not in picks:
+                picks.append(best)
+
+        # limit to max_per
+        for ix in sorted(picks)[:max_per]:
+            selected.add(ix)
 
     return sorted(selected)
 
 def find_85_point(ref, test, grid, regulation):
-    """Locate index where both (or either) curves hit ≥85% per regulation."""
     for i in range(len(grid)):
         if regulation in ("FDA", "ANVISA"):
             if ref[i] >= 85 and test[i] >= 85:
@@ -68,18 +52,17 @@ def find_85_point(ref, test, grid, regulation):
     return None
 
 def format_results(grid, indices, ref, test, regulation):
-    """Assemble final sequences, enforce ≥7% jump, add 85% point."""
     times, rvals, tvals = [], [], []
-    last_r = -np.inf
+    last = -np.inf
+
     for i in indices:
-        if abs(ref[i] - last_r) < 7:
+        if abs(ref[i] - last) < 7:
             continue
         times.append(grid[i])
         rvals.append(ref[i])
         tvals.append(test[i])
-        last_r = ref[i]
+        last = ref[i]
 
-    # always include the 85% point if missing
     idx85 = find_85_point(ref, test, grid, regulation)
     if idx85 is not None and grid[idx85] not in times:
         times.append(grid[idx85])
@@ -87,68 +70,43 @@ def format_results(grid, indices, ref, test, regulation):
         tvals.append(test[idx85])
 
     order = np.argsort(times)
-    return ([times[i] for i in order],
-            [rvals[i]  for i in order],
-            [tvals[i]  for i in order])
+    return ([times[j] for j in order],
+            [rvals[j] for j in order],
+            [tvals[j] for j in order])
 
-def predictive_optimal_combinations_monotonic_v3(
-    reference_df, test_df,
-    regulation, window_max=12, step_hours=0.25
+def predictive_optimal_combinations_monotonic_v5(
+    ref_df, test_df, regulation,
+    window_max=12, step_hours=0.25
 ):
-    # 1. mean profiles
-    ref_m = calculate_mean_profile(reference_df)
-    test_m = calculate_mean_profile(test_df)
+    # 1. Mean
+    rm = calculate_mean_profile(ref_df)
+    tm = calculate_mean_profile(test_df)
 
-    # 2. monotonic interpolation
-    ref_prof, grid = create_monotonic_profile(
-        ref_m.Time.values, ref_m.Mean.values,
-        step_hours, window_max
-    )
-    test_prof, _ = create_monotonic_profile(
-        test_m.Time.values, test_m.Mean.values,
-        step_hours, window_max
-    )
+    # 2. Monotonic interp
+    ref_prof, grid = create_monotonic_profile(rm.Time, rm.Mean, step_hours, window_max)
+    test_prof, _    = create_monotonic_profile(tm.Time, tm.Mean, step_hours, window_max)
 
-    # 3. choose up to 2 pts per bracket
+    # 3. Bracket picking
     brackets = [(0,30), (30,60), (60,80)]
-    sel = select_bracket_points_v3(ref_prof, test_prof, grid, brackets, max_points=2)
+    idxs = select_bracket_points_v5(ref_prof, test_prof, grid, brackets, max_per=2)
 
-    # 4. format & ensure order
-    times, rvals, tvals = format_results(grid, sel, ref_prof, test_prof, regulation)
+    # 4. Format & 85%
+    times, rvals, tvals = format_results(grid, idxs, ref_prof, test_prof, regulation)
 
-    # 5. f₂ calculation (skip t=0 in RMSD)
+    # 5. f2 (skip first point in RMSD)
     if len(rvals) > 1:
         diffs = np.array(tvals[1:]) - np.array(rvals[1:])
         f2 = 50 * math.log10(100.0 / (1.0 + np.sqrt(np.mean(diffs**2))))
     else:
         f2 = 0.0
 
-    # 6. clean formatting
-    clean_times = [int(t) if t.is_integer() else round(t,2) for t in times]
-
+    # Clean rounding
+    seq = [int(t) if float(t).is_integer() else round(t,2) for t in times]
     return [{
-        'sequence': clean_times,
+        'sequence': seq,
         'f2': round(f2,2),
         'compliant': f2 >= 50,
         'reasons': [],
         'ref_vals': [round(v,2) for v in rvals],
-        'test_vals':[round(v,2) for v in tvals]
+        'test_vals': [round(v,2) for v in tvals]
     }]
-
-# --- Example: no original values in 0–30% bracket ---
-# Suppose your reference curve jumps immediately to 40% at t=0.5h
-ref_df = pd.DataFrame({
-    'Time': [0.5, 1,   2, 4, 8],
-    'D1'  : [40, 50, 60,70,90],
-    'D2'  : [42, 48, 58,68,88]
-})
-test_df = pd.DataFrame({
-    'Time': [0.5, 1,   2, 4, 8],
-    'D1'  : [38, 48, 58,65,88],
-    'D2'  : [39, 47, 57,63,85]
-})
-
-res = predictive_optimal_combinations_monotonic_v3(
-    ref_df, test_df, regulation="FDA", window_max=8, step_hours=1
-)
-print(res)
