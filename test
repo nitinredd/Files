@@ -1,138 +1,94 @@
 import pandas as pd
 import numpy as np
 import math
+import itertools
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution profile (returns numpy arrays)."""
-    times_arr = df.iloc[:, 0].astype(float).values
-    means_arr = df.iloc[:, 1:].astype(float).mean(axis=1)
-    return times_arr, means_arr
+    times = df.iloc[:, 0].astype(float).values
+    means = df.iloc[:, 1:].astype(float).mean(axis=1)
+    return times, means
 
 def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """
-    Interpolate your (time, mean) onto a uniform grid [0..window_max] with spacing=step,
-    enforce monotonic increase, and avoid any Pandas-index lookups.
-    """
-    # 1. Ensure numpy arrays
-    times_arr = np.asarray(times, dtype=float)
-    means_arr = np.asarray(means, dtype=float)
-
-    # 2. Build the grid
+    t = np.asarray(times, float)
+    m = np.asarray(means, float)
     grid = np.arange(0, window_max + step, step)
-
-    # 3. Interpolate with numpy (left=0%, right=last mean)
-    profile = np.interp(grid, times_arr, means_arr,
-                        left=0.0,
-                        right=means_arr[-1])
-
-    # 4. Enforce monotonicity
-    return np.maximum.accumulate(profile), grid
-
-def select_bracket_points_v6(ref, test, grid, brackets, max_per=2):
-    """
-    Pick up to max_per points per bracket [L,U):
-     - earliest
-     - minimal |ref-test|
-    Falls back to the first ref≥L if no points in [L,U).
-    Always includes t=0.
-    """
-    selected = {0}
-    for L, U in brackets:
-        idxs = np.where((ref >= L) & (ref < U))[0].tolist()
-        if not idxs:
-            idxs = np.where(ref >= L)[0].tolist()
-        if not idxs:
-            continue
-
-        # always pick the earliest
-        picks = {idxs[0]}
-        # if there's a second, pick the one with minimal error
-        if len(idxs) > 1:
-            diffs = np.abs(test[idxs] - ref[idxs])
-            best = idxs[int(np.argmin(diffs))]
-            picks.add(best)
-
-        # keep up to max_per
-        for ix in sorted(picks)[:max_per]:
-            selected.add(ix)
-
-    return sorted(selected)
+    prof = np.interp(grid, t, m, left=0.0, right=m[-1])
+    return np.maximum.accumulate(prof), grid
 
 def find_85_point(ref, test, regulation):
-    """Return the first index where curves hit ≥85% per regulation."""
-    for i in range(len(ref)):
+    for i,(r,t) in enumerate(zip(ref,test)):
         if regulation in ("FDA","ANVISA"):
-            if ref[i] >= 85 and test[i] >= 85:
+            if r>=85 and t>=85:
                 return i
         else:
-            if ref[i] >= 85 or test[i] >= 85:
+            if r>=85 or t>=85:
                 return i
     return None
 
-def format_results(grid, idxs, ref, test, regulation):
-    """Enforce ≥7% jumps, add the 85% point, and sort chronologically."""
-    times, rvals, tvals = [], [], []
-    last = -np.inf
-    for i in idxs:
-        if abs(ref[i] - last) < 7:
-            continue
-        times.append(grid[i])
-        rvals.append(ref[i])
-        tvals.append(test[i])
-        last = ref[i]
+def f2_score(ref_vals, test_vals):
+    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
+    return 50 * math.log10(100.0 / (1.0 + np.sqrt(np.mean(diffs**2)))) if len(diffs)>0 else 0.0
 
-    idx85 = find_85_point(ref, test, regulation)
-    if idx85 is not None and grid[idx85] not in times:
-        times.append(grid[idx85])
-        rvals.append(ref[idx85])
-        tvals.append(test[idx85])
+def optimal_timepoints(reference_df, test_df, regulation,
+                       window_max=12, step_hours=0.25):
+    # 1) interpolate
+    rt, rm = calculate_mean_profile(reference_df)
+    tt, tm = calculate_mean_profile(test_df)
+    ref_prof, grid = create_monotonic_profile(rt, rm, step_hours, window_max)
+    test_prof, _   = create_monotonic_profile(tt, tm, step_hours, window_max)
 
-    order = np.argsort(times)
-    return ([times[i] for i in order],
-            [rvals[i]  for i in order],
-            [tvals[i]  for i in order])
+    # 2) find 85% index
+    idx85 = find_85_point(ref_prof, test_prof, regulation)
 
-def predictive_optimal_combinations_monotonic_v6(
-    reference_df, test_df,
-    regulation,
-    window_max=12,
-    step_hours=0.25
-):
-    # 1. Get raw mean‐profiles as numpy arrays
-    ref_times, ref_means = calculate_mean_profile(reference_df)
-    t_times,   t_means   = calculate_mean_profile(test_df)
-
-    # 2. Interpolate & enforce monotonicity
-    ref_prof, grid = create_monotonic_profile(
-        ref_times, ref_means,
-        step=step_hours, window_max=window_max
-    )
-    test_prof, _   = create_monotonic_profile(
-        t_times, t_means,
-        step=step_hours, window_max=window_max
-    )
-
-    # 3. Bracket selection
+    # 3) per-bracket candidates (ensure at least one via fallback)
     brackets = [(0,30), (30,60), (60,80)]
-    idxs = select_bracket_points_v6(ref_prof, test_prof, grid, brackets, max_per=2)
+    bracket_cands = []
+    for L,U in brackets:
+        idxs = list(np.where((ref_prof>=L)&(ref_prof<U))[0])
+        if not idxs:
+            fb = list(np.where(ref_prof>=L)[0])
+            if fb: idxs = [fb[0]]
+        bracket_cands.append(idxs)
 
-    # 4. Format & include 85% point
-    times, rvals, tvals = format_results(grid, idxs, ref_prof, test_prof, regulation)
+    # 4) build all valid selections (0–2 per bracket), plus t=0 always
+    all_designs = []
+    for picks0 in itertools.combinations(bracket_cands[0], r=min(2,len(bracket_cands[0]))):
+      for picks1 in itertools.combinations(bracket_cands[1], r=min(2,len(bracket_cands[1]))):
+        for picks2 in itertools.combinations(bracket_cands[2], r=min(2,len(bracket_cands[2]))):
+            base = {0, *picks0, *picks1, *picks2}
+            if idx85 is not None:
+                base.add(idx85)
+            all_designs.append(sorted(base))
 
-    # 5. Compute f₂ (skip the first point in RMSD)
-    if len(rvals) > 1:
-        diffs = np.array(tvals[1:]) - np.array(rvals[1:])
-        f2 = 50 * math.log10(100.0 / (1.0 + np.sqrt(np.mean(diffs**2))))
-    else:
-        f2 = 0.0
+    # 5) evaluate each design
+    best = None
+    best_f2 = -1
+    for design in all_designs:
+        # apply ≥7% jump filter
+        times, rvals, tvals = [],[],[]
+        last_r = -np.inf
+        for i in design:
+            if abs(ref_prof[i]-last_r) < 7: 
+                continue
+            times.append(grid[i]); rvals.append(ref_prof[i]); tvals.append(test_prof[i])
+            last_r = ref_prof[i]
+        if len(rvals)<2: 
+            continue
+        score = f2_score(rvals, tvals)
+        if score > best_f2:
+            best_f2 = score
+            best = (times, rvals, tvals, score)
 
-    # 6. Clean formatting
+    # 6) format output
+    if best is None:
+        return [], "No valid design found"
+    times, rvals, tvals, f2 = best
     sequence = [int(t) if t.is_integer() else round(t,2) for t in times]
     return [{
-        'sequence': sequence,
-        'f2': round(f2,2),
-        'compliant': f2 >= 50,
-        'reasons': [],
-        'ref_vals':  [round(v,2) for v in rvals],
-        'test_vals': [round(v,2) for v in tvals]
-    }]
+      'sequence': sequence,
+      'f2': round(f2,2),
+      'compliant': f2>=50,
+      'reasons': [],
+      'ref_vals':[round(v,2) for v in rvals],
+      'test_vals':[round(v,2) for v in tvals]
+    }], None
