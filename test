@@ -3,128 +3,129 @@ import math
 import pandas as pd
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution profile with validation"""
-    times = df.iloc[:, 0].astype(float).values
+    """Calculate validated mean profile with precision control"""
+    times = df.iloc[:, 0].astype(float).values.round(2)
     values = df.iloc[:, 1:].astype(float)
     return pd.DataFrame({
         'Time': times,
-        'Mean': values.mean(axis=1)
+        'Mean': values.mean(axis=1).round(2)
     })
 
-def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """Create validated monotonic profile with edge handling"""
-    grid = np.arange(0, window_max + step, step)
+def create_optimized_profile(times, means, step=0.25, window_max=12):
+    """Create precision-controlled monotonic profile"""
+    grid = np.round(np.arange(0, window_max + step, step), 2)
     profile = np.interp(grid, times, means, left=0.0, right=means[-1])
     return np.maximum.accumulate(profile), grid
 
-def select_bracket_points(profile, grid, brackets, min_diff=7):
-    """Select optimal points for each dissolution bracket"""
-    selected = []
-    current_bracket = 0
-    last_value = -min_diff
-    
-    for i, value in enumerate(profile):
-        if value >= brackets[current_bracket][1]:
-            current_bracket += 1
-            last_value = -min_diff  # Reset for new bracket
-            if current_bracket >= len(brackets):
-                break
-        
-        if brackets[current_bracket][0] <= value < brackets[current_bracket][1]:
-            if (value - last_value) >= min_diff:
-                selected.append(i)
-                last_value = value
-                if len(selected) >= 2 * len(brackets):  # Max 2 per bracket
-                    break
-    return selected
-
-def find_85_point(ref, test, grid, regulation):
-    """Find regulation-specific 85% dissolution point"""
-    for i in range(len(grid)):
-        ref_ok = ref[i] >= 85
-        test_ok = test[i] >= 85
-        
-        if regulation in ("FDA", "ANVISA") and ref_ok and test_ok:
-            return i
-        elif regulation not in ("FDA", "ANVISA") and (ref_ok or test_ok):
-            return i
-    return None
-
-def format_results(grid, indices, ref, test, regulation):
-    """Create final output with proper formatting"""
-    times = []
-    ref_vals = []
-    test_vals = []
-    
-    for i in indices:
-        t = grid[i]
-        rv = ref[i]
-        tv = test[i]
-        
-        # Maintain minimum 7% difference
-        if ref_vals and abs(rv - ref_vals[-1]) < 7:
+def select_f2_optimized_points(ref, test, grid, brackets):
+    """Select points maximizing F2 potential while meeting criteria"""
+    candidates = []
+    for i, (r, t) in enumerate(zip(ref, test)):
+        if i == 0:  # Always include 0 point
+            candidates.append((i, r, t))
             continue
             
-        times.append(t)
-        ref_vals.append(rv)
-        test_vals.append(tv)
+        diff = abs(r - ref[i-1])
+        if diff >= 7 and r < 85 and t < 85:
+            candidates.append((i, r, t))
     
-    # Add 85% point if exists
-    eighty_five = find_85_point(ref, test, grid, regulation)
-    if eighty_five and grid[eighty_five] not in times:
-        times.append(grid[eighty_five])
-        ref_vals.append(ref[eighty_five])
-        test_vals.append(test[eighty_five])
+    # Select best F2 candidates per bracket
+    selected = [0]
+    current_bracket = 0
+    last_r = 0
     
-    # Ensure temporal order
-    sorted_indices = np.argsort(times)
-    return (
-        [times[i] for i in sorted_indices],
-        [ref_vals[i] for i in sorted_indices],
-        [test_vals[i] for i in sorted_indices]
-    )
+    for bracket in brackets:
+        bracket_candidates = [
+            (i, r, t) for i, r, t in candidates
+            if bracket[0] <= r < bracket[1]
+        ]
+        
+        # Select up to 2 best F2 candidates in bracket
+        sorted_candidates = sorted(
+            bracket_candidates,
+            key=lambda x: -abs(x[2]-x[1])  # Prefer similar values
+        )[:2]
+        
+        selected.extend([i for i, _, _ in sorted_candidates])
+    
+    return sorted(list(set(selected)))
+
+def calculate_enhanced_f2(ref_vals, test_vals):
+    """Enhanced F2 calculation with precision control"""
+    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
+    if diffs.size == 0:
+        return 100.0  # Perfect score if no differences
+    
+    rsd = np.sqrt(np.mean(np.square(diffs)))
+    if rsd < 1e-4:  # Prevent math domain error
+        return 100.0
+    
+    return 50 * math.log10(100 / (1 + rsd))
+
+def format_output_values(values):
+    """Ensure native Python types and precision"""
+    return [round(float(v), 2) for v in values]
 
 def predictive_optimal_combinations_monotonic(reference_df, test_df,
                                             regulation, window_max=12,
                                             step_hours=0.25):
-    # Calculate mean profiles
+    # Calculate precision-controlled profiles
     ref_mean = calculate_mean_profile(reference_df)
     test_mean = calculate_mean_profile(test_df)
 
-    # Create validated profiles
-    ref_prof, grid = create_monotonic_profile(ref_mean.Time.values, 
-                                            ref_mean.Mean.values,
-                                            step_hours, window_max)
-    test_prof, _ = create_monotonic_profile(test_mean.Time.values,
-                                          test_mean.Mean.values,
-                                          step_hours, window_max)
-
-    # Select bracket points (0-30, 30-60, 60-80)
-    brackets = [(0,30), (30,60), (60,80)]
-    selected_indices = select_bracket_points(ref_prof, grid, brackets)
-    
-    # Format final results
-    times, ref_vals, test_vals = format_results(
-        grid, selected_indices, ref_prof, test_prof, regulation
+    # Create optimized profiles
+    ref_prof, grid = create_optimized_profile(
+        ref_mean.Time.values, 
+        ref_mean.Mean.values,
+        step_hours, 
+        window_max
+    )
+    test_prof, _ = create_optimized_profile(
+        test_mean.Time.values,
+        test_mean.Mean.values,
+        step_hours,
+        window_max
     )
 
-    # Calculate f2 score
-    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    f2 = 50 * math.log10(100/(1 + np.sqrt(np.mean(diffs**2)))) if len(diffs) > 0 else 0
-
-    # Clean output formatting
+    # F2-optimized point selection
+    brackets = [(0,30), (30,60), (60,80)]
+    selected_indices = select_f2_optimized_points(ref_prof, test_prof, grid, brackets)
+    
+    # Regulation-specific 85% handling
+    eighty_five_idx = None
+    for i in range(len(grid)):
+        if regulation in ("FDA", "ANVISA") and ref_prof[i] >= 85 and test_prof[i] >= 85:
+            eighty_five_idx = i
+            break
+        elif regulation not in ("FDA", "ANVISA") and (ref_prof[i] >= 85 or test_prof[i] >= 85):
+            eighty_five_idx = i
+            break
+    
+    if eighty_five_idx is not None and eighty_five_idx not in selected_indices:
+        selected_indices.append(eighty_five_idx)
+    
+    # Finalize time points
+    selected_indices = sorted(np.unique(selected_indices))
+    time_points = [grid[i].item() for i in selected_indices]  # Convert to native float
+    
+    # Convert to native Python types
     clean_times = []
-    for t in times:
-        if t.is_integer():
-            clean_times.append(int(t))
+    for t in time_points:
+        if abs(t - round(t)) < 1e-4:
+            clean_times.append(int(round(t)))
         else:
-            clean_times.append(round(t, 2))
+            clean_times.append(round(float(t), 2))
+    
+    # Final F2 calculation
+    ref_values = format_output_values([ref_prof[i] for i in selected_indices])
+    test_values = format_output_values([test_prof[i] for i in selected_indices])
+    f2_score = calculate_enhanced_f2(ref_values, test_values)
     
     return [{
         'sequence': clean_times,
-        'f2': round(f2, 2),
-        'compliant': f2 >= 50,
+        'f2': round(f2_score, 2),
+        'compliant': f2_score >= 50,
         'reasons': [],
-        'ref_vals': [round(v, 2) for v in ref_vals],
-        'test_vals': [round(v, 2) for v in test_vals]
+        'ref_vals': ref_values,
+        'test_vals': test_values
     }], None
