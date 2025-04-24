@@ -1,9 +1,9 @@
 import numpy as np
 import math
 
-def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
-                                               regulation, window_max,
-                                               step_hours=0.25):
+def predictive_optimal_combinations_monotonic(reference_mean_df, test_mean_df,
+                                            regulation, window_max,
+                                            step_hours=0.25):
     t_ref  = reference_mean_df.iloc[:,0].astype(float).values
     d_ref  = reference_mean_df.iloc[:,1].astype(float).values
     t_test = test_mean_df.iloc[:,0].astype(float).values
@@ -11,56 +11,63 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
     if t_ref[0] != 0.0:
         t_ref  = np.insert(t_ref,  0, 0.0); d_ref  = np.insert(d_ref,  0, 0.0)
         t_test = np.insert(t_test, 0, 0.0); d_test = np.insert(d_test, 0, 0.0)
-
-    grid      = np.arange(0.0, window_max + 1e-8, step_hours)
+    grid = np.arange(0.0, window_max + 1e-8, step_hours)
     ref_pred  = np.interp(grid, t_ref,  d_ref)
     test_pred = np.interp(grid, t_test, d_test)
-
-    seq  = [0.0]
-    seen = {0.0}
-
-    for pct in [10, 20, 40, 50, 70, 80]:
-        raw  = np.interp(pct, ref_pred, grid) if pct <= ref_pred[-1] else grid[-1]
-        idx  = int(np.argmin(np.abs(grid - raw)))
-        t_pt = float(grid[idx])
-        if t_pt not in seen:
-            seen.add(t_pt)
-            seq.append(t_pt)
-
-    raw_ref85  = np.interp(85,  ref_pred,  grid) if ref_pred[-1] >= 85 else grid[-1]
-    raw_test85 = np.interp(85,  test_pred, grid) if test_pred[-1] >= 85 else grid[-1]
-    if regulation in ("FDA", "ANVISA"):
-        raw_extra = max(raw_ref85, raw_test85)
+    ref_mon   = np.maximum.accumulate(ref_pred)
+    test_mon  = np.maximum.accumulate(test_pred)
+    seq_idxs = [0]
+    brackets = [(0,30),(30,60),(60,80)]
+    for low,high in brackets:
+        mid1 = low + (high-low)/3
+        mid2 = low + 2*(high-low)/3
+        i1 = int(np.argmin(np.abs(ref_mon - mid1)))
+        d2 = np.abs(ref_mon - mid2)
+        if np.argmin(d2) == i1:
+            d2[i1] = np.inf
+        i2 = int(np.argmin(d2))
+        seq_idxs.extend([i1,i2])
+    seq_idxs = sorted(set(seq_idxs))
+    last_idx = seq_idxs[-1]
+    post = [i for i in range(last_idx+1, len(grid))]
+    extra_idx = None
+    if regulation in ("FDA","ANVISA"):
+        for i in post:
+            if ref_mon[i]>=85 and test_mon[i]>=85:
+                extra_idx = i; break
     else:
-        raw_extra = min(raw_ref85, raw_test85)
-    idx_extra = int(np.argmin(np.abs(grid - raw_extra)))
-    extra     = float(grid[idx_extra])
-    if extra not in seen:
-        seq.append(extra)
-
-    seq = sorted(set(seq))
-
-    ref_vals  = [float(np.interp(t, grid, ref_pred))  for t in seq]
-    test_vals = [float(np.interp(t, grid, test_pred)) for t in seq]
-    ref_vals[0]  = 0.0
-    test_vals[0] = 0.0
+        for i in post:
+            if ref_mon[i]>=85 or test_mon[i]>=85:
+                extra_idx = i; break
+    if extra_idx is None:
+        best_v,best_i = -1,None
+        for i in post:
+            v = min(ref_mon[i], test_mon[i])
+            if v>best_v:
+                best_v,best_i = v,i
+        extra_idx = best_i
+    if extra_idx not in seq_idxs and extra_idx is not None:
+        seq_idxs.append(extra_idx)
+        seq_idxs = sorted(seq_idxs)
+    seq = [float(grid[i]) for i in seq_idxs]
+    ref_vals  = [float(ref_pred[i]) for i in seq_idxs]
+    test_vals = [float(test_pred[i]) for i in seq_idxs]
+    ref_vals[0]=0.0; test_vals[0]=0.0
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    mse   = np.mean(diffs**2)
-    f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
-
+    f2    = 50*math.log10(100/(1+math.sqrt(np.mean(diffs**2))))
     return [{
-        'sequence':  seq,
-        'f2':        round(f2, 2),
+        'sequence': seq,
+        'f2': round(f2,2),
         'compliant': True,
-        'reasons':   [],
-        'ref_vals':  ref_vals,
+        'reasons': [],
+        'ref_vals': ref_vals,
         'test_vals': test_vals
     }], None
 
+# In your if input1==1 block, fallback to the new function:
 try:
     results, all_results = predictive_optimal_combinations_advanced(
-        reference_mean_df,
-        test_mean_df,
+        reference_mean_df, test_mean_df,
         regulation=selected_regulation,
         window_min=window_min,
         window_max=window_max,
@@ -68,20 +75,11 @@ try:
         interp_method='linear',
         points_per_stratum=None
     )
-    print("✅ Used original predictive_optimal_combinations_advanced\n")
-except ValueError as e:
-    print(f"⚠️ Original function failed: {e}")
-    print("   Falling back to percent-targeted predictive function...\n")
-    results, _ = predictive_optimal_combinations_by_percent(
-        reference_mean_df,
-        test_mean_df,
-        selected_regulation,
-        window_max,
+except ValueError:
+    results, _ = predictive_optimal_combinations_monotonic(
+        reference_mean_df, test_mean_df,
+        selected_regulation, window_max,
         step_hours=0.25
     )
-
 for cand in results:
-    cand['sequence'] = [
-        int(t) if float(t).is_integer() else t
-        for t in cand['sequence']
-    ]
+    cand['sequence'] = [int(t) if float(t).is_integer() else t for t in cand['sequence']]
