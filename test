@@ -4,102 +4,83 @@ import math
 def predictive_optimal_combinations_final(ref_df, test_df, regulation,
                                           window_max, step_hours=0.25):
     """
-    1. Ensure a (0 h, 0%) point for interpolation.
-    2. Build a fine grid from 0 to window_max in step_hours.
-    3. Always include t=0 in the sequence (0% dissolution; excluded from f2).
-    4. For each dissolution stratum (0–30, 30–60, 60–90):
-         • Define a target at the midpoint (15, 45, 75).
-         • From grid times whose ref_pred is in that stratum, pick the two
-           with smallest |ref_pred − target|.
-         • If only one in‐stratum, pick that one plus the overall best match.
-         • If none, pick the grid times closest to the stratum bounds.
-    5. Append a single “regulatory” extra point > the last pick:
-         – FDA/ANVISA: first time where both ref & test ≥85%
-         – EMA/China/ASEAN: first time where either ≥85%
-    6. Compute f2 excluding the 0 h point.
+    ref_df / test_df each have columns ['time', 'diss'] (diss = mean %).
+    regulation ∈ {"FDA","ANVISA","EMA","China","ASEAN"}.
     """
-    # 1) Prepend 0h=0% if necessary
-    if ref_df.iloc[0, 0] != 0:
-        ref_df = ref_df.copy()
-        ref_df.loc[-1] = [0, 0]
-        ref_df.index = ref_df.index + 1
-        ref_df = ref_df.sort_index().reset_index(drop=True)
-    if test_df.iloc[0, 0] != 0:
-        test_df = test_df.copy()
-        test_df.loc[-1] = [0, 0]
-        test_df.index = test_df.index + 1
-        test_df = test_df.sort_index().reset_index(drop=True)
+    # 1) Build grid 0→window_max
+    times = np.arange(0.0, window_max + 1e-8, step_hours)
+    ref_pred  = np.array(np.interp(times, ref_df['time'],  ref_df['diss']),  dtype=float)
+    test_pred = np.array(np.interp(times, test_df['time'], test_df['diss']), dtype=float)
 
-    # 2) Grid + interpolation
-    times_all = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred  = np.array(interpolate_linear(ref_df,  times_all), dtype=float)
-    test_pred = np.array(interpolate_linear(test_df, times_all), dtype=float)
+    # 2) Always start with t=0
+    seq_idxs = [0]  # index into `times`
 
-    # 3) Initialize
-    seq = [0.0]
-    picked = {0.0}
-
-    # 4) Stratum‐target picks
-    for low, high, target in [(0,30,15), (30,60,45), (60,90,75)]:
-        # indices in the stratum
-        idxs_in = [i for i, rp in enumerate(ref_pred)
-                   if rp >= low and rp < high and times_all[i] not in picked]
-        if len(idxs_in) >= 2:
-            # two closest to the midpoint
-            dists = sorted([(abs(ref_pred[i] - target), i) for i in idxs_in])
-            idx1, idx2 = dists[0][1], dists[1][1]
-            picks = sorted([times_all[idx1], times_all[idx2]])
-        elif len(idxs_in) == 1:
-            i0 = idxs_in[0]
-            # find overall best second match
-            dists = [(abs(ref_pred[j] - target), j)
-                     for j in range(len(times_all)) if j != i0]
-            j_best = min(dists, key=lambda x: x[0])[1]
-            picks = sorted([times_all[i0], times_all[j_best]])
+    # 3) Three percent‐brackets
+    for low, high in [(0,30), (30,60), (60,80)]:
+        # indices whose ref_pred ∈ [low, high)
+        idxs = [i for i,p in enumerate(ref_pred) if p >= low and p < high]
+        if len(idxs) >= 2:
+            pick = [idxs[0], idxs[-1]]
+        elif len(idxs) == 1:
+            i0 = idxs[0]
+            mid = (low + high) / 2
+            # find grid‐point closest to that midpoint
+            dists = [(abs(ref_pred[j] - mid), j) for j in range(len(times)) if j != i0]
+            i1 = min(dists, key=lambda x: x[0])[1]
+            pick = sorted([i0, i1])
         else:
-            # no in‐stratum; pick closest to bounds
-            d_low  = [(abs(ref_pred[i] - (low + 1e-3)), i) for i in range(len(times_all))]
-            d_high = [(abs(ref_pred[i] - (high - 1e-3)), i) for i in range(len(times_all))]
-            i_low  = min(d_low,  key=lambda x: x[0])[1]
-            i_high = min(d_high, key=lambda x: x[0])[1]
-            picks = sorted({times_all[i_low], times_all[i_high]})
+            # no hits: pick closest to the low‐edge and high‐edge
+            low_d  = [(abs(ref_pred[j] - low),  j) for j in range(len(times))]
+            high_d = [(abs(ref_pred[j] - (high - 1e-6)), j) for j in range(len(times))]
+            i_low  = min(low_d,  key=lambda x: x[0])[1]
+            i_high = min(high_d, key=lambda x: x[0])[1]
+            pick = sorted({i_low, i_high})
+        seq_idxs.extend(pick)
 
-        # add to sequence
-        for t in picks:
-            if t not in picked:
-                seq.append(t)
-                picked.add(t)
+    # de‐dupe & keep in time order
+    seq_idxs = sorted(dict.fromkeys(seq_idxs))  # preserves order
 
-    seq = sorted(seq)
+    # 4) FDA/ANVISA extra point > last
+    last_i = seq_idxs[-1]
+    post   = list(range(last_i+1, len(times)))
+    extra_i = None
 
-    # 5) Regulatory extra point
-    last = seq[-1]
-    post = [t for t in times_all if t > last]
-    extra = None
-    if regulation in ("FDA", "ANVISA"):
-        for t in post:
-            i = int(np.where(times_all == t)[0][0])
+    if regulation in ("FDA","ANVISA"):
+        for i in post:
             if ref_pred[i] >= 85 and test_pred[i] >= 85:
-                extra = t
+                extra_i = i
                 break
     else:
-        for t in post:
-            i = int(np.where(times_all == t)[0][0])
+        for i in post:
             if ref_pred[i] >= 85 or test_pred[i] >= 85:
-                extra = t
+                extra_i = i
                 break
-    if extra is not None and extra not in picked:
-        seq.append(float(extra))
-        seq = sorted(seq)
 
-    # 6) Compute f2 (excluding t=0)
-    idxs = [int(np.where(times_all == t)[0][0]) for t in seq]
-    rvals = ref_pred[idxs].copy()
-    tvals = test_pred[idxs].copy()
-    # force 0% at start
-    rvals[0] = tvals[0] = 0.0
-    diffs = tvals[1:] - rvals[1:]
-    mse   = np.mean(diffs ** 2)
+    if extra_i is None:
+        # fallback: pick the post‐time that maximizes min(ref, test)
+        best_v, best_i = -1, None
+        for i in post:
+            v = min(ref_pred[i], test_pred[i])
+            if v > best_v:
+                best_v, best_i = v, i
+        extra_i = best_i
+
+    if extra_i is not None and extra_i not in seq_idxs:
+        seq_idxs.append(extra_i)
+        seq_idxs = sorted(seq_idxs)
+
+    # 5) Build actual time points & values
+    seq = [float(times[i]) for i in seq_idxs]
+    ref_vals  = [float(ref_pred[i])  for i in seq_idxs]
+    test_vals = [float(test_pred[i]) for i in seq_idxs]
+
+    # force 0% at t=0
+    ref_vals[0]  = 0.0
+    test_vals[0] = 0.0
+
+    # 6) Compute f2 EXCLUDING the first point
+    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
+    mse   = np.mean(diffs**2)
     f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
 
     return [{
@@ -107,73 +88,38 @@ def predictive_optimal_combinations_final(ref_df, test_df, regulation,
         'f2':        round(f2, 2),
         'compliant': True,
         'reasons':   [],
-        'ref_vals':  [float(v) for v in rvals],
-        'test_vals': [float(v) for v in tvals],
+        'ref_vals':  ref_vals,
+        'test_vals': test_vals,
     }], None
-#####################
+###############################################
 if input1 == 1:
-    print("According to FDA ≥ 85% guidelines\n")
+    # … your existing FDA‐rule checks/plots here …
 
-    # 1) Criteria & CV
-    both_85 = check_both_85(reference_df, test_df)
-    print("Both ≥ 85% criterion met:   ", both_85)
-    cv_check = check_cv(test_df) and check_cv(reference_df)
-    print("\nCV <20 at first non-zero, <10 thereafter:", cv_check, "\n")
-
-    # Drop t=0 rows
-    reference_df = reference_df[reference_df.iloc[:,0] != 0].reset_index(drop=True)
-    test_df      = test_df[test_df.iloc[:,0] != 0].reset_index(drop=True)
-
-    # 2) Conventional FDA f2
-    if not check_same_time_points(reference_df, test_df):
-        print("Error: time points do not match. Cannot proceed.")
-    else:
-        try:
-            f2_conv, f2_exp, ref_trim, test_trim = calculate_f2_fda(reference_df, test_df)
-            # … (print & plot trimmed results) …
-        except ValueError as e:
-            print("❌", e)
-            print("Cannot perform FDA‐rule f2 calculation.")
-
-    # 3) Predictive analysis?
     run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
     if run_predictive.lower() == 'yes':
         window_min, window_max = determine_candidate_window(
-            reference_mean_df, test_mean_df,
-            step=5, initial_threshold=10
+            reference_mean_df,
+            test_mean_df,
+            step=5,
+            initial_threshold=10
         )
         regulation_map     = {1:"FDA",2:"EMA",3:"China",4:"ASEAN",5:"ANVISA"}
         selected_regulation = regulation_map.get(input1, "FDA")
         print(f"\nCandidate window: {window_min} to {window_max}\n")
 
-        try:
-            # first, original
-            results, _ = predictive_optimal_combinations_advanced(
-                reference_mean_df,
-                test_mean_df,
-                regulation         = selected_regulation,
-                window_min         = window_min,
-                window_max         = window_max,
-                diff_threshold     = None,
-                interp_method      = 'linear',
-                points_per_stratum = None
-            )
-            print("✅ Used original integer‐grid function\n")
-        except ValueError as e:
-            print(f"⚠️ Original function failed: {e}")
-            print("   Falling back to bracket‐target selection...\n")
-            results, _ = predictive_optimal_combinations_final(
-                reference_mean_df,
-                test_mean_df,
-                selected_regulation,
-                window_max,
-                step_hours=0.25
-            )
+        # Always use the new “final” function for robust behavior
+        results, _ = predictive_optimal_combinations_final(
+            reference_mean_df,
+            test_mean_df,
+            selected_regulation,
+            window_max,
+            step_hours=0.25
+        )
 
-        # normalize sequence as python float/int
+        # Clean up sequence types
         for cand in results:
             cand['sequence'] = [
-                int(t) if float(t).is_integer() else float(t)
+                int(t) if float(t).is_integer() else t
                 for t in cand['sequence']
             ]
 
@@ -182,36 +128,4 @@ if input1 == 1:
         print(f"Time Points: {best['sequence']}")
         print(f"Predicted f2 Score: {best['f2']}")
 
-        # Plot predicted curves
-        import matplotlib.pyplot as plt
-        from matplotlib.ticker import MaxNLocator
-
-        seq      = best['sequence']
-        ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(seq), method='linear')
-        test_diss= interpolate_dissolution_curve(test_mean_df,      np.array(seq), method='linear')
-        # force 0% at start
-        ref_diss[0] = test_diss[0] = 0.0
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(seq, ref_diss,  'bo-', label='Reference')
-        plt.plot(seq, test_diss, 'r*--', label='Test')
-        plt.title(f"Optimal Profile (f2 = {best['f2']})")
-        plt.xlabel('Time (h)')
-        plt.ylabel('Dissolution (%)')
-        plt.grid(True)
-        plt.gca().yaxis.set_major_locator(MaxNLocator(integer=True))
-        plt.legend()
-        plt.show()
-
-        # Print predicted values
-        print("\nPredicted Reference Dissolution (%):")
-        for t, d in zip(seq, ref_diss):
-            print(f"  {t} h: {d:.2f}%")
-        print("\nPredicted Test Dissolution (%):")
-        for t, d in zip(seq, test_diss):
-            print(f"  {t} h: {d:.2f}%")
-
-        # List all candidates
-        print("\n=== All Candidate Combinations ===")
-        for i, cand in enumerate(results, 1):
-            print(f"{i:2d}. Points: {cand['sequence']} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+        # … (your plotting & printing of best['ref_vals'] / best['test_vals']) …
