@@ -1,73 +1,116 @@
 import numpy as np
 import math
 
-def predictive_optimal_combinations_targeted(ref_df, test_df, regulation,
-                                             window_max, step_hours=0.25):
+def predictive_optimal_combinations_final(ref_df, test_df, regulation,
+                                          window_max, step_hours=0.25):
     """
-    1. Build a uniform grid from 0 to window_max in step_hours.
-    2. Always include t=0 (0% dissolution; excluded from f2 calc).
-    3. For each dissolution stratum (0–30, 30–60, 60–90):
-         • Compute two “target” %’s at 1/3 and 2/3 through the stratum.
-         • Pick the grid times whose ref_pred is closest to those targets.
-    4. Append one “regulatory extra” point after the last candidate:
+    1. Ensure a (0 h, 0%) point for interpolation.
+    2. Build a fine grid from 0 to window_max in step_hours.
+    3. Always include t=0 in the sequence (0% dissolution; excluded from f2).
+    4. For each dissolution stratum (0–30, 30–60, 60–90):
+         • Define a target at the midpoint (15, 45, 75).
+         • From grid times whose ref_pred is in that stratum, pick the two
+           with smallest |ref_pred − target|.
+         • If only one in‐stratum, pick that one plus the overall best match.
+         • If none, pick the grid times closest to the stratum bounds.
+    5. Append a single “regulatory” extra point > the last pick:
          – FDA/ANVISA: first time where both ref & test ≥85%
-         – EMA/China/ASEAN: first time where either ref or test ≥85%
-    5. Compute f2 excluding the 0-h point.
+         – EMA/China/ASEAN: first time where either ≥85%
+    6. Compute f2 excluding the 0 h point.
     """
-    # 1) Grid + interpolation
-    valid_times   = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred      = np.array(interpolate_linear(ref_df,  valid_times), dtype=float)
-    test_pred     = np.array(interpolate_linear(test_df, valid_times), dtype=float)
+    # 1) Prepend 0h=0% if necessary
+    if ref_df.iloc[0, 0] != 0:
+        ref_df = ref_df.copy()
+        ref_df.loc[-1] = [0, 0]
+        ref_df.index = ref_df.index + 1
+        ref_df = ref_df.sort_index().reset_index(drop=True)
+    if test_df.iloc[0, 0] != 0:
+        test_df = test_df.copy()
+        test_df.loc[-1] = [0, 0]
+        test_df.index = test_df.index + 1
+        test_df = test_df.sort_index().reset_index(drop=True)
 
-    # 2) Always include zero
-    candidate = {0.0}
+    # 2) Grid + interpolation
+    times_all = np.arange(0.0, window_max + 1e-8, step_hours)
+    ref_pred  = np.array(interpolate_linear(ref_df,  times_all), dtype=float)
+    test_pred = np.array(interpolate_linear(test_df, times_all), dtype=float)
 
-    # 3) Bracket picks at 1/3 and 2/3 dissolution
-    for low, high in [(0,30), (30,60), (60,90)]:
-        span = high - low
-        targets = [low + span/3, low + 2*span/3]
-        for tgt in targets:
-            idx = int(np.argmin(np.abs(ref_pred - tgt)))
-            candidate.add(round(valid_times[idx], 3))
+    # 3) Initialize
+    seq = [0.0]
+    picked = {0.0}
 
-    # 4) Regulatory extra after last candidate
-    last = max(candidate)
-    post = valid_times[valid_times > last]
+    # 4) Stratum‐target picks
+    for low, high, target in [(0,30,15), (30,60,45), (60,90,75)]:
+        # indices in the stratum
+        idxs_in = [i for i, rp in enumerate(ref_pred)
+                   if rp >= low and rp < high and times_all[i] not in picked]
+        if len(idxs_in) >= 2:
+            # two closest to the midpoint
+            dists = sorted([(abs(ref_pred[i] - target), i) for i in idxs_in])
+            idx1, idx2 = dists[0][1], dists[1][1]
+            picks = sorted([times_all[idx1], times_all[idx2]])
+        elif len(idxs_in) == 1:
+            i0 = idxs_in[0]
+            # find overall best second match
+            dists = [(abs(ref_pred[j] - target), j)
+                     for j in range(len(times_all)) if j != i0]
+            j_best = min(dists, key=lambda x: x[0])[1]
+            picks = sorted([times_all[i0], times_all[j_best]])
+        else:
+            # no in‐stratum; pick closest to bounds
+            d_low  = [(abs(ref_pred[i] - (low + 1e-3)), i) for i in range(len(times_all))]
+            d_high = [(abs(ref_pred[i] - (high - 1e-3)), i) for i in range(len(times_all))]
+            i_low  = min(d_low,  key=lambda x: x[0])[1]
+            i_high = min(d_high, key=lambda x: x[0])[1]
+            picks = sorted({times_all[i_low], times_all[i_high]})
+
+        # add to sequence
+        for t in picks:
+            if t not in picked:
+                seq.append(t)
+                picked.add(t)
+
+    seq = sorted(seq)
+
+    # 5) Regulatory extra point
+    last = seq[-1]
+    post = [t for t in times_all if t > last]
     extra = None
     if regulation in ("FDA", "ANVISA"):
         for t in post:
-            i = int(np.where(valid_times == t)[0][0])
+            i = int(np.where(times_all == t)[0][0])
             if ref_pred[i] >= 85 and test_pred[i] >= 85:
                 extra = t
                 break
     else:
         for t in post:
-            i = int(np.where(valid_times == t)[0][0])
+            i = int(np.where(times_all == t)[0][0])
             if ref_pred[i] >= 85 or test_pred[i] >= 85:
                 extra = t
                 break
-    if extra is not None:
-        candidate.add(round(extra, 3))
+    if extra is not None and extra not in picked:
+        seq.append(float(extra))
+        seq = sorted(seq)
 
-    # 5) Compute f2 (excluding t=0)
-    seq     = sorted(candidate)
-    idxs    = [int(np.where(valid_times == t)[0][0]) for t in seq]
-    r_vals  = ref_pred[idxs].copy()
-    t_vals  = test_pred[idxs].copy()
-    r_vals[0] = t_vals[0] = 0.0
-    diffs   = t_vals[1:] - r_vals[1:]
-    mse     = np.mean(diffs**2)
-    f2      = 50 * math.log10(100 / (1 + math.sqrt(mse)))
+    # 6) Compute f2 (excluding t=0)
+    idxs = [int(np.where(times_all == t)[0][0]) for t in seq]
+    rvals = ref_pred[idxs].copy()
+    tvals = test_pred[idxs].copy()
+    # force 0% at start
+    rvals[0] = tvals[0] = 0.0
+    diffs = tvals[1:] - rvals[1:]
+    mse   = np.mean(diffs ** 2)
+    f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
 
     return [{
         'sequence':  seq,
         'f2':        round(f2, 2),
         'compliant': True,
         'reasons':   [],
-        'ref_vals':  [float(v) for v in r_vals],
-        'test_vals': [float(v) for v in t_vals],
+        'ref_vals':  [float(v) for v in rvals],
+        'test_vals': [float(v) for v in tvals],
     }], None
-############################################################
+#####################
 if input1 == 1:
     print("According to FDA ≥ 85% guidelines\n")
 
@@ -77,17 +120,17 @@ if input1 == 1:
     cv_check = check_cv(test_df) and check_cv(reference_df)
     print("\nCV <20 at first non-zero, <10 thereafter:", cv_check, "\n")
 
-    # Drop t=0 rows from raw data
+    # Drop t=0 rows
     reference_df = reference_df[reference_df.iloc[:,0] != 0].reset_index(drop=True)
     test_df      = test_df[test_df.iloc[:,0] != 0].reset_index(drop=True)
 
-    # 2) FDA conventional f2
+    # 2) Conventional FDA f2
     if not check_same_time_points(reference_df, test_df):
         print("Error: time points do not match. Cannot proceed.")
     else:
         try:
             f2_conv, f2_exp, ref_trim, test_trim = calculate_f2_fda(reference_df, test_df)
-            # … (your existing trimmed‐data printing/plots) …
+            # … (print & plot trimmed results) …
         except ValueError as e:
             print("❌", e)
             print("Cannot perform FDA‐rule f2 calculation.")
@@ -103,8 +146,8 @@ if input1 == 1:
         selected_regulation = regulation_map.get(input1, "FDA")
         print(f"\nCandidate window: {window_min} to {window_max}\n")
 
-        # Try original; on failure, use targeted‐bracket method
         try:
+            # first, original
             results, _ = predictive_optimal_combinations_advanced(
                 reference_mean_df,
                 test_mean_df,
@@ -117,9 +160,9 @@ if input1 == 1:
             )
             print("✅ Used original integer‐grid function\n")
         except ValueError as e:
-            print(f"⚠️  Original function failed: {e}")
-            print("   Falling back to targeted‐bracket selection...\n")
-            results, _ = predictive_optimal_combinations_targeted(
+            print(f"⚠️ Original function failed: {e}")
+            print("   Falling back to bracket‐target selection...\n")
+            results, _ = predictive_optimal_combinations_final(
                 reference_mean_df,
                 test_mean_df,
                 selected_regulation,
@@ -127,10 +170,10 @@ if input1 == 1:
                 step_hours=0.25
             )
 
-        # Normalize sequence values
+        # normalize sequence as python float/int
         for cand in results:
             cand['sequence'] = [
-                int(t) if float(t).is_integer() else t
+                int(t) if float(t).is_integer() else float(t)
                 for t in cand['sequence']
             ]
 
@@ -139,15 +182,14 @@ if input1 == 1:
         print(f"Time Points: {best['sequence']}")
         print(f"Predicted f2 Score: {best['f2']}")
 
-        # Plot predicted dissolution curves
+        # Plot predicted curves
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator
 
         seq      = best['sequence']
         ref_diss = interpolate_dissolution_curve(reference_mean_df, np.array(seq), method='linear')
         test_diss= interpolate_dissolution_curve(test_mean_df,      np.array(seq), method='linear')
-
-        # force 0% at start for plotting
+        # force 0% at start
         ref_diss[0] = test_diss[0] = 0.0
 
         plt.figure(figsize=(12, 6))
@@ -161,7 +203,7 @@ if input1 == 1:
         plt.legend()
         plt.show()
 
-        # Print predicted percentages
+        # Print predicted values
         print("\nPredicted Reference Dissolution (%):")
         for t, d in zip(seq, ref_diss):
             print(f"  {t} h: {d:.2f}%")
@@ -169,8 +211,7 @@ if input1 == 1:
         for t, d in zip(seq, test_diss):
             print(f"  {t} h: {d:.2f}%")
 
-        # Print all candidates
+        # List all candidates
         print("\n=== All Candidate Combinations ===")
         for i, cand in enumerate(results, 1):
-            pts = cand['sequence']
-            print(f"{i:2d}. Points: {pts} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
+            print(f"{i:2d}. Points: {cand['sequence']} | f2: {cand['f2']} | Compliant: {cand['compliant']}")
