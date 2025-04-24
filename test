@@ -3,14 +3,14 @@ import math
 import pandas as pd
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution with precision handling"""
+    """Calculate mean dissolution profile with precision control"""
     times = df.iloc[:, 0].astype(float).values.round(2)
     values = df.iloc[:, 1:].astype(float)
     means = values.mean(axis=1).round(2)
     return pd.DataFrame({'Time': times, 'Mean': means})
 
 def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """Create optimized monotonic profile with validation"""
+    """Create validated monotonic profile with edge handling"""
     grid = np.round(np.arange(0, window_max + step, step), 2)
     interp = np.interp(grid, times, means, left=0.0, right=means[-1])
     return np.maximum.accumulate(interp), grid
@@ -28,35 +28,41 @@ def select_optimized_points(ref, test, grid):
         for i in range(len(grid)):
             current_ref = ref[i]
             if low <= current_ref < high:
-                # Check minimum 7% progression
                 if current_ref - last_ref >= 7:
                     candidates.append(i)
         
         # Select up to 2 best F2 candidates
         if candidates:
-            # Sort by test-ref similarity
+            # Sort by test-ref similarity (ascending differences)
             candidates.sort(key=lambda x: abs(test[x] - ref[x]))
             
-            # Take best 2 candidates
-            selected.extend(candidates[:2])
-            
-            # Update last_ref to highest selected in bracket
-            last_ref = max(ref[candidates[:2]] if candidates else last_ref
+            # Take best 1-2 candidates maintaining progression
+            for cand in candidates[:2]:
+                if ref[cand] > last_ref:
+                    selected.append(cand)
+                    last_ref = ref[cand]
+        
+        # Ensure at least one point per bracket
+        if not any(ref[i] >= low for i in selected):
+            for i in range(len(grid)):
+                if low <= ref[i] < high:
+                    selected.append(i)
+                    last_ref = ref[i]
+                    break
     
     return sorted(list(set(selected)))
 
 def find_85_point(ref, test, grid, regulation):
-    """Find regulation-specific 85% point"""
+    """Find regulation-specific 85% dissolution point"""
     for i in range(len(grid)):
-        if regulation in ("FDA", "ANVISA") and ref[i] >= 85 and test[i] >= 85:
+        ref_ok = ref[i] >= 85
+        test_ok = test[i] >= 85
+        
+        if regulation in ("FDA", "ANVISA") and ref_ok and test_ok:
             return i
-        elif regulation not in ("FDA", "ANVISA") and (ref[i] >= 85 or test[i] >= 85):
+        elif regulation not in ("FDA", "ANVISA") and (ref_ok or test_ok):
             return i
     return None
-
-def format_output(values):
-    """Convert numpy types to native Python types"""
-    return [float(np.round(v, 2)) for v in values]
 
 def predictive_optimal_combinations_monotonic(reference_df, test_df,
                                             regulation, window_max=12,
@@ -67,14 +73,14 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
 
     # Create monotonic profiles
     ref_prof, grid = create_monotonic_profile(
-        ref_mean.Time.values, 
-        ref_mean.Mean.values,
+        ref_mean['Time'].values, 
+        ref_mean['Mean'].values,
         step_hours,
         window_max
     )
     test_prof, _ = create_monotonic_profile(
-        test_mean.Time.values,
-        test_mean.Mean.values,
+        test_mean['Time'].values,
+        test_mean['Mean'].values,
         step_hours,
         window_max
     )
@@ -90,10 +96,10 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
     # Finalize selection
     selected = sorted(np.unique(selected))
     
-    # Convert to native types
+    # Convert to native Python types
     times = [float(grid[i]) for i in selected]
-    ref_vals = format_output(ref_prof[selected])
-    test_vals = format_output(test_prof[selected])
+    ref_vals = [float(ref_prof[i]) for i in selected]
+    test_vals = [float(test_prof[i]) for i in selected]
 
     # Clean time formatting
     clean_times = []
@@ -104,9 +110,12 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
             clean_times.append(round(t, 2))
     
     # Calculate F2 score
-    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    rsd = np.sqrt(np.mean(diffs**2))
-    f2 = 50 * math.log10(100/(1 + rsd)) if rsd > 0 else 100.0
+    if len(ref_vals) > 1:
+        diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
+        rsd = np.sqrt(np.mean(diffs**2))
+        f2 = 50 * math.log10(100/(1 + rsd)) if rsd > 0 else 100.0
+    else:
+        f2 = 100.0
     
     return [{
         'sequence': clean_times,
