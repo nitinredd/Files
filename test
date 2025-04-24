@@ -1,51 +1,66 @@
 import numpy as np
 import math
 
-def predictive_optimal_combinations_final(ref_df, test_df, regulation,
+def predictive_optimal_combinations_final(reference_mean_df, test_mean_df, regulation,
                                           window_max, step_hours=0.25):
     """
-    ref_df / test_df each have columns ['time', 'diss'] (diss = mean %).
-    regulation ∈ {"FDA","ANVISA","EMA","China","ASEAN"}.
+    - Strata: 0–30%, 30–60%, 60–85%
+    - FDA/ANVISA extra: first time ≥85% on both curves
+    - EMA/China/ASEAN extra: first time ≥85% on either curve
     """
-    # 1) Build grid 0→window_max
-    times = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred  = np.array(np.interp(times, ref_df['time'],  ref_df['diss']),  dtype=float)
-    test_pred = np.array(np.interp(times, test_df['time'], test_df['diss']), dtype=float)
+    # 1) Extract and prepend (0,0)
+    t_ref  = reference_mean_df.iloc[:,0].astype(float).values
+    d_ref  = reference_mean_df.iloc[:,1].astype(float).values
+    t_test = test_mean_df.iloc[:,0].astype(float).values
+    d_test = test_mean_df.iloc[:,1].astype(float).values
 
-    # 2) Always start with t=0
-    seq_idxs = [0]  # index into `times`
+    if t_ref[0] != 0.0:
+        t_ref  = np.insert(t_ref,  0, 0.0); d_ref  = np.insert(d_ref,  0, 0.0)
+        t_test = np.insert(t_test, 0, 0.0); d_test = np.insert(d_test, 0, 0.0)
 
-    # 3) Three percent‐brackets
-    for low, high in [(0,30), (30,60), (60,80)]:
-        # indices whose ref_pred ∈ [low, high)
+    # 2) Build fine grid
+    grid     = np.arange(0.0, window_max + 1e-8, step_hours)
+    ref_pred  = np.interp(grid, t_ref,  d_ref)
+    test_pred = np.interp(grid, t_test, d_test)
+
+    # 3) Always include index 0 (t=0)
+    seq_idxs = [0]
+    picked   = {0}
+
+    # 4) Two picks per bracket
+    for low, high in [(0,30), (30,60), (60,85)]:
         idxs = [i for i,p in enumerate(ref_pred) if p >= low and p < high]
+        idxs = [i for i in idxs if i not in picked]
+
         if len(idxs) >= 2:
-            pick = [idxs[0], idxs[-1]]
+            picks = [idxs[0], idxs[-1]]
         elif len(idxs) == 1:
             i0 = idxs[0]
             mid = (low + high) / 2
-            # find grid‐point closest to that midpoint
-            dists = [(abs(ref_pred[j] - mid), j) for j in range(len(times)) if j != i0]
+            dists = [(abs(ref_pred[j] - mid), j)
+                     for j in range(len(grid)) if j != i0]
             i1 = min(dists, key=lambda x: x[0])[1]
-            pick = sorted([i0, i1])
+            picks = sorted([i0, i1])
         else:
-            # no hits: pick closest to the low‐edge and high‐edge
-            low_d  = [(abs(ref_pred[j] - low),  j) for j in range(len(times))]
-            high_d = [(abs(ref_pred[j] - (high - 1e-6)), j) for j in range(len(times))]
+            low_d  = [(abs(ref_pred[j] - low),  j) for j in range(len(grid))]
+            high_d = [(abs(ref_pred[j] - (high - 1e-6)), j) for j in range(len(grid))]
             i_low  = min(low_d,  key=lambda x: x[0])[1]
             i_high = min(high_d, key=lambda x: x[0])[1]
-            pick = sorted({i_low, i_high})
-        seq_idxs.extend(pick)
+            picks = sorted({i_low, i_high})
 
-    # de‐dupe & keep in time order
-    seq_idxs = sorted(dict.fromkeys(seq_idxs))  # preserves order
+        for i in picks:
+            if i not in picked:
+                seq_idxs.append(i)
+                picked.add(i)
 
-    # 4) FDA/ANVISA extra point > last
-    last_i = seq_idxs[-1]
-    post   = list(range(last_i+1, len(times)))
+    seq_idxs = sorted(seq_idxs)
+
+    # 5) Regulatory extra ≥85%
+    last = seq_idxs[-1]
+    post = list(range(last+1, len(grid)))
     extra_i = None
 
-    if regulation in ("FDA","ANVISA"):
+    if regulation in ("FDA", "ANVISA"):
         for i in post:
             if ref_pred[i] >= 85 and test_pred[i] >= 85:
                 extra_i = i
@@ -56,8 +71,8 @@ def predictive_optimal_combinations_final(ref_df, test_df, regulation,
                 extra_i = i
                 break
 
+    # fallback if none found
     if extra_i is None:
-        # fallback: pick the post‐time that maximizes min(ref, test)
         best_v, best_i = -1, None
         for i in post:
             v = min(ref_pred[i], test_pred[i])
@@ -69,16 +84,13 @@ def predictive_optimal_combinations_final(ref_df, test_df, regulation,
         seq_idxs.append(extra_i)
         seq_idxs = sorted(seq_idxs)
 
-    # 5) Build actual time points & values
-    seq = [float(times[i]) for i in seq_idxs]
+    # 6) Build sequences & compute f2 (excluding t=0)
+    seq       = [float(grid[i])      for i in seq_idxs]
     ref_vals  = [float(ref_pred[i])  for i in seq_idxs]
     test_vals = [float(test_pred[i]) for i in seq_idxs]
-
-    # force 0% at t=0
     ref_vals[0]  = 0.0
     test_vals[0] = 0.0
 
-    # 6) Compute f2 EXCLUDING the first point
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
     mse   = np.mean(diffs**2)
     f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
@@ -89,25 +101,23 @@ def predictive_optimal_combinations_final(ref_df, test_df, regulation,
         'compliant': True,
         'reasons':   [],
         'ref_vals':  ref_vals,
-        'test_vals': test_vals,
+        'test_vals': test_vals
     }], None
-###############################################
+##################################################3
 if input1 == 1:
-    # … your existing FDA‐rule checks/plots here …
+    print("According to FDA ≥ 85% guidelines\n")
 
-    run_predictive = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
-    if run_predictive.lower() == 'yes':
+    # … [your existing CV checks, conventional f2, plotting] …
+
+    run_pred = input("\nDo you want to run predictive optimal combination analysis? (yes/no): ")
+    if run_pred.lower() == 'yes':
         window_min, window_max = determine_candidate_window(
-            reference_mean_df,
-            test_mean_df,
-            step=5,
-            initial_threshold=10
+            reference_mean_df, test_mean_df, step=5, initial_threshold=10
         )
         regulation_map     = {1:"FDA",2:"EMA",3:"China",4:"ASEAN",5:"ANVISA"}
         selected_regulation = regulation_map.get(input1, "FDA")
         print(f"\nCandidate window: {window_min} to {window_max}\n")
 
-        # Always use the new “final” function for robust behavior
         results, _ = predictive_optimal_combinations_final(
             reference_mean_df,
             test_mean_df,
@@ -116,7 +126,7 @@ if input1 == 1:
             step_hours=0.25
         )
 
-        # Clean up sequence types
+        # Normalize types
         for cand in results:
             cand['sequence'] = [
                 int(t) if float(t).is_integer() else t
@@ -128,4 +138,4 @@ if input1 == 1:
         print(f"Time Points: {best['sequence']}")
         print(f"Predicted f2 Score: {best['f2']}")
 
-        # … (your plotting & printing of best['ref_vals'] / best['test_vals']) …
+        # … [plotting and printing best['ref_vals'], best['test_vals']] …
