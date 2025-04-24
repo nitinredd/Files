@@ -9,7 +9,7 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
     - Always includes t=0 (0%).
     - Brackets: 0–30, 30–60, 60–90 %.
     - Two targets per bracket at 1/3 and 2/3 of bracket.
-    - Finds grid points whose reference predictions are closest.
+    - Finds grid points whose reference predictions are closest (ensures two distinct picks per bracket).
     - Appends one extra: FDA/ANVISA needs both ≥85%, others need either ≥85%.
     - Computes f2 excluding the 0-h point.
     """
@@ -32,18 +32,24 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
     # 4) Initialize sequence with t=0 index
     seq_idxs = [0]
 
-    # 5) Two percentage-based picks per bracket
+    # 5) Two distinct picks per percent bracket
     for low, high in [(0,30), (30,60), (60,90)]:
-        t1 = low + (high - low) / 3
-        t2 = low + 2*(high - low) / 3
-        i1 = int(np.argmin(np.abs(ref_pred - t1)))
-        i2 = int(np.argmin(np.abs(ref_pred - t2)))
+        # target percentages at 1/3 and 2/3
+        target1 = low + (high - low) / 3
+        target2 = low + 2*(high - low) / 3
+        # find closest grid index for target1
+        dists1 = sorted([(abs(ref_pred[i] - target1), i) for i in range(len(grid))])
+        i1 = dists1[0][1]
+        # for target2, skip i1 to ensure distinct
+        dists2 = sorted([(abs(ref_pred[i] - target2), i)
+                         for i in range(len(grid)) if i != i1])
+        i2 = dists2[0][1]
         seq_idxs.extend([i1, i2])
 
     # 6) Deduplicate & sort
     seq_idxs = sorted(dict.fromkeys(seq_idxs))
 
-    # 7) One regulatory extra ≥85%
+    # 7) Append one regulatory extra ≥85%
     last = seq_idxs[-1]
     post = list(range(last+1, len(grid)))
     extra_i = None
@@ -55,9 +61,9 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
         for i in post:
             if ref_pred[i] >= 85 or test_pred[i] >= 85:
                 extra_i = i; break
-    # fallback
+    # fallback to maximize min( )
     if extra_i is None:
-        best_v, best_i = -1, None
+        best_i, best_v = None, -1
         for i in post:
             v = min(ref_pred[i], test_pred[i])
             if v > best_v:
@@ -68,17 +74,14 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
         seq_idxs.append(extra_i)
         seq_idxs = sorted(seq_idxs)
 
-    # 8) Build final sequences & compute f2
+    # 8) Build sequences & compute f2
     seq       = [float(grid[i]) for i in seq_idxs]
     ref_vals  = [float(ref_pred[i]) for i in seq_idxs]
     test_vals = [float(test_pred[i]) for i in seq_idxs]
-    # enforce 0%
     ref_vals[0]  = 0.0
     test_vals[0] = 0.0
-    # compute f2 (excluding 0)
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    mse   = np.mean(diffs**2)
-    f2    = 50 * math.log10(100 / (1 + math.sqrt(mse)))
+    f2    = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diffs**2))))
 
     return [{
         'sequence':  seq,
@@ -90,6 +93,41 @@ def predictive_optimal_combinations_by_percent(reference_mean_df, test_mean_df,
     }], None
 
 # === Updated wrapper in your if input1==1 block ===
+# After window_min, window_max determination:
+try:
+    results, all_results = predictive_optimal_combinations_advanced(
+        reference_mean_df,
+        test_mean_df,
+        regulation=selected_regulation,
+        window_min=window_min,
+        window_max=window_max,
+        diff_threshold=None,
+        interp_method='linear',
+        points_per_stratum=None
+    )
+    print("✅ Used original predictive_optimal_combinations_advanced
+")
+except ValueError as e:
+    print(f"⚠️ Original function failed: {e}")
+    print("   Falling back to percent‐targeted predictive function...
+")
+    results, _ = predictive_optimal_combinations_by_percent(
+        reference_mean_df,
+        test_mean_df,
+        selected_regulation,
+        window_max,
+        step_hours=0.25
+    )
+
+# Normalize int/float
+for cand in results:
+    cand['sequence'] = [
+        int(t) if float(t).is_integer() else t
+        for t in cand['sequence']
+    ]
+
+# Then proceed to plot and print `results` as before
+ ===
 
 # ... inside `if input1 == 1:` after computing window_min/window_max ...
 try:
