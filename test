@@ -4,140 +4,132 @@ import math
 def predictive_optimal_combinations_monotonic(reference_mean_df, test_mean_df,
                                             regulation, window_max,
                                             step_hours=0.25):
-    t_ref  = reference_mean_df.iloc[:,0].astype(float).values
-    d_ref  = reference_mean_df.iloc[:,1].astype(float).values
+    # Data extraction and preprocessing
+    t_ref = reference_mean_df.iloc[:,0].astype(float).values
+    d_ref = reference_mean_df.iloc[:,1].astype(float).values
     t_test = test_mean_df.iloc[:,0].astype(float).values
     d_test = test_mean_df.iloc[:,1].astype(float).values
-    
-    # Insert 0h if missing
+
+    # Ensure 0h point exists
     if t_ref[0] != 0.0:
-        t_ref  = np.insert(t_ref,  0, 0.0)
-        d_ref  = np.insert(d_ref,  0, 0.0)
+        t_ref = np.insert(t_ref, 0, 0.0)
+        d_ref = np.insert(d_ref, 0, 0.0)
         t_test = np.insert(t_test, 0, 0.0)
         d_test = np.insert(d_test, 0, 0.0)
+
+    # Create interpolation grid with native Python floats
+    grid = [float(x) for x in np.arange(0.0, window_max + 1e-8, step_hours)]
     
-    # Create interpolation grid
-    grid = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred  = np.interp(grid, t_ref, d_ref)
+    # Interpolate and make monotonic
+    ref_pred = np.interp(grid, t_ref, d_ref)
     test_pred = np.interp(grid, t_test, d_test)
-    
-    # Ensure monotonic increasing
-    ref_mon  = np.maximum.accumulate(ref_pred)
+    ref_mon = np.maximum.accumulate(ref_pred)
     test_mon = np.maximum.accumulate(test_pred)
-    
-    # Select initial sequence points from reference profile
+
+    # Phase 1: Initial point selection with value-based deduplication
     seq_idxs = [0]  # Always include 0h
     brackets = [(0,30), (30,60), (60,80)]
-    
+    TOLERANCE = 0.1  # Consider values equal if within 0.1% difference
+
     for low, high in brackets:
-        mid1 = low + (high - low)/3
-        mid2 = low + 2*(high - low)/3
+        # Calculate target values for this bracket
+        targets = [low + (high-low)*(i+1)/3 for i in range(2)]
         
-        # Find closest indices to midpoints
-        d1 = np.abs(ref_mon - mid1)
-        i1 = np.argmin(d1)
+        # Find best matches in reference profile
+        candidates = []
+        for target in targets:
+            diffs = np.abs(ref_mon - target)
+            best_idx = np.argmin(diffs)
+            if diffs[best_idx] > 5:  # Skip if no good match
+                continue
+            candidates.append(best_idx)
         
-        d2 = np.abs(ref_mon - mid2)
-        if np.argmin(d2) == i1:  # Prevent duplicate indices
-            d2[i1] = np.inf
-        i2 = np.argmin(d2)
+        # Select up to 2 unique values per bracket
+        selected = []
+        seen_values = set()
+        for idx in sorted(candidates):
+            current_val = ref_mon[idx]
+            if not any(abs(current_val - v) < TOLERANCE for v in seen_values):
+                seen_values.add(current_val)
+                selected.append(idx)
+                if len(selected) >= 2:
+                    break
         
-        # Ensure values are distinct and increasing
-        if ref_mon[i2] > ref_mon[i1] and i2 not in seq_idxs:
-            seq_idxs.extend([i1, i2])
-    
-    # Deduplicate and sort
-    seq_idxs = sorted(set(seq_idxs))
-    
-    # Remove points with same dissolution values
-    unique_vals = []
+        seq_idxs.extend(selected)
+
+    # Phase 2: Value-based deduplication
     unique_idxs = []
-    for idx in seq_idxs:
-        val = ref_mon[idx]
-        if val not in unique_vals:
-            unique_vals.append(val)
+    seen_values = set()
+    for idx in sorted(seq_idxs):
+        current_val = ref_mon[idx]
+        if not any(abs(current_val - v) < TOLERANCE for v in seen_values):
+            seen_values.add(current_val)
             unique_idxs.append(idx)
     seq_idxs = unique_idxs
-    
-    # Find additional point where both reach >=85% (FDA/ANVISA) or either (others)
+
+    # Phase 3: Find 85%+ point
     last_idx = seq_idxs[-1]
-    post_indices = [i for i in range(last_idx + 1, len(grid))]
-    
     extra_idx = None
+    search_range = range(last_idx + 1, len(grid))
+    
     if regulation in ("FDA", "ANVISA"):
-        for i in post_indices:
+        for i in search_range:
             if ref_mon[i] >= 85 and test_mon[i] >= 85:
                 extra_idx = i
                 break
     else:
-        for i in post_indices:
+        for i in search_range:
             if ref_mon[i] >= 85 or test_mon[i] >= 85:
                 extra_idx = i
                 break
-    
-    # Fallback: Best mutual dissolution if no point found
-    if extra_idx is None and post_indices:
-        best_value = -1
-        for i in post_indices:
+
+    # Fallback: Best mutual dissolution point
+    if extra_idx is None and search_range:
+        best_value = -np.inf
+        for i in search_range:
             current_min = min(ref_mon[i], test_mon[i])
             if current_min > best_value:
                 best_value = current_min
                 extra_idx = i
-                
-    # Add extra point if valid
-    if extra_idx is not None and extra_idx not in seq_idxs:
-        seq_idxs.append(extra_idx)
-        seq_idxs = sorted(seq_idxs)
+
+    # Add extra point if valid and unique
+    if extra_idx is not None:
+        extra_val = ref_mon[extra_idx]
+        if not any(abs(extra_val - ref_mon[idx]) < TOLERANCE for idx in seq_idxs):
+            seq_idxs.append(extra_idx)
     
-    # Final deduplication check
-    final_seq_idxs = []
-    seen_values = set()
-    for idx in seq_idxs:
-        val = ref_mon[idx]
-        if val not in seen_values:
-            seen_values.add(val)
-            final_seq_idxs.append(idx)
-    seq_idxs = final_seq_idxs
+    # Final cleanup and formatting
+    seq_idxs = sorted(set(seq_idxs))
+    seq_times = [float(grid[i]) for i in seq_idxs]
     
-    # Convert indices to time points and values
-    seq_times = [grid[i] for i in seq_idxs]
-    ref_vals  = [ref_mon[i] for i in seq_idxs]
-    test_vals = [test_mon[i] for i in seq_idxs]
+    # Ensure values are strictly increasing in reference profile
+    final_times = [0.0]
+    final_ref = [0.0]
+    final_test = [0.0]
     
-    # Format 0h explicitly
-    seq_times[0] = 0.0
-    ref_vals[0] = 0.0
-    test_vals[0] = 0.0
-    
-    # Calculate f2 similarity factor
-    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    if len(diffs) == 0:
-        f2 = 0.0
+    for t in seq_times[1:]:
+        idx = grid.index(t)
+        ref_val = ref_mon[idx]
+        test_val = test_mon[idx]
+        
+        if ref_val > final_ref[-1] + TOLERANCE:
+            final_times.append(t)
+            final_ref.append(ref_val)
+            final_test.append(test_val)
+
+    # Calculate f2 score
+    diffs = np.array(final_test[1:]) - np.array(final_ref[1:])
+    if len(diffs) > 0:
+        f2 = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diffs**2)))
     else:
-        f2 = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diffs**2))))
-    
+        f2 = 0.0
+
+    # Format output
     return [{
-        'sequence': [round(t, 2) for t in seq_times],
+        'sequence': [t if abs(t - round(t)) > 1e-4 else round(t) for t in final_times],
         'f2': round(f2, 2),
         'compliant': True,
         'reasons': [],
-        'ref_vals': [round(v, 2) for v in ref_vals],
-        'test_vals': [round(v, 2) for v in test_vals]
+        'ref_vals': [round(v, 2) for v in final_ref],
+        'test_vals': [round(v, 2) for v in final_test]
     }], None
-
-# Usage example (assuming proper data input)
-try:
-    results, all_results = predictive_optimal_combinations_advanced(...)
-except ValueError:
-    results, _ = predictive_optimal_combinations_monotonic(
-        reference_mean_df, test_mean_df,
-        selected_regulation, window_max=12,  # Ensure window_max covers full profile
-        step_hours=0.25
-    )
-
-# Post-process to clean time formatting
-for cand in results:
-    cand['sequence'] = [
-        int(t) if float(t).is_integer() else round(t, 2) 
-        for t in cand['sequence']
-    ]
