@@ -1,3 +1,7 @@
+import pandas as pd
+import numpy as np
+import math
+import itertools
 
 def calculate_mean_profile(df):
     times = df.iloc[:, 0].astype(float).values
@@ -12,56 +16,66 @@ def create_monotonic_profile(times, means, step=0.25, window_max=12):
     return np.maximum.accumulate(prof), grid
 
 def find_85_point(ref, test, regulation):
-    for i, (r, t) in enumerate(zip(ref, test)):
-        if regulation in ("FDA", "ANVISA"):
-            if r >= 85 and t >= 85:
+    for i,(r,t) in enumerate(zip(ref,test)):
+        if regulation in ("FDA","ANVISA"):
+            if r>=85 and t>=85:
                 return i
         else:
-            if r >= 85 or t >= 85:
+            if r>=85 or t>=85:
                 return i
     return None
 
 def f2_score(ref_vals, test_vals):
+    if len(ref_vals) < 2:
+        return 0.0
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    return 50 * math.log10(100.0 / (1.0 + np.sqrt(np.mean(diffs**2)))) if len(diffs) > 0 else 0.0
+    return 50 * math.log10(100.0 / (1.0 + np.sqrt(np.mean(diffs**2))))
 
-def optimal_timepoints_v7(reference_df, test_df, regulation,
-                          window_max=12, step_hours=0.25,
-                          forced_times=(1.0, 7.0)):
-    # 1) build monotonic profiles
+def optimal_timepoints_v8(reference_df, test_df, regulation,
+                          window_max=12, step_hours=0.25):
+    # 1) interpolate & enforce monotonicity
     rt, rm = calculate_mean_profile(reference_df)
     tt, tm = calculate_mean_profile(test_df)
     ref_prof, grid = create_monotonic_profile(rt, rm, step_hours, window_max)
     test_prof, _   = create_monotonic_profile(tt, tm, step_hours, window_max)
 
-    # 2) regulatory 85% index
+    # 2) find the 85% index
     idx85 = find_85_point(ref_prof, test_prof, regulation)
 
-    # 3) map your forced_times (1h,7h) onto the grid
-    forced_idxs = [int(np.argmin(np.abs(grid - ft))) for ft in forced_times]
-
-    # 4) collect bracket candidates (with fallback)
+    # 3) build per‐bracket candidate lists (with fallback)
     brackets = [(0,30), (30,60), (60,80)]
     bracket_cands = []
     for L, U in brackets:
-        idxs = list(np.where((ref_prof >= L) & (ref_prof < U))[0])
-        if not idxs:
-            fb = list(np.where(ref_prof >= L)[0])
-            if fb: idxs = [fb[0]]
-        bracket_cands.append(idxs)
+        c = list(np.where((ref_prof>=L)&(ref_prof<U))[0])
+        if not c:
+            fb = list(np.where(ref_prof>=L)[0])
+            if fb: c = [fb[0]]
+        # ensure we have at least one
+        bracket_cands.append(c)
 
-    # 5) enumerate up to 2 picks per bracket
+    # 4) generate all selections: for each bracket, pick r in {1,2} (clamped to len(cand))
     all_designs = []
-    for c0 in itertools.combinations(bracket_cands[0], min(2, len(bracket_cands[0]))):
-      for c1 in itertools.combinations(bracket_cands[1], min(2, len(bracket_cands[1]))):
-        for c2 in itertools.combinations(bracket_cands[2], min(2, len(bracket_cands[2]))):
-            base = {0, *c0, *c1, *c2, *forced_idxs}
-            if idx85 is not None:
-                base.add(idx85)
-            all_designs.append(sorted(base))
+    choices_per_bracket = []
+    for c in bracket_cands:
+        max_r = min(2, len(c))
+        # combinations of size 1 up to max_r
+        choices_per_bracket.append(
+            list(itertools.chain.from_iterable(
+                itertools.combinations(c, r) for r in range(1, max_r+1)
+            ))
+        )
 
-    # 6) score each design, enforce ≥7% jumps
-    best, best_f2 = None, -1
+    # 5) cross‐product all bracket choices
+    for combo in itertools.product(*choices_per_bracket):
+        design = {0}            # always include t=0
+        for picks in combo:     # picks is a tuple of indices for each bracket
+            design.update(picks)
+        if idx85 is not None:
+            design.add(idx85)
+        all_designs.append(sorted(design))
+
+    # 6) evaluate each design under ≥7 % jump filter
+    best, best_f2 = None, -1.0
     for design in all_designs:
         times_, rvals_, tvals_ = [], [], []
         last_r = -np.inf
@@ -72,28 +86,27 @@ def optimal_timepoints_v7(reference_df, test_df, regulation,
             rvals_.append(ref_prof[i])
             tvals_.append(test_prof[i])
             last_r = ref_prof[i]
-
         if len(rvals_) < 2:
             continue
         score = f2_score(rvals_, tvals_)
         if score > best_f2:
-            best_f2, best = score, (times_, rvals_, tvals_)
+            best_f2 = score
+            best = (times_, rvals_, tvals_)
 
     if best is None:
-        return [], "No valid sampling design found."
+        return [], "No valid design found"
 
+    # 7) format final output
     times_, rvals_, tvals_ = best
-    # 7) clean up types and round
     sequence = [
-        int(x) if float(x).is_integer() else round(float(x), 2)
-        for x in times_
+        int(t) if float(t).is_integer() else round(float(t),2)
+        for t in times_
     ]
-
     return [{
         'sequence': sequence,
-        'f2': round(best_f2, 2),
+        'f2': round(best_f2,2),
         'compliant': best_f2 >= 50,
         'reasons': [],
-        'ref_vals': [round(float(v), 2) for v in rvals_],
-        'test_vals':[round(float(v), 2) for v in tvals_]
+        'ref_vals':  [round(float(v),2) for v in rvals_],
+        'test_vals': [round(float(v),2) for v in tvals_]
     }], None
