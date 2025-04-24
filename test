@@ -3,53 +3,86 @@ import math
 import pandas as pd
 
 def calculate_mean_profile(df):
-    """Calculate mean dissolution profile from raw data"""
+    """Calculate mean dissolution profile with validation"""
     times = df.iloc[:, 0].astype(float).values
     values = df.iloc[:, 1:].astype(float)
-    means = values.mean(axis=1).values
-    return pd.DataFrame({'Time': times, 'Mean': means})
+    return pd.DataFrame({
+        'Time': times,
+        'Mean': values.mean(axis=1)
+    })
 
-def create_monotonic_profile(times, values, grid):
-    """Create monotonic profile with proper interpolation"""
-    # Insert 0h point if missing
-    if times[0] != 0.0:
-        times = np.insert(times, 0, 0.0)
-        values = np.insert(values, 0, 0.0)
-    
-    # Create fine grid for interpolation
-    grid = np.unique(np.sort(np.concatenate([
-        grid,
-        np.array(times)
-    ])))
-    
-    # Linear interpolation
-    interp_values = np.interp(grid, times, values, left=0.0, right=np.nan)
-    
-    # Ensure monotonicity
-    return np.maximum.accumulate(interp_values), grid
+def create_monotonic_profile(times, means, step=0.25, window_max=12):
+    """Create validated monotonic profile with edge handling"""
+    grid = np.arange(0, window_max + step, step)
+    profile = np.interp(grid, times, means, left=0.0, right=means[-1])
+    return np.maximum.accumulate(profile), grid
 
-def select_unique_points(profile, grid, tolerance=0.1):
-    """Select points with unique values accounting for tolerance"""
-    selected = [0]
-    last_value = profile[0]
+def select_bracket_points(profile, grid, brackets, min_diff=7):
+    """Select optimal points for each dissolution bracket"""
+    selected = []
+    current_bracket = 0
+    last_value = -min_diff
     
-    for i in range(1, len(profile)):
-        if abs(profile[i] - last_value) > tolerance:
-            selected.append(i)
-            last_value = profile[i]
+    for i, value in enumerate(profile):
+        if value >= brackets[current_bracket][1]:
+            current_bracket += 1
+            last_value = -min_diff  # Reset for new bracket
+            if current_bracket >= len(brackets):
+                break
+        
+        if brackets[current_bracket][0] <= value < brackets[current_bracket][1]:
+            if (value - last_value) >= min_diff:
+                selected.append(i)
+                last_value = value
+                if len(selected) >= 2 * len(brackets):  # Max 2 per bracket
+                    break
     return selected
 
-def find_85_point(ref_profile, test_profile, grid, regulation):
-    """Find appropriate 85% dissolution point"""
+def find_85_point(ref, test, grid, regulation):
+    """Find regulation-specific 85% dissolution point"""
     for i in range(len(grid)):
-        ref_ok = ref_profile[i] >= 85
-        test_ok = test_profile[i] >= 85
+        ref_ok = ref[i] >= 85
+        test_ok = test[i] >= 85
         
         if regulation in ("FDA", "ANVISA") and ref_ok and test_ok:
             return i
-        elif ref_ok or test_ok:
+        elif regulation not in ("FDA", "ANVISA") and (ref_ok or test_ok):
             return i
     return None
+
+def format_results(grid, indices, ref, test, regulation):
+    """Create final output with proper formatting"""
+    times = []
+    ref_vals = []
+    test_vals = []
+    
+    for i in indices:
+        t = grid[i]
+        rv = ref[i]
+        tv = test[i]
+        
+        # Maintain minimum 7% difference
+        if ref_vals and abs(rv - ref_vals[-1]) < 7:
+            continue
+            
+        times.append(t)
+        ref_vals.append(rv)
+        test_vals.append(tv)
+    
+    # Add 85% point if exists
+    eighty_five = find_85_point(ref, test, grid, regulation)
+    if eighty_five and grid[eighty_five] not in times:
+        times.append(grid[eighty_five])
+        ref_vals.append(ref[eighty_five])
+        test_vals.append(test[eighty_five])
+    
+    # Ensure temporal order
+    sorted_indices = np.argsort(times)
+    return (
+        [times[i] for i in sorted_indices],
+        [ref_vals[i] for i in sorted_indices],
+        [test_vals[i] for i in sorted_indices]
+    )
 
 def predictive_optimal_combinations_monotonic(reference_df, test_df,
                                             regulation, window_max=12,
@@ -58,46 +91,32 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
     ref_mean = calculate_mean_profile(reference_df)
     test_mean = calculate_mean_profile(test_df)
 
-    # Create interpolation grid
-    base_grid = np.arange(0.0, window_max + 1e-8, step_hours)
+    # Create validated profiles
+    ref_prof, grid = create_monotonic_profile(ref_mean.Time.values, 
+                                            ref_mean.Mean.values,
+                                            step_hours, window_max)
+    test_prof, _ = create_monotonic_profile(test_mean.Time.values,
+                                          test_mean.Mean.values,
+                                          step_hours, window_max)
+
+    # Select bracket points (0-30, 30-60, 60-80)
+    brackets = [(0,30), (30,60), (60,80)]
+    selected_indices = select_bracket_points(ref_prof, grid, brackets)
     
-    # Generate monotonic profiles
-    ref_mon, grid = create_monotonic_profile(
-        ref_mean['Time'].values,
-        ref_mean['Mean'].values,
-        base_grid
-    )
-    test_mon, _ = create_monotonic_profile(
-        test_mean['Time'].values,
-        test_mean['Mean'].values,
-        base_grid
+    # Format final results
+    times, ref_vals, test_vals = format_results(
+        grid, selected_indices, ref_prof, test_prof, regulation
     )
 
-    # Initial point selection
-    seq_indices = select_unique_points(ref_mon, grid)
-    
-    # Find 85% point
-    eighty_five_idx = find_85_point(ref_mon, test_mon, grid, regulation)
-    if eighty_five_idx and eighty_five_idx not in seq_indices:
-        seq_indices.append(eighty_five_idx)
-    
-    # Final selection and formatting
-    seq_indices = sorted(np.unique(seq_indices))
-    times = [float(grid[i]) for i in seq_indices]
-    
-    # Convert to percentages
-    ref_values = [float(ref_mon[i]) for i in seq_indices]
-    test_values = [float(test_mon[i]) for i in seq_indices]
-    
     # Calculate f2 score
-    diffs = np.array(test_values[1:]) - np.array(ref_values[1:])
-    f2 = 50 * math.log10(100/(1 + np.sqrt(np.mean(diffs**2)))) if diffs.size > 0 else 0
+    diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
+    f2 = 50 * math.log10(100/(1 + np.sqrt(np.mean(diffs**2)))) if len(diffs) > 0 else 0
 
-    # Clean time formatting
+    # Clean output formatting
     clean_times = []
     for t in times:
-        if abs(t - round(t)) < 1e-4:
-            clean_times.append(int(round(t)))
+        if t.is_integer():
+            clean_times.append(int(t))
         else:
             clean_times.append(round(t, 2))
     
@@ -106,6 +125,6 @@ def predictive_optimal_combinations_monotonic(reference_df, test_df,
         'f2': round(f2, 2),
         'compliant': f2 >= 50,
         'reasons': [],
-        'ref_vals': [round(v, 2) for v in ref_values],
-        'test_vals': [round(v, 2) for v in test_values]
+        'ref_vals': [round(v, 2) for v in ref_vals],
+        'test_vals': [round(v, 2) for v in test_vals]
     }], None
