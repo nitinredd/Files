@@ -8,78 +8,136 @@ def predictive_optimal_combinations_monotonic(reference_mean_df, test_mean_df,
     d_ref  = reference_mean_df.iloc[:,1].astype(float).values
     t_test = test_mean_df.iloc[:,0].astype(float).values
     d_test = test_mean_df.iloc[:,1].astype(float).values
+    
+    # Insert 0h if missing
     if t_ref[0] != 0.0:
-        t_ref  = np.insert(t_ref,  0, 0.0); d_ref  = np.insert(d_ref,  0, 0.0)
-        t_test = np.insert(t_test, 0, 0.0); d_test = np.insert(d_test, 0, 0.0)
+        t_ref  = np.insert(t_ref,  0, 0.0)
+        d_ref  = np.insert(d_ref,  0, 0.0)
+        t_test = np.insert(t_test, 0, 0.0)
+        d_test = np.insert(d_test, 0, 0.0)
+    
+    # Create interpolation grid
     grid = np.arange(0.0, window_max + 1e-8, step_hours)
-    ref_pred  = np.interp(grid, t_ref,  d_ref)
+    ref_pred  = np.interp(grid, t_ref, d_ref)
     test_pred = np.interp(grid, t_test, d_test)
-    ref_mon   = np.maximum.accumulate(ref_pred)
-    test_mon  = np.maximum.accumulate(test_pred)
-    seq_idxs = [0]
-    brackets = [(0,30),(30,60),(60,80)]
-    for low,high in brackets:
-        mid1 = low + (high-low)/3
-        mid2 = low + 2*(high-low)/3
-        i1 = int(np.argmin(np.abs(ref_mon - mid1)))
+    
+    # Ensure monotonic increasing
+    ref_mon  = np.maximum.accumulate(ref_pred)
+    test_mon = np.maximum.accumulate(test_pred)
+    
+    # Select initial sequence points from reference profile
+    seq_idxs = [0]  # Always include 0h
+    brackets = [(0,30), (30,60), (60,80)]
+    
+    for low, high in brackets:
+        mid1 = low + (high - low)/3
+        mid2 = low + 2*(high - low)/3
+        
+        # Find closest indices to midpoints
+        d1 = np.abs(ref_mon - mid1)
+        i1 = np.argmin(d1)
+        
         d2 = np.abs(ref_mon - mid2)
-        if np.argmin(d2) == i1:
+        if np.argmin(d2) == i1:  # Prevent duplicate indices
             d2[i1] = np.inf
-        i2 = int(np.argmin(d2))
-        seq_idxs.extend([i1,i2])
+        i2 = np.argmin(d2)
+        
+        # Ensure values are distinct and increasing
+        if ref_mon[i2] > ref_mon[i1] and i2 not in seq_idxs:
+            seq_idxs.extend([i1, i2])
+    
+    # Deduplicate and sort
     seq_idxs = sorted(set(seq_idxs))
+    
+    # Remove points with same dissolution values
+    unique_vals = []
+    unique_idxs = []
+    for idx in seq_idxs:
+        val = ref_mon[idx]
+        if val not in unique_vals:
+            unique_vals.append(val)
+            unique_idxs.append(idx)
+    seq_idxs = unique_idxs
+    
+    # Find additional point where both reach >=85% (FDA/ANVISA) or either (others)
     last_idx = seq_idxs[-1]
-    post = [i for i in range(last_idx+1, len(grid))]
+    post_indices = [i for i in range(last_idx + 1, len(grid))]
+    
     extra_idx = None
-    if regulation in ("FDA","ANVISA"):
-        for i in post:
-            if ref_mon[i]>=85 and test_mon[i]>=85:
-                extra_idx = i; break
+    if regulation in ("FDA", "ANVISA"):
+        for i in post_indices:
+            if ref_mon[i] >= 85 and test_mon[i] >= 85:
+                extra_idx = i
+                break
     else:
-        for i in post:
-            if ref_mon[i]>=85 or test_mon[i]>=85:
-                extra_idx = i; break
-    if extra_idx is None:
-        best_v,best_i = -1,None
-        for i in post:
-            v = min(ref_mon[i], test_mon[i])
-            if v>best_v:
-                best_v,best_i = v,i
-        extra_idx = best_i
-    if extra_idx not in seq_idxs and extra_idx is not None:
+        for i in post_indices:
+            if ref_mon[i] >= 85 or test_mon[i] >= 85:
+                extra_idx = i
+                break
+    
+    # Fallback: Best mutual dissolution if no point found
+    if extra_idx is None and post_indices:
+        best_value = -1
+        for i in post_indices:
+            current_min = min(ref_mon[i], test_mon[i])
+            if current_min > best_value:
+                best_value = current_min
+                extra_idx = i
+                
+    # Add extra point if valid
+    if extra_idx is not None and extra_idx not in seq_idxs:
         seq_idxs.append(extra_idx)
         seq_idxs = sorted(seq_idxs)
-    seq = [float(grid[i]) for i in seq_idxs]
-    ref_vals  = [float(ref_pred[i]) for i in seq_idxs]
-    test_vals = [float(test_pred[i]) for i in seq_idxs]
-    ref_vals[0]=0.0; test_vals[0]=0.0
+    
+    # Final deduplication check
+    final_seq_idxs = []
+    seen_values = set()
+    for idx in seq_idxs:
+        val = ref_mon[idx]
+        if val not in seen_values:
+            seen_values.add(val)
+            final_seq_idxs.append(idx)
+    seq_idxs = final_seq_idxs
+    
+    # Convert indices to time points and values
+    seq_times = [grid[i] for i in seq_idxs]
+    ref_vals  = [ref_mon[i] for i in seq_idxs]
+    test_vals = [test_mon[i] for i in seq_idxs]
+    
+    # Format 0h explicitly
+    seq_times[0] = 0.0
+    ref_vals[0] = 0.0
+    test_vals[0] = 0.0
+    
+    # Calculate f2 similarity factor
     diffs = np.array(test_vals[1:]) - np.array(ref_vals[1:])
-    f2    = 50*math.log10(100/(1+math.sqrt(np.mean(diffs**2))))
+    if len(diffs) == 0:
+        f2 = 0.0
+    else:
+        f2 = 50 * math.log10(100 / (1 + math.sqrt(np.mean(diffs**2))))
+    
     return [{
-        'sequence': seq,
-        'f2': round(f2,2),
+        'sequence': [round(t, 2) for t in seq_times],
+        'f2': round(f2, 2),
         'compliant': True,
         'reasons': [],
-        'ref_vals': ref_vals,
-        'test_vals': test_vals
+        'ref_vals': [round(v, 2) for v in ref_vals],
+        'test_vals': [round(v, 2) for v in test_vals]
     }], None
 
-# In your if input1==1 block, fallback to the new function:
+# Usage example (assuming proper data input)
 try:
-    results, all_results = predictive_optimal_combinations_advanced(
-        reference_mean_df, test_mean_df,
-        regulation=selected_regulation,
-        window_min=window_min,
-        window_max=window_max,
-        diff_threshold=None,
-        interp_method='linear',
-        points_per_stratum=None
-    )
+    results, all_results = predictive_optimal_combinations_advanced(...)
 except ValueError:
     results, _ = predictive_optimal_combinations_monotonic(
         reference_mean_df, test_mean_df,
-        selected_regulation, window_max,
+        selected_regulation, window_max=12,  # Ensure window_max covers full profile
         step_hours=0.25
     )
+
+# Post-process to clean time formatting
 for cand in results:
-    cand['sequence'] = [int(t) if float(t).is_integer() else t for t in cand['sequence']]
+    cand['sequence'] = [
+        int(t) if float(t).is_integer() else round(t, 2) 
+        for t in cand['sequence']
+    ]
