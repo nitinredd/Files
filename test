@@ -2,47 +2,135 @@ import pandas as pd
 import numpy as np
 import math
 import itertools
+import warnings
+warnings.filterwarnings('ignore')
 
-def calculate_mean_profile(df):
-    """Calculate the mean dissolution profile from a dataframe with time and multiple dissolution values"""
-    times = df.iloc[:, 0].astype(float).values
-    means = df.iloc[:, 1:].astype(float).mean(axis=1)
+def parse_dissolution_data(file_path=None, data_string=None):
+    """
+    Parse dissolution data from a file or string.
+    Expected format: First column is time, remaining columns are dissolution values.
+    """
+    if file_path:
+        df = pd.read_csv(file_path)
+    elif data_string:
+        import io
+        df = pd.read_csv(io.StringIO(data_string))
+    else:
+        raise ValueError("Either file_path or data_string must be provided")
+    
+    # Identify time column (usually first column)
+    time_col = df.columns[0]
+    # Extract time values and dissolution data
+    times = df[time_col].astype(float).values
+    # Get all columns except the time column
+    data_cols = [col for col in df.columns if col != time_col]
+    dissolution_data = df[data_cols].astype(float)
+    
+    return times, dissolution_data
+
+def calculate_mean_profile(times, dissolution_data):
+    """Calculate the mean dissolution profile"""
+    means = dissolution_data.mean(axis=1).values
     return times, means
 
-def create_monotonic_profile(times, means, step=0.25, window_max=12):
-    """Interpolate and enforce monotonicity in dissolution profile"""
-    t = np.asarray(times, float)
-    m = np.asarray(means, float)
+def interpolate_time_value(times, values, target_value, extrapolate_low=True):
+    """
+    Find the time at which a specific dissolution value occurs using linear interpolation.
+    Can extrapolate backward to find time points before the first measured point.
+    """
+    times = np.array(times)
+    values = np.array(values)
+    
+    # If target is below first value, extrapolate backward assuming 0% at time 0
+    if target_value < values[0] and extrapolate_low:
+        # Linear extrapolation assuming 0% at time 0
+        if times[0] > 0:  # Avoid division by zero
+            slope = values[0] / times[0]
+            if slope > 0:  # Ensure positive slope for meaningful extrapolation
+                return target_value / slope
+        # Fallback if we can't extrapolate properly
+        return times[0] / 2
+    
+    # If target is above last value, extrapolate forward
+    if target_value > values[-1]:
+        # Simple linear extrapolation based on last two points
+        if times[-1] > times[-2] and values[-1] != values[-2]:
+            slope = (values[-1] - values[-2]) / (times[-1] - times[-2])
+            return times[-1] + (target_value - values[-1]) / slope
+        # Fallback
+        return times[-1] * 1.2
+    
+    # Find the interval containing the target value
+    for i in range(len(values) - 1):
+        if values[i] <= target_value <= values[i+1] or values[i+1] <= target_value <= values[i]:
+            # Handle case where values might not be strictly increasing
+            if values[i] == values[i+1]:  # Avoid division by zero
+                return times[i]
+            
+            # Interpolate time
+            ratio = (target_value - values[i]) / (values[i+1] - values[i])
+            return times[i] + ratio * (times[i+1] - times[i])
+    
+    # If not found in any interval, return the closest time point
+    idx = np.argmin(np.abs(values - target_value))
+    return times[idx]
+
+def interpolate_value_at_time(times, values, target_time):
+    """
+    Find the dissolution value at a specific time using linear interpolation.
+    Can extrapolate to find values before or after the measured range.
+    """
+    times = np.array(times)
+    values = np.array(values)
+    
+    # If target time is earlier than first time point, extrapolate backward
+    if target_time < times[0]:
+        if times[0] > 0:  # Avoid division by zero
+            slope = values[0] / times[0]
+            return target_time * slope
+        return values[0] * target_time / 0.1  # Arbitrary small value
+    
+    # If target time is later than last time point, extrapolate forward
+    if target_time > times[-1]:
+        if len(times) > 1:  # Need at least two points for extrapolation
+            slope = (values[-1] - values[-2]) / (times[-1] - times[-2])
+            return values[-1] + (target_time - times[-1]) * slope
+        return values[-1]  # Just use last value if only one point
+    
+    # Find the interval containing the target time
+    for i in range(len(times) - 1):
+        if times[i] <= target_time <= times[i+1]:
+            # Interpolate value
+            ratio = (target_time - times[i]) / (times[i+1] - times[i])
+            return values[i] + ratio * (values[i+1] - values[i])
+    
+    # If not found (shouldn't happen given the previous checks), return nearest value
+    idx = np.argmin(np.abs(times - target_time))
+    return values[idx]
+
+def create_monotonic_profile(times, means, step=0.05, window_max=None):
+    """
+    Interpolate and enforce monotonicity in dissolution profile at fine resolution.
+    """
+    if window_max is None:
+        window_max = times[-1] * 1.1  # 10% beyond the last time point
+    
+    # Create fine grid for interpolation
     grid = np.arange(0, window_max + step, step)
-    prof = np.interp(grid, t, m, left=0.0, right=m[-1])
-    return np.maximum.accumulate(prof), grid
-
-def find_85_point(ref, test, regulation):
-    """Find the first point where the dissolution reaches 85%"""
-    for i, (r, t) in enumerate(zip(ref, test)):
-        if regulation in ("FDA", "ANVISA"):
-            if r >= 85 and t >= 85:
-                return i
-        else:  # EMA, China, ASEAN
-            if r >= 85 or t >= 85:
-                return i
-    return None
-
-def calculate_f2(ref_vals, test_vals):
-    """Calculate the f2 similarity factor between reference and test values"""
-    if len(ref_vals) < 2:
-        return 0.0
     
-    diffs = np.array(ref_vals) - np.array(test_vals)
-    sum_squared_diff = np.sum(diffs**2)
-    n = len(ref_vals)
+    # Linear interpolation
+    prof = np.interp(grid, times, means, left=0.0, right=means[-1])
     
-    # F2 formula: 50 × log10{[1 + (1/n)∑ᵢ₌₁ⁿ (Rᵢ - Tᵢ)²]⁻⁰·⁵ × 100}
-    f2 = 50 * math.log10(100.0 / (1.0 + np.sqrt(sum_squared_diff / n)))
-    return f2
+    # Enforce monotonicity (non-decreasing)
+    monotonic_prof = np.maximum.accumulate(prof)
+    
+    return monotonic_prof, grid
 
-def stratify_points(ref_prof, grid):
-    """Stratify time points based on reference product dissolution"""
+def stratify_dissolution_values(values):
+    """
+    Categorize dissolution values into strata based on protocol requirements.
+    Returns a dictionary with keys as strata names and values as indices.
+    """
     strata = {
         "0-30%": [],
         "30-60%": [],
@@ -50,208 +138,304 @@ def stratify_points(ref_prof, grid):
         ">85%": []
     }
     
-    for i, ref_val in enumerate(ref_prof):
-        if ref_val <= 30:
+    for i, val in enumerate(values):
+        if val < 30:
             strata["0-30%"].append(i)
-        elif ref_val <= 60:
+        elif val < 60:
             strata["30-60%"].append(i)
-        elif ref_val <= 80:
+        elif val < 80:
             strata["60-80%"].append(i)
-        elif ref_val >= 85:
+        elif val >= 85:
             strata[">85%"].append(i)
+            
+    # The protocol doesn't explicitly define handling for 80-85%, so include in closest
+    for i, val in enumerate(values):
+        if 80 <= val < 85:
+            if val >= 82.5:  # Closer to 85% than to 80%
+                strata[">85%"].append(i)
+            else:  # Closer to 80% than to 85%
+                strata["60-80%"].append(i)
+    
+    # Sort indices in each stratum
+    for stratum in strata:
+        strata[stratum].sort()
     
     return strata
 
-def select_optimal_time_points(reference_df, test_df, regulation, window_max=12, step_hours=0.25):
+def calculate_f2(ref_vals, test_vals):
     """
-    Select optimal time points for dissolution testing that will maximize the f2 similarity factor
-    while meeting regulatory requirements.
+    Calculate the f2 similarity factor between reference and test values.
+    Formula: f2 = 50 × log10{[1 + (1/n)∑ᵢ₌₁ⁿ (Rᵢ - Tᵢ)²]⁻⁰·⁵ × 100}
+    """
+    if len(ref_vals) < 2:
+        return 0.0
+    
+    ref_vals = np.array(ref_vals)
+    test_vals = np.array(test_vals)
+    
+    diffs = ref_vals - test_vals
+    sum_squared_diff = np.sum(diffs**2)
+    n = len(ref_vals)
+    
+    f2 = 50 * math.log10(100.0 / (1.0 + np.sqrt(sum_squared_diff / n)))
+    return f2
+
+def find_optimal_time_points(ref_times, ref_values, test_times, test_values, regulation="FDA", 
+                            min_points_per_stratum=1, include_early_point=True):
+    """
+    Find optimal time points for dissolution testing to maximize f2 similarity factor.
     
     Parameters:
-    - reference_df: DataFrame with time and dissolution values for reference product
-    - test_df: DataFrame with time and dissolution values for test product
+    - ref_times: Array of time points for reference product
+    - ref_values: Array of dissolution values for reference product
+    - test_times: Array of time points for test product
+    - test_values: Array of dissolution values for test product
     - regulation: Regulatory authority ("FDA", "ANVISA", "EMA", "China", "ASEAN")
-    - window_max: Maximum time window to consider
-    - step_hours: Time step for interpolation
+    - min_points_per_stratum: Minimum number of points to select from each stratum
+    - include_early_point: Whether to include a time point before first measurement (if <30%)
     
     Returns:
-    - List of dictionaries with selected time points and f2 scores
-    - Error message if any
+    - Dictionary with selected time points and f2 score
     """
-    # 1) Interpolate & enforce monotonicity
-    rt, rm = calculate_mean_profile(reference_df)
-    tt, tm = calculate_mean_profile(test_df)
-    ref_prof, grid = create_monotonic_profile(rt, rm, step_hours, window_max)
-    test_prof, _ = create_monotonic_profile(tt, tm, step_hours, window_max)
+    # Create fine resolution profiles
+    step = 0.05  # 0.05 hour (3 minute) resolution
+    window_max = max(max(ref_times), max(test_times)) * 1.1  # 10% beyond the last time point
     
-    # 2) Stratify points based on reference product dissolution
-    strata = stratify_points(ref_prof, grid)
+    # Interpolate reference and test profiles to common time grid
+    ref_prof, grid = create_monotonic_profile(ref_times, ref_values, step, window_max)
+    test_prof, _ = create_monotonic_profile(test_times, test_values, step, window_max)
     
-    # 3) Find the 85% index
-    idx85 = find_85_point(ref_prof, test_prof, regulation)
+    # Always include t=0 if both profiles start at 0
+    include_zero = True
     
-    # 4) Apply selection strategy based on regulatory authority
-    selected_designs = []
+    # Stratify reference values
+    strata = stratify_dissolution_values(ref_prof)
     
-    # For all strata except >85%, select up to 2 points with minimum difference
-    brackets = ["0-30%", "30-60%", "60-80%"]
-    bracket_candidates = []
+    # Generate candidate time points
+    candidate_times = []
+    proposed_points = []
     
-    for bracket in brackets:
-        # Calculate differences for points in this stratum
-        candidates = []
-        for idx in strata[bracket]:
-            diff = abs(ref_prof[idx] - test_prof[idx])
-            candidates.append((idx, diff))
+    # 1. Add zero time point if appropriate
+    if include_zero:
+        candidate_times.append(0)
+        proposed_points.append({
+            'time': 0,
+            'ref_val': 0,
+            'test_val': 0,
+            'diff': 0,
+            'stratum': '0-30%'
+        })
+    
+    # 2. Add early time point (before 30% dissolution) if requested
+    if include_early_point and ref_values[0] > 15:
+        # Find time for 17% dissolution or half of first measured value
+        target_val = min(17, ref_values[0] / 2)
+        early_time = interpolate_time_value(ref_times, ref_values, target_val)
         
-        # Sort by difference (ascending to get minimum difference)
-        candidates.sort(key=lambda x: x[1])
-        
-        # Add to bracket_candidates
-        if candidates:
-            bracket_candidates.append(candidates[:2] if len(candidates) >= 2 else candidates)
-        else:
-            bracket_candidates.append([])
-    
-    # Generate all possible combinations of time points
-    all_designs = []
-    choices_per_bracket = []
-    
-    for candidates in bracket_candidates:
-        max_r = min(2, len(candidates))
-        # Generate combinations of size 1 up to max_r
-        choices = []
-        for r in range(1, max_r + 1):
-            for combo in itertools.combinations(candidates, r):
-                choices.append(combo)
-        choices_per_bracket.append(choices if choices else [(None, 0)])
-    
-    # Cross-product all bracket choices
-    for combo in itertools.product(*choices_per_bracket):
-        design = {0}  # Always include t=0
-        for picks in combo:
-            if picks[0] is not None:  # Skip None entries
-                design.update(idx for idx, _ in picks)
-        
-        # Add >85% point based on regulatory authority
-        if idx85 is not None:
-            if regulation in ("FDA", "ANVISA"):
-                # For FDA/ANVISA, include points from >85% stratum
-                design.add(idx85)
-                # Add additional points from >85% stratum if available
-                if len(strata[">85%"]) > 1:
-                    # Sort by difference and add the one with minimum difference
-                    candidates = [(idx, abs(ref_prof[idx] - test_prof[idx])) for idx in strata[">85%"]]
-                    candidates.sort(key=lambda x: x[1])
-                    if candidates and candidates[0][0] != idx85 and len(candidates) > 1:
-                        design.add(candidates[1][0])
-            else:  # EMA, China, ASEAN
-                # For EMA/China/ASEAN, only one point from >85% stratum
-                design.add(idx85)
-        
-        all_designs.append(sorted(design))
-    
-    # Evaluate each design and find the one with maximum f2 score
-    best, best_f2 = None, -1.0
-    for design in all_designs:
-        times_, rvals_, tvals_ = [], [], []
-        last_r = -np.inf
-        
-        for i in design:
-            # Apply ≥7% dissolution difference filter
-            if i > 0 and abs(ref_prof[i] - last_r) < 7:
-                continue
+        if early_time > 0 and early_time < ref_times[0]:
+            early_ref_val = interpolate_value_at_time(ref_times, ref_values, early_time)
+            early_test_val = interpolate_value_at_time(test_times, test_values, early_time)
             
-            times_.append(grid[i])
-            rvals_.append(ref_prof[i])
-            tvals_.append(test_prof[i])
-            last_r = ref_prof[i]
+            candidate_times.append(early_time)
+            proposed_points.append({
+                'time': early_time,
+                'ref_val': early_ref_val,
+                'test_val': early_test_val,
+                'diff': abs(early_ref_val - early_test_val),
+                'stratum': '0-30%'
+            })
+    
+    # 3. Add actual measured time points
+    for i, time in enumerate(ref_times):
+        ref_val = ref_values[i]
+        test_val = interpolate_value_at_time(test_times, test_values, time)
+        diff = abs(ref_val - test_val)
         
-        if len(rvals_) < 2:
-            continue
+        # Determine stratum
+        if ref_val < 30:
+            stratum = '0-30%'
+        elif ref_val < 60:
+            stratum = '30-60%'
+        elif ref_val < 80:
+            stratum = '60-80%'
+        else:
+            stratum = '>85%' if ref_val >= 85 else '60-80%'
         
-        score = calculate_f2(rvals_, tvals_)
-        if score > best_f2:
-            best_f2 = score
-            best = (times_, rvals_, tvals_)
+        candidate_times.append(time)
+        proposed_points.append({
+            'time': time,
+            'ref_val': ref_val,
+            'test_val': test_val,
+            'diff': diff,
+            'stratum': stratum
+        })
     
-    if best is None:
-        return [], "No valid design found"
+    # 4. Add 85% point if not already in the dataset
+    found_85 = False
+    for point in proposed_points:
+        if point['ref_val'] >= 85 and point['test_val'] >= 85:
+            found_85 = True
+            break
     
-    # Format final output
-    times_, rvals_, tvals_ = best
-    sequence = [int(t) if float(t).is_integer() else round(float(t), 2) for t in times_]
+    if not found_85:
+        # Find time for 85% dissolution
+        time_85_ref = interpolate_time_value(ref_times, ref_values, 85)
+        time_85_test = interpolate_time_value(test_times, test_values, 85)
+        
+        # Use earliest time point where both reach 85%
+        if regulation in ("FDA", "ANVISA"):
+            time_85 = max(time_85_ref, time_85_test)  # Both must reach 85%
+        else:  # EMA, China, ASEAN
+            time_85 = min(time_85_ref, time_85_test)  # Either reaches 85%
+        
+        ref_val_85 = interpolate_value_at_time(ref_times, ref_values, time_85)
+        test_val_85 = interpolate_value_at_time(test_times, test_values, time_85)
+        
+        candidate_times.append(time_85)
+        proposed_points.append({
+            'time': time_85,
+            'ref_val': ref_val_85,
+            'test_val': test_val_85,
+            'diff': abs(ref_val_85 - test_val_85),
+            'stratum': '>85%'
+        })
     
-    # Create result dictionary
-    result = {
-        'sequence': sequence,
-        'f2': round(best_f2, 2),
-        'compliant': best_f2 >= 50,
-        'reference_values': [round(float(v), 2) for v in rvals_],
-        'test_values': [round(float(v), 2) for v in tvals_],
-        'differences': [round(abs(r - t), 2) for r, t in zip(rvals_, tvals_)],
-        'strata': []
+    # 5. Sort proposed points by time
+    proposed_points.sort(key=lambda x: x['time'])
+    
+    # 6. Select points based on regulatory strategy
+    selected_points = []
+    
+    # Group points by stratum
+    stratified_points = {
+        "0-30%": [],
+        "30-60%": [],
+        "60-80%": [],
+        ">85%": []
     }
     
-    # Add stratum information
-    for i, (time, ref, test) in enumerate(zip(times_, rvals_, tvals_)):
-        if ref <= 30:
-            stratum = "0-30%"
-        elif ref <= 60:
-            stratum = "30-60%"
-        elif ref <= 80:
-            stratum = "60-80%"
-        else:
-            stratum = ">85%"
+    for point in proposed_points:
+        stratified_points[point['stratum']].append(point)
+    
+    # Define maximum points per stratum based on regulation
+    if regulation in ("FDA", "ANVISA"):
+        max_points = {
+            "0-30%": 2,
+            "30-60%": 2,
+            "60-80%": 2,
+            ">85%": 2  # FDA allows multiple points >85%
+        }
+    else:  # EMA, China, ASEAN
+        max_points = {
+            "0-30%": 2,
+            "30-60%": 2,
+            "60-80%": 2,
+            ">85%": 1  # Only one point >85%
+        }
+    
+    # Select best points from each stratum
+    for stratum, points in stratified_points.items():
+        if not points:
+            continue  # Skip empty strata
+            
+        # Sort by minimum difference
+        points.sort(key=lambda x: x['diff'])
         
-        result['strata'].append(stratum)
+        # Select up to max_points with minimum difference
+        to_select = min(max_points[stratum], len(points))
+        to_select = max(to_select, min_points_per_stratum) if len(points) >= min_points_per_stratum else len(points)
+        
+        for i in range(to_select):
+            selected_points.append(points[i])
     
-    return [result], None
+    # Remove any duplicates (same time point)
+    selected_times = set()
+    unique_selected = []
+    
+    for point in selected_points:
+        # Round time to avoid floating point comparison issues
+        rounded_time = round(point['time'], 4)
+        if rounded_time not in selected_times:
+            selected_times.add(rounded_time)
+            unique_selected.append(point)
+    
+    # Re-sort selected points by time
+    unique_selected.sort(key=lambda x: x['time'])
+    
+    # 7. Check for minimum difference between consecutive points (≥7% rule)
+    final_selection = []
+    last_ref_val = None
+    
+    for point in unique_selected:
+        # Always include time 0
+        if point['time'] == 0:
+            final_selection.append(point)
+            last_ref_val = 0
+            continue
+            
+        # Check if difference from last point is at least 7%
+        if last_ref_val is None or abs(point['ref_val'] - last_ref_val) >= 7:
+            final_selection.append(point)
+            last_ref_val = point['ref_val']
+    
+    # 8. Calculate f2 score with selected points
+    if len(final_selection) >= 2:
+        ref_vals = [p['ref_val'] for p in final_selection]
+        test_vals = [p['test_val'] for p in final_selection]
+        f2 = calculate_f2(ref_vals, test_vals)
+    else:
+        f2 = 0.0
+    
+    # 9. Format result
+    result = {
+        'selected_points': final_selection,
+        'times': [round(p['time'], 2) if p['time'] % 1 != 0 else int(p['time']) for p in final_selection],
+        'reference_values': [round(p['ref_val'], 2) for p in final_selection],
+        'test_values': [round(p['test_val'], 2) for p in final_selection],
+        'differences': [round(p['diff'], 2) for p in final_selection],
+        'strata': [p['stratum'] for p in final_selection],
+        'f2_score': round(f2, 2),
+        'compliant': f2 >= 50
+    }
+    
+    return result
 
-# --- Example usage ---
-# Create sample dataframes
-ref_df = pd.DataFrame({
-    'Time': [0.5, 1, 2, 4, 8],
-    'D1':   [10, 25, 50, 75, 90],
-    'D2':   [12, 23, 48, 72, 89]
-})
-
-test_df = pd.DataFrame({
-    'Time': [0.5, 1, 2, 4, 8],
-    'D1':   [8, 22, 48, 68, 88],
-    'D2':   [9, 21, 47, 65, 85]
-})
-
-# Run the analysis for FDA regulation
-results_fda, error_fda = select_optimal_time_points(ref_df, test_df, regulation="FDA")
-print("\nFDA/ANVISA Results:")
-if error_fda:
-    print(f"Error: {error_fda}")
-else:
-    print(f"Selected time points: {results_fda[0]['sequence']}")
-    print(f"F2 score: {results_fda[0]['f2']}")
-    print(f"Compliant: {results_fda[0]['compliant']}")
+# Function to demonstrate results with sample data
+def run_example_analysis(ref_data_string, test_data_string, regulation="FDA"):
+    """
+    Run the optimal time point selection on sample data and display results.
+    """
+    # Parse data
+    ref_times, ref_dissolution = parse_dissolution_data(data_string=ref_data_string)
+    test_times, test_dissolution = parse_dissolution_data(data_string=test_data_string)
+    
+    # Calculate mean profiles
+    _, ref_means = calculate_mean_profile(ref_times, ref_dissolution)
+    _, test_means = calculate_mean_profile(test_times, test_dissolution)
+    
+    # Calculate conventional f2 score (using all points)
+    conventional_f2 = calculate_f2(ref_means, test_means)
+    
+    # Find optimal time points
+    results = find_optimal_time_points(ref_times, ref_means, test_times, test_means, 
+                                     regulation=regulation, include_early_point=True)
+    
+    # Display results
+    print(f"\n{regulation} Results:")
+    print(f"Selected time points: {results['times']}")
+    print(f"F2 score (optimal selection): {results['f2_score']}")
+    print(f"F2 score (conventional): {round(conventional_f2, 2)}")
+    print(f"Compliant: {results['compliant']}")
     
     # Print detailed stratum information
     print("\nSelected Time Points Table:")
     print("Time point | Stratum | Reference Value | Test Value | Difference")
     print("----------|---------|-----------------|-----------|------------")
-    for i, time in enumerate(results_fda[0]['sequence']):
-        print(f"{time:9} | {results_fda[0]['strata'][i]:7} | {results_fda[0]['reference_values'][i]:15.2f} | {results_fda[0]['test_values'][i]:9.2f} | {results_fda[0]['differences'][i]:10.2f}")
-
-# Run the analysis for EMA regulation
-results_ema, error_ema = select_optimal_time_points(ref_df, test_df, regulation="EMA")
-print("\nEMA/China/ASEAN Results:")
-if error_ema:
-    print(f"Error: {error_ema}")
-else:
-    print(f"Selected time points: {results_ema[0]['sequence']}")
-    print(f"F2 score: {results_ema[0]['f2']}")
-    print(f"Compliant: {results_ema[0]['compliant']}")
+    for i, time in enumerate(results['times']):
+        print(f"{time:9} | {results['strata'][i]:7} | {results['reference_values'][i]:15.2f} | {results['test_values'][i]:9.2f} | {results['differences'][i]:10.2f}")
     
-    # Print detailed stratum information
-    print("\nSelected Time Points Table:")
-    print("Time point | Stratum | Reference Value | Test Value | Difference")
-    print("----------|---------|-----------------|-----------|------------")
-    for i, time in enumerate(results_ema[0]['sequence']):
-        print(f"{time:9} | {results_ema[0]['strata'][i]:7} | {results_ema[0]['reference_values'][i]:15.2f} | {results_ema[0]['test_values'][i]:9.2f} | {results_ema[0]['differences'][i]:10.2f}")
+    return results
+
+# Example usage with the provided dataset
+if __name__ == "__main__":
+    # Sample 
