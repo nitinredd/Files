@@ -1,18 +1,28 @@
 import os
+import time
+import logging
 import google.auth
 import pandas as pd
 import streamlit as st
-from vertexai.preview.language_models import TextGenerationModel
-from vertexai.preview.generative_models import SafetySetting, HarmCategory, HarmBlockThreshold
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+)
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # ---------- Configuration ----------
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
 
-# Initialize Gemini 2.5 Pro via TextGenerationModel
-model = TextGenerationModel.from_pretrained("gemini-2.0-flash-thinking-exp-01-21")
+# Use the full multimodal‐capable Gemini 2.5 Pro
+model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# Safety settings
+# Safety settings (same as your template)
 safety_config = [
     SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,        threshold=HarmBlockThreshold.BLOCK_NONE),
     SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -21,17 +31,44 @@ safety_config = [
     SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
+
+def safe_gemini_text_call(prompt: str, max_retries: int = 3, delay: float = 2.0):
+    """
+    Calls Gemini.generate_content with retry logic and safety filtering.
+    Returns the first safe .text on success, or raises after retries.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.debug(f"Gemini call attempt {attempt}, prompt length={len(prompt)}")
+            response = model.generate_content([prompt], safety_settings=safety_config)
+            # .text is available on a non‐blocked GenerationResponse
+            if hasattr(response, "text") and response.text:
+                return response.text.strip()
+            # If model indicates blocking, raise to retry
+            if "blocked" in str(response).lower():
+                raise ValueError("Blocked by safety filter")
+            # Fallback if no text but no block message
+            raise ValueError("Empty response")
+        except Exception as e:
+            logger.warning(f"Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(delay)
+            else:
+                logger.error("Max retries reached, re-raising.")
+                raise
+    # Should never get here
+    raise RuntimeError("safe_gemini_text_call unexpected exit")
+
+
 # ---------- Multi-Agent Framework ----------
 class Agent:
-    """Base class for agents"""
     def __init__(self, name: str):
         self.name = name
-
     def handle(self, query, context):
         raise NotImplementedError
 
+
 class ExcelReaderAgent(Agent):
-    """Reads structured data from Excel workbooks"""
     def __init__(self, files: list[str]):
         super().__init__("ExcelReader")
         self.sheets: dict[str, pd.DataFrame] = {}
@@ -41,87 +78,71 @@ class ExcelReaderAgent(Agent):
                 self.sheets[sheet] = xl.parse(sheet)
 
     def handle(self, query, context):
-        # Return available sheet names
         return list(self.sheets.keys())
 
+
 class QueryAgent(Agent):
-    """Extracts relevant rows matching user intent"""
     def __init__(self, reader: ExcelReaderAgent):
         super().__init__("QueryAgent")
         self.reader = reader
 
     def handle(self, query: str, context):
         results: dict[str, pd.DataFrame] = {}
-        for sheet_name, df in self.reader.sheets.items():
+        for name, df in self.reader.sheets.items():
             mask = df.apply(
                 lambda col: col.astype(str)
-                                .str
-                                .contains(query, case=False, na=False, regex=False)
+                               .str
+                               .contains(query, case=False, na=False, regex=False)
             ).any(axis=1)
             matched = df.loc[mask]
             if not matched.empty:
-                results[sheet_name] = matched
+                results[name] = matched
         return results
 
+
 class GeminiAgent(Agent):
-    """Calls Gemini (via TextGenerationModel) to refine/answer based on extracted rows"""
-    def __init__(self, model: TextGenerationModel, safety_settings: list[SafetySetting]):
+    def __init__(self, safety_settings: list[SafetySetting]):
         super().__init__("GeminiAgent")
-        self.model = model
         self.safety = safety_settings
 
     def handle(self, query: str, context: dict[str, pd.DataFrame]):
-        # Build prompt payload
-        prompt = (
-            "You are a domain assistant.\n"
-            f"User query: {query}\n"
-            "Relevant data:"
-        )
+        # Build a single prompt that includes CSV snippets per sheet
+        prompt = f"You are a helpful assistant. User asks: {query}\n\n"
         for sheet, df in context.items():
-            prompt += f"\n\n--- Sheet: {sheet} ---\n{df.to_csv(index=False)}"
+            prompt += f"--- Sheet: {sheet} ---\n{df.to_csv(index=False)}\n\n"
+        # Call through the safe wrapper
+        answer = safe_gemini_text_call(prompt)
+        return answer
 
-        # Generate text directly
-        response = self.model.generate_text(
-            prompt,
-            safety_settings=self.safety
-        )
-        return response.text.strip()
 
 class CoordinatorAgent(Agent):
-    """Orchestrates workflow among agents"""
-    def __init__(
-        self,
-        reader: ExcelReaderAgent,
-        query_agent: QueryAgent,
-        gemini_agent: GeminiAgent
-    ):
+    def __init__(self, reader, query_agent, gemini_agent):
         super().__init__("Coordinator")
         self.reader = reader
         self.query_agent = query_agent
         self.gemini_agent = gemini_agent
 
     def handle(self, query: str):
-        # 1) List available sheets (not strictly needed by end user)
+        # 1) Discover sheets (optional)
         _ = self.reader.handle(query, None)
-
-        # 2) Find matching rows
+        # 2) Match rows
         matched = self.query_agent.handle(query, None)
         if not matched:
             return None, None
-
-        # 3) Ask Gemini to interpret
+        # 3) Get Gemini’s answer
         answer = self.gemini_agent.handle(query, matched)
         return answer, matched
+
 
 # ---------- Streamlit App ----------
 st.set_page_config(page_title="Excel Chatbot", layout="wide")
 
-# Initialize or retrieve agents
+# Initialize agents in session state
 if 'agents' not in st.session_state:
     files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
     reader       = ExcelReaderAgent(files)
     query_agent  = QueryAgent(reader)
-    gemini_agent = GeminiAgent(model, safety_config)
+    gemini_agent = GeminiAgent(safety_config)
     coordinator  = CoordinatorAgent(reader, query_agent, gemini_agent)
 
     st.session_state['agents'] = {
@@ -131,33 +152,37 @@ if 'agents' not in st.session_state:
         'coordinator': coordinator
     }
 
-reader       = st.session_state['agents']['reader']
-query_agent  = st.session_state['agents']['query_agent']
-gemini_agent = st.session_state['agents']['gemini_agent']
-coordinator  = st.session_state['agents']['coordinator']
+reader      = st.session_state['agents']['reader']
+query_agent = st.session_state['agents']['query_agent']
+gemini_agent= st.session_state['agents']['gemini_agent']
+coordinator = st.session_state['agents']['coordinator']
 
-# Greeting & Samples
+# Greeting + sample prompts
 if 'greeted' not in st.session_state:
     st.write("**Hi! I’m your Excel Chatbot powered by Gemini 2.5 Pro.**")
     st.markdown("**Try these prompts:**")
     for sheet, df in list(reader.sheets.items())[:3]:
-        first_row = df.iloc[0].to_dict()
-        key, val  = next(iter(first_row.items()))
-        st.write(f"- Do we have **{key}** with value **{val}** in *{sheet}*?")
+        row = df.iloc[0].to_dict()
+        k, v = next(iter(row.items()))
+        st.write(f"- Do we have **{k}** = **{v}** in *{sheet}*?")
     st.session_state['greeted'] = True
 
-# User Input
+# User interaction
 query = st.text_input("Enter your query:")
 if st.button("Ask") and query:
     with st.spinner("Processing…"):
-        answer, matched = coordinator.handle(query)
-        if matched is None:
-            st.error("No relevant information found in the Excel workbooks.")
-        else:
-            st.subheader("Matched Data")
-            for sheet, df in matched.items():
-                st.write(f"**Sheet: {sheet}**")
-                st.dataframe(df)
+        try:
+            answer, matched = coordinator.handle(query)
+            if matched is None:
+                st.error("No matching rows found in your workbooks.")
+            else:
+                st.subheader("Matched Data")
+                for sheet, df in matched.items():
+                    st.write(f"**Sheet: {sheet}**")
+                    st.dataframe(df)
 
-            st.subheader("Answer")
-            st.write(answer)
+                st.subheader("Answer")
+                st.write(answer)
+        except Exception as e:
+            logger.exception("Chatbot error")
+            st.error(f"An error occurred: {e}")
