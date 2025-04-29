@@ -1,22 +1,163 @@
+import os
+import google.auth
+import pandas as pd
+import streamlit as st
+from vertexai.preview.language_models import TextGenerationModel
+from vertexai.preview.generative_models import SafetySetting, HarmCategory, HarmBlockThreshold
+
+# ---------- Configuration ----------
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+
+# Initialize Gemini 2.5 Pro via TextGenerationModel
+model = TextGenerationModel.from_pretrained("gemini-2.0-flash-thinking-exp-01-21")
+
+# Safety settings
+safety_config = [
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,        threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+]
+
+# ---------- Multi-Agent Framework ----------
+class Agent:
+    """Base class for agents"""
+    def __init__(self, name: str):
+        self.name = name
+
+    def handle(self, query, context):
+        raise NotImplementedError
+
+class ExcelReaderAgent(Agent):
+    """Reads structured data from Excel workbooks"""
+    def __init__(self, files: list[str]):
+        super().__init__("ExcelReader")
+        self.sheets: dict[str, pd.DataFrame] = {}
+        for f in files:
+            xl = pd.ExcelFile(f)
+            for sheet in xl.sheet_names:
+                self.sheets[sheet] = xl.parse(sheet)
+
+    def handle(self, query, context):
+        # Return available sheet names
+        return list(self.sheets.keys())
+
+class QueryAgent(Agent):
+    """Extracts relevant rows matching user intent"""
+    def __init__(self, reader: ExcelReaderAgent):
+        super().__init__("QueryAgent")
+        self.reader = reader
+
+    def handle(self, query: str, context):
+        results: dict[str, pd.DataFrame] = {}
+        for sheet_name, df in self.reader.sheets.items():
+            mask = df.apply(
+                lambda col: col.astype(str)
+                                .str
+                                .contains(query, case=False, na=False, regex=False)
+            ).any(axis=1)
+            matched = df.loc[mask]
+            if not matched.empty:
+                results[sheet_name] = matched
+        return results
+
 class GeminiAgent(Agent):
-    def __init__(self, model, safety_settings):
+    """Calls Gemini (via TextGenerationModel) to refine/answer based on extracted rows"""
+    def __init__(self, model: TextGenerationModel, safety_settings: list[SafetySetting]):
         super().__init__("GeminiAgent")
         self.model = model
         self.safety = safety_settings
 
     def handle(self, query: str, context: dict[str, pd.DataFrame]):
-        # Build single‐turn prompt
+        # Build prompt payload
         prompt = (
             "You are a domain assistant.\n"
             f"User query: {query}\n"
-            + "".join(
-                f"\nSheet: {sheet}\nRows:\n{df.to_csv(index=False)}\n"
-                for sheet, df in context.items()
-            )
+            "Relevant data:"
         )
+        for sheet, df in context.items():
+            prompt += f"\n\n--- Sheet: {sheet} ---\n{df.to_csv(index=False)}"
 
-        # Start a chat session
-        chat = self.model.start_chat(safety_settings=self.safety)
-        # Send the prompt & get back a ChatMessage with .text
-        reply = chat.send_message(prompt)
-        return reply.text.strip()
+        # Generate text directly
+        response = self.model.generate_text(
+            prompt,
+            safety_settings=self.safety
+        )
+        return response.text.strip()
+
+class CoordinatorAgent(Agent):
+    """Orchestrates workflow among agents"""
+    def __init__(
+        self,
+        reader: ExcelReaderAgent,
+        query_agent: QueryAgent,
+        gemini_agent: GeminiAgent
+    ):
+        super().__init__("Coordinator")
+        self.reader = reader
+        self.query_agent = query_agent
+        self.gemini_agent = gemini_agent
+
+    def handle(self, query: str):
+        # 1) List available sheets (not strictly needed by end user)
+        _ = self.reader.handle(query, None)
+
+        # 2) Find matching rows
+        matched = self.query_agent.handle(query, None)
+        if not matched:
+            return None, None
+
+        # 3) Ask Gemini to interpret
+        answer = self.gemini_agent.handle(query, matched)
+        return answer, matched
+
+# ---------- Streamlit App ----------
+st.set_page_config(page_title="Excel Chatbot", layout="wide")
+
+# Initialize or retrieve agents
+if 'agents' not in st.session_state:
+    files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
+    reader       = ExcelReaderAgent(files)
+    query_agent  = QueryAgent(reader)
+    gemini_agent = GeminiAgent(model, safety_config)
+    coordinator  = CoordinatorAgent(reader, query_agent, gemini_agent)
+
+    st.session_state['agents'] = {
+        'reader': reader,
+        'query_agent': query_agent,
+        'gemini_agent': gemini_agent,
+        'coordinator': coordinator
+    }
+
+reader       = st.session_state['agents']['reader']
+query_agent  = st.session_state['agents']['query_agent']
+gemini_agent = st.session_state['agents']['gemini_agent']
+coordinator  = st.session_state['agents']['coordinator']
+
+# Greeting & Samples
+if 'greeted' not in st.session_state:
+    st.write("**Hi! I’m your Excel Chatbot powered by Gemini 2.5 Pro.**")
+    st.markdown("**Try these prompts:**")
+    for sheet, df in list(reader.sheets.items())[:3]:
+        first_row = df.iloc[0].to_dict()
+        key, val  = next(iter(first_row.items()))
+        st.write(f"- Do we have **{key}** with value **{val}** in *{sheet}*?")
+    st.session_state['greeted'] = True
+
+# User Input
+query = st.text_input("Enter your query:")
+if st.button("Ask") and query:
+    with st.spinner("Processing…"):
+        answer, matched = coordinator.handle(query)
+        if matched is None:
+            st.error("No relevant information found in the Excel workbooks.")
+        else:
+            st.subheader("Matched Data")
+            for sheet, df in matched.items():
+                st.write(f"**Sheet: {sheet}**")
+                st.dataframe(df)
+
+            st.subheader("Answer")
+            st.write(answer)
