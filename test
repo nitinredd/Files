@@ -1,124 +1,122 @@
-# excel_adk_agent.py
+# excel_chatbot.py
 
+import re
 import os
+import json
 import pandas as pd
 import streamlit as st
+from typing import Dict, Any
 
-from typing import Dict, Any, List
-from google.adk.agents import Agent                                         # ADK Agent base class :contentReference[oaicite:0]{index=0}
-from google.adk.tools import FunctionTool, ToolContext                        # ADK FunctionTool & Context :contentReference[oaicite:1]{index=1}
-from google.adk.runners import Runner                                         # ADK Runner for orchestration :contentReference[oaicite:2]{index=2}
-from google.adk.sessions import InMemorySessionService                        # In-memory sessions for demo :contentReference[oaicite:3]{index=3}
-from google.genai import types                                                # GenAI content types :contentReference[oaicite:4]{index=4}
-
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    SafetySetting,
-    HarmCategory,
-    HarmBlockThreshold,
-)
-
-# ---------- Configuration & LLM Setup ----------
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-MODEL_ID = "gemini-2.0-flash-thinking-exp-01-21"                                # Use multimodal Gemini 2.5 Pro :contentReference[oaicite:5]{index=5}
-llm = GenerativeModel(MODEL_ID)
-
-# Safety settings to avoid undesired content :contentReference[oaicite:6]{index=6}
-safety = [
-    SafetySetting(HarmCategory.HARM_CATEGORY_UNSPECIFIED,     HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HARASSMENT,      HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HATE_SPEECH,     HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,HarmBlockThreshold.BLOCK_NONE),
+# ---------- CONFIGURE YOUR EXCEL FILES HERE ----------
+EXCEL_PATHS = [
+    "formula master_osd.xlsx",
+    "masterlist osd equipments.xlsx",
 ]
+# ------------------------------------------------------
 
-# ---------- Function Tools Definition ----------
-def load_excel(paths: List[str]) -> Dict[str, List[str]]:
-    """
-    Loads all sheets from given Excel files and returns a mapping
-    of sheet name to its column list.
-    """
-    sheets: Dict[str, pd.DataFrame] = {}
+# ---------- AGENTS ----------
+
+class IntentAgent:
+    """Parses a natural-language query into structured intent."""
+    @staticmethod
+    def handle(query: str) -> Dict[str, str]:
+        # Regex‐based extraction for equipment, plant
+        eq = re.search(r"equipment\s+(\w+)", query, re.I)
+        pl = re.search(r"plant\s+(\w+)", query, re.I)
+        # Parameter = everything after the word "range" or after equipment/plant
+        param = query
+        if eq:
+            param = param.replace(eq.group(1), "")
+        if pl:
+            param = param.replace(pl.group(1), "")
+        param = re.sub(r"\b(what|is|the|in|for|of|range|unit|operation)\b", "", param, flags=re.I).strip()
+        return {
+            "equipment": eq.group(1) if eq else "",
+            "plant":     pl.group(1) if pl else "",
+            "parameter": param
+        }
+
+class SchemaAgent:
+    """Validates sheets & columns exist, and picks the right sheet/cols."""
+    def __init__(self, sheets: Dict[str, pd.DataFrame]):
+        self.sheets = sheets
+
+    def handle(self, intent: Dict[str,str]) -> Dict[str,Any]:
+        # Find a sheet that contains both equipment & plant columns
+        # and at least one column matching the parameter phrase.
+        best = {}
+        for name, df in self.sheets.items():
+            cols = [c.lower() for c in df.columns]
+            if intent["equipment"] and not any("equipment" in c for c in cols):
+                continue
+            if intent["plant"]     and not any("plant"     in c for c in cols):
+                continue
+            # parameter match: substring in column name
+            matches = [c for c in df.columns if intent["parameter"].lower() in c.lower()]
+            if matches:
+                best = {
+                    "sheet":  name,
+                    "filters":{"equipment": intent["equipment"], "plant": intent["plant"]},
+                    "columns": matches
+                }
+                break
+        return best
+
+class DataAgent:
+    """Applies the filters & selects only those columns."""
+    def __init__(self, sheets: Dict[str,pd.DataFrame]):
+        self.sheets = sheets
+
+    def handle(self, schema_map: Dict[str,Any]) -> pd.DataFrame:
+        name = schema_map["sheet"]
+        df   = self.sheets[name]
+        f    = schema_map["filters"]
+        # filter equipment & plant
+        if f["equipment"]:
+            eq_col = next(c for c in df.columns if "equipment" in c.lower())
+            df = df[df[eq_col].astype(str).str.contains(f["equipment"], case=False)]
+        if f["plant"]:
+            pl_col = next(c for c in df.columns if "plant" in c.lower())
+            df = df[df[pl_col].astype(str).str.contains(f["plant"], case=False)]
+        return df[schema_map["columns"]]
+
+class ResponseAgent:
+    """Formats the final DataFrame into markdown."""
+    @staticmethod
+    def handle(df: pd.DataFrame) -> str:
+        if df.empty:
+            return "No matching data found."
+        return df.to_markdown(index=False)
+
+# ---------- STREAMLIT UI ----------
+
+# Load sheets once
+@st.cache_data
+def load_sheets(paths):
+    sheets = {}
     for p in paths:
+        if not os.path.exists(p):
+            st.error(f"File not found: {p}")
+            continue
         xl = pd.ExcelFile(p)
         for s in xl.sheet_names:
             sheets[s] = xl.parse(s)
-    return {name: df.columns.tolist() for name, df in sheets.items()}
+    return sheets
 
-excel_loader = FunctionTool(func=load_excel)                                  # Wrap loader as a FunctionTool :contentReference[oaicite:7]{index=7}
+sheets = load_sheets(EXCEL_PATHS)
+schema_agent = SchemaAgent(sheets)
+data_agent   = DataAgent(sheets)
 
-def query_data(
-    sheet: str,
-    filters: Dict[str, str],
-    columns: List[str],
-    tool_context: ToolContext
-) -> List[Dict[str, Any]]:
-    """
-    Filters `sheet` by exact substring matches on `filters`, and returns
-    only the requested `columns` as a list of row-dicts.
-    """
-    # Retrieve loaded sheets from context
-    sheets = tool_context.user_state.get("excel_loader_result", {})
-    df = pd.DataFrame(sheets.get(sheet, [])) if False else None
-    # Actually reload here for simplicity:
-    df_full = pd.read_excel(sheet) if isinstance(sheet, str) else pd.DataFrame()
-    df = df_full
-    for col, val in filters.items():
-        df = df[df[col].astype(str).str.contains(val, case=False, regex=False)]
-    result = df[columns].to_dict(orient="records")
-    return result
+st.title("Excel Multi-Agent Chatbot")
+st.markdown("Ask questions like: *What is the impeller speed range in unit operation RMG for the equipment Glatt in Plant F20?*")
 
-data_query = FunctionTool(func=query_data)                                    # Wrap query tool :contentReference[oaicite:8]{index=8}
-
-# ---------- Agent Construction ----------
-excel_agent = Agent(
-    model=MODEL_ID,
-    name="excel_agent",
-    description="Agent to query Excel spreadsheets by sheet, filters, and columns.",
-    instruction="""
-You are an Excel assistant.  
-1) When the user asks a question, parse it into JSON:
-   {
-     "sheet": "<sheet name>",
-     "filters": { "<column>": "<value>" },
-     "columns": ["<col1>", "<col2>", ...]
-   }  
-2) Return *only* that JSON.  
-3) After the tool runs, you will receive the data back; then format it as Markdown:
-   | col1 | col2 |
-   |------|------|
-   |  v1  |  v2  |
-""",
-    tools=[excel_loader, data_query],
-    safety_settings=safety,
-    tool_context_fields=["user_state"]                                       # allow persisting loader output :contentReference[oaicite:9]{index=9}
-)
-
-# ---------- Runner & Session ----------
-runner = Runner(
-    agent=excel_agent,
-    app_name="excel_app",
-    session_service=InMemorySessionService(),
-)
-
-SESSION_ID = "session_1"
-USER_ID = "user_123"
-
-# Initialize session
-runner.session_service.create_session(
-    app_name="excel_app",
-    user_id=USER_ID,
-    session_id=SESSION_ID,
-    state={}
-)
-
-# ---------- Streamlit UI ----------
-st.title("Excel ADK Chatbot")
-query = st.text_input("Ask about your Excel workbooks:")
-if st.button("Ask") and query:
-    content = types.Content(role="user", parts=[types.Part.from_text(query)])
-    events = runner.run(user_id=USER_ID, session_id=SESSION_ID, new_message=content)
-    # Display final response
-    for event in events:
-        if event.is_final_response():
-            st.markdown(event.content.parts[0].text)
+query = st.text_input("Your question:")
+if st.button("Ask") and query.strip():
+    intent = IntentAgent.handle(query)
+    schema_map = schema_agent.handle(intent)
+    if not schema_map:
+        st.error("Couldn’t map your question to any sheet/columns. Please check spelling and schema.")
+    else:
+        df = data_agent.handle(schema_map)
+        response = ResponseAgent.handle(df)
+        st.markdown(response)
