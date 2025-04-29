@@ -1,12 +1,11 @@
 import os
 import time
 import logging
-import re
+import json
 
 import google.auth
 import pandas as pd
 import streamlit as st
-
 from rapidfuzz import process, fuzz
 from vertexai.preview.generative_models import (
     GenerativeModel,
@@ -23,223 +22,175 @@ logger = logging.getLogger(__name__)
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
 
-# Use the full multinodal‐capable Gemini 2.5 Pro
+# Use multimodal Gemini 2.5 Pro
 model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# Safety settings (same as your template)
 safety_config = [
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,        threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
     SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
     SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-
+# ---------- Safe LLM Call ----------
 def safe_gemini_text_call(prompt: str, max_retries: int = 3, delay: float = 2.0) -> str:
-    """
-    Calls Gemini.generate_content with retry logic and safety filtering.
-    Returns the first safe .text on success, or raises after retries.
-    """
     for attempt in range(1, max_retries + 1):
         try:
-            logger.debug(f"Gemini call attempt {attempt}, prompt length={len(prompt)}")
-            response = model.generate_content([prompt], safety_settings=safety_config)
-            if hasattr(response, "text") and response.text:
-                return response.text.strip()
-            if "blocked" in str(response).lower():
+            logger.debug(f"Gemini call attempt {attempt} | prompt length={len(prompt)}")
+            resp = model.generate_content([prompt], safety_settings=safety_config)
+            if hasattr(resp, "text") and resp.text:
+                return resp.text.strip()
+            if "blocked" in str(resp).lower():
                 raise ValueError("Blocked by safety filter")
-            raise ValueError("Empty response")
+            raise ValueError("Empty response from Gemini")
         except Exception as e:
             logger.warning(f"Attempt {attempt} failed: {e}")
             if attempt < max_retries:
                 time.sleep(delay)
             else:
-                logger.error("Max retries reached, re-raising.")
+                logger.error("Max retries reached, aborting.")
                 raise
-    raise RuntimeError("Unexpected exit from safe_gemini_text_call")
+    raise RuntimeError("safe_gemini_text_call unexpected exit")
 
-
-# ---------- Natural Language to Column Mapping ----------
-def extract_entities(query: str) -> dict:
-    """
-    Very simple entity extraction: looks for equipment names, plant codes,
-    and parameter phrases by regexing capital words or known keywords.
-    You may extend this with a proper NLP model if needed.
-    """
-    # Example regex patterns; tweak to your sheet’s vocabulary
-    equipment = re.findall(r"\b(?:equipment|unit operation|machine)\s+(\w+)", query, flags=re.IGNORECASE)
-    plant     = re.findall(r"\bplant\s+(\w+)", query, flags=re.IGNORECASE)
-    # the rest of the query after those can be the parameter phrase
-    param_txt = query
-    for w in equipment + plant:
-        param_txt = re.sub(re.escape(w), "", param_txt, flags=re.IGNORECASE)
-    # clean up words like "what is" etc.
-    param_txt = re.sub(r"\b(what|is|the|in|for|of|range)\b", "", param_txt, flags=re.IGNORECASE)
-    param_txt = param_txt.strip()
-    return {
-        "equipment": equipment[0] if equipment else None,
-        "plant":     plant[0]     if plant     else None,
-        "parameter": param_txt
-    }
-
-
-def fuzzy_match_columns(col_names: list[str], desired: str, score_cutoff: int = 60) -> list[str]:
-    """
-    Return the subset of col_names whose fuzzy match against 'desired'
-    yields a score above score_cutoff.
-    """
-    matches = process.extract(
-        desired,
-        col_names,
-        scorer=fuzz.token_set_ratio,
-        score_cutoff=score_cutoff,
-        limit=None
-    )
-    # matches is list of (col_name, score, idx)
-    return [m[0] for m in matches]
-
-
-# ---------- Multi-Agent Framework ----------
+# ---------- Agents ----------
 class Agent:
-    def __init__(self, name: str):
-        self.name = name
-    def handle(self, query, context):
+    def __init__(self, name: str): self.name = name
+    def handle(self, *args, **kwargs):
         raise NotImplementedError
 
+class QueryUnderstandingAgent(Agent):
+    def __init__(self): super().__init__("QueryUnderstandingAgent")
+    def handle(self, query: str) -> dict:
+        prompt = (
+            "Extract the values for equipment, plant, and parameter from the user question. "
+            "Output JSON with keys: equipment, plant, parameter.\n"
+            f"Question: {query}\n"
+        )
+        resp = safe_gemini_text_call(prompt)
+        try:
+            data = json.loads(resp)
+            return {k: data.get(k) for k in ("equipment","plant","parameter")}
+        except Exception:
+            # fallback simple regex
+            import re
+            eq = re.search(r"equipment\s+(\w+)", query, re.I)
+            pl = re.search(r"plant\s+(\w+)", query, re.I)
+            param = query
+            for w in [eq.group(1) if eq else None, pl.group(1) if pl else None]:
+                if w: param = param.replace(w, "")
+            return {"equipment": eq.group(1) if eq else None,
+                    "plant": pl.group(1) if pl else None,
+                    "parameter": param.strip()}
 
-class ExcelReaderAgent(Agent):
-    def __init__(self, files: list[str]):
-        super().__init__("ExcelReader")
-        self.sheets: dict[str, pd.DataFrame] = {}
-        for f in files:
-            xl = pd.ExcelFile(f)
-            for sheet in xl.sheet_names:
-                self.sheets[sheet] = xl.parse(sheet)
-
-    def handle(self, query, context):
-        return list(self.sheets.keys())
-
-
-class QueryAgent(Agent):
-    def __init__(self, reader: ExcelReaderAgent):
-        super().__init__("QueryAgent")
+class SchemaRetrievalAgent(Agent):
+    def __init__(self, reader):
+        super().__init__("SchemaRetrievalAgent")
         self.reader = reader
+    def handle(self, intent: dict) -> dict:
+        # gather all sheet/column names
+        schema = {}
+        for sheet, df in self.reader.sheets.items():
+            schema[sheet] = df.columns.tolist()
+        prompt = (
+            "Given available sheets and their columns, choose the best sheet and columns for the parameter. "
+            "Output JSON: {sheet: [col1, col2,...]}.\n"
+        )
+        for sheet, cols in schema.items():
+            prompt += f"Sheet: {sheet}, Columns: {cols}\n"
+        prompt += f"Parameter to match: {intent['parameter']}\n"
+        resp = safe_gemini_text_call(prompt)
+        try:
+            return json.loads(resp)
+        except Exception:
+            # fallback: fuzzy match across all
+            from rapidfuzz import process, fuzz
+            best = {}
+            for sheet, cols in schema.items():
+                matches = process.extract(intent['parameter'], cols, scorer=fuzz.token_set_ratio, score_cutoff=60)
+                if matches:
+                    best[sheet] = [m[0] for m in matches]
+            return best
 
-    def handle(self, query: str, context) -> dict[str, pd.DataFrame]:
-        ents = extract_entities(query)
-        equipment = ents["equipment"]
-        plant     = ents["plant"]
-        param_txt = ents["parameter"]
-
-        results: dict[str, pd.DataFrame] = {}
-        for sheet_name, df in self.reader.sheets.items():
-            df_matched = df
-            # filter by equipment column if recognized
-            if equipment:
-                equip_cols = fuzzy_match_columns(df.columns.tolist(), "equipment", 50)
-                if equip_cols:
-                    df_matched = df_matched[df_matched[equip_cols[0]].astype(str).str.contains(equipment, case=False, regex=False)]
-            # filter by plant column if recognized
-            if plant:
-                plant_cols = fuzzy_match_columns(df.columns.tolist(), "plant", 50)
-                if plant_cols:
-                    df_matched = df_matched[df_matched[plant_cols[0]].astype(str).str.contains(plant, case=False, regex=False)]
-            if df_matched.empty:
-                continue
-
-            # now pick parameter columns
-            if param_txt:
-                matched_cols = fuzzy_match_columns(df_matched.columns.tolist(), param_txt, 60)
-                if matched_cols:
-                    results[sheet_name] = df_matched[matched_cols]
-            else:
-                # no clear parameter => return all columns
-                results[sheet_name] = df_matched
-
+class DataExtractionAgent(Agent):
+    def __init__(self, reader):
+        super().__init__("DataExtractionAgent")
+        self.reader = reader
+    def handle(self, intent: dict, schema_map: dict) -> dict:
+        results = {}
+        for sheet, cols in schema_map.items():
+            df = self.reader.sheets.get(sheet)
+            if df is None: continue
+            sub = df.copy()
+            if intent.get("equipment"):
+                eq_col = process.extractOne("equipment", sub.columns, scorer=fuzz.token_set_ratio)[0]
+                sub = sub[sub[eq_col].astype(str).str.contains(intent["equipment"], case=False, regex=False)]
+            if intent.get("plant"):
+                pl_col = process.extractOne("plant", sub.columns, scorer=fuzz.token_set_ratio)[0]
+                sub = sub[sub[pl_col].astype(str).str.contains(intent["plant"], case=False, regex=False)]
+            if sub.empty: continue
+            # select only requested columns
+            selected = [c for c in cols if c in sub.columns]
+            results[sheet] = sub[selected]
         return results
 
-
-class GeminiAgent(Agent):
-    def __init__(self, safety_settings: list[SafetySetting]):
-        super().__init__("GeminiAgent")
-        self.safety = safety_settings
-
-    def handle(self, query: str, context: dict[str, pd.DataFrame]) -> str:
-        # Even though we now filter locally, we can still ask Gemini to nicely
-        # phrase the result if desired. Here we simply join CSV fragments.
-        prompt = f"User asked: {query}\nHere is the filtered data:\n"
-        for sheet, df in context.items():
-            prompt += f"\n--- {sheet} ---\n{df.to_csv(index=False)}\n"
-        return safe_gemini_text_call(prompt)
-
+class ResponseGenerationAgent(Agent):
+    def __init__(self): super().__init__("ResponseGenerationAgent")
+    def handle(self, intent: dict, extracted: dict) -> str:
+        # Format tables
+        text = f"Results for `{intent['parameter']}` on equipment `{intent['equipment']}` in plant `{intent['plant']}`:\n"
+        for sheet, df in extracted.items():
+            text += f"\nSheet: {sheet}\n" + df.to_markdown(index=False) + "\n"
+        return text
 
 class CoordinatorAgent(Agent):
-    def __init__(self, reader, query_agent, gemini_agent):
+    def __init__(self, reader):
         super().__init__("Coordinator")
-        self.reader      = reader
-        self.query_agent = query_agent
-        self.gemini_agent= gemini_agent
-
+        self.understander = QueryUnderstandingAgent()
+        self.schema_ret   = SchemaRetrievalAgent(reader)
+        self.extractor    = DataExtractionAgent(reader)
+        self.generator    = ResponseGenerationAgent()
     def handle(self, query: str):
-        # Step 1: just load sheets
-        _ = self.reader.handle(query, None)
-        # Step 2: filter & select relevant columns
-        matched = self.query_agent.handle(query, None)
-        if not matched:
+        intent = self.understander.handle(query)
+        schema_map = self.schema_ret.handle(intent)
+        extracted = self.extractor.handle(intent, schema_map)
+        if not extracted:
             return None, None
-        # Step 3: wrap in a nice answer via Gemini
-        answer = self.gemini_agent.handle(query, matched)
-        return answer, matched
+        resp = self.generator.handle(intent, extracted)
+        return resp, extracted
 
+# ---------- Excel Reader ----------
+class ExcelReaderAgent(Agent):
+    def __init__(self, files):
+        super().__init__("ExcelReader")
+        self.sheets = {}
+        for f in files:
+            xl = pd.ExcelFile(f)
+            for s in xl.sheet_names:
+                self.sheets[s] = xl.parse(s)
 
-# ---------- Streamlit App ----------
+# ---------- Streamlit UI ----------
 st.set_page_config(page_title="Excel Chatbot", layout="wide")
 
-# Initialize agents
 if 'agents' not in st.session_state:
     files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
-    reader       = ExcelReaderAgent(files)
-    query_agent  = QueryAgent(reader)
-    gemini_agent = GeminiAgent(safety_config)
-    coordinator  = CoordinatorAgent(reader, query_agent, gemini_agent)
+    reader      = ExcelReaderAgent(files)
+    coordinator = CoordinatorAgent(reader)
+    st.session_state['agents'] = {'reader': reader, 'coordinator': coordinator}
 
-    st.session_state['agents'] = {
-        'reader': reader,
-        'query_agent': query_agent,
-        'gemini_agent': gemini_agent,
-        'coordinator': coordinator
-    }
+reader      = st.session_state['agents']['reader']
+coordinator = st.session_state['agents']['coordinator']
 
-reader       = st.session_state['agents']['reader']
-query_agent  = st.session_state['agents']['query_agent']
-gemini_agent = st.session_state['agents']['gemini_agent']
-coordinator  = st.session_state['agents']['coordinator']
-
-# Greeting & samples
-if 'greeted' not in st.session_state:
-    st.write("**Hi! I’m your Excel Chatbot powered by Gemini 2.5 Pro.**")
-    st.markdown("**Try these prompts:**")
-    st.write("- What is the impeller speed range in unit operation RMG for the equipment Glatt in Plant F20?")
-    st.write("- Show me the impeller speed min/max for Glatt in plant F20.")
-    st.session_state['greeted'] = True
-
-# User query
-query = st.text_input("Enter your query:")
+st.title("Agentic Excel Chatbot")
+query = st.text_input("Enter your question:")
 if st.button("Ask") and query:
-    with st.spinner("Processing…"):
+    with st.spinner("Thinking..."):
         try:
-            answer, matched = coordinator.handle(query)
-            if matched is None:
+            answer, extracted = coordinator.handle(query)
+            if not extracted:
                 st.error("No matching data found.")
             else:
-                st.subheader("Matched Data")
-                for sheet, df in matched.items():
-                    st.write(f"**Sheet: {sheet}**")
-                    st.dataframe(df)
-
-                st.subheader("Answer")
-                st.write(answer)
+                st.markdown(answer)
         except Exception as e:
-            logger.exception("Error in chatbot")
-            st.error(f"An error occurred: {e}")
+            logger.exception("Error in pipeline")
+            st.error(f"Failed: {e}")
