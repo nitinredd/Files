@@ -1,63 +1,60 @@
-name: excel_chatbot_env
-channels:
-  - defaults
-  - conda-forge
-dependencies:
-  - python=3.9
-  - nodejs           # for building React from within conda
-  - pip
-  - pip:
-      - fastapi
-      - uvicorn[standard]
-      - pandas
-      - openpyxl
-      - google-auth
-      - vertexai        # Gemini client
-########
-conda env create -f environment.yml
-conda activate excel_chatbot_env
-####
 import os
 import google.auth
-import json
 import time
 import logging
 from vertexai.preview.generative_models import (
     GenerativeModel,
     Image as GeminiImage,
+    Part,
     HarmCategory,
     HarmBlockThreshold,
     SafetySetting
 )
 
+# ── ENVIRONMENT & AUTH ─────────────────────────────────────────────
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+
+# ── MODEL INITIALIZATION ───────────────────────────────────────────
+multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+
+# ── SAFETY SETTINGS ────────────────────────────────────────────────
+safety_config = [
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+]
+
+# ── LOGGING ────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── GEMINI CLIENT ──────────────────────────────────────────────────
 class GeminiClient:
-    def __init__(
-        self,
-        model_name: str = "gemini-2.5-pro",
-        project_id: str = None,
-        location: str = "us-central1"
-    ):
-        self.credentials, default_project = google.auth.default()
-        self.project_id = project_id or default_project
-        self.location = location
-        self.model = GenerativeModel(model_name)
-        self.safety_settings = self._get_default_safety_settings()
+    def __init__(self):
+        self.model = multimodal_model
+        self.safety_settings = safety_config
         self.max_retries = 3
         self.retry_delay = 1
 
-    def _get_default_safety_settings(self) -> list[SafetySetting]:
-        return [
-            {
-                "category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                "threshold": HarmBlockThreshold.BLOCK_NONE,
-            },
-            # add other categories as needed...
-        ]
-
-    def generate_content(self, prompt, generation_config=None, stream=False) -> str:
+    def generate_content(self, prompt, stream=False, generation_config=None) -> str:
         for attempt in range(self.max_retries):
             try:
                 response = self.model.generate_content(
@@ -71,274 +68,36 @@ class GeminiClient:
                 )
                 return self._handle_response(response)
             except Exception as e:
-                logger.warning(f"Attempt {attempt+1} failed: {e}")
+                logger.warning(f"Attempt {attempt + 1} failed: {e}")
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay * (attempt+1))
+                    time.sleep(self.retry_delay * (attempt + 1))
                     continue
                 raise
 
     def _handle_response(self, response) -> str:
-        if response.candidates:
+        if getattr(response, "candidates", None):
             return response.candidates[0].content.text
-        if response.filters:
+        if getattr(response, "filters", None):
             reasons = [f"{f.category.name}:{f.action.name}" for f in response.filters]
             raise ValueError("Blocked: " + ", ".join(reasons))
         raise ValueError("Empty response")
-#####
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import pandas as pd
-from gemini_client import GeminiClient
 
-# 1. Load your workbooks once on startup
-WORKBOOKS = {
-    "formula": pd.read_excel("formula_master_osd.xlsx", sheet_name=None),
-    "equipment": pd.read_excel("masterlist_osd_equipments.xlsx", sheet_name=None),
-}
-
-app = FastAPI()
-gemini = GeminiClient(model_name="gemini-2.5-pro")
-
-class ChatRequest(BaseModel):
-    message: str
-
-# --- Simple Agent Definitions ----------------------------------------------
-class ChildAgent:
-    def __init__(self, name, sheets):
-        self.name = name
-        self.sheets = sheets  # dict of sheet_name → DataFrame
-
-    def find(self, query: str):
-        # Very naive: search any cell containing the query substring
-        results = []
-        for name, df in self.sheets.items():
-            mask = df.astype(str).apply(lambda col: col.str.contains(query, case=False, na=False))
-            if mask.any().any():
-                sub = df[mask.any(axis=1)]
-                results.append((name, sub))
-        return results
-
-class CoordinatorAgent:
-    def __init__(self, workbooks):
-        # spawn two children for each workbook
-        self.children = [
-            ChildAgent("formula", workbooks["formula"]),
-            ChildAgent("equipment", workbooks["equipment"])
-        ]
-
-    def dispatch(self, query: str):
-        all_hits = []
-        for c in self.children:
-            hits = c.find(query)
-            all_hits.extend(hits)
-        return all_hits
-
-# (OversightAgent simply checks for hallucination; LearningAgent could log queries/responses)
-# For brevity they are no-ops here.
-
-# 2. Single /chat endpoint
-@app.post("/chat")
-def chat(req: ChatRequest):
-    query = req.message.strip()
-    if not query:
-        raise HTTPException(400, "Empty query")
-
-    coord = CoordinatorAgent(WORKBOOKS)
-    hits = coord.dispatch(query)
-
-    if not hits:
-        return {"response": "Relevant information not found in the provided datasets."}
-
-    # Format each hit as a table
-    tables = []
-    for sheet_name, df in hits:
-        tables.append({
-            "sheet": sheet_name,
-            "columns": df.columns.tolist(),
-            "rows": df.values.tolist()
-        })
-
-    # Optionally post-process via Gemini for nicer wording
-    prompt = f"User asked: '{query}'. Found data in sheets: {', '.join(h[0] for h in hits)}. " \
-             f"Please summarize results in plain English."
-    summary = gemini.generate_content(prompt)
-
-    return {
-        "response": summary,
-        "tables": tables
-    }
-######
-{
-  "name": "excel-chatbot-ui",
-  "version": "0.1.0",
-  "private": true,
-  "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "axios": "^1.4.0"
-  },
-  "devDependencies": {
-    "vite": "^4.3.0",
-    "@vitejs/plugin-react": "^4.0.0"
-  },
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  }
-}
-#####
-import React from 'react'
-import Chatbot from './components/Chatbot'
-
-function App() {
-  return (
-    <div className="App">
-      {/* Your site content… */}
-      <Chatbot
-        apiUrl="http://localhost:8000/chat"
-        backgroundImage="PLACEHOLDER_FOR_BACKGROUND_IMAGE_URL"
-        samplePrompts={[
-          "PLACEHOLDER: Check formula X in Formula Master",
-          "PLACEHOLDER: List equipment for process Y",
-          "PLACEHOLDER: What’s the batch size for formula Z?"
-        ]}
-      />
-    </div>
-  )
-}
-
-export default App
-######
-import React, { useState, useRef, useEffect } from 'react'
-import axios from 'axios'
-import './Chatbot.css'
-
-export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
-  const [open, setOpen] = useState(false)
-  const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
-  const messagesEndRef = useRef(null)
-
-  useEffect(() => {
-    if (open && messages.length === 0) {
-      setMessages([
-        { from: 'bot', text: 'Hi! How can I help?' },
-        { from: 'bot', options: samplePrompts }
-      ])
-    }
-  }, [open])
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  const send = async (text) => {
-    setMessages(m => [...m, { from: 'user', text }])
-    setInput('')
-    const res = await axios.post(apiUrl, { message: text })
-    if (res.data.tables) {
-      setMessages(m => [
-        ...m,
-        { from: 'bot', text: res.data.response },
-        { from: 'bot', tables: res.data.tables }
-      ])
-    } else {
-      setMessages(m => [...m, { from: 'bot', text: res.data.response }])
-    }
-  }
-
-  return (
-    <>
-      <div
-        className={`chatbot-widget ${open ? 'open' : ''}`}
-        style={{ backgroundImage: `url(${backgroundImage})` }}
-      >
-        <div className="chat-header" onClick={() => setOpen(o => !o)}>
-          {open ? '––' : '💬'}
-        </div>
-        {open && (
-          <div className="chat-body">
-            <div className="messages">
-              {messages.map((m, i) =>
-                m.options ? (
-                  <div key={i} className="bot-options">
-                    {m.options.map((opt, j) => (
-                      <button key={j} onClick={() => send(opt)}>{opt}</button>
-                    ))}
-                  </div>
-                ) : m.tables ? (
-                  m.tables.map((tbl, ti) => (
-                    <div key={ti}>
-                      <strong>Sheet: {tbl.sheet}</strong>
-                      <table>
-                        <thead>
-                          <tr>{tbl.columns.map((c, ci) => <th key={ci}>{c}</th>)}</tr>
-                        </thead>
-                        <tbody>
-                          {tbl.rows.map((row, ri) => (
-                            <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{cell}</td>)}</tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ))
-                ) : (
-                  <div key={i} className={m.from}>{m.text}</div>
-                )
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-            <div className="chat-input">
-              <input
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && input.trim() && send(input)}
-                placeholder="Type your question…"
-              />
-              <button disabled={!input.trim()} onClick={() => send(input)}>Send</button>
-            </div>
-          </div>
-        )}
-      </div>
-    </>
-  )
-}
-######
-.chatbot-widget {
-  position: fixed;
-  bottom: 20px; right: 20px;
-  width: 300px; max-height: 400px;
-  background-size: cover;
-  border-radius: 10px;
-  overflow: hidden;
-  box-shadow: 0 0 10px rgba(0,0,0,0.3);
-}
-.chat-header {
-  padding: 8px; background: rgba(0,0,0,0.5);
-  color: #fff; cursor: pointer; text-align: center;
-}
-.chat-body {
-  display: flex; flex-direction: column;
-  height: 100%;
-  background: rgba(255,255,255,0.9);
-}
-.messages { flex: 1; overflow-y: auto; padding: 8px; }
-.user { text-align: right; margin: 4px; }
-.bot { text-align: left; margin: 4px; }
-.bot-options button { margin: 4px; }
-.chat-input {
-  display: flex; border-top: 1px solid #ccc;
-}
-.chat-input input {
-  flex: 1; border: none; padding: 8px;
-}
-.chat-input button {
-  border: none; padding: 8px; cursor: pointer;
-}
-table {
-  width: 100%; border-collapse: collapse; margin: 8px 0;
-}
-th, td {
-  border: 1px solid #999; padding: 4px; font-size: 0.9em;
-}
+# ── SAFE CALL EXAMPLE (OPTIONAL) ───────────────────────────────────
+def safe_gemini_call(image, max_retries=3, delay=2):
+    prompt = get_safe_extraction_prompt()  # Make sure you define this function
+    for attempt in range(max_retries):
+        try:
+            response = multimodal_model.generate_content(
+                [
+                    prompt,
+                    image
+                ],
+                safety_settings=safety_config
+            )
+            return response.candidates[0].content.text
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(delay * (attempt + 1))
+                continue
+            raise
