@@ -62,55 +62,34 @@ class Agent:
 class QueryUnderstandingAgent(Agent):
     def __init__(self): super().__init__("QueryUnderstandingAgent")
     def handle(self, query: str) -> dict:
-        prompt = (
-            "Extract the values for equipment, plant, and parameter from the user question. "
-            "Output JSON with keys: equipment, plant, parameter.\n"
-            f"Question: {query}\n"
-        )
-        resp = safe_gemini_text_call(prompt)
-        try:
-            data = json.loads(resp)
-            return {k: data.get(k) for k in ("equipment","plant","parameter")}
-        except Exception:
-            # fallback simple regex
-            import re
-            eq = re.search(r"equipment\s+(\w+)", query, re.I)
-            pl = re.search(r"plant\s+(\w+)", query, re.I)
-            param = query
-            for w in [eq.group(1) if eq else None, pl.group(1) if pl else None]:
-                if w: param = param.replace(w, "")
-            return {"equipment": eq.group(1) if eq else None,
-                    "plant": pl.group(1) if pl else None,
-                    "parameter": param.strip()}
+        # fallback simple regex entity extraction
+        import re
+        eq = re.search(r"equipment\s+(\w+)", query, re.I)
+        pl = re.search(r"plant\s+(\w+)", query, re.I)
+        # parameter is rest of the query minus equipment and plant terms
+        param = query
+        for w in [eq.group(1) if eq else None, pl.group(1) if pl else None]:
+            if w:
+                param = re.sub(re.escape(w), "", param, flags=re.IGNORECASE)
+        # remove filler words
+        param = re.sub(r"\b(what|is|the|in|for|of|range|unit|operation|equipment|plant)\b", "", param, flags=re.IGNORECASE).strip()
+        return {"equipment": eq.group(1) if eq else None,
+                "plant": pl.group(1)     if pl else None,
+                "parameter": param}
 
 class SchemaRetrievalAgent(Agent):
     def __init__(self, reader):
         super().__init__("SchemaRetrievalAgent")
         self.reader = reader
     def handle(self, intent: dict) -> dict:
-        # gather all sheet/column names
-        schema = {}
-        for sheet, df in self.reader.sheets.items():
-            schema[sheet] = df.columns.tolist()
-        prompt = (
-            "Given available sheets and their columns, choose the best sheet and columns for the parameter. "
-            "Output JSON: {sheet: [col1, col2,...]}.\n"
-        )
-        for sheet, cols in schema.items():
-            prompt += f"Sheet: {sheet}, Columns: {cols}\n"
-        prompt += f"Parameter to match: {intent['parameter']}\n"
-        resp = safe_gemini_text_call(prompt)
-        try:
-            return json.loads(resp)
-        except Exception:
-            # fallback: fuzzy match across all
-            from rapidfuzz import process, fuzz
-            best = {}
-            for sheet, cols in schema.items():
-                matches = process.extract(intent['parameter'], cols, scorer=fuzz.token_set_ratio, score_cutoff=60)
-                if matches:
-                    best[sheet] = [m[0] for m in matches]
-            return best
+        # fallback: fuzzy match parameter to all sheet columns
+        best = {}
+        for sheet, cols in self.reader.sheets.items():
+            # fuzzy match parameter to column names
+            matches = process.extract(intent['parameter'], cols.columns.tolist(), scorer=fuzz.token_set_ratio, score_cutoff=40)
+            if matches:
+                best[sheet] = [m[0] for m in matches]
+        return best
 
 class DataExtractionAgent(Agent):
     def __init__(self, reader):
@@ -120,40 +99,44 @@ class DataExtractionAgent(Agent):
         results = {}
         for sheet, cols in schema_map.items():
             df = self.reader.sheets.get(sheet)
-            if df is None: continue
-            sub = df.copy()
+            if df is None or df.empty:
+                continue
+            sub = df
+            # filter by equipment term: match against any column
             if intent.get("equipment"):
-                eq_col = process.extractOne("equipment", sub.columns, scorer=fuzz.token_set_ratio)[0]
+                eq_col, score, _ = process.extractOne(intent["equipment"], sub.columns, scorer=fuzz.token_set_ratio)
                 sub = sub[sub[eq_col].astype(str).str.contains(intent["equipment"], case=False, regex=False)]
+            # filter by plant term
             if intent.get("plant"):
-                pl_col = process.extractOne("plant", sub.columns, scorer=fuzz.token_set_ratio)[0]
+                pl_col, score, _ = process.extractOne(intent["plant"], sub.columns, scorer=fuzz.token_set_ratio)
                 sub = sub[sub[pl_col].astype(str).str.contains(intent["plant"], case=False, regex=False)]
-            if sub.empty: continue
-            # select only requested columns
+            if sub.empty:
+                continue
+            # select only matched parameter columns
             selected = [c for c in cols if c in sub.columns]
-            results[sheet] = sub[selected]
+            if selected:
+                results[sheet] = sub[selected]
         return results
 
 class ResponseGenerationAgent(Agent):
     def __init__(self): super().__init__("ResponseGenerationAgent")
     def handle(self, intent: dict, extracted: dict) -> str:
-        # Format tables
-        text = f"Results for `{intent['parameter']}` on equipment `{intent['equipment']}` in plant `{intent['plant']}`:\n"
+        text = f"**Results for '{intent['parameter']}'** on equipment **{intent['equipment']}** in plant **{intent['plant']}**:\n"
         for sheet, df in extracted.items():
-            text += f"\nSheet: {sheet}\n" + df.to_markdown(index=False) + "\n"
+            text += f"\n**Sheet: {sheet}**\n" + df.to_markdown(index=False) + "\n"
         return text
 
 class CoordinatorAgent(Agent):
     def __init__(self, reader):
         super().__init__("Coordinator")
         self.understander = QueryUnderstandingAgent()
-        self.schema_ret   = SchemaRetrievalAgent(reader)
+        self.schema       = SchemaRetrievalAgent(reader)
         self.extractor    = DataExtractionAgent(reader)
         self.generator    = ResponseGenerationAgent()
     def handle(self, query: str):
-        intent = self.understander.handle(query)
-        schema_map = self.schema_ret.handle(intent)
-        extracted = self.extractor.handle(intent, schema_map)
+        intent     = self.understander.handle(query)
+        schema_map = self.schema.handle(intent)
+        extracted  = self.extractor.handle(intent, schema_map)
         if not extracted:
             return None, None
         resp = self.generator.handle(intent, extracted)
