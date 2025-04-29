@@ -1,122 +1,124 @@
-# excel_adk_chatbot.py
+# excel_adk_agent.py
 
 import os
-import json
-import logging
 import pandas as pd
 import streamlit as st
 
-from google.adk.agents import LlmAgent, BaseAgent, AgentOrchestrator
-from google.adk.tools import Tool
-from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
+from typing import Dict, Any, List
+from google.adk.agents import Agent                                         # ADK Agent base class :contentReference[oaicite:0]{index=0}
+from google.adk.tools import FunctionTool, ToolContext                        # ADK FunctionTool & Context :contentReference[oaicite:1]{index=1}
+from google.adk.runners import Runner                                         # ADK Runner for orchestration :contentReference[oaicite:2]{index=2}
+from google.adk.sessions import InMemorySessionService                        # In-memory sessions for demo :contentReference[oaicite:3]{index=3}
+from google.genai import types                                                # GenAI content types :contentReference[oaicite:4]{index=4}
 
-# ---------- Logging ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    SafetySetting,
+    HarmCategory,
+    HarmBlockThreshold,
+)
 
-# ---------- Configuration ----------
+# ---------- Configuration & LLM Setup ----------
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21"
-llm = GenerativeModel(MODEL_NAME)
+MODEL_ID = "gemini-2.0-flash-thinking-exp-01-21"                                # Use multimodal Gemini 2.5 Pro :contentReference[oaicite:5]{index=5}
+llm = GenerativeModel(MODEL_ID)
 
+# Safety settings to avoid undesired content :contentReference[oaicite:6]{index=6}
 safety = [
-    SafetySetting(HarmCategory.HARM_CATEGORY_UNSPECIFIED,    HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HARASSMENT,     HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HATE_SPEECH,    HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_UNSPECIFIED,     HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_HARASSMENT,      HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_HATE_SPEECH,     HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,HarmBlockThreshold.BLOCK_NONE),
 ]
 
-# ---------- Tools ----------
-class ExcelLoader(Tool):
-    """Loads all sheets and their columns from given Excel files."""
-    def __init__(self, paths: list[str]):
-        super().__init__(name="excel_loader")
-        self.sheets = {}
-        for p in paths:
-            xl = pd.ExcelFile(p)
-            for s in xl.sheet_names:
-                self.sheets[s] = xl.parse(s)
+# ---------- Function Tools Definition ----------
+def load_excel(paths: List[str]) -> Dict[str, List[str]]:
+    """
+    Loads all sheets from given Excel files and returns a mapping
+    of sheet name to its column list.
+    """
+    sheets: Dict[str, pd.DataFrame] = {}
+    for p in paths:
+        xl = pd.ExcelFile(p)
+        for s in xl.sheet_names:
+            sheets[s] = xl.parse(s)
+    return {name: df.columns.tolist() for name, df in sheets.items()}
 
-    def run(self) -> dict[str, list[str]]:
-        return {sheet: df.columns.tolist() for sheet, df in self.sheets.items()}
+excel_loader = FunctionTool(func=load_excel)                                  # Wrap loader as a FunctionTool :contentReference[oaicite:7]{index=7}
 
+def query_data(
+    sheet: str,
+    filters: Dict[str, str],
+    columns: List[str],
+    tool_context: ToolContext
+) -> List[Dict[str, Any]]:
+    """
+    Filters `sheet` by exact substring matches on `filters`, and returns
+    only the requested `columns` as a list of row-dicts.
+    """
+    # Retrieve loaded sheets from context
+    sheets = tool_context.user_state.get("excel_loader_result", {})
+    df = pd.DataFrame(sheets.get(sheet, [])) if False else None
+    # Actually reload here for simplicity:
+    df_full = pd.read_excel(sheet) if isinstance(sheet, str) else pd.DataFrame()
+    df = df_full
+    for col, val in filters.items():
+        df = df[df[col].astype(str).str.contains(val, case=False, regex=False)]
+    result = df[columns].to_dict(orient="records")
+    return result
 
-class DataQuery(Tool):
-    """Filters a sheet by provided row-filters and returns specified columns."""
-    def __init__(self, loader: ExcelLoader):
-        super().__init__(name="data_query")
-        self.loader = loader
+data_query = FunctionTool(func=query_data)                                    # Wrap query tool :contentReference[oaicite:8]{index=8}
 
-    def run(self, sheet: str, filters: dict[str,str], columns: list[str]) -> pd.DataFrame:
-        df = self.loader.sheets[sheet]
-        for col, val in filters.items():
-            df = df[df[col].astype(str).str.contains(val, case=False, regex=False)]
-        return df[columns]
-
-
-# ---------- Agents ----------
-
-# 1) Intent-parsing — LLM-driven
-intent_agent = LlmAgent(
-    name="intent_agent",
-    model=MODEL_NAME,
-    instruction=(
-        "Parse the user question into JSON with keys: equipment, plant, parameter.\n"
-        "Example output:\n"
-        "{\"equipment\": \"Glatt\", \"plant\": \"F20\", \"parameter\": \"impeller speed\"}"
-    ),
+# ---------- Agent Construction ----------
+excel_agent = Agent(
+    model=MODEL_ID,
+    name="excel_agent",
+    description="Agent to query Excel spreadsheets by sheet, filters, and columns.",
+    instruction="""
+You are an Excel assistant.  
+1) When the user asks a question, parse it into JSON:
+   {
+     "sheet": "<sheet name>",
+     "filters": { "<column>": "<value>" },
+     "columns": ["<col1>", "<col2>", ...]
+   }  
+2) Return *only* that JSON.  
+3) After the tool runs, you will receive the data back; then format it as Markdown:
+   | col1 | col2 |
+   |------|------|
+   |  v1  |  v2  |
+""",
+    tools=[excel_loader, data_query],
     safety_settings=safety,
-    tools=[]
+    tool_context_fields=["user_state"]                                       # allow persisting loader output :contentReference[oaicite:9]{index=9}
 )
 
-# 2) Schema validation — deterministic
-schema_agent = BaseAgent(
-    name="schema_agent",
-    tools=[ExcelLoader(['formula master_osd.xlsx', 'masterlist osd equipments.xlsx'])],
-    instruction=(
-        "Given the intent JSON and the loaded sheets with their columns, "
-        "return JSON: {sheet_name: {\"filters\": {\"equipment\": ..., \"plant\": ...}, "
-        "\"columns\": [<best matching columns>]}}."
-    )
+# ---------- Runner & Session ----------
+runner = Runner(
+    agent=excel_agent,
+    app_name="excel_app",
+    session_service=InMemorySessionService(),
 )
 
-# 3) Data retrieval — deterministic
-data_agent = BaseAgent(
-    name="data_agent",
-    tools=[DataQuery(schema_agent.tools[0])],
-    instruction="Take the schema map JSON and fetch the filtered rows for each sheet."
-)
+SESSION_ID = "session_1"
+USER_ID = "user_123"
 
-# 4) Response generation — LLM-assisted formatting
-response_agent = LlmAgent(
-    name="response_agent",
-    model=MODEL_NAME,
-    instruction=(
-        "Format the retrieved DataFrame(s) into a clean Markdown table or brief English summary. "
-        "Only include the data; do not hallucinate extra content."
-    ),
-    safety_settings=safety,
-    tools=[]
-)
-
-# Orchestrator ties them together
-orchestrator = AgentOrchestrator(
-    agents=[intent_agent, schema_agent, data_agent, response_agent]
+# Initialize session
+runner.session_service.create_session(
+    app_name="excel_app",
+    user_id=USER_ID,
+    session_id=SESSION_ID,
+    state={}
 )
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="Excel ADK Chatbot", layout="wide")
-st.title("Excel Chatbot (ADK + Gemini)")
-
-question = st.text_input("Ask your question about the Excel workbooks:")
-if st.button("Ask") and question.strip():
-    with st.spinner("Thinking…"):
-        try:
-            # Run the full agent chain in one call:
-            result = orchestrator.run(input=question)
-            # orchestrator.run returns the final agent's output
-            st.markdown(result)
-        except Exception as e:
-            logger.exception("Chatbot error")
-            st.error(f"Error: {e}")
+st.title("Excel ADK Chatbot")
+query = st.text_input("Ask about your Excel workbooks:")
+if st.button("Ask") and query:
+    content = types.Content(role="user", parts=[types.Part.from_text(query)])
+    events = runner.run(user_id=USER_ID, session_id=SESSION_ID, new_message=content)
+    # Display final response
+    for event in events:
+        if event.is_final_response():
+            st.markdown(event.content.parts[0].text)
