@@ -1,17 +1,15 @@
+# app.py
 import os
-import google.auth
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from difflib import SequenceMatcher
+import google.auth
 from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
 
-# ---------- Configuration ----------
+# ─── Gemini Setup ──────────────────────────────────────────────────────────────
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
-
-# Initialize Gemini 2.5 Pro (using flash-thinking as placeholder)
-model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-
-# Safety settings
+gemini = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 safety_config = [
     SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
     SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -20,121 +18,127 @@ safety_config = [
     SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-# ---------- Multi-Agent Framework ----------
-class Agent:
-    """Base class for agents"""
-    def __init__(self, name):
-        self.name = name
-    def handle(self, query, context):
-        raise NotImplementedError
+def safe_gemini_summarize(question: str, df: pd.DataFrame) -> str:
+    """Send only the found rows + question to Gemini for polished NLP."""
+    table_text = df.to_csv(index=False)
+    prompt = (
+        "User asked: “%s”\n\n"
+        "Below are the exact matching rows from the Excel data (CSV format):\n\n"
+        "%s\n\n"
+        "Please concisely answer the user’s question *using only the above data*, "
+        "and do NOT add any extra information."
+    ) % (question, table_text)
+    resp = gemini.generate_content([prompt], safety_settings=safety_config)
+    return resp.text or "Sorry, I couldn’t formulate an answer."
 
-class ExcelReaderAgent(Agent):
-    """Reads structured data from Excel workbooks"""
-    def __init__(self, files):
-        super().__init__("ExcelReader")
-        self.sheets = {}
-        for f in files:
-            xl = pd.ExcelFile(f)
-            for sheet in xl.sheet_names:
-                self.sheets[sheet] = xl.parse(sheet)
+# ─── Agents ───────────────────────────────────────────────────────────────────
+class ExcelReaderAgent:
+    def __init__(self, paths):
+        self.paths = paths
+        self.sheets = {}  # { "formula master_osd": {sheet: df}, ... }
+        self._load_all()
 
-    def handle(self, query, context):
-        # Provide sheet keys to coordinator
-        return list(self.sheets.keys())
+    def _load_all(self):
+        for p in self.paths:
+            xl = pd.ExcelFile(p)
+            self.sheets[p] = {s: xl.parse(s) for s in xl.sheet_names}
 
-class QueryAgent(Agent):
-    """Extracts relevant rows matching user intent"""
-    def __init__(self, reader: ExcelReaderAgent):
-        super().__init__("QueryAgent")
+    def get_all_rows(self):
+        # flatten to list of (workbook, sheet, row_series)
+        rows = []
+        for wb, sheet_map in self.sheets.items():
+            for sheet, df in sheet_map.items():
+                for _, row in df.iterrows():
+                    rows.append((wb, sheet, row))
+        return rows
+
+class FuzzyMatchAgent:
+    @staticmethod
+    def score(query: str, text: str) -> float:
+        return SequenceMatcher(None, query.lower(), text.lower()).ratio()
+
+    def find_matches(self, query: str, rows, threshold=0.6):
+        matches = []
+        for wb, sheet, row in rows:
+            combined = " ".join(str(v) for v in row.values)
+            if self.score(query, combined) >= threshold:
+                matches.append((wb, sheet, row))
+        return matches
+
+class CoordinatorAgent:
+    def __init__(self, reader, matcher):
         self.reader = reader
+        self.matcher = matcher
 
-    def handle(self, query, context):
-        results = {}
-        for sheet, df in self.reader.sheets.items():
-            # naive contains search across all columns
-            mask = df.apply(lambda col: col.astype(str).str.contains(query, case=False, na=False)).any(axis=1)
-            matched = df[mask]
-            if not matched.empty:
-                results[sheet] = matched
-        return results
-
-class GeminiAgent(Agent):
-    """Calls Gemini to refine/answer based on extracted rows"""
-    def __init__(self, model, safety_settings):
-        super().__init__("GeminiAgent")
-        self.model = model
-        self.safety = safety_settings
-
-    def handle(self, query, context):
-        # Build prompt from context rows
-        prompt = f"You are a domain assistant.\nUser query: {query}\nRelevant data:"
-        for sheet, df in context.items():
-            prompt += f"\nSheet: {sheet}, Rows: {df.to_dict(orient='list')}"
-        resp = self.model.generate_content([prompt], safety_settings=self.safety)
-        return resp[0].text if resp else "No answer generated"
-
-class CoordinatorAgent(Agent):
-    """Orchestrates workflow among agents"""
-    def __init__(self, reader, query_agent, gemini_agent):
-        super().__init__("Coordinator")
-        self.reader = reader
-        self.query_agent = query_agent
-        self.gemini_agent = gemini_agent
-
-    def handle(self, query):
-        # Step 1: extract potential sheets
-        sheets = self.reader.handle(query, None)
-        # Step 2: detailed row matching
-        matched = self.query_agent.handle(query, None)
+    def handle(self, query: str):
+        all_rows = self.reader.get_all_rows()
+        matched = self.matcher.find_matches(query, all_rows)
         if not matched:
             return None, None
-        # Step 3: call Gemini
-        answer = self.gemini_agent.handle(query, matched)
-        return answer, matched
+        # build a DataFrame for display & for Gemini
+        data = []
+        for wb, sheet, row in matched:
+            d = row.to_dict()
+            d["_workbook"] = os.path.basename(wb)
+            d["_sheet"] = sheet
+            data.append(d)
+        df = pd.DataFrame(data)
+        return df, matched
 
-# ---------- Streamlit App ----------
+# ─── Streamlit App UI ─────────────────────────────────────────────────────────
 st.set_page_config(page_title="Excel Chatbot", layout="wide")
+st.title("🔎 Excel‐Powered Chatbot")
 
-# Initialize or load agents
-if 'agents' not in st.session_state:
-    files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
-    reader = ExcelReaderAgent(files)
-    query_agent = QueryAgent(reader)
-    gemini_agent = GeminiAgent(model, safety_config)
-    coordinator = CoordinatorAgent(reader, query_agent, gemini_agent)
-    st.session_state['agents'] = {'coordinator': coordinator, 'reader': reader}
+# file paths (assumes app.py sits with the .xlsx files)
+EXCEL_FILES = ["formula master_osd.xlsx", "masterlist osd equipments.xlsx"]
+if not all(os.path.exists(f) for f in EXCEL_FILES):
+    st.error("Please place both Excel files alongside app.py")
+    st.stop()
 
-coordinator = st.session_state['agents']['coordinator']
-reader = st.session_state['agents']['reader']
+# Initialize agents (cached)
+@st.cache_resource
+def init_agents():
+    reader = ExcelReaderAgent(EXCEL_FILES)
+    matcher = FuzzyMatchAgent()
+    return CoordinatorAgent(reader, matcher)
 
-# Greeting and sample prompts
-if 'greeted' not in st.session_state:
-    st.write("**Hi! I'm your Excel Chatbot powered by Gemini 2.5 Pro.**")
-    # dynamic sample prompts based on sheet data
-    samples = []
-    # pick first 3 sheets and first row values
-    for sheet, df in list(reader.sheets.items())[:3]:
-        row = df.iloc[0].to_dict()
-        key, val = list(row.items())[0]
-        samples.append(f"Do we have {key} with value {val} in {sheet}?")
-    st.markdown("**Try these prompts:**")
-    for s in samples:
-        st.write(f"- {s}")
-    st.session_state['greeted'] = True
+coord = init_agents()
 
-# User input
-query = st.text_input("Enter your query:")
-if st.button("Ask") and query:
-    with st.spinner("Processing..."):
-        answer, matched = coordinator.handle(query)
-        if matched is None:
-            st.error("Relevant information not found in the Excel workbooks.")
-        else:
-            # Display table results
-            st.subheader("Matched Data")
-            for sheet, df in matched.items():
-                st.write(f"**Sheet: {sheet}**")
-                st.dataframe(df)
-            # Display Gemini answer
-            st.subheader("Answer")
-            st.write(answer)
+# --- dynamic example prompts -----------------------------------------------
+# choose three random or based on sheet contents
+EXAMPLES = [
+    f"Do we have {row['Equipment']} with Capacity {row.get('Capacity','?')} in {sheet}?"
+    for _, sheet_map in coord.reader.sheets.items()
+    for sheet, df in sheet_map.items()
+    for _, row in df.sample(min(3, len(df))).iterrows()
+]
+# ensure exactly 3 unique
+import random
+EXAMPLES = random.sample(list(set(EXAMPLES)), 3)
+
+st.markdown("**Try one of these:**")
+cols = st.columns(3)
+for i, prompt in enumerate(EXAMPLES):
+    if cols[i].button(prompt):
+        st.session_state["question"] = prompt
+
+# --- user input ------------------------------------------------------------
+question = st.text_input("Your question:", key="question")
+if not question:
+    st.info("Ask something about the Excel data above.")
+    st.stop()
+
+# --- process query --------------------------------------------------------
+with st.spinner("Searching the Excel data…"):
+    df, matched = coord.handle(question)
+
+if df is None or df.empty:
+    st.warning("Relevant information not found.")
+else:
+    st.success(f"Found {len(df)} matching row(s).")
+    st.dataframe(df, use_container_width=True)
+
+    # Gemini summarization
+    with st.expander("Generate human‐readable answer via Gemini"):
+        answer = safe_gemini_summarize(question, df)
+        st.markdown(f"> {answer}")
