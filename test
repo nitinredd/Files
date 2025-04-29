@@ -1,186 +1,122 @@
-import os
-import time
-import logging
-import json
+# excel_adk_chatbot.py
 
-import google.auth
+import os
+import json
+import logging
 import pandas as pd
 import streamlit as st
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    SafetySetting,
-    HarmCategory,
-    HarmBlockThreshold,
-)
+
+from google.adk.agents import LlmAgent, BaseAgent, AgentOrchestrator
+from google.adk.tools import Tool
+from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
 
 # ---------- Logging ----------
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------- Configuration ----------
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-credentials, project_id = google.auth.default()
+MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21"
+llm = GenerativeModel(MODEL_NAME)
 
-# Initialize multimodal Gemini 2.5 Pro
-model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-safety_config = [
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,        threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,        threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,       threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+safety = [
+    SafetySetting(HarmCategory.HARM_CATEGORY_UNSPECIFIED,    HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_HARASSMENT,     HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_HATE_SPEECH,    HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmBlockThreshold.BLOCK_NONE),
 ]
 
-# ---------- Safe LLM Call ----------
-def safe_gemini_call(messages, max_retries=3, delay=1.0):
-    for attempt in range(1, max_retries + 1):
-        try:
-            logger.debug(f"Gemini call attempt {attempt}")
-            resp = model.generate_content(messages, safety_settings=safety_config)
-            if hasattr(resp, 'text') and resp.text:
-                return resp.text.strip()
-            if "blocked" in str(resp).lower():
-                raise ValueError("Blocked by safety")
-            raise ValueError("Empty response")
-        except Exception as e:
-            logger.warning(f"Attempt {attempt} failed: {e}")
-            if attempt < max_retries:
-                time.sleep(delay)
-            else:
-                logger.error("Gemini call failed after retries")
-                raise
-    raise RuntimeError("safe_gemini_call exited unexpectedly")
+# ---------- Tools ----------
+class ExcelLoader(Tool):
+    """Loads all sheets and their columns from given Excel files."""
+    def __init__(self, paths: list[str]):
+        super().__init__(name="excel_loader")
+        self.sheets = {}
+        for p in paths:
+            xl = pd.ExcelFile(p)
+            for s in xl.sheet_names:
+                self.sheets[s] = xl.parse(s)
+
+    def run(self) -> dict[str, list[str]]:
+        return {sheet: df.columns.tolist() for sheet, df in self.sheets.items()}
+
+
+class DataQuery(Tool):
+    """Filters a sheet by provided row-filters and returns specified columns."""
+    def __init__(self, loader: ExcelLoader):
+        super().__init__(name="data_query")
+        self.loader = loader
+
+    def run(self, sheet: str, filters: dict[str,str], columns: list[str]) -> pd.DataFrame:
+        df = self.loader.sheets[sheet]
+        for col, val in filters.items():
+            df = df[df[col].astype(str).str.contains(val, case=False, regex=False)]
+        return df[columns]
+
 
 # ---------- Agents ----------
-class Agent:
-    def __init__(self, name): self.name = name
-    def handle(self, *args, **kwargs): raise NotImplementedError
 
-class ExcelReaderAgent(Agent):
-    def __init__(self, files):
-        super().__init__("ExcelReader")
-        self.sheets = {}
-        for f in files:
-            xl = pd.ExcelFile(f)
-            for sheet in xl.sheet_names:
-                self.sheets[sheet] = xl.parse(sheet)
+# 1) Intent-parsing — LLM-driven
+intent_agent = LlmAgent(
+    name="intent_agent",
+    model=MODEL_NAME,
+    instruction=(
+        "Parse the user question into JSON with keys: equipment, plant, parameter.\n"
+        "Example output:\n"
+        "{\"equipment\": \"Glatt\", \"plant\": \"F20\", \"parameter\": \"impeller speed\"}"
+    ),
+    safety_settings=safety,
+    tools=[]
+)
 
-class QueryUnderstandingAgent(Agent):
-    def __init__(self): super().__init__("QueryUnderstanding")
-    def handle(self, query: str) -> dict:
-        prompt = (
-            "Parse the user question into JSON with keys: equipment, plant, parameter."
-            f"\nQuestion: {query}\nJSON:"   )
-        resp = safe_gemini_call([prompt])
-        try:
-            data = json.loads(resp)
-            return {k: data.get(k) for k in ['equipment','plant','parameter']}
-        except Exception:
-            # fallback simple regex
-            import re
-            eq = re.search(r"equipment\s+(\w+)", query, re.I)
-            pl = re.search(r"plant\s+(\w+)", query, re.I)
-            param = re.sub(r".*for", "", query, flags=re.I).strip()
-            return {
-                'equipment': eq.group(1) if eq else None,
-                'plant': pl.group(1) if pl else None,
-                'parameter': param
-            }
+# 2) Schema validation — deterministic
+schema_agent = BaseAgent(
+    name="schema_agent",
+    tools=[ExcelLoader(['formula master_osd.xlsx', 'masterlist osd equipments.xlsx'])],
+    instruction=(
+        "Given the intent JSON and the loaded sheets with their columns, "
+        "return JSON: {sheet_name: {\"filters\": {\"equipment\": ..., \"plant\": ...}, "
+        "\"columns\": [<best matching columns>]}}."
+    )
+)
 
-class SchemaRetrievalAgent(Agent):
-    def __init__(self, reader):
-        super().__init__("SchemaRetrieval")
-        self.reader = reader
-    def handle(self, intent: dict) -> dict:
-        # Use LLM to match parameter to columns
-        catalog = ''
-        for sheet, df in self.reader.sheets.items():
-            catalog += f"Sheet {sheet} columns: {list(df.columns)}\n"
-        prompt = (
-            "Given available sheet columns below and a parameter, return JSON mapping sheet -> list of best matching columns."
-            f"\n{catalog}\nParameter: {intent['parameter']}\nJSON:" )
-        resp = safe_gemini_call([prompt])
-        try:
-            mapping = json.loads(resp)
-            # ensure valid lists and existing sheets
-            return {s: [c for c in cols if c in self.reader.sheets[s].columns]
-                    for s, cols in mapping.items() if s in self.reader.sheets}
-        except Exception:
-            # fallback: all columns containing any word from parameter
-            words = intent['parameter'].split()
-            result = {}
-            for sheet, df in self.reader.sheets.items():
-                matched = [col for col in df.columns if any(w.lower() in col.lower() for w in words)]
-                if matched: result[sheet] = matched
-            return result
+# 3) Data retrieval — deterministic
+data_agent = BaseAgent(
+    name="data_agent",
+    tools=[DataQuery(schema_agent.tools[0])],
+    instruction="Take the schema map JSON and fetch the filtered rows for each sheet."
+)
 
-class DataExtractionAgent(Agent):
-    def __init__(self, reader): super().__init__("DataExtraction"); self.reader = reader
-    def handle(self, intent, schema_map) -> dict:
-        results = {}
-        for sheet, cols in schema_map.items():
-            df = self.reader.sheets[sheet]
-            sub = df.copy()
-            if intent.get('equipment'):
-                # filter equipment- smart case-insensitive
-                eq_candidates = [c for c in sub.columns if 'equipment' in c.lower()]
-                if eq_candidates:
-                    sub = sub[sub[eq_candidates[0]].astype(str).str.contains(intent['equipment'], case=False)]
-            if intent.get('plant'):
-                plant_cols = [c for c in sub.columns if 'plant' in c.lower()]
-                if plant_cols:
-                    sub = sub[sub[plant_cols[0]].astype(str).str.contains(intent['plant'], case=False)]
-            if sub.empty: continue
-            selected = [c for c in cols if c in sub.columns]
-            if selected:
-                results[sheet] = sub[selected]
-        return results
+# 4) Response generation — LLM-assisted formatting
+response_agent = LlmAgent(
+    name="response_agent",
+    model=MODEL_NAME,
+    instruction=(
+        "Format the retrieved DataFrame(s) into a clean Markdown table or brief English summary. "
+        "Only include the data; do not hallucinate extra content."
+    ),
+    safety_settings=safety,
+    tools=[]
+)
 
-class ResponseGenerationAgent(Agent):
-    def __init__(self): super().__init__("ResponseGen")
-    def handle(self, intent, extracted) -> str:
-        out = f"Results for {intent['parameter']} (Equipment: {intent['equipment']}, Plant: {intent['plant']}):\n"
-        for sheet, df in extracted.items():
-            out += f"\nSheet: {sheet}\n{df.to_markdown(index=False)}\n"
-        return out
-
-class CoordinatorAgent(Agent):
-    def __init__(self, reader):
-        super().__init__("Coordinator")
-        self.understand = QueryUnderstandingAgent()
-        self.schema     = SchemaRetrievalAgent(reader)
-        self.extract    = DataExtractionAgent(reader)
-        self.respond    = ResponseGenerationAgent()
-    def handle(self, query):
-        intent = self.understand.handle(query)
-        logger.debug(f"Intent: {intent}")
-        schema_map = self.schema.handle(intent)
-        logger.debug(f"Schema map: {schema_map}")
-        extracted = self.extract.handle(intent, schema_map)
-        logger.debug(f"Extracted: {extracted}")
-        if not extracted: return None, None
-        return self.respond.handle(intent, extracted), extracted
+# Orchestrator ties them together
+orchestrator = AgentOrchestrator(
+    agents=[intent_agent, schema_agent, data_agent, response_agent]
+)
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="Excel Chatbot", layout="wide")
-if 'agents' not in st.session_state:
-    files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
-    reader = ExcelReaderAgent(files)
-    coordinator = CoordinatorAgent(reader)
-    st.session_state['agents'] = {'reader': reader, 'coordinator': coordinator}
-reader = st.session_state['agents']['reader']
-coordinator = st.session_state['agents']['coordinator']
+st.set_page_config(page_title="Excel ADK Chatbot", layout="wide")
+st.title("Excel Chatbot (ADK + Gemini)")
 
-st.title("Agentic Excel Chatbot")
-query = st.text_input("Enter your question:")
-if st.button("Ask") and query:
-    with st.spinner("Processing..."):
+question = st.text_input("Ask your question about the Excel workbooks:")
+if st.button("Ask") and question.strip():
+    with st.spinner("Thinking…"):
         try:
-            answer, extracted = coordinator.handle(query)
-            if not extracted:
-                st.error("No matching data found. Please refine your query.")
-            else:
-                st.markdown(answer)
+            # Run the full agent chain in one call:
+            result = orchestrator.run(input=question)
+            # orchestrator.run returns the final agent's output
+            st.markdown(result)
         except Exception as e:
-            logger.exception("Pipeline error")
+            logger.exception("Chatbot error")
             st.error(f"Error: {e}")
