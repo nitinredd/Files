@@ -1,62 +1,140 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware   # ← add this
-from pydantic import BaseModel
+import os
+import google.auth
 import pandas as pd
-from gemini_client import GeminiClient
+import streamlit as st
+from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
 
-# 1. Load your workbooks
-WORKBOOKS = {
-    "formula": pd.read_excel("formula_master_osd.xlsx", sheet_name=None),
-    "equipment": pd.read_excel("masterlist_osd_equipments.xlsx", sheet_name=None),
-}
+# ---------- Configuration ----------
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
 
-# 2. Create the app
-app = FastAPI()
+# Initialize Gemini 2.5 Pro (using flash-thinking as placeholder)
+model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# 3. CORS setup — allow your React frontend origin (or "*" for all)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # your Vite dev server
-    allow_credentials=True,
-    allow_methods=["*"],       # this enables OPTIONS, GET, POST, etc.
-    allow_headers=["*"],       # allow Content-Type, Authorization, etc.
-)
+# Safety settings
+safety_config = [
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+]
 
-gemini = GeminiClient()
+# ---------- Multi-Agent Framework ----------
+class Agent:
+    """Base class for agents"""
+    def __init__(self, name):
+        self.name = name
+    def handle(self, query, context):
+        raise NotImplementedError
 
-class ChatRequest(BaseModel):
-    message: str
+class ExcelReaderAgent(Agent):
+    """Reads structured data from Excel workbooks"""
+    def __init__(self, files):
+        super().__init__("ExcelReader")
+        self.sheets = {}
+        for f in files:
+            xl = pd.ExcelFile(f)
+            for sheet in xl.sheet_names:
+                self.sheets[sheet] = xl.parse(sheet)
 
-# --- your existing agents and /chat endpoint below...
-@app.post("/chat")
-def chat(req: ChatRequest):
-    query = req.message.strip()
-    if not query:
-        raise HTTPException(400, "Empty query")
+    def handle(self, query, context):
+        # Provide sheet keys to coordinator
+        return list(self.sheets.keys())
 
-    # ... dispatch to agents, build tables, summarize via Gemini ...
-    coord = CoordinatorAgent(WORKBOOKS)
-    hits = coord.dispatch(query)
+class QueryAgent(Agent):
+    """Extracts relevant rows matching user intent"""
+    def __init__(self, reader: ExcelReaderAgent):
+        super().__init__("QueryAgent")
+        self.reader = reader
 
-    if not hits:
-        return {"response": "Relevant information not found in the provided datasets."}
+    def handle(self, query, context):
+        results = {}
+        for sheet, df in self.reader.sheets.items():
+            # naive contains search across all columns
+            mask = df.apply(lambda col: col.astype(str).str.contains(query, case=False, na=False)).any(axis=1)
+            matched = df[mask]
+            if not matched.empty:
+                results[sheet] = matched
+        return results
 
-    tables = []
-    for sheet, df in hits:
-        tables.append({
-            "sheet": sheet,
-            "columns": df.columns.tolist(),
-            "rows": df.values.tolist()
-        })
+class GeminiAgent(Agent):
+    """Calls Gemini to refine/answer based on extracted rows"""
+    def __init__(self, model, safety_settings):
+        super().__init__("GeminiAgent")
+        self.model = model
+        self.safety = safety_settings
 
-    prompt = (
-        f"User asked: '{query}'. "
-        f"Found data in sheets: {', '.join(h[0] for h in hits)}. "
-        "Please summarize results in plain English."
-    )
-    summary = gemini.generate_content(prompt)
+    def handle(self, query, context):
+        # Build prompt from context rows
+        prompt = f"You are a domain assistant.\nUser query: {query}\nRelevant data:"
+        for sheet, df in context.items():
+            prompt += f"\nSheet: {sheet}, Rows: {df.to_dict(orient='list')}"
+        resp = self.model.generate_content([prompt], safety_settings=self.safety)
+        return resp[0].text if resp else "No answer generated"
 
-    return {
-        "response": summary,
-        "tables": tables
-    }
+class CoordinatorAgent(Agent):
+    """Orchestrates workflow among agents"""
+    def __init__(self, reader, query_agent, gemini_agent):
+        super().__init__("Coordinator")
+        self.reader = reader
+        self.query_agent = query_agent
+        self.gemini_agent = gemini_agent
+
+    def handle(self, query):
+        # Step 1: extract potential sheets
+        sheets = self.reader.handle(query, None)
+        # Step 2: detailed row matching
+        matched = self.query_agent.handle(query, None)
+        if not matched:
+            return None, None
+        # Step 3: call Gemini
+        answer = self.gemini_agent.handle(query, matched)
+        return answer, matched
+
+# ---------- Streamlit App ----------
+st.set_page_config(page_title="Excel Chatbot", layout="wide")
+
+# Initialize or load agents
+if 'agents' not in st.session_state:
+    files = ['formula master_osd.xlsx', 'masterlist osd equipments.xlsx']
+    reader = ExcelReaderAgent(files)
+    query_agent = QueryAgent(reader)
+    gemini_agent = GeminiAgent(model, safety_config)
+    coordinator = CoordinatorAgent(reader, query_agent, gemini_agent)
+    st.session_state['agents'] = {'coordinator': coordinator, 'reader': reader}
+
+coordinator = st.session_state['agents']['coordinator']
+reader = st.session_state['agents']['reader']
+
+# Greeting and sample prompts
+if 'greeted' not in st.session_state:
+    st.write("**Hi! I'm your Excel Chatbot powered by Gemini 2.5 Pro.**")
+    # dynamic sample prompts based on sheet data
+    samples = []
+    # pick first 3 sheets and first row values
+    for sheet, df in list(reader.sheets.items())[:3]:
+        row = df.iloc[0].to_dict()
+        key, val = list(row.items())[0]
+        samples.append(f"Do we have {key} with value {val} in {sheet}?")
+    st.markdown("**Try these prompts:**")
+    for s in samples:
+        st.write(f"- {s}")
+    st.session_state['greeted'] = True
+
+# User input
+query = st.text_input("Enter your query:")
+if st.button("Ask") and query:
+    with st.spinner("Processing..."):
+        answer, matched = coordinator.handle(query)
+        if matched is None:
+            st.error("Relevant information not found in the Excel workbooks.")
+        else:
+            # Display table results
+            st.subheader("Matched Data")
+            for sheet, df in matched.items():
+                st.write(f"**Sheet: {sheet}**")
+                st.dataframe(df)
+            # Display Gemini answer
+            st.subheader("Answer")
+            st.write(answer)
