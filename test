@@ -1,122 +1,221 @@
-# excel_chatbot.py
+Chapter 1: Introduction & High-Level Overview
 
-import re
-import os
-import json
-import pandas as pd
-import streamlit as st
-from typing import Dict, Any
+Purpose & Scope:
 
-# ---------- CONFIGURE YOUR EXCEL FILES HERE ----------
-EXCEL_PATHS = [
-    "formula master_osd.xlsx",
-    "masterlist osd equipments.xlsx",
-]
-# ------------------------------------------------------
+Introduce the overall goals: a scalable, multi-agent LLM system with real-time streaming, rich tool integration, and layered optimization.
+Present the high-level block diagram (the image you provided) and its major zones: Infrastructure, Data & Storage, Agent Orchestration, Context & Prompting, and Optimization/Feedback.
+Chapter 2: Infrastructure & Deployment
 
-# ---------- AGENTS ----------
+2.1 Cloud Run & Kubernetes
+Why chosen:
 
-class IntentAgent:
-    """Parses a natural-language query into structured intent."""
-    @staticmethod
-    def handle(query: str) -> Dict[str, str]:
-        # Regex‐based extraction for equipment, plant
-        eq = re.search(r"equipment\s+(\w+)", query, re.I)
-        pl = re.search(r"plant\s+(\w+)", query, re.I)
-        # Parameter = everything after the word "range" or after equipment/plant
-        param = query
-        if eq:
-            param = param.replace(eq.group(1), "")
-        if pl:
-            param = param.replace(pl.group(1), "")
-        param = re.sub(r"\b(what|is|the|in|for|of|range|unit|operation)\b", "", param, flags=re.I).strip()
-        return {
-            "equipment": eq.group(1) if eq else "",
-            "plant":     pl.group(1) if pl else "",
-            "parameter": param
-        }
+Serverless container hosting (Cloud Run) for stateless microservices—automatic scaling and minimal ops.
+Kubernetes (GKE) for stateful or highly customized services (e.g., Neo4j, side-cars).
+Pros:
 
-class SchemaAgent:
-    """Validates sheets & columns exist, and picks the right sheet/cols."""
-    def __init__(self, sheets: Dict[str, pd.DataFrame]):
-        self.sheets = sheets
+Auto-scaling on demand; pay-per-use.
+Consistent container-based dev→prod parity.
+Integration with Google Cloud IAM, VPC, monitoring, and logging.
+Cons:
 
-    def handle(self, intent: Dict[str,str]) -> Dict[str,Any]:
-        # Find a sheet that contains both equipment & plant columns
-        # and at least one column matching the parameter phrase.
-        best = {}
-        for name, df in self.sheets.items():
-            cols = [c.lower() for c in df.columns]
-            if intent["equipment"] and not any("equipment" in c for c in cols):
-                continue
-            if intent["plant"]     and not any("plant"     in c for c in cols):
-                continue
-            # parameter match: substring in column name
-            matches = [c for c in df.columns if intent["parameter"].lower() in c.lower()]
-            if matches:
-                best = {
-                    "sheet":  name,
-                    "filters":{"equipment": intent["equipment"], "plant": intent["plant"]},
-                    "columns": matches
-                }
-                break
-        return best
+Cold-start latency in serverless functions.
+Added complexity if mixing Cloud Run and full-blown Kubernetes.
+Possible vendor lock-in.
+2.2 CI/CD & Git Source Registry
+Why chosen:
 
-class DataAgent:
-    """Applies the filters & selects only those columns."""
-    def __init__(self, sheets: Dict[str,pd.DataFrame]):
-        self.sheets = sheets
+Enforce reproducible builds; version-controlled infrastructure (Infrastructure as Code).
+Automatic deployment triggers for both code and infra changes.
+Pros:
 
-    def handle(self, schema_map: Dict[str,Any]) -> pd.DataFrame:
-        name = schema_map["sheet"]
-        df   = self.sheets[name]
-        f    = schema_map["filters"]
-        # filter equipment & plant
-        if f["equipment"]:
-            eq_col = next(c for c in df.columns if "equipment" in c.lower())
-            df = df[df[eq_col].astype(str).str.contains(f["equipment"], case=False)]
-        if f["plant"]:
-            pl_col = next(c for c in df.columns if "plant" in c.lower())
-            df = df[df[pl_col].astype(str).str.contains(f["plant"], case=False)]
-        return df[schema_map["columns"]]
+Traceability of every change.
+Fast rollback on broken releases.
+Automated testing integration.
+Cons:
 
-class ResponseAgent:
-    """Formats the final DataFrame into markdown."""
-    @staticmethod
-    def handle(df: pd.DataFrame) -> str:
-        if df.empty:
-            return "No matching data found."
-        return df.to_markdown(index=False)
+Setup and maintenance overhead.
+Potential for cascading failures if pipelines are mis-configured.
+Chapter 3: Data Ingestion & Preprocessing
 
-# ---------- STREAMLIT UI ----------
+3.1 Document Repository & OCR/Parser
+Why chosen:
 
-# Load sheets once
-@st.cache_data
-def load_sheets(paths):
-    sheets = {}
-    for p in paths:
-        if not os.path.exists(p):
-            st.error(f"File not found: {p}")
-            continue
-        xl = pd.ExcelFile(p)
-        for s in xl.sheet_names:
-            sheets[s] = xl.parse(s)
-    return sheets
+Centralized storage (Cloud Storage buckets) for raw documents.
+OCR and PDF parsers (pdfplumber, Tika) to convert to plain text.
+Pros:
 
-sheets = load_sheets(EXCEL_PATHS)
-schema_agent = SchemaAgent(sheets)
-data_agent   = DataAgent(sheets)
+Scalable, cost-effective storage.
+Flexible parser plug-ins for different document types.
+Cons:
 
-st.title("Excel Multi-Agent Chatbot")
-st.markdown("Ask questions like: *What is the impeller speed range in unit operation RMG for the equipment Glatt in Plant F20?*")
+OCR errors require downstream cleaning.
+Parsing edge-cases slow ingestion.
+3.2 Chunking & Text Embedding Pipeline
+Why chosen:
 
-query = st.text_input("Your question:")
-if st.button("Ask") and query.strip():
-    intent = IntentAgent.handle(query)
-    schema_map = schema_agent.handle(intent)
-    if not schema_map:
-        st.error("Couldn’t map your question to any sheet/columns. Please check spelling and schema.")
-    else:
-        df = data_agent.handle(schema_map)
-        response = ResponseAgent.handle(df)
-        st.markdown(response)
+Break large documents into semantically coherent chunks.
+Pre-compute embeddings via a high-throughput embedding model (e.g. PaLM-Embed).
+Pros:
+
+Improves retrieval precision.
+Enables vector similarity search.
+Cons:
+
+Chunk size/tuning tradeoffs (too small loses context; too large slows search).
+Pre-computation cost.
+Chapter 4: Embedding Store & Similarity Search
+
+4.1 Vector Database (e.g., Neo4j+Vector or Pinecone)
+Why chosen:
+
+Neo4j with vector plugin for graph-enriched vector search (relationships + similarity).
+Alternatively Pinecone for pure vector at scale.
+Pros:
+
+Graph layer allows contextual relationships (metadata, citations).
+Graph queries + vector queries in one system.
+Cons:
+
+Complexity of deploying and tuning Neo4j cluster.
+Hybrid query performance tuning.
+Chapter 5: Agent Swarm & Orchestration
+
+5.1 LLM Wrapper & LiteLLM Interface
+Why chosen:
+
+Unified interface for calling any LLM (Gemini, GPT-4o, Claude, etc.).
+Simplifies swapping models.
+Pros:
+
+Vendor-agnostic.
+Easy A/B testing of models.
+Cons:
+
+Lowest-common-denominator interface may not expose all model features.
+5.2 Orchestration Layer (“Agent Swarm”)
+Why chosen:
+
+Define workflows: sequential, parallel, hierarchical multi-agent tasks.
+Each agent specialized (e.g. Retrieval Agent, Summarization Agent, Action Agent).
+Pros:
+
+Modular, reusable agent definitions.
+Clear separation of concerns.
+Cons:
+
+Overhead in inter-agent messaging.
+Potential latency if many small agents.
+Chapter 6: Model Context Protocol (MCP) Integration
+
+6.1 MCP Tool Registration & Discovery
+Why chosen:
+
+Agents need to invoke external tools/APIs (databases, calculators, internal services).
+MCP provides standard metadata and invocation patterns.
+Pros:
+
+Strong typing of inputs/outputs.
+Automatic stub generation and validation.
+Cons:
+
+Requires maintenance of tool definitions.
+Versioning complexity in MCP specs.
+Chapter 7: Prompt Orchestration & META-Prompting
+
+7.1 Prompt Orchestrator & Context Engine
+Why chosen:
+
+Dynamically assemble prompts based on historical context, user intent, and document snippets.
+Support for few-shot examples, dynamic context windows.
+Pros:
+
+Improves LLM accuracy by controlling context.
+Reusable prompt templates.
+Cons:
+
+Prompt drift over time; requires periodic review.
+Risk of context size limits — must manage token budgets.
+7.2 META-Prompting & Strategy Optimizer
+Why chosen:
+
+High-level “prompts about prompts” to adapt strategy based on task type (e.g., summarization vs. question answering).
+Strategy Optimizer tunes which agent or prompt variant to use.
+Pros:
+
+Self-optimizing prompting improves performance on heterogeneous tasks.
+Enables rapid experimentation.
+Cons:
+
+Added complexity; meta-level layer can be hard to debug.
+Requires logging & evaluation framework to tune.
+Chapter 8: Learning & Query Optimization
+
+8.1 Learning Matrix & Query Optimizer
+Why chosen:
+
+Tracks past query performance, success/failure, and adjusts retrieval/query generation parameters.
+Continuous learning from feedback.
+Pros:
+
+System becomes more accurate over time.
+Automated parameter tuning.
+Cons:
+
+Cold start: little data in the beginning.
+Risk of overfitting to early feedback.
+Chapter 9: Memory & Knowledge Management
+
+9.1 Short-Term & Long-Term Memory Stores
+Why chosen:
+
+Short-term: conversational history, session data.
+Long-term: user profiles, persistent facts in a vector or graph store.
+Pros:
+
+Personalized, context-aware interactions.
+Knowledge reuse across sessions.
+Cons:
+
+Privacy/security considerations.
+Garbage collection: stale memories bloat the store.
+9.2 Knowledge Base & Parameter Matrix
+Why chosen:
+
+Central repository of domain knowledge (FAQs, SOPs).
+Parameter Matrix holds configurable thresholds (similarity, confidence).
+Pros:
+
+Decouples domain content from code.
+Fine-grained control via matrices.
+Cons:
+
+Synchronization of KB updates.
+Complexity managing parameter versions.
+Chapter 10: Feedback Loop & Output Refinement
+
+10.1 Response Router & Relevance Filter
+Why chosen:
+
+Route answers through filters to ensure relevance, safety, and compliance.
+Can block, flag, or reroute low-confidence responses.
+Pros:
+
+Improves trustworthiness and accuracy.
+Enforces guardrails.
+Cons:
+
+May over-filter valid responses.
+Latency added by extra validation steps.
+10.2 Output Refiner & User Feedback Integration
+Why chosen:
+
+Post-process LLM outputs for style, formatting, or additional fact-checking.
+Capture explicit user feedback to feed back into the Learning Matrix.
+Pros:
+
+Consistent voice and branding.
+Continuous improvement loop.
+Cons:
+
+Additional compute cost.
+Complexity in mapping feedback to model adjustments.
