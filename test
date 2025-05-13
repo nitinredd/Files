@@ -1,152 +1,150 @@
-import os
-import io
 import streamlit as st
 import pandas as pd
 import google.auth
-from summit.domain import Domain, ContinuousVariable
-from summit.strategies import TSEMO, SNOBFIT
-from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
+from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
+import utils.domain
+import utils.lhs
+import ast
+import re
 
-st.set_page_config(page_title="SOR Phase I - Flowrate Calculator", layout="wide")
+# Configure Gemini
+def configure_gemini():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "your-service-account.json"
+    credentials, project_id = google.auth.default()
+    return GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# --- Gemini setup (fixed GCP configuration) ---
-# Set up credentials
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-credentials, project_id = google.auth.default()
-# Initialize the Gemini model
-multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-# Safety settings configuration
+# Safety settings
 safety_config = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
     SafetySetting(
         category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
         threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
+    )
 ]
 
-# Example safe call without tinkering temperature param
-def safe_gemini_call(prompt_text, max_retries=3, delay=2):
-    for attempt in range(max_retries):
-        try:
-            response = multimodal_model.generate_content(
-                [prompt_text],
+def parse_excel(uploaded_file):
+    """Parse uploaded Excel file into DataFrames"""
+    dfs = {
+        'lhs': pd.read_excel(uploaded_file, sheet_name="LHS"),
+        'objectives': pd.read_excel(uploaded_file, sheet_name="Objectives"),
+        'pump': pd.read_excel(uploaded_file, sheet_name="Pump Details"),
+        'reactor': pd.read_excel(uploaded_file, sheet_name="Reactor Details", header=None)
+    }
+    return dfs
+
+def generate_flowrate_prompt(df_pump, df_reactor, user_input):
+    """Generate structured prompt for Gemini"""
+    pump_details = "\n".join([f"Pump {i+1}: {row['Solvent Name']} ({row['Concentration of reagent (g/ml)']} g/ml, MW: {row['Molecular weight (g/mol)']})" 
+                            for i, row in df_pump.iterrows()])
+    
+    prompt = f"""You are a chemical engineering expert. Analyze this pump setup:
+    {pump_details}
+    Reactor Volume: {df_reactor[1][0]} mL
+    User Description: "{user_input}"
+    
+    Output Python dictionary with:
+    1. "pump_count" - number of pumps needed
+    2. "reaction_scheme" - numerical identifier
+    3. "formulas" - dictionary with flowrate formulas for each pump using variables from LHS
+    4. "reaction_time" - reaction time formula
+    
+    Use these variables from LHS:
+    - Equivalence1, Equivalence2, Equivalence3
+    - ResidencetimeT1, ResidencetimeT2
+    - ReactionTemperature1, ReactionTemperature2
+    
+    Example output:
+    {{"pump_count": 3, "reaction_scheme": 1, 
+    "formulas": {{"Pump 1": "(reactor_vol / ResidencetimeT1) * (...)", ...}},
+    "reaction_time": "ResidencetimeT1 * steady_state_factor"}}
+    """
+    return prompt
+
+def calculate_flowrates(lhs_df, formulas, reactor_df, pump_df):
+    """Calculate flow rates using generated formulas"""
+    results = lhs_df.copy()
+    reactor_vol = reactor_df[1][0]
+    steady_state = reactor_df[3][0]
+    
+    # Calculate reaction time
+    results['Reaction time'] = eval(formulas['reaction_time'], {}, {
+        'ResidencetimeT1': results['ResidencetimeT1'],
+        'steady_state_factor': steady_state
+    })
+    
+    # Calculate pump flow rates
+    for pump, formula in formulas['formulas'].items():
+        results[f'Flow rate of {pump}'] = eval(formula, {}, {
+            'reactor_vol': reactor_vol,
+            'ResidencetimeT1': results['ResidencetimeT1'],
+            'Equivalence1': results['Equivalence1'],
+            'Equivalence2': results['Equivalence2'],
+            'Equivalence3': results['Equivalence3'],
+            'C': pump_df['Concentration of reagent (g/ml)'],
+            'MW': pump_df['Molecular weight (g/mol)']
+        })
+    
+    return results
+
+def main():
+    st.title("SOR Flow Rate Calculator (Phase 1)")
+    st.subheader("Gemini-Powered Flow Rate Calculation")
+    
+    # File Upload
+    uploaded_file = st.file_uploader("Upload Master Excel File", type=["xlsx"])
+    if not uploaded_file:
+        return
+    
+    # Parse Excel
+    dfs = parse_excel(uploaded_file)
+    
+    # LHS Configuration
+    n_exp = st.number_input("Number of LHS Experiments", min_value=5, max_value=100, value=7)
+    domain = utils.domain.create_domain_X(dfs['lhs'])
+    domain = utils.domain.create_domain_y(domain, dfs['objectives'])
+    
+    # Generate LHS
+    lhs_design = utils.lhs.LHSDesign(n_exp, domain, dfs['objectives'].shape[1]-1)
+    lhs_df = lhs_design.to_dataframe()
+    
+    # Reaction Scheme Input
+    user_input = st.text_area("Describe your reaction scheme:", 
+                             placeholder="e.g. '3 pumps with KSM, R1 and R2 reacting in series with quenching...'")
+    
+    if st.button("Calculate Flow Rates"):
+        # Generate and execute Gemini prompt
+        model = configure_gemini()
+        prompt = generate_flowrate_prompt(dfs['pump'], dfs['reactor'], user_input)
+        
+        with st.spinner("Analyzing with Gemini..."):
+            response = model.generate_content(
+                [prompt],
                 safety_settings=safety_config
             )
-            return response
-        except Exception:
-            time.sleep(delay)
-    st.error("Gemini call failed after retries.")
-    return None
+            
+        try:
+            # Parse Gemini response
+            clean_response = re.sub(r'[\s\S]*?({[\s\S]*?})[\s\S]*', r'\1', response.text)
+            config = ast.literal_eval(clean_response)
+            
+            # Calculate flow rates
+            with st.spinner("Calculating flow rates..."):
+                results_df = calculate_flowrates(lhs_df, config['formulas'], 
+                                                dfs['reactor'], dfs['pump'])
+            
+            # Display results
+            st.success("Calculation Complete!")
+            st.dataframe(results_df)
+            
+            # Export to Excel
+            output = pd.ExcelWriter('SOR_Result.xlsx')
+            results_df.to_excel(output, sheet_name='Results')
+            st.download_button("Download Results", output, 
+                               file_name="SOR_Results.xlsx",
+                               mime="application/vnd.ms-excel")
+            
+        except Exception as e:
+            st.error(f"Error processing Gemini response: {str(e)}")
+            st.text_area("Gemini Raw Response", response.text, height=200)
 
-# --- Helper: build Summit domain from LHS sheet ---
-def create_domain_X(df_lhs: pd.DataFrame) -> Domain:
-    domain = Domain()
-    for col in df_lhs.columns[1:]:
-        name = col.strip().replace(" ", "")
-        if df_lhs[col].notna().all():
-            lb, ub = float(df_lhs[col].iloc[1]), float(df_lhs[col].iloc[2])
-            desc = str(df_lhs[col].iloc[0])
-            domain += ContinuousVariable(name=name, description=desc, bounds=[lb, ub])
-    return domain
-
-# Generate LHS experiments
-@st.cache_data
-def generate_lhs(_df_lhs: pd.DataFrame, n_exp: int, n_obj: int) -> pd.DataFrame:
-    domain = create_domain_X(_df_lhs)
-    seed = 42
-    if n_obj > 1:
-        strat = TSEMO(domain, random_rate=0.0, n_spectral_points=4000, seed=seed)
-        df_out = strat.suggest_experiments(n_exp, use_spectral_sample=True, pop_size=100, iterations=100)
-    else:
-        strat = SNOBFIT(domain, seed=seed)
-        df_out = strat.suggest_experiments(n_exp)
-    df_out = df_out.drop(columns=["strategy"])
-    df_out.columns = [c[0] for c in df_out.columns]
-    return df_out.reset_index(drop=True)
-
-# Compute flowrates vectorized
-@st.cache_data
-def compute_flowrates(_df_exp: pd.DataFrame, _df_pump: pd.DataFrame, _df_reactor: pd.DataFrame) -> pd.DataFrame:
-    df = _df_exp.copy()
-    reactor_vol = float(_df_reactor.iloc[0,1])
-    steady_state = float(_df_reactor.iloc[0,3])
-    def molarity(c, mw): return c/mw*1000
-    def inv_molarity(c, mw): return 1.0/molarity(c, mw)
-    df['Reaction time'] = df['ResidencetimeT1'] * steady_state
-    num1 = inv_molarity(_df_pump.iloc[0,0], _df_pump.iloc[0,3])
-    num2 = df['Equivalence1'] * inv_molarity(_df_pump.iloc[1,0], _df_pump.iloc[1,3])
-    num3 = df['Equivalence2'] * inv_molarity(_df_pump.iloc[2,0], _df_pump.iloc[2,3])
-    denom = num1 + num2 + num3
-    df['Flow rate of Pump 1'] = reactor_vol / df['ResidencetimeT1'] * num1 / denom
-    df['Flow rate of Pump 2'] = reactor_vol / df['ResidencetimeT1'] * num2 / denom
-    df['Flow rate of Pump 3'] = reactor_vol / df['ResidencetimeT1'] * num3 / denom
-    if _df_pump.shape[0] >= 4:
-        q_factor = float(_df_pump.iloc[3,4]) if not pd.isna(_df_pump.iloc[3,4]) else 1.0
-        df['Flow rate of Pump 4'] = q_factor * df['Flow rate of Pump 2']
-    return df
-
-# Streamlit UI
-st.title("🔬 SOR Phase I: Automated Flowrate Calculator")
-master = st.sidebar.file_uploader("Upload Master Excel (LHS, Pump, Objectives, Reactor)", type=["xlsx"])
-if master:
-    xls = pd.ExcelFile(master)
-    df_lhs = pd.read_excel(xls, sheet_name="LHS")
-    df_pump = pd.read_excel(xls, sheet_name="Pump Details")
-    df_obj = pd.read_excel(xls, sheet_name="Objectives")
-    df_reactor = pd.read_excel(xls, sheet_name="Reactor Details", header=None)
-
-    n_exp = st.sidebar.number_input("Number of LHS experiments", min_value=1, value=7)
-    n_obj = df_obj.shape[1] - 1
-
-    st.subheader("💬 Describe your setup in plain English")
-    prompt = st.text_area("Enter prompt to Gemini:", height=150,
-                         placeholder="E.g., 'I have three reagent streams and one quench stream...' ")
-    if st.button("Send to Gemini"):
-        if not prompt:
-            st.error("Please enter a reaction description.")
-        else:
-            response = safe_gemini_call(prompt)
-            if response:
-                code = response.text
-                st.subheader("📝 Generated flowrate.py code from Gemini")
-                st.code(code, language="python")
-                st.markdown("---")
-
-    if st.button("▶️ Generate Flowrates"):
-        lhs_df = generate_lhs(df_lhs, int(n_exp), int(n_obj))
-        result = compute_flowrates(lhs_df, df_pump, df_reactor)
-        st.subheader("📊 LHS + Flowrate Results")
-        st.dataframe(result)
-        towrite = io.BytesIO()
-        result.to_excel(towrite, index=False, sheet_name="Results")
-        towrite.seek(0)
-        st.download_button("📥 Download SOR_RESULT.xlsx", data=towrite,
-                           file_name="SOR_RESULT.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    if st.button("🤖 Gemini Compute Flowrates"):
-        gemini_prompt = (
-            f"Given the uploaded Excel with {n_exp} LHS experiments and pump/reactor details, "
-            "compute the flowrate table for each experiment as markdown."
-        )
-        response = safe_gemini_call(gemini_prompt)
-        if response:
-            st.subheader("📋 Gemini-generated flowrate table")
-            st.markdown(response.text)
-else:
-    st.info("Please upload your master Excel file to begin.")
+if __name__ == "__main__":
+    main()
