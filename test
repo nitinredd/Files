@@ -9,22 +9,27 @@ from vertexai.preview.generative_models import GenerativeModel, SafetySetting, H
 
 st.set_page_config(page_title="SOR Phase I - Flowrate Calculator", layout="wide")
 
-# --- Gemini setup (using fixed GCP configuration) ---
+# --- Gemini setup (fixed GCP configuration) ---
 # Set up credentials
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
 # Initialize the Gemini model
 multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-# Safety settings
+# Safety settings (use keyword args)
 safety_config = [
-    SafetySetting(HarmCategory.HARM_CATEGORY_UNSPECIFIED, HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HARASSMENT, HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_HATE_SPEECH, HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-# --- Helper functions ---
+# --- Helper: build Summit domain from LHS sheet ---
 def create_domain_X(df_lhs: pd.DataFrame) -> Domain:
     domain = Domain()
     for col in df_lhs.columns[1:]:
@@ -35,6 +40,7 @@ def create_domain_X(df_lhs: pd.DataFrame) -> Domain:
             domain += ContinuousVariable(name=col_clean, description=desc, bounds=[lb, ub])
     return domain
 
+# --- Generate initial LHS experiments ---
 @st.cache_data
 def generate_lhs(df_lhs: pd.DataFrame, n_exp: int, n_obj: int) -> pd.DataFrame:
     domain = create_domain_X(df_lhs)
@@ -48,6 +54,7 @@ def generate_lhs(df_lhs: pd.DataFrame, n_exp: int, n_obj: int) -> pd.DataFrame:
     df_out.columns = [c[0] for c in df_out.columns]
     return df_out.reset_index(drop=True)
 
+# --- Compute flowrates vectorized ---
 @st.cache_data
 def compute_flowrates(df_exp: pd.DataFrame, df_pump: pd.DataFrame, df_reactor: pd.DataFrame) -> pd.DataFrame:
     df = df_exp.copy()
@@ -55,22 +62,28 @@ def compute_flowrates(df_exp: pd.DataFrame, df_pump: pd.DataFrame, df_reactor: p
     steady_state = float(df_reactor.iloc[0,3])
     def molarity(c, mw): return c/mw*1000
     def inv_molarity(c, mw): return 1.0/molarity(c, mw)
+    # Reaction time
     df['Reaction time'] = df['ResidencetimeT1'] * steady_state
+    # Numerators
     num1 = inv_molarity(df_pump.iloc[0,0], df_pump.iloc[0,3])
     num2 = df['Equivalence1'] * inv_molarity(df_pump.iloc[1,0], df_pump.iloc[1,3])
     num3 = df['Equivalence2'] * inv_molarity(df_pump.iloc[2,0], df_pump.iloc[2,3])
     denom = num1 + num2 + num3
+    # Flowrates
     df['Flow rate of Pump 1'] = reactor_vol / df['ResidencetimeT1'] * num1 / denom
     df['Flow rate of Pump 2'] = reactor_vol / df['ResidencetimeT1'] * num2 / denom
     df['Flow rate of Pump 3'] = reactor_vol / df['ResidencetimeT1'] * num3 / denom
+    # Optional 4th pump (quench)
     if df_pump.shape[0] >= 4:
         q_factor = float(df_pump.iloc[3,4]) if not pd.isna(df_pump.iloc[3,4]) else 1.0
         df['Flow rate of Pump 4'] = q_factor * df['Flow rate of Pump 2']
     return df
 
-# --- UI ---
+# --- Streamlit UI ---
 st.title("🔬 SOR Phase I: Automated Flowrate Calculator")
-master = st.sidebar.file_uploader("Upload Master Excel (LHS, Pump, Objectives, Reactor)", type=["xlsx"])
+master = st.sidebar.file_uploader(
+    "Upload Master Excel (LHS, Pump, Objectives, Reactor)", type=["xlsx"]
+)
 if master:
     try:
         xls = pd.ExcelFile(master)
@@ -85,16 +98,20 @@ if master:
     n_exp = st.sidebar.number_input("Number of LHS experiments", min_value=1, value=5)
     n_obj = df_obj.shape[1] - 1
 
+    # Prompt input and Gemini call
     st.subheader("💬 Describe your setup in plain English")
-    prompt = st.text_area("Enter prompt to Gemini:", height=150,
-                         placeholder="E.g., 'I have 3 reagent streams and 1 quench stream...' ")
-
-    if st.button("Send to Gemini"):  # call once
+    prompt = st.text_area(
+        "Enter prompt to Gemini:", height=150,
+        placeholder="E.g., 'I have three reagent streams and one quench stream...'"
+    )
+    if st.button("Send to Gemini"):
         if not prompt:
             st.error("Please enter a description of your reaction and flowrate requirements.")
         else:
             try:
-                response = multimodal_model.generate_content([prompt], safety_settings=safety_config)
+                response = multimodal_model.generate_content(
+                    [prompt], safety_settings=safety_config
+                )
                 code = response.text
                 st.subheader("📝 Generated flowrate.py code from Gemini")
                 st.code(code, language="python")
@@ -102,6 +119,7 @@ if master:
             except Exception as e:
                 st.error(f"Gemini call failed: {e}")
 
+    # Generate LHS + compute flowrates
     if st.button("▶️ Generate Flowrates"):
         with st.spinner("Computing flowrates..."):
             lhs_df = generate_lhs(df_lhs, int(n_exp), int(n_obj))
@@ -111,8 +129,10 @@ if master:
             towrite = io.BytesIO()
             result.to_excel(towrite, index=False, sheet_name="Results")
             towrite.seek(0)
-            st.download_button("📥 Download SOR_RESULT.xlsx", data=towrite,
-                               file_name="SOR_RESULT.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "📥 Download SOR_RESULT.xlsx", data=towrite,
+                file_name="SOR_RESULT.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 else:
     st.info("Please upload your master Excel file to begin.")
