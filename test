@@ -3,222 +3,141 @@ import streamlit as st
 import pandas as pd
 import google.auth
 from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-from summit.domain import Domain, ContinuousVariable
-from summit.strategies import TSEMO, SNOBFIT
-from summit.utils.dataset import DataSet
-import ast
-import re
-import numpy as np
+from typing import Dict, List, Tuple
 
 # Configure Gemini
-def configure_gemini():
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "your-service-account.json"
-    credentials, project_id = google.auth.default()
-    return GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
 
-# Safety settings
 safety_config = [
     SafetySetting(
         category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
         threshold=HarmBlockThreshold.BLOCK_NONE,
-    )
+    ),
+    # Add other safety categories as per your original config
 ]
 
-def parse_excel(uploaded_file):
-    """Parse uploaded Excel file into DataFrames"""
-    dfs = {
-        'lhs': pd.read_excel(uploaded_file, sheet_name="LHS"),
-        'objectives': pd.read_excel(uploaded_file, sheet_name="Objectives"),
-        'pump': pd.read_excel(uploaded_file, sheet_name="Pump Details"),
-        'reactor': pd.read_excel(uploaded_file, sheet_name="Reactor Details", header=None)
-    }
-    return dfs
+model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-def create_domain(df_lhs, df_objectives):
-    """Create Summit domain from DataFrames"""
-    domain = Domain()
-    
-    # Add variables
-    for col in df_lhs.columns[1:]:
-        if pd.notna(df_lhs[col]).all():
-            name = col.replace(" ", "")
-            desc = df_lhs[col].iloc[0]
-            bounds = [df_lhs[col].iloc[1], df_lhs[col].iloc[2]]
-            domain += ContinuousVariable(name=name, description=desc, bounds=bounds)
-    
-    # Add objectives
-    for col in df_objectives.columns[1:]:
-        if pd.notna(df_objectives[col]).all():
-            name = col.replace(" ", "")
-            desc = df_objectives[col].iloc[0]
-            maximize = df_objectives[col].iloc[1] == "Maximize"
-            domain += ContinuousVariable(
-                name=name,
-                description=desc,
-                bounds=[0, 100],
-                is_objective=True,
-                maximize=maximize
-            )
-    return domain
+# Agent System Components
+class ExcelAnalyzer:
+    def __init__(self):
+        self.data: Dict[str, Dict[str, pd.DataFrame]] = {}
+        
+    def load_excel(self, file_path: str) -> None:
+        """Load all sheets from an Excel file"""
+        xls = pd.ExcelFile(file_path)
+        self.data[file_path] = {sheet_name: xls.parse(sheet_name) 
+                               for sheet_name in xls.sheet_names}
 
-def lhs_design(domain, n_exp, nobj):
-    """Generate LHS experiments"""
-    if nobj > 1:
-        strategy = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
-        experiments = strategy.suggest_experiments(n_exp, use_spectral_sample=True)
+class QueryProcessor:
+    def __init__(self, analyzer: ExcelAnalyzer):
+        self.analyzer = analyzer
+        self.cache = {}
+
+    def _search_data(self, query: str) -> Tuple[str, pd.DataFrame]:
+        """Multi-agent search process"""
+        # Coordinator Agent: Determine search parameters
+        search_params = self._parse_query(query)
+        
+        # Child Agents: Search across all sheets
+        results = []
+        for file in self.analyzer.data.values():
+            for sheet_name, df in file.items():
+                # Manager Agent: Apply search filters
+                filtered = self._filter_df(df, search_params)
+                if not filtered.empty:
+                    results.append((sheet_name, filtered))
+        
+        # Oversight Agent: Validate results
+        if not results:
+            return None
+        return results
+
+    def _filter_df(self, df: pd.DataFrame, params: dict) -> pd.DataFrame:
+        """Filter dataframe based on search parameters"""
+        # Implement actual filtering logic based on params
+        return df
+
+class ResponseGenerator:
+    def __init__(self, model: GenerativeModel):
+        self.model = model
+        self.base_prompt = """You're an Excel analysis expert. Given the following context from our spreadsheets:
+        {context}
+        Answer this query: {query}
+        If information isn't available, say 'Data not found in documents'"""
+
+    def generate(self, query: str, context: str) -> str:
+        prompt = self.base_prompt.format(context=context, query=query)
+        response = self.model.generate_content(
+            prompt,
+            safety_settings=safety_config
+        )
+        return response.text
+
+# Streamlit App
+def main():
+    st.title("Excel Analysis Chatbot")
+    
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+        st.session_state.analyzer = ExcelAnalyzer()
+        st.session_state.analyzer.load_excel("formula master_osd.xlsx")
+        st.session_state.analyzer.load_excel("masterlist osd equipments.xlsx")
+        st.session_state.processor = QueryProcessor(st.session_state.analyzer)
+        st.session_state.generator = ResponseGenerator(model)
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Dynamic sample prompts
+    sample_questions = [
+        "Do we have Tapasya make with Capacity 600L in FTO-3?",
+        "What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
+        "What are the various literature sources considered in RMG?"
+    ]
+
+    # Show sample questions as buttons
+    if len(st.session_state.messages) == 0:
+        with st.chat_message("assistant"):
+            st.write("Hi! How can I help you with the equipment data today?")
+            for q in sample_questions:
+                if st.button(q):
+                    st.session_state.messages.append({"role": "user", "content": q})
+                    process_query(q)
+
+    # User input
+    if prompt := st.chat_input("Ask about equipment data..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        process_query(prompt)
+
+def process_query(query: str):
+    # Query Processing Agents
+    results = st.session_state.processor._search_data(query)
+    
+    # Validation Agent
+    if not results:
+        response = "This information is not available in the documents."
     else:
-        strategy = SNOBFIT(domain)
-        experiments = strategy.suggest_experiments(n_exp)
-    return experiments
-
-def generate_flowrate_prompt(df_pump, df_reactor, user_input):
-    """Generate structured prompt for Gemini"""
-    pump_details = "\n".join([
-        f"Pump {i+1}: {row['Solvent Name']} "
-        f"(Conc: {row['Concentration of reagent (g/ml)']} g/ml, "
-        f"MW: {row['Molecular weight (g/mol)']} g/mol, "
-        f"Quenching: {row.get('(Quenching) Flow rate factor w.r.t. Pump', 'N/A')})"
-        for i, row in df_pump.iterrows()
-    ])
-    
-    prompt = f"""You are a chemical engineering expert. Analyze this pump setup:
-    {pump_details}
-    Reactor Volume: {df_reactor[1][0]} mL
-    Steady State Factor: {df_reactor[3][0]}
-    User Description: "{user_input}"
-    
-    Output Python dictionary with:
-    1. "pump_count" - number of pumps needed
-    2. "reaction_scheme" - numerical identifier
-    3. "formulas" - dictionary with flowrate formulas for each pump using variables from LHS
-    4. "reaction_time" - reaction time formula
-    
-    Use these variables from LHS:
-    {', '.join([v.name for v in domain.variables if not v.is_objective])}
-    
-    Example output:
-    {{
-        "pump_count": 3,
-        "reaction_scheme": 1,
-        "formulas": {{
-            "Pump 1": "(reactor_vol / ResidencetimeT1) * (1/((C0/MW0)*1000)) / (...)",
-            "Pump 2": "...",
-            "Pump 3": "..."
-        }},
-        "reaction_time": "ResidencetimeT1 * steady_state_factor"
-    }}
-    """
-    return prompt
-
-def calculate_flowrates(lhs_df, formulas, reactor_df, pump_df):
-    """Calculate flow rates using generated formulas"""
-    results = lhs_df.copy()
-    reactor_vol = reactor_df[1][0]
-    steady_state = reactor_df[3][0]
-    
-    # Prepare variables
-    variables = {
-        'reactor_vol': reactor_vol,
-        'steady_state_factor': steady_state,
-        'C': pump_df['Concentration of reagent (g/ml)'].values,
-        'MW': pump_df['Molecular weight (g/mol)'].values
-    }
-    
-    # Add LHS variables
-    for col in lhs_df.columns:
-        variables[col] = lhs_df[col].values
-    
-    try:
-        # Calculate reaction time
-        results['Reaction time'] = eval(
-            formulas['reaction_time'],
-            variables
+        # Format context for LLM
+        context = "\n\n".join(
+            [f"Sheet: {sheet}\nData:\n{df.head(3).to_markdown()}" 
+             for sheet, df in results]
         )
         
-        # Calculate pump flow rates
-        for pump, formula in formulas['formulas'].items():
-            results[f'Flow rate of {pump}'] = eval(
-                formula,
-                variables
-            )
-            
-        return results
-    except Exception as e:
-        st.error(f"Error in calculation: {str(e)}")
-        st.error(f"Verify formulas contain valid variables: {list(variables.keys())}")
-        raise
-
-def main():
-    st.title("SOR Flow Rate Calculator (Phase 1)")
-    st.subheader("Gemini-Powered Flow Rate Calculation")
+        # Generate response with safety checks
+        response = st.session_state.generator.generate(query, context)
     
-    # File Upload
-    uploaded_file = st.file_uploader("Upload Master Excel File", type=["xlsx"])
-    if not uploaded_file:
-        return
-    
-    # Parse Excel
-    dfs = parse_excel(uploaded_file)
-    
-    # Create domain
-    domain = create_domain(dfs['lhs'], dfs['objectives'])
-    nobj = len([v for v in domain.variables if v.is_objective])
-    
-    # LHS Configuration
-    n_exp = st.number_input("Number of LHS Experiments", min_value=5, max_value=100, value=7)
-    
-    # Generate LHS
-    with st.spinner("Generating LHS design..."):
-        experiments = lhs_design(domain, n_exp, nobj)
-        lhs_df = experiments.to_df()
-        lhs_df.columns = [col[0] for col in lhs_df.columns]
-    
-    # Reaction Scheme Input
-    user_input = st.text_area("Describe your reaction scheme:", 
-                            placeholder="e.g. '3 pumps with KSM, R1 and R2 reacting in series with quenching...'")
-    
-    if st.button("Calculate Flow Rates"):
-        # Generate and execute Gemini prompt
-        model = configure_gemini()
-        prompt = generate_flowrate_prompt(dfs['pump'], dfs['reactor'], user_input)
-        
-        with st.spinner("Analyzing with Gemini..."):
-            response = model.generate_content(
-                [prompt],
-                safety_settings=safety_config
-            )
-            
-        try:
-            # Parse Gemini response
-            clean_response = re.sub(r'[\s\S]*?({[\s\S]*?})[\s\S]*', r'\1', response.text)
-            config = ast.literal_eval(clean_response)
-            
-            # Validate response
-            required_keys = ['pump_count', 'reaction_scheme', 'formulas', 'reaction_time']
-            if not all(key in config for key in required_keys):
-                raise ValueError("Invalid Gemini response format")
-            
-            # Calculate flow rates
-            with st.spinner("Calculating flow rates..."):
-                results_df = calculate_flowrates(lhs_df, config, dfs['reactor'], dfs['pump'])
-            
-            # Display results
-            st.success("Calculation Complete!")
-            st.dataframe(results_df)
-            
-            # Export to Excel
-            output = pd.ExcelWriter('SOR_Result.xlsx')
-            results_df.to_excel(output, sheet_name='Results')
-            st.download_button(
-                "Download Results",
-                output,
-                file_name="SOR_Results.xlsx",
-                mime="application/vnd.ms-excel"
-            )
-            
-        except Exception as e:
-            st.error(f"Error processing Gemini response: {str(e)}")
-            st.text_area("Gemini Raw Response", response.text, height=200)
+    # Add response to chat
+    with st.chat_message("assistant"):
+        st.markdown(response)
+    st.session_state.messages.append({"role": "assistant", "content": response})
 
 if __name__ == "__main__":
     main()
