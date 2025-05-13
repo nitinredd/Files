@@ -3,7 +3,7 @@ import streamlit as st
 import pandas as pd
 import google.auth
 from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # Configure Gemini
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
@@ -14,70 +14,121 @@ safety_config = [
         category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
         threshold=HarmBlockThreshold.BLOCK_NONE,
     ),
-    # Add other safety categories as per your original config
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_NONE,
+    ),
 ]
 
 model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 
-# Agent System Components
 class ExcelAnalyzer:
     def __init__(self):
         self.data: Dict[str, Dict[str, pd.DataFrame]] = {}
         
     def load_excel(self, file_path: str) -> None:
-        """Load all sheets from an Excel file"""
-        xls = pd.ExcelFile(file_path)
-        self.data[file_path] = {sheet_name: xls.parse(sheet_name) 
-                               for sheet_name in xls.sheet_names}
+        """Load all sheets from an Excel file with error handling"""
+        try:
+            xls = pd.ExcelFile(file_path)
+            self.data[file_path] = {}
+            for sheet_name in xls.sheet_names:
+                df = xls.parse(sheet_name)
+                # Clean data: convert all to string for consistent searching
+                self.data[file_path][sheet_name] = df.astype(str).apply(lambda x: x.str.lower())
+        except Exception as e:
+            st.error(f"Error loading {file_path}: {str(e)}")
+            st.stop()
 
 class QueryProcessor:
     def __init__(self, analyzer: ExcelAnalyzer):
         self.analyzer = analyzer
-        self.cache = {}
+    
+    def _parse_query(self, query: str) -> Dict[str, str]:
+        """Extract search parameters using Gemini"""
+        try:
+            prompt = f"""Extract key equipment search parameters from this query. Return as key:value pairs.
+            Possible parameters: manufacturer, equipment_name, capacity, location, specification.
+            Query: {query}
+            Format: parameter:value separated by newlines"""
+            
+            response = model.generate_content(prompt, safety_settings=safety_config)
+            return dict(line.split(":", 1) for line in response.text.split("\n") if ":" in line)
+        except Exception as e:
+            st.error(f"Query parsing failed: {str(e)}")
+            return {}
 
-    def _search_data(self, query: str) -> Tuple[str, pd.DataFrame]:
-        """Multi-agent search process"""
-        # Coordinator Agent: Determine search parameters
-        search_params = self._parse_query(query)
+    def _search_sheet(self, df: pd.DataFrame, params: dict) -> Optional[pd.DataFrame]:
+        """Search a single sheet with fuzzy matching"""
+        try:
+            mask = pd.Series([True] * len(df))
+            for key, value in params.items():
+                value = value.lower().strip()
+                column_mask = pd.Series([False] * len(df))
+                for col in df.columns:
+                    column_mask |= df[col].str.contains(value)
+                mask &= column_mask
+            return df[mask] if not df[mask].empty else None
+        except Exception as e:
+            st.error(f"Search error: {str(e)}")
+            return None
+
+    def execute_search(self, query: str) -> List[Tuple[str, pd.DataFrame]]:
+        """Main search execution flow"""
+        params = self._parse_query(query)
+        if not params:
+            return []
         
-        # Child Agents: Search across all sheets
         results = []
         for file in self.analyzer.data.values():
             for sheet_name, df in file.items():
-                # Manager Agent: Apply search filters
-                filtered = self._filter_df(df, search_params)
-                if not filtered.empty:
-                    results.append((sheet_name, filtered))
-        
-        # Oversight Agent: Validate results
-        if not results:
-            return None
+                result_df = self._search_sheet(df, params)
+                if result_df is not None:
+                    results.append((sheet_name, result_df))
         return results
 
-    def _filter_df(self, df: pd.DataFrame, params: dict) -> pd.DataFrame:
-        """Filter dataframe based on search parameters"""
-        # Implement actual filtering logic based on params
-        return df
-
 class ResponseGenerator:
-    def __init__(self, model: GenerativeModel):
-        self.model = model
-        self.base_prompt = """You're an Excel analysis expert. Given the following context from our spreadsheets:
-        {context}
-        Answer this query: {query}
-        If information isn't available, say 'Data not found in documents'"""
-
-    def generate(self, query: str, context: str) -> str:
-        prompt = self.base_prompt.format(context=context, query=query)
-        response = self.model.generate_content(
-            prompt,
-            safety_settings=safety_config
-        )
-        return response.text
+    def __init__(self):
+        self.base_prompt = """Analyze this equipment data and answer the query. Rules:
+        1. Be precise and use only provided data
+        2. For multiple matches, create markdown table
+        3. If no matches: "No matching records found"
+        4. Never invent information
+        
+        Data from {sheet} (first 5 matches):
+        {data}
+        
+        Query: {query}
+        Answer:"""
+    
+    def generate(self, results: List[Tuple[str, pd.DataFrame]], query: str) -> str:
+        """Generate final response with validation"""
+        if not results:
+            return "No matching records found in documents"
+        
+        responses = []
+        for sheet_name, df in results:
+            try:
+                data_sample = df.head().to_markdown(index=False)
+                prompt = self.base_prompt.format(
+                    sheet=sheet_name,
+                    data=data_sample,
+                    query=query
+                )
+                response = model.generate_content(prompt, safety_settings=safety_config)
+                responses.append(f"**From {sheet_name}:**\n{response.text}")
+            except Exception as e:
+                st.error(f"Response generation failed: {str(e)}")
+                continue
+        
+        return "\n\n".join(responses) if responses else "Found matches but couldn't generate response"
 
 # Streamlit App
 def main():
-    st.title("Excel Analysis Chatbot")
+    st.title("🔍 Equipment Data Assistant")
     
     # Initialize session state
     if "messages" not in st.session_state:
@@ -86,58 +137,51 @@ def main():
         st.session_state.analyzer.load_excel("formula master_osd.xlsx")
         st.session_state.analyzer.load_excel("masterlist osd equipments.xlsx")
         st.session_state.processor = QueryProcessor(st.session_state.analyzer)
-        st.session_state.generator = ResponseGenerator(model)
+        st.session_state.generator = ResponseGenerator()
 
-    # Display chat messages
+    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Dynamic sample prompts
+    # Show sample questions on first load
     sample_questions = [
         "Do we have Tapasya make with Capacity 600L in FTO-3?",
         "What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
         "What are the various literature sources considered in RMG?"
     ]
-
-    # Show sample questions as buttons
-    if len(st.session_state.messages) == 0:
+    
+    if not st.session_state.messages:
         with st.chat_message("assistant"):
-            st.write("Hi! How can I help you with the equipment data today?")
-            for q in sample_questions:
-                if st.button(q):
-                    st.session_state.messages.append({"role": "user", "content": q})
-                    process_query(q)
+            st.markdown("**Welcome!** Ask about equipment data or try:")
+            cols = st.columns(3)
+            for i, q in enumerate(sample_questions):
+                cols[i%3].button(q, use_container_width=True, 
+                               on_click=lambda q=q: st.session_state.messages.append(
+                                   {"role": "user", "content": q}))
 
-    # User input
-    if prompt := st.chat_input("Ask about equipment data..."):
+    # Process user input
+    if prompt := st.chat_input("Ask about equipment..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
         
-        process_query(prompt)
-
-def process_query(query: str):
-    # Query Processing Agents
-    results = st.session_state.processor._search_data(query)
-    
-    # Validation Agent
-    if not results:
-        response = "This information is not available in the documents."
-    else:
-        # Format context for LLM
-        context = "\n\n".join(
-            [f"Sheet: {sheet}\nData:\n{df.head(3).to_markdown()}" 
-             for sheet, df in results]
-        )
+        # Search documents
+        with st.spinner("🔍 Searching records..."):
+            try:
+                results = st.session_state.processor.execute_search(prompt)
+            except Exception as e:
+                st.error(f"Search failed: {str(e)}")
+                results = []
         
-        # Generate response with safety checks
-        response = st.session_state.generator.generate(query, context)
-    
-    # Add response to chat
-    with st.chat_message("assistant"):
-        st.markdown(response)
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        # Generate response
+        with st.spinner("📝 Analyzing results..."):
+            try:
+                response = st.session_state.generator.generate(results, prompt)
+            except Exception as e:
+                response = f"Error generating response: {str(e)}"
+        
+        # Display response
+        st.session_state.messages.append({"role": "assistant", "content": response})
+        st.rerun()
 
 if __name__ == "__main__":
     main()
