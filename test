@@ -1,187 +1,85 @@
 import os
+import io
 import streamlit as st
 import pandas as pd
+import time
 import google.auth
-from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-from typing import Dict, List, Tuple, Optional
+from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
 
-# Configure Gemini
+# --- Gemini setup ---
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
-
+multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
 safety_config = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_UNSPECIFIED, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
-
-class ExcelAnalyzer:
-    def __init__(self):
-        self.data: Dict[str, Dict[str, pd.DataFrame]] = {}
-        
-    def load_excel(self, file_path: str) -> None:
-        """Load all sheets from an Excel file with error handling"""
+def safe_gemini_call(prompt_text, max_retries=3, delay=2):
+    for attempt in range(max_retries):
         try:
-            xls = pd.ExcelFile(file_path)
-            self.data[file_path] = {}
-            for sheet_name in xls.sheet_names:
-                df = xls.parse(sheet_name)
-                # Clean data: convert all to string for consistent searching
-                self.data[file_path][sheet_name] = df.astype(str).apply(lambda x: x.str.lower())
-        except Exception as e:
-            st.error(f"Error loading {file_path}: {str(e)}")
-            st.stop()
+            return multimodal_model.generate_content([prompt_text], safety_settings=safety_config)
+        except Exception:
+            time.sleep(delay)
+    st.error("Gemini call failed after retries.")
+    return None
 
-class QueryProcessor:
-    def __init__(self, analyzer: ExcelAnalyzer):
-        self.analyzer = analyzer
-    
-    def _parse_query(self, query: str) -> Dict[str, str]:
-        """Extract search parameters using Gemini"""
-        try:
-            prompt = f"""Extract key equipment search parameters from this query. Return as key:value pairs.
-            Possible parameters: manufacturer, equipment_name, capacity, location, specification.
-            Query: {query}
-            Format: parameter:value separated by newlines"""
-            
-            response = model.generate_content(prompt, safety_settings=safety_config)
-            return dict(line.split(":", 1) for line in response.text.split("\n") if ":" in line)
-        except Exception as e:
-            st.error(f"Query parsing failed: {str(e)}")
-            return {}
+st.set_page_config(page_title="SOR Phase I - Flowrate Calculator", layout="wide")
+st.title("🔬 SOR Phase I: Gemini Flowrate Calculator")
 
-    def _search_sheet(self, df: pd.DataFrame, params: dict) -> Optional[pd.DataFrame]:
-        """Search a single sheet with fuzzy matching"""
-        try:
-            mask = pd.Series([True] * len(df))
-            for key, value in params.items():
-                value = value.lower().strip()
-                column_mask = pd.Series([False] * len(df))
-                for col in df.columns:
-                    column_mask |= df[col].str.contains(value)
-                mask &= column_mask
-            return df[mask] if not df[mask].empty else None
-        except Exception as e:
-            st.error(f"Search error: {str(e)}")
-            return None
+# Upload and preview
+master = st.file_uploader("Upload Master Excel (LHS, Pump, Reactor Details)", type=["xlsx"])
+if master:
+    xls = pd.ExcelFile(master)
+    df_lhs = pd.read_excel(xls, sheet_name="LHS")
+    df_pump = pd.read_excel(xls, sheet_name="Pump Details")
+    df_reactor = pd.read_excel(xls, sheet_name="Reactor Details", header=None)
+    st.subheader("Edit LHS and Pump sheets as needed")
+    st.data_editor(df_lhs, num_rows="dynamic", key="lhs_editor")
+    st.data_editor(df_pump, num_rows="dynamic", key="pump_editor")
+    st.data_editor(df_reactor, num_rows="dynamic", key="reactor_editor")
+    # capture edits
+    lhs_df = st.session_state.lhs_editor
+    pump_df = st.session_state.pump_editor
+    reactor_df = st.session_state.reactor_editor
 
-    def execute_search(self, query: str) -> List[Tuple[str, pd.DataFrame]]:
-        """Main search execution flow"""
-        params = self._parse_query(query)
-        if not params:
-            return []
-        
-        results = []
-        for file in self.analyzer.data.values():
-            for sheet_name, df in file.items():
-                result_df = self._search_sheet(df, params)
-                if result_df is not None:
-                    results.append((sheet_name, result_df))
-        return results
+    n_exp = lhs_df.shape[0]
 
-class ResponseGenerator:
-    def __init__(self):
-        self.base_prompt = """Analyze this equipment data and answer the query. Rules:
-        1. Be precise and use only provided data
-        2. For multiple matches, create markdown table
-        3. If no matches: "No matching records found"
-        4. Never invent information
-        
-        Data from {sheet} (first 5 matches):
-        {data}
-        
-        Query: {query}
-        Answer:"""
-    
-    def generate(self, results: List[Tuple[str, pd.DataFrame]], query: str) -> str:
-        """Generate final response with validation"""
-        if not results:
-            return "No matching records found in documents"
-        
-        responses = []
-        for sheet_name, df in results:
-            try:
-                data_sample = df.head().to_markdown(index=False)
-                prompt = self.base_prompt.format(
-                    sheet=sheet_name,
-                    data=data_sample,
-                    query=query
-                )
-                response = model.generate_content(prompt, safety_settings=safety_config)
-                responses.append(f"**From {sheet_name}:**\n{response.text}")
-            except Exception as e:
-                st.error(f"Response generation failed: {str(e)}")
-                continue
-        
-        return "\n\n".join(responses) if responses else "Found matches but couldn't generate response"
+    st.subheader("💬 Describe your setup in plain English")
+    prompt = st.text_area("Enter prompt to Gemini:", height=150,
+                          placeholder="E.g., 'Compute flowrates for 3 reagent pumps and 1 quench pump using Equivalence/Molarity with reaction time = ResidenceTimeT1 × steady-state factor.'")
 
-# Streamlit App
-def main():
-    st.title("🔍 Equipment Data Assistant")
-    
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-        st.session_state.analyzer = ExcelAnalyzer()
-        st.session_state.analyzer.load_excel("formula master_osd.xlsx")
-        st.session_state.analyzer.load_excel("masterlist osd equipments.xlsx")
-        st.session_state.processor = QueryProcessor(st.session_state.analyzer)
-        st.session_state.generator = ResponseGenerator()
-
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # Show sample questions on first load
-    sample_questions = [
-        "Do we have Tapasya make with Capacity 600L in FTO-3?",
-        "What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
-        "What are the various literature sources considered in RMG?"
-    ]
-    
-    if not st.session_state.messages:
-        with st.chat_message("assistant"):
-            st.markdown("**Welcome!** Ask about equipment data or try:")
-            cols = st.columns(3)
-            for i, q in enumerate(sample_questions):
-                cols[i%3].button(q, use_container_width=True, 
-                               on_click=lambda q=q: st.session_state.messages.append(
-                                   {"role": "user", "content": q}))
-
-    # Process user input
-    if prompt := st.chat_input("Ask about equipment..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        
-        # Search documents
-        with st.spinner("🔍 Searching records..."):
-            try:
-                results = st.session_state.processor.execute_search(prompt)
-            except Exception as e:
-                st.error(f"Search failed: {str(e)}")
-                results = []
-        
-        # Generate response
-        with st.spinner("📝 Analyzing results..."):
-            try:
-                response = st.session_state.generator.generate(results, prompt)
-            except Exception as e:
-                response = f"Error generating response: {str(e)}"
-        
-        # Display response
-        st.session_state.messages.append({"role": "assistant", "content": response})
-        st.rerun()
-
-if __name__ == "__main__":
-    main()
+    if st.button("🤖 Gemini Compute Flowrates"):
+        if not prompt:
+            st.error("Please enter a description of your reaction and flowrate requirements.")
+        else:
+            # instruct Gemini for exact table output
+            full_prompt = (
+                f"Given this master Excel with {n_exp} experiments (LHS and pump/reactor tables visible), "
+                "compute a table with columns: all LHS columns (Equivalence1, Equivalence2, ..., ResidenceTimeT1, ResidenceTimeT2, ReactionTemperature1, ReactionTemperature2), "
+                "Reaction Time, Flowrate of Pump1, Flowrate of Pump2, Flowrate of Pump3, and if present Flowrate of Pump4, and Total Flowrate. "
+                "Return ONLY the raw CSV without explanation, matching the Excel format." 
+                f"Here is the prompt: {prompt}"
+            )
+            response = safe_gemini_call(full_prompt)
+            if response:
+                # parse CSV text into DataFrame
+                csv_text = response.text.strip()
+                try:
+                    result_df = pd.read_csv(io.StringIO(csv_text))
+                    st.subheader("📊 Gemini-generated Flowrate Results")
+                    st.dataframe(result_df)
+                    # download
+                    towrite = io.BytesIO()
+                    result_df.to_excel(towrite, index=False, sheet_name="Results")
+                    towrite.seek(0)
+                    st.download_button("📥 Download SOR_RESULT.xlsx", data=towrite,
+                                       file_name="SOR_RESULT.xlsx",
+                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                except Exception as e:
+                    st.error(f"Failed to parse Gemini output as CSV: {e}")
+else:
+    st.info("Please upload your master Excel file to begin.")
