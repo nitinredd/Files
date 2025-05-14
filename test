@@ -19,6 +19,7 @@ safety_config = [
 ]
 
 def safe_gemini_call(prompt_text: str, max_retries: int = 3, delay: int = 2):
+    """Deterministic Gemini call with retries."""
     for _ in range(max_retries):
         try:
             return multimodal_model.generate_content([prompt_text], safety_settings=safety_config)
@@ -27,72 +28,74 @@ def safe_gemini_call(prompt_text: str, max_retries: int = 3, delay: int = 2):
     st.error("Gemini call failed after retries.")
     return None
 
+# --- Streamlit UI ---
 st.set_page_config(page_title="SOR Phase I - Gemini Flowrate Calculator", layout="wide")
 st.title("🔬 SOR Phase I: Gemini Flowrate Calculator")
 
-# 1. Upload master Excel
+# 1. Upload Excel
 master = st.file_uploader("Upload Master Excel (LHS, Pump Details, Reactor Details)", type=["xlsx"])
 if not master:
     st.info("Please upload your master Excel file to begin.")
     st.stop()
 
+# 2. Read sheets
 xls = pd.ExcelFile(master)
-df_lhs = pd.read_excel(xls, sheet_name="LHS")
-df_pump = pd.read_excel(xls, sheet_name="Pump Details")
+df_lhs     = pd.read_excel(xls, sheet_name="LHS")
+df_pump    = pd.read_excel(xls, sheet_name="Pump Details")
 df_reactor = pd.read_excel(xls, sheet_name="Reactor Details", header=None)
 
-# 2. Let user edit directly—returns a DataFrame
-st.subheader("Edit LHS sheet")
-lhs_df = st.experimental_data_editor(df_lhs, num_rows="dynamic", key="lhs_editor")
+# 3. Show for confirmation
+st.subheader("LHS Sheet (Equivalences & Conditions)")
+st.dataframe(df_lhs, use_container_width=True)
 
-st.subheader("Edit Pump Details sheet")
-pump_df = st.experimental_data_editor(df_pump, num_rows="dynamic", key="pump_editor")
+st.subheader("Pump Details Sheet")
+st.dataframe(df_pump, use_container_width=True)
 
-st.subheader("Edit Reactor Details sheet")
-reactor_df = st.experimental_data_editor(df_reactor, num_rows="dynamic", key="reactor_editor")
+st.subheader("Reactor Details Sheet")
+st.dataframe(df_reactor, use_container_width=True)
 
-# Number of experiments inferred
-n_exp = lhs_df.shape[0]
+# 4. Number of experiments
+n_exp = df_lhs.shape[0]
 
-# 3. Prompt and compute
+# 5. User prompt
 st.subheader("💬 Describe your setup in plain English")
 prompt = st.text_area(
     "Enter prompt to Gemini:",
     height=150,
     placeholder=(
-        "E.g., 'Compute flowrates for 3 reagent pumps and 1 quench pump using Equivalence/Molarity "
-        "with reaction time = ResidenceTimeT1 × steady-state factor.'"
+        "E.g., 'Compute flowrates for 3 reagent pumps and 1 quench pump "
+        "using Equivalence/Molarity with reaction time = ResidenceTimeT1 × steady-state factor.'"
     )
 )
 
+# 6. Compute via Gemini
 if st.button("🤖 Gemini Compute Flowrates"):
-    if not prompt:
-        st.error("Please enter your reaction description and flowrate requirements.")
+    if not prompt.strip():
+        st.error("Please enter a description of your reaction and flowrate requirements.")
     else:
-        # Build instruction
+        # Build strict instruction
+        cols = list(df_lhs.columns) + ["Reaction Time"]
+        pump_cols = [f"Flowrate of Pump{i+1}" for i in range(df_pump.shape[0])]
+        cols += pump_cols + ["Total Flowrate"]
+
         full_prompt = (
-            f"Master Excel has {n_exp} LHS experiments, Pump Details, Reactor Details. "
-            "Compute a CSV table with columns:\n"
-            "- All LHS columns in order (Equivalence1, Equivalence2, ..., ResidenceTimeT1, ResidenceTimeT2, "
-            "ReactionTemperature1, ReactionTemperature2)\n"
-            "- Reaction Time\n"
-            "- Flowrate of Pump1, Flowrate of Pump2, Flowrate of Pump3"
+            f"Master Excel has {n_exp} experiments in LHS, Pump Details, Reactor Details. "
+            "Compute a CSV table with columns exactly:\n"
+            + ", ".join(cols) +
+            "\nReturn ONLY the raw CSV rows (no header row, no markdown, no explanation).\n"
+            f"User instruction: {prompt}"
         )
-        if pump_df.shape[0] >= 4:
-            full_prompt += ", Flowrate of Pump4"
-        full_prompt += ", Total Flowrate\n"
-        full_prompt += "Return ONLY the raw CSV (no markdown, no explanation).\n"
-        full_prompt += f"User instruction: {prompt}"
 
         response = safe_gemini_call(full_prompt)
         if response:
             text = response.text.strip()
             try:
-                result_df = pd.read_csv(io.StringIO(text))
+                # Parse CSV (assumes no header in text, add headers manually)
+                result_df = pd.read_csv(io.StringIO(text), header=None, names=cols)
                 st.subheader("📊 Gemini‑generated Flowrate Results")
                 st.dataframe(result_df, use_container_width=True)
 
-                # Download
+                # Download as Excel
                 towrite = io.BytesIO()
                 result_df.to_excel(towrite, index=False, sheet_name="SOR_RESULT")
                 towrite.seek(0)
