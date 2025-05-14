@@ -1,12 +1,12 @@
 import os
 import io
+import time
 import streamlit as st
 import pandas as pd
-import time
 import google.auth
 from vertexai.preview.generative_models import GenerativeModel, SafetySetting, HarmCategory, HarmBlockThreshold
 
-# --- Gemini setup ---
+# --- Gemini setup (fixed GCP configuration) ---
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
 credentials, project_id = google.auth.default()
 multimodal_model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
@@ -18,7 +18,8 @@ safety_config = [
     SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
 ]
 
-def safe_gemini_call(prompt_text, max_retries=3, delay=2):
+def safe_gemini_call(prompt_text: str, max_retries: int = 3, delay: int = 2):
+    """Call Gemini deterministically with retries."""
     for attempt in range(max_retries):
         try:
             return multimodal_model.generate_content([prompt_text], safety_settings=safety_config)
@@ -27,59 +28,85 @@ def safe_gemini_call(prompt_text, max_retries=3, delay=2):
     st.error("Gemini call failed after retries.")
     return None
 
-st.set_page_config(page_title="SOR Phase I - Flowrate Calculator", layout="wide")
+st.set_page_config(page_title="SOR Phase I - Gemini Flowrate Calculator", layout="wide")
 st.title("🔬 SOR Phase I: Gemini Flowrate Calculator")
 
-# Upload and preview
-master = st.file_uploader("Upload Master Excel (LHS, Pump, Reactor Details)", type=["xlsx"])
-if master:
-    xls = pd.ExcelFile(master)
-    df_lhs = pd.read_excel(xls, sheet_name="LHS")
-    df_pump = pd.read_excel(xls, sheet_name="Pump Details")
-    df_reactor = pd.read_excel(xls, sheet_name="Reactor Details", header=None)
-    st.subheader("Edit LHS and Pump sheets as needed")
-    st.data_editor(df_lhs, num_rows="dynamic", key="lhs_editor")
-    st.data_editor(df_pump, num_rows="dynamic", key="pump_editor")
-    st.data_editor(df_reactor, num_rows="dynamic", key="reactor_editor")
-    # capture edits
-    lhs_df = st.session_state.lhs_editor
-    pump_df = st.session_state.pump_editor
-    reactor_df = st.session_state.reactor_editor
-
-    n_exp = lhs_df.shape[0]
-
-    st.subheader("💬 Describe your setup in plain English")
-    prompt = st.text_area("Enter prompt to Gemini:", height=150,
-                          placeholder="E.g., 'Compute flowrates for 3 reagent pumps and 1 quench pump using Equivalence/Molarity with reaction time = ResidenceTimeT1 × steady-state factor.'")
-
-    if st.button("🤖 Gemini Compute Flowrates"):
-        if not prompt:
-            st.error("Please enter a description of your reaction and flowrate requirements.")
-        else:
-            # instruct Gemini for exact table output
-            full_prompt = (
-                f"Given this master Excel with {n_exp} experiments (LHS and pump/reactor tables visible), "
-                "compute a table with columns: all LHS columns (Equivalence1, Equivalence2, ..., ResidenceTimeT1, ResidenceTimeT2, ReactionTemperature1, ReactionTemperature2), "
-                "Reaction Time, Flowrate of Pump1, Flowrate of Pump2, Flowrate of Pump3, and if present Flowrate of Pump4, and Total Flowrate. "
-                "Return ONLY the raw CSV without explanation, matching the Excel format." 
-                f"Here is the prompt: {prompt}"
-            )
-            response = safe_gemini_call(full_prompt)
-            if response:
-                # parse CSV text into DataFrame
-                csv_text = response.text.strip()
-                try:
-                    result_df = pd.read_csv(io.StringIO(csv_text))
-                    st.subheader("📊 Gemini-generated Flowrate Results")
-                    st.dataframe(result_df)
-                    # download
-                    towrite = io.BytesIO()
-                    result_df.to_excel(towrite, index=False, sheet_name="Results")
-                    towrite.seek(0)
-                    st.download_button("📥 Download SOR_RESULT.xlsx", data=towrite,
-                                       file_name="SOR_RESULT.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                except Exception as e:
-                    st.error(f"Failed to parse Gemini output as CSV: {e}")
-else:
+# 1. Upload and preview editable sheets
+master = st.file_uploader("Upload Master Excel (LHS, Pump Details, Reactor Details)", type=["xlsx"])
+if not master:
     st.info("Please upload your master Excel file to begin.")
+    st.stop()
+
+xls = pd.ExcelFile(master)
+df_lhs = pd.read_excel(xls, sheet_name="LHS")
+df_pump = pd.read_excel(xls, sheet_name="Pump Details")
+df_reactor = pd.read_excel(xls, sheet_name="Reactor Details", header=None)
+
+st.subheader("Edit LHS sheet")
+st.data_editor(df_lhs, num_rows="dynamic", key="lhs_editor")
+raw_lhs = st.session_state.lhs_editor
+lhs_df = pd.DataFrame(raw_lhs) if isinstance(raw_lhs, dict) else raw_lhs
+
+st.subheader("Edit Pump Details sheet")
+st.data_editor(df_pump, num_rows="dynamic", key="pump_editor")
+raw_pump = st.session_state.pump_editor
+pump_df = pd.DataFrame(raw_pump) if isinstance(raw_pump, dict) else raw_pump
+
+st.subheader("Edit Reactor Details sheet")
+st.data_editor(df_reactor, num_rows="dynamic", key="reactor_editor")
+raw_reactor = st.session_state.reactor_editor
+reactor_df = pd.DataFrame(raw_reactor) if isinstance(raw_reactor, dict) else raw_reactor
+
+# Number of LHS experiments
+n_exp = lhs_df.shape[0]
+
+# 2. Prompt Gemini
+st.subheader("💬 Describe your setup in plain English")
+prompt = st.text_area(
+    "Enter prompt to Gemini:",
+    height=150,
+    placeholder=(
+        "E.g., 'Compute flowrates for 3 reagent pumps and 1 quench pump using Equivalence/Molarity "
+        "with reaction time = ResidenceTimeT1 × steady-state factor.'"
+    )
+)
+
+# 3. Compute via Gemini
+if st.button("🤖 Gemini Compute Flowrates"):
+    if not prompt:
+        st.error("Please enter a description of your reaction and flowrate requirements.")
+    else:
+        full_prompt = (
+            f"Given this master Excel with {n_exp} experiments (LHS, Pump Details, Reactor Details), "
+            "compute a table with columns:\n"
+            "- All LHS columns in order (Equivalence1, Equivalence2, ..., ResidenceTimeT1, ResidenceTimeT2, "
+            "ReactionTemperature1, ReactionTemperature2)\n"
+            "- Reaction Time\n"
+            "- Flowrate of Pump1, Flowrate of Pump2, Flowrate of Pump3"
+        )
+        # If pump_df has >=4 rows, include Pump4
+        if pump_df.shape[0] >= 4:
+            full_prompt += ", Flowrate of Pump4"
+        full_prompt += ", Total Flowrate.\n"
+        full_prompt += "Return ONLY the raw CSV data, no explanations."
+        full_prompt += f"\nUser prompt: {prompt}"
+
+        response = safe_gemini_call(full_prompt)
+        if response:
+            csv_text = response.text.strip()
+            try:
+                result_df = pd.read_csv(io.StringIO(csv_text))
+                st.subheader("📊 Gemini-generated Flowrate Results")
+                st.dataframe(result_df, use_container_width=True)
+
+                towrite = io.BytesIO()
+                result_df.to_excel(towrite, index=False, sheet_name="SOR_RESULT")
+                towrite.seek(0)
+                st.download_button(
+                    "📥 Download SOR_RESULT.xlsx",
+                    data=towrite,
+                    file_name="SOR_RESULT.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.error(f"Failed to parse Gemini output as CSV: {e}")
