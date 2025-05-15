@@ -1,223 +1,76 @@
-import os
 import streamlit as st
 import pandas as pd
-import google.auth
-from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-from typing import Dict, List, Optional, Tuple
+import json
+from io import BytesIO
 
-# Configure Gemini
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-credentials, project_id = google.auth.default()
+st.set_page_config(page_title="Excel → JSON Converter", layout="wide")
 
-safety_config = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
-]
+st.title("📊 Excel Workbook to JSON Converter")
 
-model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+st.markdown(
+    """
+    1. Upload an `.xlsx` or `.xls` file.  
+    2. The app reads each sheet as a table.  
+    3. Downloads a single JSON file with one key per sheet.
+    """
+)
 
-# Column mapping configuration (Update with your actual column names)
-SHEET_CONFIG = {
-    "RMG": {
-        "columns": {
-            "equipment": "Make",
-            "plant": "Plant",
-            "impeller_speed_range": ["Impeller Speed Range Min", "Impeller Speed Range Max"],
-        },
-        "key_columns": ["Make", "Plant"]
-    }
-}
+uploaded_file = st.file_uploader(
+    "Upload your Excel workbook",
+    type=["xlsx", "xls"],
+    help="Supported formats: .xlsx, .xls"
+)
 
-class ExcelAnalyzer:
-    def __init__(self):
-        self.data: Dict[str, Dict[str, pd.DataFrame]] = {}
-        
-    def load_excel(self, file_path: str) -> None:
-        """Robust Excel loading with column normalization"""
-        try:
-            # Validate file existence
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-                
-            xls = pd.ExcelFile(file_path)
-            self.data[file_path] = {}
-            
-            for sheet_name in xls.sheet_names:
-                # Read with dtype=str to prevent mixed types
-                df = xls.parse(sheet_name, dtype=str)
-                
-                # Clean and normalize columns
-                df.columns = (
-                    df.columns
-                    .astype(str)  # Convert all column names to strings
-                    .str.strip()
-                    .str.lower()
-                    .str.replace(r'\s+', '_', regex=True)  # Standardize naming
-                )
-                
-                # Convert all data to lowercase strings
-                df = df.map(lambda x: x.strip().lower() if isinstance(x, str) else x)
-                
-                self.data[file_path][sheet_name] = df
-                
-        except Exception as e:
-            st.error(f"Error loading {file_path}: {str(e)}")
-            st.stop()
+if uploaded_file:
+    try:
+        # Read all sheets into a dict of DataFrames
+        all_sheets: dict[str, pd.DataFrame] = pd.read_excel(
+            uploaded_file, sheet_name=None, engine="openpyxl"
+        )
+    except Exception as e:
+        st.error(f"❌ Failed to read Excel file: {e}")
+    else:
+        result = {}
+        skipped = []
+        for sheet_name, df in all_sheets.items():
+            # Skip completely empty sheets
+            if df.empty or df.dropna(how="all").empty:
+                skipped.append(sheet_name)
+                continue
 
-class QueryProcessor:
-    def __init__(self, analyzer: ExcelAnalyzer):
-        self.analyzer = analyzer
-    
-    def _parse_query(self, query: str) -> Dict[str, str]:
-        """Enhanced query parsing with error handling"""
-        prompt = f"""Extract from this equipment query:
-        - Equipment manufacturer/model
-        - Specification type
-        - Plant location
-        - Sheet name
-        Return as JSON with keys: equipment, specification, plant, sheet"""
-        
-        try:
-            response = model.generate_content(prompt + "\nQuery: " + query)
-            clean_response = response.text.replace("```json", "").replace("```", "").strip()
-            return eval(clean_response)
-        except Exception as e:
-            st.error(f"Query parsing error: {str(e)}")
-            return {}
+            # Reset index in case it's meaningful
+            df = df.reset_index(drop=True)
 
-    def _search_sheet(self, sheet_name: str, params: dict) -> Optional[pd.DataFrame]:
-        """Precision search with column validation"""
-        try:
-            sheet_config = SHEET_CONFIG.get(sheet_name, {})
-            if not sheet_config:
-                return None
+            # Convert DataFrame to list-of-records
+            try:
+                records = df.to_dict(orient="records")
+            except Exception as e:
+                st.warning(f"Could not convert sheet '{sheet_name}' to JSON: {e}")
+                skipped.append(sheet_name)
+                continue
 
-            results = []
-            for file in self.analyzer.data.values():
-                if sheet_name in file:
-                    df = file[sheet_name]
-                    mask = pd.Series([True]*len(df))
-                    
-                    # Column validation
-                    valid_columns = [
-                        col.lower().strip() 
-                        for col in sheet_config["key_columns"] + 
-                        sheet_config["columns"].get("impeller_speed_range", [])
-                    ]
-                    missing = [col for col in valid_columns if col not in df.columns]
-                    if missing:
-                        raise ValueError(f"Missing columns in {sheet_name}: {missing}")
+            result[sheet_name] = records
 
-                    # Apply filters
-                    for key in sheet_config["key_columns"]:
-                        if key in params:
-                            mask &= df[key].str.contains(params[key].lower(), na=False)
-                    
-                    if mask.any():
-                        result_cols = sheet_config["key_columns"] + sheet_config["columns"]["impeller_speed_range"]
-                        return df.loc[mask, result_cols].dropna(how='all')
-            return None
-        except Exception as e:
-            st.error(f"Search error: {str(e)}")
-            return None
+        if not result:
+            st.warning("⚠️ No non-empty sheets found to convert.")
+        else:
+            # Pretty-print JSON
+            json_str = json.dumps(result, indent=2, ensure_ascii=False)
 
-    def execute_search(self, query: str) -> List[Tuple[str, pd.DataFrame]]:
-        """Validated search execution"""
-        try:
-            params = self._parse_query(query)
-            if not params:
-                return []
-            
-            target_sheet = params.get("sheet", "RMG").upper()
-            result = self._search_sheet(target_sheet, params)
-            return [(target_sheet, result)] if result is not None else []
-        except Exception as e:
-            st.error(f"Search execution failed: {str(e)}")
-            return []
+            st.success(f"✅ Converted {len(result)} sheet(s) to JSON.")
+            if skipped:
+                st.info(f"Skipped empty or unreadable sheets: {', '.join(skipped)}")
 
-class ResponseGenerator:
-    @staticmethod
-    def format_response(results: List[Tuple[str, pd.DataFrame]], query: str) -> str:
-        """Guaranteed safe response formatting"""
-        if not results:
-            return "No matching specifications found in documents"
-        
-        try:
-            response = []
-            for sheet_name, df in results:
-                if df.empty:
-                    continue
-                
-                # Handle range specifications
-                if all(col in df.columns for col in ['impeller_speed_range_min', 'impeller_speed_range_max']):
-                    row = df.iloc[0]
-                    response.append(
-                        f"In {sheet_name}: {row['make']} at {row['plant']} has "
-                        f"impeller speed range {row['impeller_speed_range_min']}-"
-                        f"{row['impeller_speed_range_max']} RPM"
-                    )
-                else:
-                    response.append(f"**{sheet_name} Data:**\n{df.to_markdown(index=False)}")
-            
-            return "\n\n".join(response) if response else "No displayable results found"
-        except Exception as e:
-            return f"Response formatting error: {str(e)}"
+            st.code(json_str, language="json")
 
-# Streamlit App
-def main():
-    st.title("🏭 Industrial Equipment Specs Finder")
-    
-    # Initialize system
-    if "system" not in st.session_state:
-        st.session_state.system = {
-            "analyzer": ExcelAnalyzer(),
-            "processor": None,
-            "messages": []
-        }
-        try:
-            st.session_state.system["analyzer"].load_excel("formula_master_osd.xlsx")
-            st.session_state.system["analyzer"].load_excel("masterlist_osd_equipments.xlsx")
-            st.session_state.system["processor"] = QueryProcessor(st.session_state.system["analyzer"])
-        except Exception as e:
-            st.error(f"System initialization failed: {str(e)}")
-            st.stop()
+            # Provide download
+            b = BytesIO()
+            b.write(json_str.encode("utf-8"))
+            b.seek(0)
 
-    # Chat interface
-    for msg in st.session_state.system["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    # Sample questions
-    sample_queries = [
-        "What is the impeller speed range in RMG for the Equipment Glatt in FTO 2?",
-        "Show me the capacity specifications for Tapasya equipment in FTO-3",
-        "What literature sources are referenced for RMG processes?"
-    ]
-    
-    if not st.session_state.system["messages"]:
-        with st.chat_message("assistant"):
-            st.markdown("**Technical Specifications Assistant Ready**\n\nSample queries:")
-            for q in sample_queries:
-                st.code(q, language="sql")
-
-    # Process queries
-    if prompt := st.chat_input("Enter technical query..."):
-        st.session_state.system["messages"].append({"role": "user", "content": prompt})
-        
-        try:
-            # Execute search
-            with st.spinner("🔬 Analyzing technical specs..."):
-                results = st.session_state.system["processor"].execute_search(prompt)
-            
-            # Generate response
-            response = ResponseGenerator.format_response(results, prompt)
-        except Exception as e:
-            response = f"System error: {str(e)}"
-        
-        st.session_state.system["messages"].append({"role": "assistant", "content": response})
-        st.rerun()
-
-if __name__ == "__main__":
-    main()
+            st.download_button(
+                label="📥 Download JSON",
+                data=b,
+                file_name="workbook.json",
+                mime="application/json"
+            )
