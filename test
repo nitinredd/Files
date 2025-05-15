@@ -45,40 +45,39 @@ class DataManager:
             if file_name not in self.data_sources:
                 self.data_sources[file_name] = {}
             
-            xls = pd.ExcelFile(file_path)
+            try:
+                xls = pd.ExcelFile(file_path)
+            except Exception as e:
+                logger.error(f"Failed to open Excel file {file_path}: {str(e)}")
+                st.error(f"Failed to open Excel file {file_path}: {str(e)}")
+                return
             
             # Process each sheet
             for sheet_name in xls.sheet_names:
                 with st.spinner(f"Loading {sheet_name} from {file_name}..."):
-                    # First, try to infer header row by sampling
-                    header_sample = pd.read_excel(file_path, sheet_name=sheet_name, nrows=5)
-                    
-                    # Check if first row looks like a header (more string values than numeric)
-                    first_row_strings = sum(isinstance(val, str) for val in header_sample.iloc[0])
-                    if first_row_strings > len(header_sample.columns) / 2:
-                        header_row = 0
-                    else:
-                        # Try to detect header row based on string content
-                        for i in range(min(5, len(header_sample))):
-                            if sum(isinstance(val, str) and bool(val.strip()) for val in header_sample.iloc[i]) > len(header_sample.columns) / 2:
-                                header_row = i
-                                break
-                        else:
-                            header_row = 0  # Default if not found
-                    
-                    # Read the actual data with the determined header
-                    df = pd.read_excel(file_path, sheet_name=sheet_name, header=header_row)
-                    
-                    # Basic data cleaning
-                    df = self._clean_dataframe(df)
-                    
-                    # Store the dataframe
-                    self.data_sources[file_name][sheet_name] = df
-                    
-                    # Extract and store metadata about this sheet
-                    self._extract_sheet_metadata(file_name, sheet_name, df)
-                    
-                    logger.info(f"Loaded sheet {sheet_name} from {file_name} with {len(df)} rows and {len(df.columns)} columns")
+                    try:
+                        # Safe approach: Skip header detection and use default settings
+                        df = pd.read_excel(file_path, sheet_name=sheet_name)
+                        
+                        # If the DataFrame is empty, skip this sheet
+                        if df.empty:
+                            logger.warning(f"Sheet {sheet_name} in {file_name} is empty, skipping")
+                            continue
+                        
+                        # Basic data cleaning
+                        df = self._clean_dataframe(df)
+                        
+                        # Store the dataframe
+                        self.data_sources[file_name][sheet_name] = df
+                        
+                        # Extract and store metadata about this sheet
+                        self._extract_sheet_metadata(file_name, sheet_name, df)
+                        
+                        logger.info(f"Loaded sheet {sheet_name} from {file_name} with {len(df)} rows and {len(df.columns)} columns")
+                    except Exception as e:
+                        logger.error(f"Failed to load sheet {sheet_name} from {file_name}: {str(e)}")
+                        st.warning(f"Skipped sheet {sheet_name} from {file_name} due to an error: {str(e)}")
+                        continue
         
         except Exception as e:
             logger.error(f"Error loading {file_path}: {str(e)}")
@@ -139,41 +138,60 @@ class DataManager:
         return normalized_cols
         
     def _extract_sheet_metadata(self, file_name: str, sheet_name: str, df: pd.DataFrame) -> None:
-        """Extract and store metadata about the sheet structure"""
-        # Create a unique key for this sheet
-        sheet_key = f"{file_name}/{sheet_name}"
-        
-        # Initialize metadata structure
-        metadata = {
-            "column_types": {},
-            "potential_id_columns": [],
-            "numeric_columns": [],
-            "text_columns": [],
-            "date_columns": [],
-            "row_count": len(df),
-            "column_count": len(df.columns)
-        }
-        
-        # Analyze column types and store in metadata
-        for col in df.columns:
-            # Check if column might be an ID column (unique values, string)
-            unique_ratio = df[col].nunique() / len(df) if len(df) > 0 else 0
-            if unique_ratio > 0.8 and df[col].dtype == 'object':
-                metadata["potential_id_columns"].append(col)
+        """Extract and store metadata about the sheet structure with error handling"""
+        try:
+            # Create a unique key for this sheet
+            sheet_key = f"{file_name}/{sheet_name}"
             
-            # Determine and store column type
-            if pd.api.types.is_numeric_dtype(df[col]):
-                metadata["numeric_columns"].append(col)
-                metadata["column_types"][col] = "numeric"
-            elif pd.api.types.is_datetime64_dtype(df[col]):
-                metadata["date_columns"].append(col)
-                metadata["column_types"][col] = "date"
-            else:
-                metadata["text_columns"].append(col)
-                metadata["column_types"][col] = "text"
-        
-        # Store the metadata
-        self.sheet_metadata[sheet_key] = metadata
+            # Initialize metadata structure
+            metadata = {
+                "column_types": {},
+                "potential_id_columns": [],
+                "numeric_columns": [],
+                "text_columns": [],
+                "date_columns": [],
+                "row_count": len(df),
+                "column_count": len(df.columns)
+            }
+            
+            # Analyze column types and store in metadata
+            for col in df.columns:
+                try:
+                    # Check if column might be an ID column (unique values, string)
+                    if len(df) > 0:
+                        unique_ratio = df[col].nunique() / len(df)
+                        if unique_ratio > 0.8 and df[col].dtype == 'object':
+                            metadata["potential_id_columns"].append(col)
+                    
+                    # Determine and store column type
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        metadata["numeric_columns"].append(col)
+                        metadata["column_types"][col] = "numeric"
+                    elif pd.api.types.is_datetime64_dtype(df[col]):
+                        metadata["date_columns"].append(col)
+                        metadata["column_types"][col] = "date"
+                    else:
+                        metadata["text_columns"].append(col)
+                        metadata["column_types"][col] = "text"
+                except Exception as e:
+                    # Skip this column if there's an error
+                    logger.warning(f"Error analyzing column {col} in {sheet_key}: {str(e)}")
+                    continue
+            
+            # Store the metadata
+            self.sheet_metadata[sheet_key] = metadata
+        except Exception as e:
+            logger.error(f"Error extracting metadata for {file_name}/{sheet_name}: {str(e)}")
+            # Initialize with empty metadata to avoid further errors
+            self.sheet_metadata[f"{file_name}/{sheet_name}"] = {
+                "column_types": {},
+                "potential_id_columns": [],
+                "numeric_columns": [],
+                "text_columns": [],
+                "date_columns": [],
+                "row_count": len(df) if isinstance(df, pd.DataFrame) else 0,
+                "column_count": len(df.columns) if isinstance(df, pd.DataFrame) else 0
+            }
 
     def generate_schema_mapping(self) -> None:
         """Generate smart schema mappings based on column name patterns"""
@@ -582,27 +600,12 @@ def initialize_system():
             "messages": []
         }
         
-        try:
-            # Load Excel files
-            st.session_state.system["data_manager"].load_excel("formula_master_osd.xlsx")
-            st.session_state.system["data_manager"].load_excel("masterlist_osd_equipments.xlsx")
-            
-            # Generate schema mappings
-            st.session_state.system["data_manager"].generate_schema_mapping()
-            
-            # Initialize query processor
-            st.session_state.system["query_processor"] = QueryProcessor(
-                st.session_state.system["data_manager"]
-            )
-            
-            # Log available sheets
-            sheet_info = st.session_state.system["data_manager"].get_sheet_info()
-            logger.info(f"Loaded system with {len(sheet_info)} sheets")
-            
-        except Exception as e:
-            logger.error(f"System initialization failed: {str(e)}")
-            st.error(f"System initialization failed: {str(e)}")
-            st.stop()
+        # Initialize query processor
+        st.session_state.system["query_processor"] = QueryProcessor(
+            st.session_state.system["data_manager"]
+        )
+        
+        # Don't load files automatically, wait for user upload
 
 def main():
     """Main application function"""
@@ -610,6 +613,26 @@ def main():
     
     # Initialize system
     initialize_system()
+    
+    # Display a file uploader for Excel files
+    uploaded_files = st.file_uploader("Upload Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            # Save the uploaded file to a temporary location
+            with open(uploaded_file.name, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            # Load the file
+            with st.spinner(f"Loading {uploaded_file.name}..."):
+                try:
+                    st.session_state.system["data_manager"].load_excel(uploaded_file.name)
+                    st.success(f"Successfully loaded {uploaded_file.name}")
+                except Exception as e:
+                    st.error(f"Failed to load {uploaded_file.name}: {str(e)}")
+            
+        # Regenerate schema mappings
+        st.session_state.system["data_manager"].generate_schema_mapping()
     
     # Display messages
     for msg in st.session_state.system["messages"]:
