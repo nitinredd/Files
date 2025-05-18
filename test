@@ -1,685 +1,165 @@
 import os
-import streamlit as st
-import pandas as pd
-import numpy as np
 import json
-import re
-import logging
-from typing import Dict, List, Optional, Tuple, Union, Any
-import google.auth
-from vertexai.preview.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage
+filename = r"C:\Users\\Desktop\WORK\RA\SOP Documents\Chunks\Sop_Test.xlsx"
+output_dir = "DRL_annual_report_output"
+os.makedirs(output_dir, exist_ok=True)
+text_column = 'para'
+# n_subtopics = 10
+n_subtopics = 10
+print("Number of subtopics:", n_subtopics)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# OPTIONAL: Pick the rough number of topics you want
+# n_topics = int(n_subtopics ** 0.5)
+n_topics = 30
+print("Number of topics:", n_topics)
 
-# Configure Gemini
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "D:/datascience-254609-genai.json"
-credentials, project_id = google.auth.default()
+# OPTIONAL: Ignore any similarities less than min_similarity.
+# 0.75 is a good setting for text-embedding-ada-002
+# 0.40 is a good setting for text-embedding-3-small/large
+min_similarity = 0.75
 
-safety_config = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=HarmBlockThreshold.BLOCK_NONE,
-    ),
+base_url=""
+api_version=""
+
+api_key=""
+deployment_name="GPT4o"
+model_name="GPT4o"
+
+import os
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+
+from langchain_openai import AzureOpenAIEmbeddings
+
+file_store = LocalFileStore('langchain-embeddings')
+
+base = AzureOpenAIEmbeddings(
+    model="",
+    api_version="",
+    # base_url=base_url,
+    azure_endpoint="",
+    # openai_api_type="azure"
+    api_key="",
+    azure_deployment=""
+)
+
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+# Define classify() and cluster() functions
+import numpy as np
+from typing import List
+from sklearn.cluster import BisectingKMeans
+from sklearn.metrics import silhouette_score, silhouette_samples
+
+
+def classify(docs: List[str], topics: List[str], **kwargs):
+    doc_embed = np.array(cached_embeddings.embed_documents(docs))
+    topic_embed = np.array(cached_embeddings.embed_documents(topics))
+    return np.dot(doc_embed, topic_embed.T)
+
+
+def cluster(docs: List[str], n: int = 20, **kwargs):
+    # Cluster the documents
+    cluster_model = BisectingKMeans(init='k-means++', n_clusters=n, n_init=10, max_iter=1000)
+    doc_embed = np.array(cached_embeddings.embed_documents(docs))
+    cluster_model.fit(doc_embed)
+    # Calculate the distance from each point to each centroid
+    distances = np.linalg.norm(doc_embed[:, np.newaxis] - cluster_model.cluster_centers_, axis=2)
+    return {
+        "label": cluster_model.labels_,
+        "score": silhouette_score(doc_embed, cluster_model.labels_),
+        "scores": silhouette_samples(doc_embed, cluster_model.labels_),
+        "centroid": np.argmin(distances, axis=0),
+    }
+
+# Create topics by clustering
+import pandas as pd
+
+docs = pd.read_excel(filename).dropna(subset=text_column).fillna('').astype(str)
+result = cluster(docs[text_column].tolist(), n=n_subtopics)
+docs['cluster'] = result['label']
+docs['score'] = result['scores']
+clusters = (
+    docs.groupby('cluster')
+    .apply(lambda group: group.nlargest(3, 'score')[text_column].tolist())
+    .tolist()
+)
+
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    # base_url=base_url,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+messages = [
+    HumanMessage(
+        content=f'''Here are {len(clusters)} clusters of documents.
+Suggest 2-4 word topic names for each cluster.
+Return a JSON string array of length {len(clusters)}.
+
+{json.dumps(clusters, indent=2)}'''
+    )
 ]
 
-model = GenerativeModel("gemini-2.0-flash-thinking-exp-01-21")
+subtopic_response = chat_model.invoke(messages)
 
-class DataManager:
-    """Manages Excel data loading, preprocessing, and schema mapping"""
-    
-    def __init__(self):
-        self.data_sources = {}  # Stores all loaded dataframes by file and sheet
-        self.schema_mappings = {}  # Stores normalized column mappings
-        self.sheet_metadata = {}  # Stores info about each sheet (column types, etc.)
-        
-    def load_excel(self, file_path: str) -> None:
-        """Load Excel file with robust error handling and metadata extraction"""
-        try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-            
-            # Extract just the filename without path for cleaner references
-            file_name = os.path.basename(file_path)
-            if file_name not in self.data_sources:
-                self.data_sources[file_name] = {}
-            
-            try:
-                xls = pd.ExcelFile(file_path)
-            except Exception as e:
-                logger.error(f"Failed to open Excel file {file_path}: {str(e)}")
-                st.error(f"Failed to open Excel file {file_path}: {str(e)}")
-                return
-            
-            # Process each sheet
-            for sheet_name in xls.sheet_names:
-                with st.spinner(f"Loading {sheet_name} from {file_name}..."):
-                    try:
-                        # Safe approach: Skip header detection and use default settings
-                        df = pd.read_excel(file_path, sheet_name=sheet_name)
-                        
-                        # If the DataFrame is empty, skip this sheet
-                        if df.empty:
-                            logger.warning(f"Sheet {sheet_name} in {file_name} is empty, skipping")
-                            continue
-                        
-                        # Basic data cleaning
-                        df = self._clean_dataframe(df)
-                        
-                        # Store the dataframe
-                        self.data_sources[file_name][sheet_name] = df
-                        
-                        # Extract and store metadata about this sheet
-                        self._extract_sheet_metadata(file_name, sheet_name, df)
-                        
-                        logger.info(f"Loaded sheet {sheet_name} from {file_name} with {len(df)} rows and {len(df.columns)} columns")
-                    except Exception as e:
-                        logger.error(f"Failed to load sheet {sheet_name} from {file_name}: {str(e)}")
-                        st.warning(f"Skipped sheet {sheet_name} from {file_name} due to an error: {str(e)}")
-                        continue
-        
-        except Exception as e:
-            logger.error(f"Error loading {file_path}: {str(e)}")
-            st.error(f"Error loading {file_path}: {str(e)}")
-            
-    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Perform comprehensive DataFrame cleaning"""
-        # Make a copy to avoid modifying the original
-        df = df.copy()
-        
-        # Replace any completely empty rows or columns
-        df = df.dropna(how='all')
-        df = df.dropna(axis=1, how='all')
-        
-        # Normalize column names
-        df.columns = self._normalize_column_names(df.columns)
-        
-        # Convert string columns to lowercase and strip whitespace
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                df[col] = df[col].apply(lambda x: x.lower().strip() if isinstance(x, str) else x)
-                
-        return df
-        
-    def _normalize_column_names(self, columns):
-        """Normalize column names with multiple strategies for robustness"""
-        normalized_cols = []
-        for col in columns:
-            # Convert to string in case of numeric column names
-            col_str = str(col)
-            
-            # Basic cleaning
-            col_clean = col_str.lower().strip()
-            
-            # Replace multiple spaces with single underscore
-            col_clean = re.sub(r'\s+', '_', col_clean)
-            
-            # Replace special characters with underscore
-            col_clean = re.sub(r'[^a-z0-9_]', '_', col_clean)
-            
-            # Remove duplicate underscores
-            col_clean = re.sub(r'_+', '_', col_clean)
-            
-            # Remove leading/trailing underscores
-            col_clean = col_clean.strip('_')
-            
-            normalized_cols.append(col_clean)
-            
-        # Handle duplicate column names by adding suffix
-        seen = {}
-        for i, col in enumerate(normalized_cols):
-            if col in seen:
-                seen[col] += 1
-                normalized_cols[i] = f"{col}_{seen[col]}"
-            else:
-                seen[col] = 0
-                
-        return normalized_cols
-        
-    def _extract_sheet_metadata(self, file_name: str, sheet_name: str, df: pd.DataFrame) -> None:
-        """Extract and store metadata about the sheet structure with error handling"""
-        try:
-            # Create a unique key for this sheet
-            sheet_key = f"{file_name}/{sheet_name}"
-            
-            # Initialize metadata structure
-            metadata = {
-                "column_types": {},
-                "potential_id_columns": [],
-                "numeric_columns": [],
-                "text_columns": [],
-                "date_columns": [],
-                "row_count": len(df),
-                "column_count": len(df.columns)
-            }
-            
-            # Analyze column types and store in metadata
-            for col in df.columns:
-                try:
-                    # Check if column might be an ID column (unique values, string)
-                    if len(df) > 0:
-                        unique_ratio = df[col].nunique() / len(df)
-                        if unique_ratio > 0.8 and df[col].dtype == 'object':
-                            metadata["potential_id_columns"].append(col)
-                    
-                    # Determine and store column type
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        metadata["numeric_columns"].append(col)
-                        metadata["column_types"][col] = "numeric"
-                    elif pd.api.types.is_datetime64_dtype(df[col]):
-                        metadata["date_columns"].append(col)
-                        metadata["column_types"][col] = "date"
-                    else:
-                        metadata["text_columns"].append(col)
-                        metadata["column_types"][col] = "text"
-                except Exception as e:
-                    # Skip this column if there's an error
-                    logger.warning(f"Error analyzing column {col} in {sheet_key}: {str(e)}")
-                    continue
-            
-            # Store the metadata
-            self.sheet_metadata[sheet_key] = metadata
-        except Exception as e:
-            logger.error(f"Error extracting metadata for {file_name}/{sheet_name}: {str(e)}")
-            # Initialize with empty metadata to avoid further errors
-            self.sheet_metadata[f"{file_name}/{sheet_name}"] = {
-                "column_types": {},
-                "potential_id_columns": [],
-                "numeric_columns": [],
-                "text_columns": [],
-                "date_columns": [],
-                "row_count": len(df) if isinstance(df, pd.DataFrame) else 0,
-                "column_count": len(df.columns) if isinstance(df, pd.DataFrame) else 0
-            }
+import re
 
-    def generate_schema_mapping(self) -> None:
-        """Generate smart schema mappings based on column name patterns"""
-        schema_patterns = {
-            "equipment": ["equipment", "make", "model", "machinery", "device"],
-            "plant": ["plant", "location", "facility", "factory", "site"],
-            "speed": ["speed", "rpm", "rotation", "impeller"],
-            "capacity": ["capacity", "volume", "throughput"],
-            "temperature": ["temperature", "temp", "celsius", "fahrenheit"],
-            "pressure": ["pressure", "psi", "bar", "kpa"]
-        }
-        
-        # Build mappings for each file/sheet
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                sheet_key = f"{file_name}/{sheet_name}"
-                self.schema_mappings[sheet_key] = {}
-                
-                # Map each column based on pattern matching
-                for col in df.columns:
-                    col_lower = col.lower()
-                    
-                    # Check which category this column belongs to
-                    for category, patterns in schema_patterns.items():
-                        if any(pattern in col_lower for pattern in patterns):
-                            # Special handling for range columns (min/max pairs)
-                            if category == "speed" and ("min" in col_lower or "max" in col_lower):
-                                if "min" in col_lower:
-                                    self.schema_mappings[sheet_key]["speed_min"] = col
-                                elif "max" in col_lower:
-                                    self.schema_mappings[sheet_key]["speed_max"] = col
-                            else:
-                                # Regular mapping
-                                self.schema_mappings[sheet_key][category] = col
-                
-                logger.info(f"Generated schema mapping for {sheet_key}: {self.schema_mappings[sheet_key]}")
+match = re.search(r'```json(.*?)```', subtopic_response.content, re.DOTALL)
+subtopics = json.loads(match.group(1) if match else subtopic_response.content)
+subtopics
 
-    def get_sheet_info(self) -> Dict[str, List[str]]:
-        """Return information about available sheets and their columns"""
-        sheet_info = {}
-        
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                key = f"{file_name}/{sheet_name}"
-                sheet_info[key] = list(df.columns)
-                
-        return sheet_info
-
-    def get_all_sheet_names(self) -> List[str]:
-        """Get a list of all sheet names across all files"""
-        sheet_names = []
-        
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name in sheets.keys():
-                sheet_names.append(sheet_name)
-                
-        return sheet_names
-
-    def search(self, query_params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Enhanced search function with fuzzy matching and ranking"""
-        results = []
-        
-        # Extract search parameters
-        target_sheet = query_params.get("sheet")
-        equipment = query_params.get("equipment", "").lower()
-        plant = query_params.get("plant", "").lower()
-        spec_type = query_params.get("specification", "").lower()
-        
-        # Search across all sheets if no specific sheet is provided
-        sheets_to_search = []
-        if target_sheet:
-            # Look for sheet by name (case-insensitive) across all files
-            for file_name, sheets in self.data_sources.items():
-                for sheet_name in sheets.keys():
-                    if sheet_name.lower() == target_sheet.lower():
-                        sheets_to_search.append((file_name, sheet_name))
-        else:
-            # Search all sheets
-            for file_name, sheets in self.data_sources.items():
-                for sheet_name in sheets.keys():
-                    sheets_to_search.append((file_name, sheet_name))
-        
-        # Process each relevant sheet
-        for file_name, sheet_name in sheets_to_search:
-            df = self.data_sources[file_name][sheet_name]
-            sheet_key = f"{file_name}/{sheet_name}"
-            mapping = self.schema_mappings.get(sheet_key, {})
-            
-            # Build search filters based on available mapped columns
-            filters = []
-            
-            # Equipment filter
-            if equipment and "equipment" in mapping:
-                equipment_col = mapping["equipment"]
-                # Fuzzy match: check if equipment term is contained in the column
-                equipment_mask = df[equipment_col].astype(str).str.contains(equipment, case=False, na=False)
-                filters.append(equipment_mask)
-            
-            # Plant filter  
-            if plant and "plant" in mapping:
-                plant_col = mapping["plant"]
-                # Fuzzy match: check if plant term is contained in the column
-                plant_mask = df[plant_col].astype(str).str.contains(plant, case=False, na=False)
-                filters.append(plant_mask)
-            
-            # If we have filters, apply them
-            if filters:
-                # Combine all filters with AND logic
-                combined_filter = filters[0]
-                for f in filters[1:]:
-                    combined_filter &= f
-                
-                # Apply filter to get matching rows
-                matches = df[combined_filter]
-                
-                # If we have matches, prepare result
-                if not matches.empty:
-                    # Determine what spec info to return based on spec_type
-                    spec_columns = []
-                    
-                    # If specific spec type requested
-                    if spec_type:
-                        if "speed" in spec_type:
-                            if "speed_min" in mapping and "speed_max" in mapping:
-                                spec_columns.extend([mapping["speed_min"], mapping["speed_max"]])
-                        elif "capacity" in spec_type and "capacity" in mapping:
-                            spec_columns.append(mapping["capacity"])
-                        elif "temperature" in spec_type and "temperature" in mapping:
-                            spec_columns.append(mapping["temperature"])
-                        elif "pressure" in spec_type and "pressure" in mapping:
-                            spec_columns.append(mapping["pressure"])
-                    
-                    # If no specific spec columns found, include all potential spec columns
-                    if not spec_columns:
-                        for spec in ["speed_min", "speed_max", "capacity", "temperature", "pressure"]:
-                            if spec in mapping:
-                                spec_columns.append(mapping[spec])
-                    
-                    # Include key identifier columns
-                    id_columns = []
-                    for key_col in ["equipment", "plant"]:
-                        if key_col in mapping:
-                            id_columns.append(mapping[key_col])
-                    
-                    # Combine all columns we want to show
-                    display_columns = id_columns + spec_columns
-                    
-                    # Ensure we have valid columns
-                    valid_columns = [col for col in display_columns if col in df.columns]
-                    
-                    # Create result object
-                    if valid_columns:
-                        result = {
-                            "file": file_name,
-                            "sheet": sheet_name,
-                            "data": matches[valid_columns].to_dict(orient="records"),
-                            "mapping": {col: col for col in valid_columns},  # For display purposes
-                            "spec_type": spec_type
-                        }
-                        results.append(result)
-        
-        return results
-
-class QueryProcessor:
-    """Handles query understanding and parameter extraction"""
-    
-    def __init__(self, data_manager: DataManager):
-        self.data_manager = data_manager
-        self.sheet_info = None
-        self.last_query_params = None
-    
-    def update_sheet_info(self):
-        """Update sheet information from data manager"""
-        self.sheet_info = self.data_manager.get_sheet_info()
-    
-    def extract_search_parameters(self, query: str) -> Dict[str, str]:
-        """Use Gemini to extract search parameters from query"""
-        try:
-            # Get all sheet names for context
-            all_sheets = self.data_manager.get_all_sheet_names()
-            sheet_list = ", ".join(all_sheets)
-            
-            # Build prompt with available sheet names
-            prompt = f"""Extract precise search parameters from this equipment query. 
-            Available sheets are: {sheet_list}
-            
-            Parameters to extract:
-            - equipment: The name of the equipment/make/model mentioned
-            - specification: What specification is being asked about (e.g., speed, capacity, temperature)
-            - plant: The plant/location mentioned
-            - sheet: Which sheet to search in (should be one of the available sheets)
-            
-            Consider common industrial terms and abbreviations. Be as specific as possible.
-            
-            Return a valid Python dictionary with these keys (leave empty if not found):
-            {{
-                "equipment": "extracted equipment name",
-                "specification": "extracted specification type",
-                "plant": "extracted plant",
-                "sheet": "extracted sheet name"
-            }}
-            
-            User query: {query}
-            
-            Python dict:"""
-            
-            # Get response from Gemini
-            response = model.generate_content(prompt)
-            
-            # Clean and parse the response
-            response_text = response.text
-            # Remove backticks if present
-            clean_response = response_text.replace("```python", "").replace("```", "").strip()
-            
-            # Safely evaluate the response as a Python dictionary
-            try:
-                params = eval(clean_response)
-                # Validate the dictionary structure
-                if not isinstance(params, dict):
-                    raise ValueError("Response is not a dictionary")
-                
-                # Ensure all expected keys are present
-                for key in ["equipment", "specification", "plant", "sheet"]:
-                    if key not in params:
-                        params[key] = ""
-                
-                logger.info(f"Extracted parameters: {params}")
-                return params
-                
-            except Exception as e:
-                logger.error(f"Failed to parse Gemini response: {str(e)}")
-                logger.error(f"Raw response: {clean_response}")
-                # Fall back to regex-based extraction
-                return self._fallback_parameter_extraction(query, all_sheets)
-                
-        except Exception as e:
-            logger.error(f"Gemini query processing error: {str(e)}")
-            # Fall back to regex-based extraction
-            return self._fallback_parameter_extraction(query, self.data_manager.get_all_sheet_names())
-    
-    def _fallback_parameter_extraction(self, query: str, available_sheets: List[str]) -> Dict[str, str]:
-        """Fallback method using regex to extract parameters"""
-        params = {
-            "equipment": "",
-            "specification": "",
-            "plant": "",
-            "sheet": ""
-        }
-        
-        # Convert query to lowercase for case-insensitive matching
-        query_lower = query.lower()
-        
-        # Equipment extraction - common patterns
-        equipment_patterns = [
-            r'equipment\s+([a-zA-Z0-9\s]+?)(?:\s+in|\s+at|\s+for|\s+from|\?|$)',
-            r'for\s+(?:the\s+)?equipment\s+([a-zA-Z0-9\s]+?)(?:\s+in|\s+at|\?|$)'
+# Create higher-level topic groups
+messages = [
+    HumanMessage(
+        content=f'''Cluster these topics into {n_topics} groups.
+            Return a JSON object with keys as a 2-4 word group name and values as arrays of topics.
+            Ensure at least 2 topics per group.
+        {json.dumps(subtopics, indent=2)}'''
+            )
         ]
-        
-        for pattern in equipment_patterns:
-            match = re.search(pattern, query_lower)
-            if match:
-                params["equipment"] = match.group(1).strip()
-                break
-        
-        # Plant extraction
-        plant_patterns = [
-            r'in\s+([a-zA-Z0-9\s\-]+?)(?:\?|$)',
-            r'at\s+([a-zA-Z0-9\s\-]+?)(?:\?|$)',
-            r'plant\s+([a-zA-Z0-9\s\-]+?)(?:\?|$)'
-        ]
-        
-        for pattern in plant_patterns:
-            match = re.search(pattern, query_lower)
-            if match:
-                params["plant"] = match.group(1).strip()
-                break
-        
-        # Specification type extraction
-        spec_keywords = {
-            "speed": ["speed", "rpm", "impeller", "rotation"],
-            "capacity": ["capacity", "volume", "throughput"],
-            "temperature": ["temperature", "temp", "heat"],
-            "pressure": ["pressure", "psi", "bar"]
-        }
-        
-        for spec_type, keywords in spec_keywords.items():
-            if any(keyword in query_lower for keyword in keywords):
-                params["specification"] = spec_type
-                break
-        
-        # Sheet extraction - check if any sheet name is mentioned
-        for sheet in available_sheets:
-            if sheet.lower() in query_lower:
-                params["sheet"] = sheet
-                break
-        
-        logger.info(f"Fallback extracted parameters: {params}")
-        return params
-    
-    def process_query(self, query: str) -> List[Dict[str, Any]]:
-        """Process query to extract parameters and perform search"""
-        # Update sheet info
-        self.update_sheet_info()
-        
-        # Extract search parameters
-        params = self.extract_search_parameters(query)
-        self.last_query_params = params
-        
-        # Perform search using the data manager
-        results = self.data_manager.search(params)
-        
-        return results
 
-class ResponseFormatter:
-    """Formats search results into human-readable responses"""
-    
-    @staticmethod
-    def format_results(results: List[Dict[str, Any]], query_params: Dict[str, str]) -> str:
-        """Format search results into a readable response"""
-        if not results:
-            # Generate a helpful "no results" message
-            no_results_message = "No matching specifications found in the documents. "
-            
-            # Add details about what was searched for
-            search_terms = []
-            if query_params.get("equipment"):
-                search_terms.append(f"equipment '{query_params['equipment']}'")
-            if query_params.get("plant"):
-                search_terms.append(f"plant '{query_params['plant']}'")
-            if query_params.get("specification"):
-                search_terms.append(f"specification type '{query_params['specification']}'")
-            if query_params.get("sheet"):
-                search_terms.append(f"sheet '{query_params['sheet']}'")
-            
-            if search_terms:
-                no_results_message += f"I looked for {', '.join(search_terms)}. "
-                no_results_message += "Please check if the terms match exactly what's in your spreadsheets or try with different search terms."
-            
-            return no_results_message
-        
-        # Has results - format them
-        response_parts = []
-        
-        for result in results:
-            sheet_name = result["sheet"]
-            file_name = result["file"]
-            data = result["data"]
-            mapping = result["mapping"]
-            spec_type = query_params.get("specification", "")
-            
-            # Create header
-            header = f"**Results from {sheet_name} in {file_name}**"
-            response_parts.append(header)
-            
-            # Format each result row
-            if spec_type == "speed" and len(data) > 0:
-                # Special formatting for speed ranges
-                for item in data:
-                    equipment_col = next((col for col in mapping if "equipment" in col.lower() or "make" in col.lower()), None)
-                    plant_col = next((col for col in mapping if "plant" in col.lower() or "location" in col.lower()), None)
-                    speed_min_col = next((col for col in mapping if "min" in col.lower() and any(s in col.lower() for s in ["speed", "rpm", "impeller"])), None)
-                    speed_max_col = next((col for col in mapping if "max" in col.lower() and any(s in col.lower() for s in ["speed", "rpm", "impeller"])), None)
-                    
-                    # Build response with available info
-                    response_row = ""
-                    if equipment_col and equipment_col in item:
-                        response_row += f"Equipment: {item[equipment_col]} "
-                    if plant_col and plant_col in item:
-                        response_row += f"at {item[plant_col]} "
-                    
-                    # Add speed range if available
-                    if speed_min_col and speed_max_col and speed_min_col in item and speed_max_col in item:
-                        response_row += f"has impeller speed range {item[speed_min_col]}-{item[speed_max_col]} RPM"
-                    elif speed_min_col and speed_min_col in item:
-                        response_row += f"has minimum speed of {item[speed_min_col]} RPM"
-                    elif speed_max_col and speed_max_col in item:
-                        response_row += f"has maximum speed of {item[speed_max_col]} RPM"
-                    
-                    response_parts.append(response_row)
-            else:
-                # General formatting for other types of data
-                # Convert the data to a pandas DataFrame for better formatting
-                df = pd.DataFrame(data)
-                
-                # Rename columns using friendly names where possible
-                rename_map = {}
-                for col in df.columns:
-                    friendly_name = col.replace('_', ' ').title()
-                    rename_map[col] = friendly_name
-                
-                df = df.rename(columns=rename_map)
-                
-                # Convert DataFrame to markdown
-                table_md = df.to_markdown(index=False)
-                response_parts.append(table_md)
-        
-        # Combine all parts with newlines
-        return "\n\n".join(response_parts)
+topic_response = chat_model.invoke(messages)
 
-def initialize_system():
-    """Initialize the system components"""
-    if "system" not in st.session_state:
-        st.session_state.system = {
-            "data_manager": DataManager(),
-            "query_processor": None,
-            "messages": []
-        }
-        
-        # Initialize query processor
-        st.session_state.system["query_processor"] = QueryProcessor(
-            st.session_state.system["data_manager"]
-        )
-        
-        # Don't load files automatically, wait for user upload
+match = re.search(r'```json(.*?)```', topic_response.content, re.DOTALL)
+topics = json.loads(match.group(1) if match else topic_response.content)
+topics = pd.DataFrame([
+    {'topic': topic, 'subtopic': subtopic}
+    for topic, subtopics in topics.items()
+    for subtopic in subtopics
+])
 
-def main():
-    """Main application function"""
-    st.title("🏭 Industrial Equipment Specs Finder")
-    
-    # Initialize system
-    initialize_system()
-    
-    # Display a file uploader for Excel files
-    uploaded_files = st.file_uploader("Upload Excel files", type=["xlsx", "xls"], accept_multiple_files=True)
-    
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            # Save the uploaded file to a temporary location
-            with open(uploaded_file.name, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Load the file
-            with st.spinner(f"Loading {uploaded_file.name}..."):
-                try:
-                    st.session_state.system["data_manager"].load_excel(uploaded_file.name)
-                    st.success(f"Successfully loaded {uploaded_file.name}")
-                except Exception as e:
-                    st.error(f"Failed to load {uploaded_file.name}: {str(e)}")
-            
-        # Regenerate schema mappings
-        st.session_state.system["data_manager"].generate_schema_mapping()
-    
-    # Display messages
-    for msg in st.session_state.system["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-    
-    # Sample questions
-    sample_queries = [
-        "What is the impeller speed range in RMG for the Equipment Glatt in FTO 2?",
-        "Show me the capacity specifications for Tapasya equipment in FTO-3",
-        "What is the temperature range for Fluid Bed Dryer in Plant 4?"
-    ]
-    
-    if not st.session_state.system["messages"]:
-        with st.chat_message("assistant"):
-            st.markdown("**Technical Specifications Assistant Ready**\n\nSample queries:")
-            for q in sample_queries:
-                st.code(q)
-    
-    # Process new queries
-    if prompt := st.chat_input("Enter technical query..."):
-        # Add user message
-        st.session_state.system["messages"].append({"role": "user", "content": prompt})
-        
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        
-        # Process query
-        try:
-            with st.spinner("🔬 Analyzing technical specs..."):
-                # Process query and get results
-                results = st.session_state.system["query_processor"].process_query(prompt)
-                
-                # Get the last query parameters used
-                query_params = st.session_state.system["query_processor"].last_query_params
-                
-                # Format response
-                response = ResponseFormatter.format_results(results, query_params)
-        except Exception as e:
-            logger.error(f"Query processing error: {str(e)}")
-            response = f"An error occurred while processing your query: {str(e)}"
-        
-        # Add assistant message
-        st.session_state.system["messages"].append({"role": "assistant", "content": response})
-        
-        with st.chat_message("assistant"):
-            st.markdown(response)
+data = {
+    'docs': docs.to_dict(orient='records'),
+    'topics': topics.to_dict(orient='records'),
+}
 
-if __name__ == "__main__":
-    main()
+
+matches = data['matches'] = []
+similarity = classify(
+    [row[text_column] for row in data['docs']],
+    [row['subtopic'] for row in data['topics']]
+)
+
+for row in range(len(similarity)):
+    for col in range(len(similarity[row])):
+        if similarity[row][col] > min_similarity:
+            matches.append({'doc': row, 'topic': col, 'similarity': similarity[row][col]})
+
+# Save as Excel
+with pd.ExcelWriter('docexplore.xlsx') as writer:
+    docs.to_excel(writer, sheet_name='docs', index=False)
+    topics.to_excel(writer, sheet_name='topics', index=False)
+    grid = pd.DataFrame(matches).pivot_table(index='doc', columns='topic', values='similarity')
+    grid.index = pd.Series(grid.index).replace(dict(enumerate(docs[text_column].tolist())))
+    grid.columns = pd.Series(grid.columns).replace(dict(enumerate(topics['subtopic'].tolist())))
+    grid.index.name = text_column
+    grid.reset_index().to_excel(writer, sheet_name='matches', index=False)
+
+with open(f"{output_dir}/docexplore.json", "w") as handle:
+    handle.write(json.dumps(data, indent=2))
+
