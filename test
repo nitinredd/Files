@@ -1,996 +1,185 @@
 import os
-import streamlit as st
-import pandas as pd
-import numpy as np
 import json
-import re
-import logging
-import tempfile
-import uuid
-from typing import Dict, List, Optional, Tuple, Union, Any
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-
-# Import LangChain components
+import pandas as pd
+import streamlit as st
 from langchain_openai import AzureChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from langchain.embeddings.cache import CacheBackedEmbeddings
 from langchain.storage.file_system import LocalFileStore
 from langchain_openai import AzureOpenAIEmbeddings
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import tool
-from langchain_core.prompts import ChatPromptTemplate
+from langchain.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# GPT & Embedding Configuration (as provided)
+# ---------------------------------------------------------------------------
+base_url = os.getenv('AZURE_BASE_URL', '')
+api_version = os.getenv('AZURE_API_VERSION', '')
+api_key = os.getenv('AZURE_API_KEY', '')
+deployment_name = os.getenv('AZURE_DEPLOYMENT_NAME', 'GPT4o')
+model_name = os.getenv('AZURE_MODEL_NAME', 'GPT4o')
 
-# Directory for embedding cache and vector store
-CACHE_DIR = os.path.join(tempfile.gettempdir(), "equipment_specs_finder")
-os.makedirs(CACHE_DIR, exist_ok=True)
-VECTOR_STORE_PATH = os.path.join(CACHE_DIR, "vector_store")
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
 
-# ================= LLM Configuration =================
-# Load API keys from environment variables or .env file (using streamlit secrets)
-def get_api_config():
-    try:
-        # First try to get from Streamlit secrets
-        return {
-            "azure_endpoint": st.secrets.get("AZURE_OPENAI_ENDPOINT", ""),
-            "api_key": st.secrets.get("AZURE_OPENAI_API_KEY", ""),
-            "api_version": st.secrets.get("AZURE_OPENAI_API_VERSION", "2023-12-01-preview"),
-            "deployment_name": st.secrets.get("AZURE_OPENAI_DEPLOYMENT", "GPT4o"),
-            "embedding_deployment": st.secrets.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002"),
-        }
-    except Exception:
-        # Fallback to environment variables
-        return {
-            "azure_endpoint": os.environ.get("AZURE_OPENAI_ENDPOINT", ""),
-            "api_key": os.environ.get("AZURE_OPENAI_API_KEY", ""),
-            "api_version": os.environ.get("AZURE_OPENAI_API_VERSION", "2023-12-01-preview"),
-            "deployment_name": os.environ.get("AZURE_OPENAI_DEPLOYMENT", "GPT4o"),
-            "embedding_deployment": os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "text-embedding-ada-002"),
-        }
+file_store = LocalFileStore('langchain-embeddings')
+base_embed = AzureOpenAIEmbeddings(
+    model=os.getenv('AZURE_EMBED_MODEL', ''),
+    api_version=api_version,
+    azure_endpoint=base_url,
+    api_key=api_key,
+    azure_deployment=os.getenv('AZURE_EMBED_DEPLOYMENT', '')
+)
 
-# Initialize Azure OpenAI LLM
-def init_azure_openai():
-    config = get_api_config()
-    
-    # Initialize the LLM
-    chat_model = AzureChatOpenAI(
-        azure_deployment=config["deployment_name"],
-        model=config["deployment_name"],  # Model name same as deployment for Azure
-        api_version=config["api_version"],
-        api_key=config["api_key"],
-        azure_endpoint=config["azure_endpoint"],
-        temperature=0
-    )
-    
-    # Initialize embedding model with caching
-    file_store = LocalFileStore(os.path.join(CACHE_DIR, 'embeddings-cache'))
-    base_embeddings = AzureOpenAIEmbeddings(
-        model=config["embedding_deployment"],
-        api_version=config["api_version"],
-        azure_endpoint=config["azure_endpoint"],
-        api_key=config["api_key"],
-        azure_deployment=config["embedding_deployment"]
-    )
-    
-    cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
-        base_embeddings, 
-        file_store, 
-        namespace=config["embedding_deployment"]
-    )
-    
-    return chat_model, cached_embeddings
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
+    base_embed, file_store, namespace=base_embed.model
+)
 
-class DataManager:
-    """Enhanced data manager with RAG integration for Excel processing and querying"""
-    
-    def __init__(self, embedding_model):
-        self.data_sources = {}  # Stores all loaded dataframes by file and sheet
-        self.schema_mappings = {}  # Stores normalized column mappings
-        self.sheet_metadata = {}  # Stores info about each sheet (column types, etc.)
-        self.embedding_model = embedding_model
-        self.vector_store = None
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
+# ---------------------------------------------------------------------------
+# Multi-Agent Components
+# ---------------------------------------------------------------------------
+class ChildAgent:
+    def __init__(self, name, retriever):
+        self.name = name
+        self.chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=False
         )
-        
-    def load_excel(self, file_path: str) -> None:
-        """Load Excel file with robust error handling and metadata extraction"""
-        try:
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-            
-            # Extract just the filename without path for cleaner references
-            file_name = os.path.basename(file_path)
-            if file_name not in self.data_sources:
-                self.data_sources[file_name] = {}
-            
+
+    def ask(self, query):
+        return self.chain.run(query)
+
+
+class CoordinatorAgent:
+    def __init__(self, child_agents):
+        self.children = child_agents
+
+    def coordinate(self, query):
+        # ask all children and consolidate
+        answers = []
+        for child in self.children:
             try:
-                xls = pd.ExcelFile(file_path)
-            except Exception as e:
-                logger.error(f"Failed to open Excel file {file_path}: {str(e)}")
-                st.error(f"Failed to open Excel file {file_path}: {str(e)}")
-                return
-            
-            # Process each sheet
-            for sheet_name in xls.sheet_names:
-                with st.spinner(f"Loading {sheet_name} from {file_name}..."):
-                    try:
-                        # Safe approach: Skip header detection and use default settings
-                        df = pd.read_excel(file_path, sheet_name=sheet_name)
-                        
-                        # If the DataFrame is empty, skip this sheet
-                        if df.empty:
-                            logger.warning(f"Sheet {sheet_name} in {file_name} is empty, skipping")
-                            continue
-                        
-                        # Basic data cleaning
-                        df = self._clean_dataframe(df)
-                        
-                        # Store the dataframe
-                        self.data_sources[file_name][sheet_name] = df
-                        
-                        # Extract and store metadata about this sheet
-                        self._extract_sheet_metadata(file_name, sheet_name, df)
-                        
-                        logger.info(f"Loaded sheet {sheet_name} from {file_name} with {len(df)} rows and {len(df.columns)} columns")
-                    except Exception as e:
-                        logger.error(f"Failed to load sheet {sheet_name} from {file_name}: {str(e)}")
-                        st.warning(f"Skipped sheet {sheet_name} from {file_name} due to an error: {str(e)}")
-                        continue
-            
-            # Build vector store after loading
-            self._build_vector_store()
-            
-        except Exception as e:
-            logger.error(f"Error loading {file_path}: {str(e)}")
-            st.error(f"Error loading {file_path}: {str(e)}")
-            
-    def _clean_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Perform comprehensive DataFrame cleaning"""
-        # Make a copy to avoid modifying the original
-        df = df.copy()
-        
-        # Replace any completely empty rows or columns
-        df = df.dropna(how='all')
-        df = df.dropna(axis=1, how='all')
-        
-        # Normalize column names
-        df.columns = self._normalize_column_names(df.columns)
-        
-        # Convert string columns to lowercase and strip whitespace
-        for col in df.columns:
-            if df[col].dtype == 'object':
-                try:
-                    df[col] = df[col].apply(lambda x: x.lower().strip() if isinstance(x, str) else x)
-                except Exception as e:
-                    logger.warning(f"Error cleaning column {col}: {str(e)}")
-                
-        return df
-        
-    def _normalize_column_names(self, columns):
-        """Normalize column names with multiple strategies for robustness"""
-        normalized_cols = []
-        for col in columns:
-            # Convert to string in case of numeric column names
-            col_str = str(col)
-            
-            # Basic cleaning
-            col_clean = col_str.lower().strip()
-            
-            # Replace multiple spaces with single underscore
-            col_clean = re.sub(r'\s+', '_', col_clean)
-            
-            # Replace special characters with underscore
-            col_clean = re.sub(r'[^a-z0-9_]', '_', col_clean)
-            
-            # Remove duplicate underscores
-            col_clean = re.sub(r'_+', '_', col_clean)
-            
-            # Remove leading/trailing underscores
-            col_clean = col_clean.strip('_')
-            
-            normalized_cols.append(col_clean)
-            
-        # Handle duplicate column names by adding suffix
-        seen = {}
-        for i, col in enumerate(normalized_cols):
-            if col in seen:
-                seen[col] += 1
-                normalized_cols[i] = f"{col}_{seen[col]}"
-            else:
-                seen[col] = 0
-                
-        return normalized_cols
-        
-    def _extract_sheet_metadata(self, file_name: str, sheet_name: str, df: pd.DataFrame) -> None:
-        """Extract and store metadata about the sheet structure with error handling"""
-        try:
-            # Create a unique key for this sheet
-            sheet_key = f"{file_name}/{sheet_name}"
-            
-            # Initialize metadata structure
-            metadata = {
-                "column_types": {},
-                "potential_id_columns": [],
-                "numeric_columns": [],
-                "text_columns": [],
-                "date_columns": [],
-                "row_count": len(df),
-                "column_count": len(df.columns)
-            }
-            
-            # Analyze column types and store in metadata
-            for col in df.columns:
-                try:
-                    # Check if column might be an ID column (unique values, string)
-                    if len(df) > 0:
-                        unique_ratio = df[col].nunique() / len(df)
-                        if unique_ratio > 0.8 and df[col].dtype == 'object':
-                            metadata["potential_id_columns"].append(col)
-                    
-                    # Determine and store column type
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        metadata["numeric_columns"].append(col)
-                        metadata["column_types"][col] = "numeric"
-                    elif pd.api.types.is_datetime64_dtype(df[col]):
-                        metadata["date_columns"].append(col)
-                        metadata["column_types"][col] = "date"
-                    else:
-                        metadata["text_columns"].append(col)
-                        metadata["column_types"][col] = "text"
-                except Exception as e:
-                    # Skip this column if there's an error
-                    logger.warning(f"Error analyzing column {col} in {sheet_key}: {str(e)}")
-                    continue
-            
-            # Store the metadata
-            self.sheet_metadata[sheet_key] = metadata
-        except Exception as e:
-            logger.error(f"Error extracting metadata for {file_name}/{sheet_name}: {str(e)}")
-            # Initialize with empty metadata to avoid further errors
-            self.sheet_metadata[f"{file_name}/{sheet_name}"] = {
-                "column_types": {},
-                "potential_id_columns": [],
-                "numeric_columns": [],
-                "text_columns": [],
-                "date_columns": [],
-                "row_count": len(df) if isinstance(df, pd.DataFrame) else 0,
-                "column_count": len(df.columns) if isinstance(df, pd.DataFrame) else 0
-            }
+                resp = child.ask(query)
+                if resp and 'not found' not in resp.lower():
+                    answers.append((child.name, resp))
+            except Exception:
+                continue
+        return answers
 
-    def _generate_document_chunks(self):
-        """Generate document chunks from all sheets for vector store indexing"""
-        documents = []
-        
-        # Process each sheet as a separate document
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                sheet_key = f"{file_name}/{sheet_name}"
-                
-                # Create a structured representation of the dataframe
-                # Convert to string representation with column details
-                column_info = "\n".join([
-                    f"Column: {col}, Type: {self.sheet_metadata[sheet_key]['column_types'].get(col, 'unknown')}"
-                    for col in df.columns
-                ])
-                
-                # Sample data representation (first 5 rows)
-                sample_data = df.head(5).to_string(index=False)
-                
-                # Create metadata document
-                metadata_doc = f"""
-                File: {file_name}
-                Sheet: {sheet_name}
-                Rows: {len(df)}
-                Columns: {len(df.columns)}
-                
-                Column Information:
-                {column_info}
-                
-                Sample Data:
-                {sample_data}
-                """
-                
-                documents.append({
-                    "page_content": metadata_doc,
-                    "metadata": {
-                        "file": file_name,
-                        "sheet": sheet_name,
-                        "type": "metadata"
-                    }
-                })
-                
-                # Process each row as a separate document chunk
-                # This is more efficient for retrieval than processing the whole dataframe
-                for i, row in df.iterrows():
-                    row_content = []
-                    
-                    # Add key-value pairs as text
-                    for col, value in row.items():
-                        # Skip empty values
-                        if pd.isna(value):
-                            continue
-                            
-                        # Format value based on type
-                        if isinstance(value, (int, float)):
-                            # Format numerics nicely
-                            if value == int(value):
-                                value = int(value)
-                            row_content.append(f"{col}: {value}")
-                        else:
-                            row_content.append(f"{col}: {value}")
-                    
-                    # Create document with metadata
-                    row_doc = {
-                        "page_content": "\n".join(row_content),
-                        "metadata": {
-                            "file": file_name,
-                            "sheet": sheet_name,
-                            "row": i,
-                            "type": "row"
-                        }
-                    }
-                    
-                    documents.append(row_doc)
-        
-        return documents
 
-    def _build_vector_store(self):
-        """Build or update the vector store with all data"""
-        try:
-            if not self.data_sources:
-                logger.warning("No data sources loaded, skipping vector store build")
-                return
-                
-            # Generate document chunks
-            documents = self._generate_document_chunks()
-            
-            if not documents:
-                logger.warning("No documents generated for vector store")
-                return
-                
-            # Create the vector store
-            logger.info(f"Building vector store with {len(documents)} documents")
-            
-            # Convert to LangChain Document format
-            from langchain_core.documents import Document
-            langchain_docs = [
-                Document(page_content=doc["page_content"], metadata=doc["metadata"])
-                for doc in documents
-            ]
-            
-            # Create or update vector store
-            self.vector_store = FAISS.from_documents(
-                documents=langchain_docs,
-                embedding=self.embedding_model,
-            )
-            
-            # Save the vector store
-            if not os.path.exists(VECTOR_STORE_PATH):
-                os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
-                
-            self.vector_store.save_local(VECTOR_STORE_PATH)
-            logger.info(f"Vector store built and saved to {VECTOR_STORE_PATH}")
-            
-        except Exception as e:
-            logger.error(f"Error building vector store: {str(e)}")
-            st.error(f"Error building search index: {str(e)}")
+class OversightAgent:
+    def validate(self, answers):
+        if not answers:
+            return None
+        # pick best (first) for simplicity
+        return answers[0][1]
 
-    def generate_schema_mapping(self) -> None:
-        """Generate smart schema mappings based on column name patterns"""
-        schema_patterns = {
-            "equipment": ["equipment", "make", "model", "machinery", "device"],
-            "plant": ["plant", "location", "facility", "factory", "site"],
-            "speed": ["speed", "rpm", "rotation", "impeller"],
-            "capacity": ["capacity", "volume", "throughput"],
-            "temperature": ["temperature", "temp", "celsius", "fahrenheit"],
-            "pressure": ["pressure", "psi", "bar", "kpa"]
-        }
-        
-        # Build mappings for each file/sheet
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                sheet_key = f"{file_name}/{sheet_name}"
-                self.schema_mappings[sheet_key] = {}
-                
-                # Map each column based on pattern matching
-                for col in df.columns:
-                    col_lower = col.lower()
-                    
-                    # Check which category this column belongs to
-                    for category, patterns in schema_patterns.items():
-                        if any(pattern in col_lower for pattern in patterns):
-                            # Special handling for range columns (min/max pairs)
-                            if category == "speed" and ("min" in col_lower or "max" in col_lower):
-                                if "min" in col_lower:
-                                    self.schema_mappings[sheet_key]["speed_min"] = col
-                                elif "max" in col_lower:
-                                    self.schema_mappings[sheet_key]["speed_max"] = col
-                            else:
-                                # Regular mapping
-                                self.schema_mappings[sheet_key][category] = col
-                
-                logger.info(f"Generated schema mapping for {sheet_key}: {self.schema_mappings[sheet_key]}")
 
-    def get_sheet_info(self) -> Dict[str, List[str]]:
-        """Return information about available sheets and their columns"""
-        sheet_info = {}
-        
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                key = f"{file_name}/{sheet_name}"
-                sheet_info[key] = list(df.columns)
-                
-        return sheet_info
+class LearningAgent:
+    def __init__(self):
+        self.logs = []
 
-    def get_all_sheet_names(self) -> List[str]:
-        """Get a list of all sheet names across all files"""
-        sheet_names = []
-        
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name in sheets.keys():
-                sheet_names.append(sheet_name)
-                
-        return sheet_names
-        
-    def get_all_data_as_text(self) -> str:
-        """Get all data as a single text representation for context"""
-        text_parts = []
-        
-        for file_name, sheets in self.data_sources.items():
-            for sheet_name, df in sheets.items():
-                text_parts.append(f"File: {file_name}, Sheet: {sheet_name}")
-                text_parts.append(f"Columns: {', '.join(df.columns)}")
-                text_parts.append(f"First 3 rows: {df.head(3).to_string()}")
-                text_parts.append("---")
-                
-        return "\n".join(text_parts)
-        
-    def search_rag(self, query: str, llm, k: int = 5) -> List[Dict[str, Any]]:
-        """Search using RAG approach"""
-        if not self.vector_store:
-            logger.warning("Vector store not built - no search results available")
-            return []
-            
-        try:
-            # Query the vector store to get relevant chunks
-            retriever = self.vector_store.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": k}
-            )
-            
-            # Create a RAG prompt template
-            template = """
-            You are an industrial equipment specifications assistant. Your task is to find specific 
-            equipment specifications based on the question and the context provided.
-            
-            Question: {question}
-            
-            Context:
-            {context}
-            
-            Based on the context, identify:
-            1. The equipment being searched for
-            2. The plant/location mentioned
-            3. The specification type (speed, capacity, temperature, pressure)
-            4. The file and sheet names that contain the relevant data
-            
-            Return ONLY a JSON object with these fields:
-            {{
-                "equipment": "extracted equipment name",
-                "plant": "extracted plant name",
-                "specification": "extracted specification type",
-                "files": ["file1", "file2"],
-                "sheets": ["sheet1", "sheet2"],
-                "column_filters": {{"column_name": "value_to_filter"}}
-            }}
-            """
-            
-            prompt = ChatPromptTemplate.from_template(template)
-            
-            # Create a simple RAG chain
-            chain = (
-                {"context": retriever, "question": RunnablePassthrough()}
-                | prompt
-                | llm
-                | StrOutputParser()
-            )
-            
-            # Run the chain
-            result = chain.invoke(query)
-            
-            # Parse the result as JSON
-            try:
-                logger.info(f"RAG search result: {result}")
-                search_params = json.loads(result)
-                
-                # Perform the actual search using the extracted parameters
-                return self._execute_search(search_params)
-            except json.JSONDecodeError as e:
-                logger.error(f"Error parsing RAG result as JSON: {e}")
-                logger.error(f"Raw result: {result}")
-                return []
-                
-        except Exception as e:
-            logger.error(f"Error in RAG search: {str(e)}")
-            return []
-            
-    def _execute_search(self, search_params: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Execute search with the parameters extracted by RAG"""
-        results = []
-        
-        equipment = search_params.get("equipment", "").lower() if search_params.get("equipment") else ""
-        plant = search_params.get("plant", "").lower() if search_params.get("plant") else ""
-        spec_type = search_params.get("specification", "").lower() if search_params.get("specification") else ""
-        target_files = search_params.get("files", [])
-        target_sheets = search_params.get("sheets", [])
-        column_filters = search_params.get("column_filters", {})
-        
-        # Determine which sheets to search
-        sheets_to_search = []
-        
-        # If specific files/sheets are specified, use those
-        if target_files or target_sheets:
-            for file_name, sheets in self.data_sources.items():
-                # Check if this file is in the target files
-                if target_files and file_name not in target_files:
-                    continue
-                    
-                for sheet_name in sheets.keys():
-                    # Check if this sheet is in the target sheets
-                    if target_sheets and sheet_name not in target_sheets:
-                        continue
-                        
-                    sheets_to_search.append((file_name, sheet_name))
+    def log(self, user_query, response):
+        self.logs.append({'query': user_query, 'response': response})
+
+
+class AgentManager:
+    def __init__(self, agents):
+        self.coordinator = CoordinatorAgent(agents)
+        self.oversight = OversightAgent()
+        self.learning = LearningAgent()
+
+    def handle_query(self, query):
+        raw_answers = self.coordinator.coordinate(query)
+        validated = self.oversight.validate(raw_answers)
+        if not validated:
+            answer = "Relevant information not found in the workbooks."
         else:
-            # Otherwise search all sheets
-            for file_name, sheets in self.data_sources.items():
-                for sheet_name in sheets.keys():
-                    sheets_to_search.append((file_name, sheet_name))
-        
-        # Process each relevant sheet
-        for file_name, sheet_name in sheets_to_search:
-            df = self.data_sources[file_name][sheet_name]
-            sheet_key = f"{file_name}/{sheet_name}"
-            mapping = self.schema_mappings.get(sheet_key, {})
-            
-            # Build search filters based on available mapped columns
-            filters = []
-            
-            # Equipment filter
-            if equipment and "equipment" in mapping:
-                equipment_col = mapping["equipment"]
-                # Fuzzy match: check if equipment term is contained in the column
-                equipment_mask = df[equipment_col].astype(str).str.contains(equipment, case=False, na=False)
-                filters.append(equipment_mask)
-            
-            # Plant filter  
-            if plant and "plant" in mapping:
-                plant_col = mapping["plant"]
-                # Fuzzy match: check if plant term is contained in the column
-                plant_mask = df[plant_col].astype(str).str.contains(plant, case=False, na=False)
-                filters.append(plant_mask)
-            
-            # Apply any additional column filters from RAG
-            for col_name, col_value in column_filters.items():
-                if col_name in df.columns:
-                    # Fuzzy match
-                    col_mask = df[col_name].astype(str).str.contains(str(col_value), case=False, na=False)
-                    filters.append(col_mask)
-            
-            # If we have filters, apply them
-            if filters:
-                # Combine all filters with AND logic
-                combined_filter = filters[0]
-                for f in filters[1:]:
-                    combined_filter &= f
-                
-                # Apply filter to get matching rows
-                matches = df[combined_filter]
-                
-                # If we have matches, prepare result
-                if not matches.empty:
-                    # Determine what spec info to return based on spec_type
-                    spec_columns = []
-                    
-                    # If specific spec type requested
-                    if spec_type:
-                        if "speed" in spec_type:
-                            if "speed_min" in mapping and "speed_max" in mapping:
-                                spec_columns.extend([mapping["speed_min"], mapping["speed_max"]])
-                            elif "speed" in mapping:
-                                spec_columns.append(mapping["speed"])
-                        elif "capacity" in spec_type and "capacity" in mapping:
-                            spec_columns.append(mapping["capacity"])
-                        elif "temperature" in spec_type and "temperature" in mapping:
-                            spec_columns.append(mapping["temperature"])
-                        elif "pressure" in spec_type and "pressure" in mapping:
-                            spec_columns.append(mapping["pressure"])
-                    
-                    # If no specific spec columns found, include all potential spec columns
-                    if not spec_columns:
-                        for spec in ["speed", "speed_min", "speed_max", "capacity", "temperature", "pressure"]:
-                            if spec in mapping:
-                                spec_columns.append(mapping[spec])
-                    
-                    # Include key identifier columns
-                    id_columns = []
-                    for key_col in ["equipment", "plant"]:
-                        if key_col in mapping:
-                            id_columns.append(mapping[key_col])
-                    
-                    # When no mappings found, use the most relevant columns
-                    if not id_columns and not spec_columns:
-                        # Use all columns as fallback
-                        valid_columns = list(df.columns)
-                    else:
-                        # Combine all columns we want to show
-                        display_columns = id_columns + spec_columns
-                        
-                        # Ensure we have valid columns
-                        valid_columns = [col for col in display_columns if col in df.columns]
-                    
-                    # Create result object
-                    if valid_columns:
-                        result = {
-                            "file": file_name,
-                            "sheet": sheet_name,
-                            "data": matches[valid_columns].to_dict(orient="records"),
-                            "mapping": {col: col for col in valid_columns},  # For display purposes
-                            "spec_type": spec_type
-                        }
-                        results.append(result)
-        
-        return results
+            answer = validated
+        self.learning.log(query, answer)
+        return answer
 
-class AgentTools:
-    """Tools for the LangChain agent to use"""
-    
-    def __init__(self, data_manager):
-        self.data_manager = data_manager
+# ---------------------------------------------------------------------------
+# Data & Vectorstore Setup
+# ---------------------------------------------------------------------------
+@st.cache_data
+def load_workbooks(paths):
+    dfs = {}
+    for name, path in paths.items():
+        xls = pd.ExcelFile(path)
+        for sheet in xls.sheet_names:
+            df = xls.parse(sheet)
+            key = f"{name}:{sheet}"
+            dfs[key] = df
+    return dfs
 
-    @tool
-    def list_available_sheets(self) -> str:
-        """Lists all available sheets in the loaded Excel files"""
-        sheet_info = self.data_manager.get_sheet_info()
-        result = []
-        
-        for sheet_key, columns in sheet_info.items():
-            file_name, sheet_name = sheet_key.split('/')
-            result.append(f"Sheet: {sheet_name} (File: {file_name})")
-            result.append(f"  Columns: {', '.join(columns[:10])}...")
-            
-        return "\n".join(result) if result else "No sheets loaded yet."
+@st.cache_resource
+def build_vectorstores(dfs):
+    agents = []
+    for key, df in dfs.items():
+        docs = []
+        for _, row in df.iterrows():
+            text = json.dumps(row.dropna().to_dict())
+            docs.append(Document(page_content=text, metadata={'source': key}))
+        store = FAISS.from_documents(docs, cached_embeddings)
+        retriever = store.as_retriever(search_kwargs={"k": 5})
+        agents.append(ChildAgent(name=key, retriever=retriever))
+    return agents
 
-    @tool
-    def get_sheet_details(self, sheet_name: str) -> str:
-        """Gets detailed information about a specific sheet including columns and sample data"""
-        found = False
-        result = []
-        
-        for file_name, sheets in self.data_manager.data_sources.items():
-            if sheet_name in sheets:
-                df = sheets[sheet_name]
-                found = True
-                
-                result.append(f"Sheet: {sheet_name} (File: {file_name})")
-                result.append(f"Rows: {len(df)}, Columns: {len(df.columns)}")
-                result.append("Columns:")
-                for col in df.columns:
-                    result.append(f"  - {col} ({df[col].dtype})")
-                
-                result.append("Sample data (first 3 rows):")
-                result.append(df.head(3).to_string())
-                
-                break
-                
-        return "\n".join(result) if found else f"Sheet '{sheet_name}' not found."
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="Excel Chatbot", page_icon="🤖")
+st.title("🤖 Excel-based Multi-Agent Chatbot")
 
-    @tool
-    def extract_query_parameters(self, query: str) -> str:
-        """Extract equipment, specification, plant and other parameters from a query"""
-        all_sheets = self.data_manager.get_all_sheet_names()
-        sheet_list = ", ".join(all_sheets)
-        
-        # Define common patterns for extraction
-        equipment_patterns = ["equipment", "machine", "machinery", "device", "make", "model"]
-        spec_patterns = {
-            "speed": ["speed", "rpm", "rotation", "impeller"],
-            "capacity": ["capacity", "volume", "throughput", "output"],
-            "temperature": ["temperature", "temp", "heat", "celsius", "fahrenheit"],
-            "pressure": ["pressure", "psi", "bar", "kpa"]
+uploaded1 = st.file_uploader("Upload 'formula_master_osd.xlsx'", type=["xlsx"] )
+uploaded2 = st.file_uploader("Upload 'masterlist_osd_equipments.xlsx'", type=["xlsx"] )
+
+if uploaded1 and uploaded2:
+    with st.spinner("Loading data and building agents..."):
+        paths = {
+            'formula_master_osd': uploaded1,
+            'masterlist_osd_equipments': uploaded2
         }
-        plant_patterns = ["plant", "location", "facility", "factory", "site"]
-        
-        # Extract parameters through pattern matching
-        params = {
-            "equipment": "",
-            "specification": "",
-            "plant": "",
-            "sheet": ""
-        }
-        
-        # Simple pattern-based extraction
-        query_lower = query.lower()
-        
-        # Check for sheet names
-        for sheet in all_sheets:
-            if sheet.lower() in query_lower:
-                params["sheet"] = sheet
-                break
-                
-        # Check for spec types
-        for spec_type, patterns in spec_patterns.items():
-            if any(pattern in query_lower for pattern in patterns):
-                params["specification"] = spec_type
-                break
-                
-        # Extract using regex patterns for equipment and plant
-        # Equipment patterns
-        equipment_regex = r'(?:equipment|machine|device|model)\s+([a-zA-Z0-9\s\-]+?)(?:\s+in|\s+at|\s+from|\?|$)'
-        equipment_match = re.search(equipment_regex, query_lower)
-        if equipment_match:
-            params["equipment"] = equipment_match.group(1).strip()
-            
-        # Plant patterns  
-        plant_regex = r'(?:in|at|plant)\s+([a-zA-Z0-9\s\-]+?)(?:\?|$)'
-        plant_match = re.search(plant_regex, query_lower)
-        if plant_match:
-            params["plant"]
-# Completing the extract_query_parameters method first
-        plant_regex = r'(?:in|at|plant)\s+([a-zA-Z0-9\s\-]+?)(?:\?|$)'
-        plant_match = re.search(plant_regex, query_lower)
-        if plant_match:
-            params["plant"] = plant_match.group(1).strip()
-            
-        return json.dumps(params, indent=2)
+        dfs = load_workbooks(paths)
+        child_agents = build_vectorstores(dfs)
+        manager = AgentManager(child_agents)
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    if 'initialized' not in st.session_state:
+        st.session_state.initialized = True
+        st.session_state.chat_history.append(("bot", 
+            "Hi! I'm your Excel Chatbot. Here are some sample prompts to get you started:"))
+        sample_prompts = [
+            f"Do we have Tapasya made with Capacity 600L in FTO-3?",
+            f"What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
+            f"What are the various literature sources considered in RMG?"
+        ]
+        for p in sample_prompts:
+            st.session_state.chat_history.append(("bot", p))
 
-    @tool
-    def search_equipment_specs(self, query_params_json: str) -> str:
-        """Search for equipment specifications using the provided parameters"""
-        try:
-            # Parse the JSON parameters
-            params = json.loads(query_params_json)
-            
-            # Extract search parameters
-            equipment = params.get("equipment", "")
-            specification = params.get("specification", "")
-            plant = params.get("plant", "")
-            sheet = params.get("sheet", "")
-            
-            # Build search params for the data manager
-            search_params = {
-                "equipment": equipment,
-                "plant": plant,
-                "specification": specification,
-                "files": [],
-                "sheets": [sheet] if sheet else [],
-                "column_filters": {}
-            }
-            
-            # Execute the search
-            results = self.data_manager._execute_search(search_params)
-            
-            if not results:
-                return "No matching equipment specifications found. Try a different query."
-            
-            # Format the results
-            formatted_results = []
-            for result in results:
-                formatted_results.append(f"File: {result['file']}, Sheet: {result['sheet']}")
-                formatted_results.append("Matching Specifications:")
-                
-                # Format each row of data
-                for i, row in enumerate(result['data']):
-                    formatted_results.append(f"  Result {i+1}:")
-                    for col, value in row.items():
-                        formatted_results.append(f"    {col}: {value}")
-                
-            return "\n".join(formatted_results)
-        except Exception as e:
-            return f"Error searching for equipment specifications: {str(e)}"
-
-    @tool
-    def rag_search(self, query: str) -> str:
-        """Perform a RAG-based search for equipment specifications"""
-        try:
-            # Get the LLM from global scope or initialize it
-            global llm
-            if 'llm' not in globals() or llm is None:
-                # Initialize if needed
-                llm, _ = init_azure_openai()
-            
-            # Perform the RAG search
-            results = self.data_manager.search_rag(query, llm)
-            
-            if not results:
-                return "No matching equipment specifications found. Try a different query."
-                
-            # Format the results
-            formatted_results = []
-            for result in results:
-                formatted_results.append(f"File: {result['file']}, Sheet: {result['sheet']}")
-                if result.get('spec_type'):
-                    formatted_results.append(f"Specification Type: {result['spec_type']}")
-                formatted_results.append("Matching Specifications:")
-                
-                # Format each row of data
-                for i, row in enumerate(result['data']):
-                    formatted_results.append(f"  Result {i+1}:")
-                    for col, value in row.items():
-                        formatted_results.append(f"    {col}: {value}")
-                
-            return "\n".join(formatted_results)
-        except Exception as e:
-            return f"Error performing RAG search: {str(e)}"
-
-
-# ================= Agent Configuration =================
-def create_equipment_specs_agent(llm, data_manager):
-    """Create an agent with tools for equipment specifications lookup"""
-    
-    # Initialize tools
-    tools = AgentTools(data_manager)
-    
-    # Define the tools
-    tool_list = [
-        tools.list_available_sheets,
-        tools.get_sheet_details,
-        tools.extract_query_parameters,
-        tools.search_equipment_specs,
-        tools.rag_search
-    ]
-    
-    # Define the system prompt for the agent
-    system_prompt = """You are an Equipment Specifications Assistant designed to help users find equipment specifications 
-from Excel files containing industrial equipment data.
-
-Your goal is to help users find specific information about equipment like speeds, capacities, temperatures, 
-pressures, and other specifications.
-
-When looking up specifications, follow these steps:
-1. First check what sheets are available using list_available_sheets if you're not sure.
-2. Use extract_query_parameters to analyze the user's query for equipment name, plant, specification type etc.
-3. Use rag_search for more complex or ambiguous queries to leverage the RAG capabilities.
-4. Use search_equipment_specs for more direct searches when parameters are clear.
-5. Use get_sheet_details to get more information about specific sheets if needed.
-
-Always format your responses in a clear, table-like format when presenting specification data.
-"""
-
-    # Create the prompt for the agent
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{input}"),
-        ("agent", "{agent_scratchpad}")
-    ])
-    
-    # Create the agent
-    agent = create_react_agent(llm, tool_list, prompt)
-    
-    # Create the agent executor
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tool_list,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=10  # Limit iterations to prevent infinite loops
-    )
-    
-    return agent_executor
-
-
-# ================= Streamlit App =================
-def main():
-    st.set_page_config(
-        page_title="Equipment Specifications Finder",
-        page_icon="🔍",
-        layout="wide"
-    )
-    
-    st.title("Equipment Specifications Finder")
-    st.markdown("""
-    This app helps you find equipment specifications from Excel files using natural language questions.
-    Upload your equipment specification spreadsheets and then ask questions in plain English.
-    """)
-    
-    # Initialize session state for conversation history
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    if "data_manager" not in st.session_state:
-        # Initialize LLM and data manager on first run
-        llm, embeddings = init_azure_openai()
-        st.session_state.llm = llm
-        st.session_state.data_manager = DataManager(embeddings)
-
-    # File uploader
-    uploaded_files = st.file_uploader(
-        "Upload Excel files containing equipment specifications",
-        type=["xlsx", "xls"],
-        accept_multiple_files=True
-    )
-    
-    # Process uploaded files
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            # Save the file to a temporary location
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp_file:
-                tmp_file.write(uploaded_file.getvalue())
-                file_path = tmp_file.name
-                
-            # Load the Excel file
-            with st.spinner(f"Processing {uploaded_file.name}..."):
-                st.session_state.data_manager.load_excel(file_path)
-        
-        # Generate schema mappings after loading all files
-        st.session_state.data_manager.generate_schema_mapping()
-        
-        # Create the agent after data is loaded
-        if "agent" not in st.session_state:
-            st.session_state.agent = create_equipment_specs_agent(
-                st.session_state.llm,
-                st.session_state.data_manager
-            )
-    
-    # Display available sheets
-    if "data_manager" in st.session_state and st.session_state.data_manager.data_sources:
-        with st.expander("Available Data"):
-            sheet_info = st.session_state.data_manager.get_sheet_info()
-            for sheet_key, columns in sheet_info.items():
-                file_name, sheet_name = sheet_key.split('/')
-                st.markdown(f"**Sheet:** {sheet_name} (File: {file_name})")
-                st.markdown(f"*Columns:* {', '.join(columns[:10])}...")
-    
-    # Chat interface
-    st.divider()
-    st.subheader("Ask Questions About Equipment Specifications")
-    
-    # Display chat history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-    
-    # Get user input
-    if user_query := st.chat_input("Ask about equipment specifications..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_query})
-        
-        # Display user message
-        with st.chat_message("user"):
-            st.markdown(user_query)
-        
-        # Check if data is loaded
-        if "data_manager" not in st.session_state or not st.session_state.data_manager.data_sources:
-            with st.chat_message("assistant"):
-                st.markdown("Please upload Excel files with equipment specifications first.")
-                st.session_state.messages.append({"role": "assistant", "content": "Please upload Excel files with equipment specifications first."})
+    # display chat history
+    for sender, msg in st.session_state.chat_history:
+        if sender == 'user':
+            st.markdown(f"**You:** {msg}")
         else:
-            # Process with agent
-            with st.chat_message("assistant"):
-                with st.spinner("Thinking..."):
-                    try:
-                        # Get response from agent
-                        response = st.session_state.agent.invoke({"input": user_query})
-                        assistant_response = response.get("output", "I couldn't find an answer to your question.")
-                        
-                        # Display assistant response
-                        st.markdown(assistant_response)
-                        
-                        # Add to chat history
-                        st.session_state.messages.append({"role": "assistant", "content": assistant_response})
-                    except Exception as e:
-                        error_msg = f"Error processing your question: {str(e)}"
-                        st.error(error_msg)
-                        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            st.markdown(f"**Bot:** {msg}")
 
-if __name__ == "__main__":
-    main()
+    # user input
+    query = st.text_input("Your question:", key="input_query")
+    if query:
+        st.session_state.chat_history.append(("user", query))
+        response = manager.handle_query(query)
+        st.session_state.chat_history.append(("bot", response))
+        st.experimental_rerun()
+else:
+    st.info("Please upload both Excel workbooks to initialize the chatbot.")
