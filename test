@@ -1,185 +1,328 @@
-import os
-import json
-import pandas as pd
 import streamlit as st
-from langchain_openai import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
+import pandas as pd
+import base64
+import json
+import io
+import os
+import tempfile
+import openpyxl
+from openpyxl.utils.cell import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
+from PIL import Image as PILImage
+import numpy as np
+from io import BytesIO
 
-# ---------------------------------------------------------------------------
-# GPT & Embedding Configuration (as provided)
-# ---------------------------------------------------------------------------
-base_url = os.getenv('AZURE_BASE_URL', '')
-api_version = os.getenv('AZURE_API_VERSION', '')
-api_key = os.getenv('AZURE_API_KEY', '')
-deployment_name = os.getenv('AZURE_DEPLOYMENT_NAME', 'GPT4o')
-model_name = os.getenv('AZURE_MODEL_NAME', 'GPT4o')
-
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-
-file_store = LocalFileStore('langchain-embeddings')
-base_embed = AzureOpenAIEmbeddings(
-    model=os.getenv('AZURE_EMBED_MODEL', ''),
-    api_version=api_version,
-    azure_endpoint=base_url,
-    api_key=api_key,
-    azure_deployment=os.getenv('AZURE_EMBED_DEPLOYMENT', '')
-)
-
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
-    base_embed, file_store, namespace=base_embed.model
-)
-
-# ---------------------------------------------------------------------------
-# Multi-Agent Components
-# ---------------------------------------------------------------------------
-class ChildAgent:
-    def __init__(self, name, retriever):
-        self.name = name
-        self.chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False
-        )
-
-    def ask(self, query):
-        return self.chain.run(query)
-
-
-class CoordinatorAgent:
-    def __init__(self, child_agents):
-        self.children = child_agents
-
-    def coordinate(self, query):
-        # ask all children and consolidate
-        answers = []
-        for child in self.children:
-            try:
-                resp = child.ask(query)
-                if resp and 'not found' not in resp.lower():
-                    answers.append((child.name, resp))
-            except Exception:
-                continue
-        return answers
-
-
-class OversightAgent:
-    def validate(self, answers):
-        if not answers:
-            return None
-        # pick best (first) for simplicity
-        return answers[0][1]
-
-
-class LearningAgent:
-    def __init__(self):
-        self.logs = []
-
-    def log(self, user_query, response):
-        self.logs.append({'query': user_query, 'response': response})
-
-
-class AgentManager:
-    def __init__(self, agents):
-        self.coordinator = CoordinatorAgent(agents)
-        self.oversight = OversightAgent()
-        self.learning = LearningAgent()
-
-    def handle_query(self, query):
-        raw_answers = self.coordinator.coordinate(query)
-        validated = self.oversight.validate(raw_answers)
-        if not validated:
-            answer = "Relevant information not found in the workbooks."
-        else:
-            answer = validated
-        self.learning.log(query, answer)
-        return answer
-
-# ---------------------------------------------------------------------------
-# Data & Vectorstore Setup
-# ---------------------------------------------------------------------------
-@st.cache_data
-def load_workbooks(paths):
-    dfs = {}
-    for name, path in paths.items():
-        xls = pd.ExcelFile(path)
-        for sheet in xls.sheet_names:
-            df = xls.parse(sheet)
-            key = f"{name}:{sheet}"
-            dfs[key] = df
-    return dfs
-
-@st.cache_resource
-def build_vectorstores(dfs):
-    agents = []
-    for key, df in dfs.items():
-        docs = []
-        for _, row in df.iterrows():
-            text = json.dumps(row.dropna().to_dict())
-            docs.append(Document(page_content=text, metadata={'source': key}))
-        store = FAISS.from_documents(docs, cached_embeddings)
-        retriever = store.as_retriever(search_kwargs={"k": 5})
-        agents.append(ChildAgent(name=key, retriever=retriever))
-    return agents
-
-# ---------------------------------------------------------------------------
-# Streamlit UI
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="Excel Chatbot", page_icon="🤖")
-st.title("🤖 Excel-based Multi-Agent Chatbot")
-
-uploaded1 = st.file_uploader("Upload 'formula_master_osd.xlsx'", type=["xlsx"] )
-uploaded2 = st.file_uploader("Upload 'masterlist_osd_equipments.xlsx'", type=["xlsx"] )
-
-if uploaded1 and uploaded2:
-    with st.spinner("Loading data and building agents..."):
-        paths = {
-            'formula_master_osd': uploaded1,
-            'masterlist_osd_equipments': uploaded2
-        }
-        dfs = load_workbooks(paths)
-        child_agents = build_vectorstores(dfs)
-        manager = AgentManager(child_agents)
+def convert_excel_to_json(file_path):
+    """
+    Convert Excel file to JSON, handling various edge cases including images,
+    formulas, merged cells, and multiple sheets.
+    """
+    # Load the Excel file with openpyxl to handle images and cell properties
+    wb = openpyxl.load_workbook(file_path, data_only=False)
+    wb_data_only = openpyxl.load_workbook(file_path, data_only=True)
     
-    if 'chat_history' not in st.session_state:
-        st.session_state.chat_history = []
-    if 'initialized' not in st.session_state:
-        st.session_state.initialized = True
-        st.session_state.chat_history.append(("bot", 
-            "Hi! I'm your Excel Chatbot. Here are some sample prompts to get you started:"))
-        sample_prompts = [
-            f"Do we have Tapasya made with Capacity 600L in FTO-3?",
-            f"What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
-            f"What are the various literature sources considered in RMG?"
-        ]
-        for p in sample_prompts:
-            st.session_state.chat_history.append(("bot", p))
+    result = {}
+    
+    # Process each sheet
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        ws_data = wb_data_only[sheet_name]
+        
+        # Get merged cell ranges
+        merged_cells = list(ws.merged_cells.ranges)
+        merged_cell_info = []
+        
+        for merged_range in merged_cells:
+            merged_cell_info.append({
+                'range': str(merged_range),
+                'min_row': merged_range.min_row,
+                'max_row': merged_range.max_row,
+                'min_col': merged_range.min_col,
+                'max_col': merged_range.max_col,
+                'top_left_cell': f"{get_column_letter(merged_range.min_col)}{merged_range.min_row}"
+            })
+        
+        # Extract images
+        images = []
+        for image in ws._images:
+            img_data = {
+                'anchor': str(image.anchor),
+                'description': image.description or '',
+                'filename': image.filename,
+                'type': os.path.splitext(image.filename)[1] if hasattr(image, 'filename') else None
+            }
+            
+            # Try to get image data if possible
+            try:
+                img_bytes = BytesIO()
+                pil_img = PILImage.open(BytesIO(image._data()))
+                pil_img.save(img_bytes, format=pil_img.format)
+                img_data['data'] = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
+                img_data['format'] = pil_img.format
+                img_data['size'] = pil_img.size
+            except Exception as e:
+                img_data['error'] = str(e)
+            
+            images.append(img_data)
+        
+        # Extract cell data including formulas
+        data = []
+        max_row = ws.max_row
+        max_col = ws.max_column
+        
+        for row in range(1, max_row + 1):
+            row_data = {}
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row=row, column=col)
+                cell_data = ws_data.cell(row=row, column=col)
+                col_letter = get_column_letter(col)
+                cell_address = f"{col_letter}{row}"
+                
+                # Skip cells that are part of a merged range but not the top-left cell
+                is_merged_cell = False
+                is_top_left = True
+                for merged_range in merged_cells:
+                    if row >= merged_range.min_row and row <= merged_range.max_row and \
+                       col >= merged_range.min_col and col <= merged_range.max_col:
+                        is_merged_cell = True
+                        if row > merged_range.min_row or col > merged_range.min_col:
+                            is_top_left = False
+                        break
+                
+                if is_merged_cell and not is_top_left:
+                    continue
+                
+                # Extract cell content
+                cell_info = {
+                    'address': cell_address,
+                    'formula': cell.value if cell.data_type == 'f' else None,
+                    'calculated_value': process_cell_value(cell_data.value),
+                    'data_type': cell.data_type,
+                    'style': {
+                        'number_format': cell.number_format,
+                        'font': {
+                            'name': cell.font.name,
+                            'size': cell.font.size,
+                            'bold': cell.font.bold,
+                            'italic': cell.font.italic,
+                            'color': cell.font.color.rgb if cell.font.color else None
+                        },
+                        'fill': {
+                            'type': cell.fill.fill_type,
+                            'color': cell.fill.start_color.rgb if cell.fill.start_color else None
+                        },
+                        'border': {
+                            'top': {
+                                'style': cell.border.top.style,
+                                'color': cell.border.top.color.rgb if cell.border.top.color else None
+                            },
+                            'bottom': {
+                                'style': cell.border.bottom.style,
+                                'color': cell.border.bottom.color.rgb if cell.border.bottom.color else None
+                            },
+                            'left': {
+                                'style': cell.border.left.style,
+                                'color': cell.border.left.color.rgb if cell.border.left.color else None
+                            },
+                            'right': {
+                                'style': cell.border.right.style,
+                                'color': cell.border.right.color.rgb if cell.border.right.color else None
+                            }
+                        }
+                    }
+                }
+                
+                # Add merged cell info if applicable
+                if is_merged_cell and is_top_left:
+                    for merged_cell in merged_cell_info:
+                        if merged_cell['top_left_cell'] == cell_address:
+                            cell_info['merged_cell'] = merged_cell
+                            break
+                
+                row_data[cell_address] = cell_info
+            
+            if row_data:  # Only add non-empty rows
+                data.append(row_data)
+        
+        # Store sheet data
+        result[sheet_name] = {
+            'data': data,
+            'merged_cells': merged_cell_info,
+            'images': images,
+            'properties': {
+                'title': sheet_name,
+                'index': wb.sheetnames.index(sheet_name),
+                'visibility': 'visible'  # Default, would need additional logic for hidden sheets
+            }
+        }
+    
+    # Add workbook metadata
+    result['workbook_properties'] = {
+        'title': os.path.basename(file_path),
+        'creator': wb.properties.creator,
+        'last_modified_by': wb.properties.lastModifiedBy,
+        'created': wb.properties.created.isoformat() if wb.properties.created else None,
+        'modified': wb.properties.modified.isoformat() if wb.properties.modified else None,
+        'sheet_count': len(wb.sheetnames),
+        'sheets': wb.sheetnames
+    }
+    
+    return result
 
-    # display chat history
-    for sender, msg in st.session_state.chat_history:
-        if sender == 'user':
-            st.markdown(f"**You:** {msg}")
-        else:
-            st.markdown(f"**Bot:** {msg}")
+def process_cell_value(value):
+    """Process cell values for JSON serialization"""
+    if pd.isna(value):
+        return None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, (np.ndarray, list, tuple)):
+        return [process_cell_value(v) for v in value]
+    if isinstance(value, (pd.Timestamp, pd.DatetimeIndex)):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        return base64.b64encode(value).decode('utf-8')
+    return value
 
-    # user input
-    query = st.text_input("Your question:", key="input_query")
-    if query:
-        st.session_state.chat_history.append(("user", query))
-        response = manager.handle_query(query)
-        st.session_state.chat_history.append(("bot", response))
-        st.experimental_rerun()
-else:
-    st.info("Please upload both Excel workbooks to initialize the chatbot.")
+def main():
+    st.set_page_config(
+        page_title="Excel to JSON Converter",
+        page_icon="📊",
+        layout="wide"
+    )
+    
+    st.title("📊 Excel to JSON Converter")
+    st.markdown("""
+    This application converts Excel files to detailed JSON format, preserving:
+    * Images (including ChemDraw)
+    * Formulas
+    * Merged cells
+    * Multiple sheets
+    * Cell styling
+    * And more!
+    """)
+    
+    uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx", "xls", "xlsm"])
+    
+    if uploaded_file is not None:
+        with st.spinner("Converting Excel to JSON..."):
+            # Save the uploaded file to a temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+                tmp.write(uploaded_file.getvalue())
+                tmp_path = tmp.name
+            
+            try:
+                # Process the Excel file
+                result = convert_excel_to_json(tmp_path)
+                
+                # Clean up the temporary file
+                os.unlink(tmp_path)
+                
+                # Convert to JSON string
+                json_str = json.dumps(result, indent=2, ensure_ascii=False)
+                
+                # Display success message
+                st.success("Conversion Completed Successfully!")
+                
+                # Show statistics
+                st.subheader("Excel File Statistics")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Sheets", len(result.keys()) - 1)  # Subtract 1 for the workbook_properties
+                
+                sheet_data = [sheet for name, sheet in result.items() if name != 'workbook_properties']
+                with col2:
+                    total_images = sum(len(sheet.get('images', [])) for sheet in sheet_data)
+                    st.metric("Images", total_images)
+                
+                with col3:
+                    total_merged_cells = sum(len(sheet.get('merged_cells', [])) for sheet in sheet_data)
+                    st.metric("Merged Cell Ranges", total_merged_cells)
+                
+                # Allow user to download the JSON file
+                st.download_button(
+                    label="Download JSON",
+                    data=json_str.encode('utf-8'),
+                    file_name=f"{os.path.splitext(uploaded_file.name)[0]}.json",
+                    mime="application/json"
+                )
+                
+                # Preview the JSON
+                with st.expander("Preview JSON Output"):
+                    st.json(result)
+                
+                # Show sheet previews
+                st.subheader("Sheet Previews")
+                sheet_tabs = st.tabs(result['workbook_properties']['sheets'])
+                
+                for i, sheet_name in enumerate(result['workbook_properties']['sheets']):
+                    with sheet_tabs[i]:
+                        if sheet_name in result:
+                            # Display basic sheet info
+                            st.write(f"Sheet Index: {result[sheet_name]['properties']['index']}")
+                            
+                            # Display cells in a simplified table format
+                            if result[sheet_name]['data']:
+                                st.write("Sample Cell Data:")
+                                sample_cells = {}
+                                
+                                # Extract first 10 rows for preview
+                                max_preview_rows = min(10, len(result[sheet_name]['data']))
+                                for row_idx in range(max_preview_rows):
+                                    for cell_addr, cell_info in result[sheet_name]['data'][row_idx].items():
+                                        sample_cells[cell_addr] = cell_info['calculated_value']
+                                
+                                # Create a simplified preview table
+                                preview_data = []
+                                row_addresses = sorted(list({int(addr[1:]) for addr in sample_cells.keys()}))
+                                col_addresses = sorted(list({addr[0] for addr in sample_cells.keys()}))
+                                
+                                header = ["Row/Col"] + col_addresses
+                                preview_data.append(header)
+                                
+                                for row in row_addresses:
+                                    row_data = [str(row)]
+                                    for col in col_addresses:
+                                        cell_addr = f"{col}{row}"
+                                        row_data.append(sample_cells.get(cell_addr, ""))
+                                    preview_data.append(row_data)
+                                
+                                st.table(preview_data)
+                            
+                            # Display merged cells
+                            if result[sheet_name]['merged_cells']:
+                                with st.expander("Merged Cells"):
+                                    for mc in result[sheet_name]['merged_cells'][:10]:  # Show first 10
+                                        st.write(f"Range: {mc['range']}")
+                            
+                            # Display images
+                            if result[sheet_name]['images']:
+                                with st.expander("Images"):
+                                    st.write(f"Sheet contains {len(result[sheet_name]['images'])} images")
+                                    
+                                    # Display first 5 images with their information
+                                    for idx, img in enumerate(result[sheet_name]['images'][:5]):
+                                        st.write(f"Image {idx+1}:")
+                                        st.write(f"- Type: {img['type']}")
+                                        st.write(f"- Position: {img['anchor']}")
+                                        
+                                        # Try to display the image if data is available
+                                        if 'data' in img:
+                                            try:
+                                                img_data = base64.b64decode(img['data'])
+                                                st.image(img_data, caption=f"Image at {img['anchor']}")
+                                            except Exception as e:
+                                                st.error(f"Could not display image: {e}")
+                        else:
+                            st.error(f"No data found for sheet: {sheet_name}")
+                
+            except Exception as e:
+                st.error(f"Error processing Excel file: {str(e)}")
+                st.exception(e)
+                # Clean up in case of error
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+
+if __name__ == "__main__":
+    main()
