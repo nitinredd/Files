@@ -1,328 +1,36 @@
 import streamlit as st
-import pandas as pd
+from PIL import Image
 import base64
-import json
 import io
-import os
-import tempfile
-import openpyxl
-from openpyxl.utils.cell import get_column_letter
-from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage
-import numpy as np
-from io import BytesIO
 
-def convert_excel_to_json(file_path):
-    """
-    Convert Excel file to JSON, handling various edge cases including images,
-    formulas, merged cells, and multiple sheets.
-    """
-    # Load the Excel file with openpyxl to handle images and cell properties
-    wb = openpyxl.load_workbook(file_path, data_only=False)
-    wb_data_only = openpyxl.load_workbook(file_path, data_only=True)
-    
-    result = {}
-    
-    # Process each sheet
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        ws_data = wb_data_only[sheet_name]
-        
-        # Get merged cell ranges
-        merged_cells = list(ws.merged_cells.ranges)
-        merged_cell_info = []
-        
-        for merged_range in merged_cells:
-            merged_cell_info.append({
-                'range': str(merged_range),
-                'min_row': merged_range.min_row,
-                'max_row': merged_range.max_row,
-                'min_col': merged_range.min_col,
-                'max_col': merged_range.max_col,
-                'top_left_cell': f"{get_column_letter(merged_range.min_col)}{merged_range.min_row}"
-            })
-        
-        # Extract images
-        images = []
-        for image in ws._images:
-            img_data = {
-                'anchor': str(image.anchor),
-                'description': image.description or '',
-                'filename': image.filename,
-                'type': os.path.splitext(image.filename)[1] if hasattr(image, 'filename') else None
-            }
-            
-            # Try to get image data if possible
-            try:
-                img_bytes = BytesIO()
-                pil_img = PILImage.open(BytesIO(image._data()))
-                pil_img.save(img_bytes, format=pil_img.format)
-                img_data['data'] = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
-                img_data['format'] = pil_img.format
-                img_data['size'] = pil_img.size
-            except Exception as e:
-                img_data['error'] = str(e)
-            
-            images.append(img_data)
-        
-        # Extract cell data including formulas
-        data = []
-        max_row = ws.max_row
-        max_col = ws.max_column
-        
-        for row in range(1, max_row + 1):
-            row_data = {}
-            for col in range(1, max_col + 1):
-                cell = ws.cell(row=row, column=col)
-                cell_data = ws_data.cell(row=row, column=col)
-                col_letter = get_column_letter(col)
-                cell_address = f"{col_letter}{row}"
-                
-                # Skip cells that are part of a merged range but not the top-left cell
-                is_merged_cell = False
-                is_top_left = True
-                for merged_range in merged_cells:
-                    if row >= merged_range.min_row and row <= merged_range.max_row and \
-                       col >= merged_range.min_col and col <= merged_range.max_col:
-                        is_merged_cell = True
-                        if row > merged_range.min_row or col > merged_range.min_col:
-                            is_top_left = False
-                        break
-                
-                if is_merged_cell and not is_top_left:
-                    continue
-                
-                # Extract cell content
-                cell_info = {
-                    'address': cell_address,
-                    'formula': cell.value if cell.data_type == 'f' else None,
-                    'calculated_value': process_cell_value(cell_data.value),
-                    'data_type': cell.data_type,
-                    'style': {
-                        'number_format': cell.number_format,
-                        'font': {
-                            'name': cell.font.name,
-                            'size': cell.font.size,
-                            'bold': cell.font.bold,
-                            'italic': cell.font.italic,
-                            'color': cell.font.color.rgb if cell.font.color else None
-                        },
-                        'fill': {
-                            'type': cell.fill.fill_type,
-                            'color': cell.fill.start_color.rgb if cell.fill.start_color else None
-                        },
-                        'border': {
-                            'top': {
-                                'style': cell.border.top.style,
-                                'color': cell.border.top.color.rgb if cell.border.top.color else None
-                            },
-                            'bottom': {
-                                'style': cell.border.bottom.style,
-                                'color': cell.border.bottom.color.rgb if cell.border.bottom.color else None
-                            },
-                            'left': {
-                                'style': cell.border.left.style,
-                                'color': cell.border.left.color.rgb if cell.border.left.color else None
-                            },
-                            'right': {
-                                'style': cell.border.right.style,
-                                'color': cell.border.right.color.rgb if cell.border.right.color else None
-                            }
-                        }
-                    }
-                }
-                
-                # Add merged cell info if applicable
-                if is_merged_cell and is_top_left:
-                    for merged_cell in merged_cell_info:
-                        if merged_cell['top_left_cell'] == cell_address:
-                            cell_info['merged_cell'] = merged_cell
-                            break
-                
-                row_data[cell_address] = cell_info
-            
-            if row_data:  # Only add non-empty rows
-                data.append(row_data)
-        
-        # Store sheet data
-        result[sheet_name] = {
-            'data': data,
-            'merged_cells': merged_cell_info,
-            'images': images,
-            'properties': {
-                'title': sheet_name,
-                'index': wb.sheetnames.index(sheet_name),
-                'visibility': 'visible'  # Default, would need additional logic for hidden sheets
-            }
-        }
-    
-    # Add workbook metadata
-    result['workbook_properties'] = {
-        'title': os.path.basename(file_path),
-        'creator': wb.properties.creator,
-        'last_modified_by': wb.properties.lastModifiedBy,
-        'created': wb.properties.created.isoformat() if wb.properties.created else None,
-        'modified': wb.properties.modified.isoformat() if wb.properties.modified else None,
-        'sheet_count': len(wb.sheetnames),
-        'sheets': wb.sheetnames
-    }
-    
-    return result
+def optimize_image(image: Image.Image, max_size=(800, 800), quality=85):
+    """Optimize the image by resizing and compressing."""
+    image.thumbnail(max_size)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality)
+    buffer.seek(0)
+    return buffer
 
-def process_cell_value(value):
-    """Process cell values for JSON serialization"""
-    if pd.isna(value):
-        return None
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    if isinstance(value, (np.ndarray, list, tuple)):
-        return [process_cell_value(v) for v in value]
-    if isinstance(value, (pd.Timestamp, pd.DatetimeIndex)):
-        return value.isoformat()
-    if isinstance(value, (bytes, bytearray)):
-        return base64.b64encode(value).decode('utf-8')
-    return value
+def image_to_base64(image: Image.Image):
+    """Convert image to base64 string."""
+    optimized_image = optimize_image(image)
+    encoded_string = base64.b64encode(optimized_image.read()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded_string}"
+
+def display_image_from_base64(base64_string):
+    """Display image from base64 string."""
+    st.image(base64_string, caption="Uploaded Image", use_column_width=True)
 
 def main():
-    st.set_page_config(
-        page_title="Excel to JSON Converter",
-        page_icon="📊",
-        layout="wide"
-    )
-    
-    st.title("📊 Excel to JSON Converter")
-    st.markdown("""
-    This application converts Excel files to detailed JSON format, preserving:
-    * Images (including ChemDraw)
-    * Formulas
-    * Merged cells
-    * Multiple sheets
-    * Cell styling
-    * And more!
-    """)
-    
-    uploaded_file = st.file_uploader("Upload an Excel file", type=["xlsx", "xls", "xlsm"])
-    
+    st.title("Image to Base64 Converter")
+
+    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
     if uploaded_file is not None:
-        with st.spinner("Converting Excel to JSON..."):
-            # Save the uploaded file to a temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-                tmp.write(uploaded_file.getvalue())
-                tmp_path = tmp.name
-            
-            try:
-                # Process the Excel file
-                result = convert_excel_to_json(tmp_path)
-                
-                # Clean up the temporary file
-                os.unlink(tmp_path)
-                
-                # Convert to JSON string
-                json_str = json.dumps(result, indent=2, ensure_ascii=False)
-                
-                # Display success message
-                st.success("Conversion Completed Successfully!")
-                
-                # Show statistics
-                st.subheader("Excel File Statistics")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Sheets", len(result.keys()) - 1)  # Subtract 1 for the workbook_properties
-                
-                sheet_data = [sheet for name, sheet in result.items() if name != 'workbook_properties']
-                with col2:
-                    total_images = sum(len(sheet.get('images', [])) for sheet in sheet_data)
-                    st.metric("Images", total_images)
-                
-                with col3:
-                    total_merged_cells = sum(len(sheet.get('merged_cells', [])) for sheet in sheet_data)
-                    st.metric("Merged Cell Ranges", total_merged_cells)
-                
-                # Allow user to download the JSON file
-                st.download_button(
-                    label="Download JSON",
-                    data=json_str.encode('utf-8'),
-                    file_name=f"{os.path.splitext(uploaded_file.name)[0]}.json",
-                    mime="application/json"
-                )
-                
-                # Preview the JSON
-                with st.expander("Preview JSON Output"):
-                    st.json(result)
-                
-                # Show sheet previews
-                st.subheader("Sheet Previews")
-                sheet_tabs = st.tabs(result['workbook_properties']['sheets'])
-                
-                for i, sheet_name in enumerate(result['workbook_properties']['sheets']):
-                    with sheet_tabs[i]:
-                        if sheet_name in result:
-                            # Display basic sheet info
-                            st.write(f"Sheet Index: {result[sheet_name]['properties']['index']}")
-                            
-                            # Display cells in a simplified table format
-                            if result[sheet_name]['data']:
-                                st.write("Sample Cell Data:")
-                                sample_cells = {}
-                                
-                                # Extract first 10 rows for preview
-                                max_preview_rows = min(10, len(result[sheet_name]['data']))
-                                for row_idx in range(max_preview_rows):
-                                    for cell_addr, cell_info in result[sheet_name]['data'][row_idx].items():
-                                        sample_cells[cell_addr] = cell_info['calculated_value']
-                                
-                                # Create a simplified preview table
-                                preview_data = []
-                                row_addresses = sorted(list({int(addr[1:]) for addr in sample_cells.keys()}))
-                                col_addresses = sorted(list({addr[0] for addr in sample_cells.keys()}))
-                                
-                                header = ["Row/Col"] + col_addresses
-                                preview_data.append(header)
-                                
-                                for row in row_addresses:
-                                    row_data = [str(row)]
-                                    for col in col_addresses:
-                                        cell_addr = f"{col}{row}"
-                                        row_data.append(sample_cells.get(cell_addr, ""))
-                                    preview_data.append(row_data)
-                                
-                                st.table(preview_data)
-                            
-                            # Display merged cells
-                            if result[sheet_name]['merged_cells']:
-                                with st.expander("Merged Cells"):
-                                    for mc in result[sheet_name]['merged_cells'][:10]:  # Show first 10
-                                        st.write(f"Range: {mc['range']}")
-                            
-                            # Display images
-                            if result[sheet_name]['images']:
-                                with st.expander("Images"):
-                                    st.write(f"Sheet contains {len(result[sheet_name]['images'])} images")
-                                    
-                                    # Display first 5 images with their information
-                                    for idx, img in enumerate(result[sheet_name]['images'][:5]):
-                                        st.write(f"Image {idx+1}:")
-                                        st.write(f"- Type: {img['type']}")
-                                        st.write(f"- Position: {img['anchor']}")
-                                        
-                                        # Try to display the image if data is available
-                                        if 'data' in img:
-                                            try:
-                                                img_data = base64.b64decode(img['data'])
-                                                st.image(img_data, caption=f"Image at {img['anchor']}")
-                                            except Exception as e:
-                                                st.error(f"Could not display image: {e}")
-                        else:
-                            st.error(f"No data found for sheet: {sheet_name}")
-                
-            except Exception as e:
-                st.error(f"Error processing Excel file: {str(e)}")
-                st.exception(e)
-                # Clean up in case of error
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+        image = Image.open(uploaded_file)
+        base64_string = image_to_base64(image)
+        display_image_from_base64(base64_string)
+        st.write("Base64 String:")
+        st.text_area("Base64 Output", base64_string, height=300)
 
 if __name__ == "__main__":
     main()
