@@ -2,93 +2,168 @@ import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './Chatbot.css'
 
-export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
+export default function Chatbot({ apiUrl }) {
   const [open, setOpen] = useState(false)
+  const [tiles, setTiles] = useState({})
+  const [selectedTile, setSelectedTile] = useState(null)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
+  const [recording, setRecording] = useState(false)
+  const mediaRecorderRef = useRef(null)
+  const audioChunksRef = useRef([])
   const messagesEndRef = useRef(null)
 
+  // Load sample‑prompt tiles
   useEffect(() => {
-    if (open && messages.length === 0) {
+    axios.get(`${apiUrl}/sample-tiles`)
+      .then(res => setTiles(res.data))
+      .catch(console.error)
+  }, [apiUrl])
+
+  // On open, send greeting + tiles options
+  useEffect(() => {
+    if (open && messages.length === 0 && Object.keys(tiles).length) {
       setMessages([
         { from: 'bot', text: 'Hi! How can I help?' },
-        { from: 'bot', options: samplePrompts }
+        { from: 'bot', options: Object.keys(tiles) }
       ])
     }
-  }, [open])
+  }, [open, tiles])
 
+  // Scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const send = async (text) => {
+  // Send a text query
+  const sendText = async (text) => {
     setMessages(m => [...m, { from: 'user', text }])
     setInput('')
-    const res = await axios.post(apiUrl, { message: text })
-    if (res.data.tables) {
-      setMessages(m => [
-        ...m,
-        { from: 'bot', text: res.data.response },
-        { from: 'bot', tables: res.data.tables }
-      ])
-    } else {
+    try {
+      const res = await axios.post(`${apiUrl}/chat`, { message: text })
       setMessages(m => [...m, { from: 'bot', text: res.data.response }])
+    } catch {
+      setMessages(m => [...m, { from: 'bot', text: 'Server error.' }])
+    }
+  }
+
+  // Handle tile click
+  const onTileClick = (tile) => {
+    setSelectedTile(tile)
+    setMessages(m => [...m, { from: 'user', text: tile }])
+    setMessages(m => [...m, { from: 'bot', options: tiles[tile] }])
+  }
+
+  // Handle option click
+  const onOptionClick = (opt) => {
+    sendText(opt)
+    setSelectedTile(null)
+  }
+
+  // Voice recording start
+  const startRecording = async () => {
+    setRecording(true)
+    audioChunksRef.current = []
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+    const mr = new MediaRecorder(stream)
+    mediaRecorderRef.current = mr
+    mr.ondataavailable = e => audioChunksRef.current.push(e.data)
+    mr.start()
+  }
+
+  // Voice recording stop & upload
+  const stopRecording = () => {
+    mediaRecorderRef.current.stop()
+    mediaRecorderRef.current.onstop = async () => {
+      setRecording(false)
+      const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
+      const form = new FormData()
+      form.append('file', blob, 'voice.webm')
+      try {
+        const sttRes = await axios.post(
+          `${apiUrl}/speech-to-text`,
+          form,
+          { headers: { 'Content-Type': 'multipart/form-data' } }
+        )
+        const text = sttRes.data.text
+        sendText(text)
+      } catch {
+        setMessages(m => [...m, { from: 'bot', text: 'Voice‑to‑text failed.' }])
+      }
+    }
+  }
+
+  // Play TTS for a bot message
+  const playAudio = async (text) => {
+    try {
+      const audioRes = await axios.get(
+        `${apiUrl}/text-to-speech`,
+        { params: { text }, responseType: 'blob' }
+      )
+      const url = URL.createObjectURL(audioRes.data)
+      new Audio(url).play()
+    } catch {
+      // silently ignore
     }
   }
 
   return (
-    <>
-      <div
-        className={`chatbot-widget ${open ? 'open' : ''}`}
-        style={{ backgroundImage: `url(${backgroundImage})` }}
-      >
-        <div className="chat-header" onClick={() => setOpen(o => !o)}>
-          {open ? '––' : '💬'}
-        </div>
-        {open && (
-          <div className="chat-body">
-            <div className="messages">
-              {messages.map((m, i) =>
-                m.options ? (
-                  <div key={i} className="bot-options">
-                    {m.options.map((opt, j) => (
-                      <button key={j} onClick={() => send(opt)}>{opt}</button>
-                    ))}
-                  </div>
-                ) : m.tables ? (
-                  m.tables.map((tbl, ti) => (
-                    <div key={ti}>
-                      <strong>Sheet: {tbl.sheet}</strong>
-                      <table>
-                        <thead>
-                          <tr>{tbl.columns.map((c, ci) => <th key={ci}>{c}</th>)}</tr>
-                        </thead>
-                        <tbody>
-                          {tbl.rows.map((row, ri) => (
-                            <tr key={ri}>{row.map((cell, ci) => <td key={ci}>{cell}</td>)}</tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ))
-                ) : (
-                  <div key={i} className={m.from}>{m.text}</div>
-                )
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-            <div className="chat-input">
-              <input
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && input.trim() && send(input)}
-                placeholder="Type your question…"
-              />
-              <button disabled={!input.trim()} onClick={() => send(input)}>Send</button>
-            </div>
-          </div>
-        )}
+    <div
+      className={`chatbot-widget ${open ? 'open' : ''}`}
+      style={{ backgroundImage: `url('/chat-widget-bg.png')` }}
+    >
+      <div className="chat-header" onClick={() => setOpen(o => !o)}>
+        {open ? '––' : '💬'}
       </div>
-    </>
+      {open && (
+        <div className="chat-body">
+          <div className="messages">
+            {messages.map((m, i) =>
+              m.options ? (
+                <div key={i} className="bot-options">
+                  {m.options.map((opt, j) => (
+                    <button key={j} onClick={() => onOptionClick(opt)}>
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div key={i} className={m.from}>
+                  {m.text}
+                  {m.from === 'bot' && (
+                    <button
+                      className="read-button"
+                      onClick={() => playAudio(m.text)}
+                    >🔊</button>
+                  )}
+                </div>
+              )
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+          <div className="chat-input">
+            <button
+              className={`mic-button ${recording ? 'recording' : ''}`}
+              onMouseDown={startRecording}
+              onMouseUp={stopRecording}
+            >
+              🎙️
+            </button>
+            <input
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && input.trim() && sendText(input)}
+              placeholder="Type your question…"
+            />
+            <button
+              disabled={!input.trim()}
+              onClick={() => sendText(input)}
+            >
+              Send
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   )
 }
