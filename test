@@ -1,227 +1,126 @@
-import os
-import json
-import pandas as pd
-import streamlit as st
-from langchain_openai import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from gtts import gTTS
-import speech_recognition as sr
-import io
-import uuid
+# [PREVIOUS CODE UNCHANGED — UP TO build_vectorstores()]
 
-recognizer = sr.Recognizer()
+# ------------------ START STREAMLIT UI ------------------
+st.set_page_config(page_title="AI Chatbot", page_icon="🤖", layout="wide")
+st.title("AI Chatbot")
 
-# Azure GPT Configuration
-base_url = ""
-api_version = "2024-02-15-preview"
-api_key = ""
-deployment_name = "GPT4o"
-model_name = "GPT4o"
+# Load JSON data and initialize agents
+with st.spinner("Loading data and building agents..."):
+    dfs = load_json_data(embedded_files)
+    child_agents = build_vectorstores(dfs)
+    manager = AgentManager(child_agents)
 
-# Paths to embedded JSON files
-embedded_files = {
-    'data_1': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Test_1.json",
-    'data_2': None,
-    'data_3': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Formulas.json",
-}
+# Initialize session state once
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.chat_history = [("bot", "Hi! I'm your AI Chatbot. Here are sample prompts to get you started:")]
+    st.session_state.chat_history_speaker = None
+    st.session_state.selected_tile = None
+    st.session_state.selected_question = None
 
-# Initialize embeddings & chat_model
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_version="2023-07-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment=""
-)
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
-
-# Voice helpers
-def recognize_google_stt():
-    with sr.Microphone() as source:
-        st.info("🎙️ Listening… speak now")
-        audio = recognizer.listen(source, phrase_time_limit=5)
-        st.success("🔍 Processing…")
-        try:
-            return recognizer.recognize_google(audio)
-        except sr.UnknownValueError:
-            return "Sorry, I couldn't understand your voice."
-        except sr.RequestError as e:
-            return f"Error: {e}"
-
-def tts_stream(text: str):
-    buf = io.BytesIO()
-    gTTS(text).write_to_fp(buf)
-    buf.seek(0)
-    return buf
-
-# Multi-Agent classes (unchanged core logic except the no-results message)
-class ChildAgent:
-    def __init__(self, name, retriever):
-        self.name = name
-        self.chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=True
-        )
-    def ask(self, query):
-        response = self.chain.invoke({"query": query})
-        result = response.get("result", "")
-        return result
-
+# ---- STRICT QUERY HANDLING ----
 class CoordinatorAgent:
     def __init__(self, child_agents):
         self.children = child_agents
 
     def coordinate(self, query):
-        # Return only the first child that gives a non-"not found" answer
         for child in self.children:
             try:
-                resp = child.ask(query)
-                if resp and 'not found' not in resp.lower():
-                    return resp
-            except:
+                resp = child.chain.invoke({"query": query})
+                result = resp.get("result", "")
+                docs = resp.get("source_documents", [])
+
+                if not docs or all(len(doc.page_content.strip()) < 30 for doc in docs):
+                    continue  # Not enough substance
+
+                # Optional: stricter matching can be done here (e.g., cosine similarity threshold)
+
+                image_paths = [
+                    f"{key}: {doc.metadata.get(key)}"
+                    for doc in docs
+                    for key in ['tables', 'synthetic_scheme']
+                    if doc.metadata.get(key)
+                ]
+                if image_paths:
+                    result += "\n\nRelated Images:\n" + "\n".join(image_paths)
+
+                return [(child.name, result)]
+            except Exception as e:
+                st.error(f"Error querying {child.name}: {e}")
                 continue
-        return None
+        return [("Coordinator", "Oops! No relevant information found.")]
 
+# --- Oversight Agent ---
 class OversightAgent:
-    def validate(self, answer):
-        return answer  # pass through
+    def validate(self, answers):
+        if not answers:
+            return None
+        first_answer = answers[0][1]
+        if not first_answer or "no relevant" in first_answer.lower():
+            return None
+        return first_answer
 
-class LearningAgent:
-    def __init__(self):
-        self.logs = []
-    def log(self, user_query, response):
-        self.logs.append({'query': user_query, 'response': response})
+# --- Sample Prompt Tiles & Dropdown ---
+TILE_QUESTIONS = {
+    "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
+    "Line B": ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
+    "Facility X": ["Who owns this facility?", "What lines are operational?"],
+    "Formulation Z": ["List excipients used", "Describe dissolution method"],
+    "Process Y": ["Steps in granulation?", "Drying temperature?"],
+    "Machine Q": ["Model number details?", "Maintenance interval?"],
+    "Raw Material P": ["What are specs?", "Approved vendors?"]
+}
 
-class AgentManager:
-    def __init__(self, agents):
-        self.coordinator = CoordinatorAgent(agents)
-        self.oversight = OversightAgent()
-        self.learning = LearningAgent()
+st.subheader("Sample Prompts:")
+selected_tile = None
+cols = st.columns(len(TILE_QUESTIONS))
 
-    def handle_query(self, query):
-        raw = self.coordinator.coordinate(query)
-        if not raw:
-            answer = "Oops! No relevant information found."
-        else:
-            answer = raw
-        self.learning.log(query, answer)
-        return answer
+for i, (tile_name, questions) in enumerate(TILE_QUESTIONS.items()):
+    with cols[i]:
+        if st.button(tile_name, key=f"tile_{i}"):
+            st.session_state.selected_tile = tile_name
 
-# Data loading & vectorstore
-def load_json_data(file_paths):
-    dfs = {}
-    for name, path in file_paths.items():
-        if not path:
-            continue
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                records = []
-                for item in data:
-                    content = json.dumps(item, sort_keys=True)
-                    records.append({'content': content})
-                dfs[name] = pd.DataFrame(records)
-            elif isinstance(data, dict):
-                content = json.dumps({**{'source': name}, **data}, sort_keys=True)
-                dfs[name] = pd.DataFrame([{'content': content}])
-        except Exception as e:
-            st.error(f"Error loading JSON '{name}': {e}")
-    return dfs
+# Show dropdown when a tile is clicked
+if st.session_state.get("selected_tile"):
+    selected_tile = st.session_state.selected_tile
+    question = st.selectbox("Select a question:", TILE_QUESTIONS[selected_tile], key="tile_question")
+    if st.button("Ask", key="tile_ask"):
+        response = manager.handle_query(question)
+        st.session_state.chat_history.append(("user", question))
+        st.session_state.chat_history.append(("bot", response))
+        st.rerun()
 
-def build_vectorstores(dfs):
-    child_agents = []
-    for key, df in dfs.items():
-        docs = [Document(page_content=row['content'], metadata={'source': key}) for _, row in df.iterrows()]
-        if not docs:
-            continue
-        store = FAISS.from_documents(docs, cached_embeddings)
-        retriever = store.as_retriever(search_kwargs={"k": 5})
-        child_agents.append(ChildAgent(name=key, retriever=retriever))
-    return child_agents
-
-# Streamlit UI
-st.set_page_config(page_title="AI Chatbot", layout="wide")
-st.title("AI Chatbot")
-
-# Load data & agents once
-with st.spinner("Initializing..."):
-    dfs = load_json_data(embedded_files)
-    agents = build_vectorstores(dfs)
-    manager = AgentManager(agents)
-
-# Initialize session state
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = [("bot", "Hi! I'm your AI Chatbot.")]
-
-# Display chat history
-for sender, msg in st.session_state.chat_history:
+# ---- Chat Display ----
+for idx, (sender, msg) in enumerate(st.session_state.chat_history):
     if sender == "user":
         st.chat_message("user").markdown(f"**You:** {msg}")
     else:
         st.chat_message("assistant").markdown(f"**Bot:** {msg}")
         if sender == "bot":
-            if st.button("🔊 Read Aloud", key=f"read_{uuid.uuid4()}"):
-                st.audio(tts_stream(msg), format="audio/mp3")
+            unique_key = f"read_aloud_{idx}"
+            if st.button("🔊 Read Aloud", key=unique_key):
+                try:
+                    mp3_bytes = tts_stream(msg)
+                    st.audio(mp3_bytes, format="audio/mp3")
+                except Exception as e:
+                    st.error(f"⚠️ Could not process audio: {e}")
 
-# Sample-prompt tiles (7 empty tiles for you to populate)
-st.markdown("#### Sample Prompts")
-cols = st.columns(7)
-# A list-of-lists where you'll fill in your 7 prompt groups
-sample_prompt_lists = [[] for _ in range(7)]
-for i, col in enumerate(cols):
-    with col:
-        if st.button(f"Prompt {i+1}", key=f"tile_{i}"):
-            selected = st.selectbox(
-                "Choose a question…", 
-                sample_prompt_lists[i], 
-                key=f"select_{i}"
-            )
-            if selected:
-                st.session_state.chat_history.append(("user", selected))
-                response = manager.handle_query(selected)
-                st.session_state.chat_history.append(("bot", response))
-                # clear the widget state
-                st.experimental_rerun()
+# ---- Text Input + Mic ----
+with st.container():
+    col1, col2 = st.columns([0.85, 0.15])
+    query = col1.text_input("Your question:", key="input_query", value="")
 
-# Main input form
-with st.form(key="query_form", clear_on_submit=True):
-    text = st.text_input("Your question:", key="input_query")
-    mic, submit = st.columns([0.85, 0.15])
-    with mic:
-        st.write("")  # spacer
-    with submit:
-        submit_pressed = st.form_submit_button("Send")
-    if submit_pressed:
-        if not text.strip():
-            st.warning("Please enter a question or use 🎙️ to speak.")
-        else:
-            st.session_state.chat_history.append(("user", text))
-            answer = manager.handle_query(text)
-            st.session_state.chat_history.append(("bot", answer))
-            st.experimental_rerun()
+    if col2.button("🎙️ Speak", key="mic_button"):
+        recognized_query = recognize_google_stt()
+        if recognized_query:
+            st.session_state['temp_query'] = recognized_query
+            st.rerun()
 
-# Microphone outside the form
-if st.button("🎙️ Speak"):
-    voice_q = recognize_google_stt()
-    if voice_q:
-        st.session_state.chat_history.append(("user", voice_q))
-        answer = manager.handle_query(voice_q)
-        st.session_state.chat_history.append(("bot", answer))
-        st.experimental_rerun()
+if 'temp_query' in st.session_state:
+    query = st.session_state.pop('temp_query')
+
+if query:
+    response = manager.handle_query(query)
+    st.session_state.chat_history.append(("user", query))
+    st.session_state.chat_history.append(("bot", response))
+    st.rerun()
