@@ -1,10 +1,11 @@
+// src/components/Chatbot.jsx
+
 import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './Chatbot.css'
 
-export default function Chatbot({ apiBase }) {
+export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
   const [open, setOpen] = useState(false)
-  const [tiles, setTiles] = useState({})
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [recording, setRecording] = useState(false)
@@ -12,48 +13,39 @@ export default function Chatbot({ apiBase }) {
   const audioChunksRef = useRef([])
   const messagesEndRef = useRef(null)
 
-  // Load sample prompts
+  // When widget opens for the first time, show greeting + samplePrompts
   useEffect(() => {
-    axios.get(`${apiBase}/sample-tiles`)
-      .then(res => setTiles(res.data))
-      .catch(console.error)
-  }, [apiBase])
-
-  // On open: greeting + show tile buttons
-  useEffect(() => {
-    if (open && messages.length === 0 && Object.keys(tiles).length) {
+    if (open && messages.length === 0) {
       setMessages([
         { from: 'bot', text: 'Hi! How can I help?' },
-        { from: 'bot', options: Object.keys(tiles) }
+        { from: 'bot', options: samplePrompts }
       ])
     }
-  }, [open, tiles, messages.length])
+  }, [open, samplePrompts, messages.length])
 
   // Auto-scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const sendText = async (text) => {
+  // Core send function
+  const send = async (text) => {
     setMessages(m => [...m, { from: 'user', text }])
     setInput('')
     try {
-      const res = await axios.post(`${apiBase}/chat`, { message: text })
+      const res = await axios.post(apiUrl, { message: text })
       setMessages(m => [...m, { from: 'bot', text: res.data.response }])
     } catch {
       setMessages(m => [...m, { from: 'bot', text: 'Server error.' }])
     }
   }
 
-  const onTileClick = tile => {
-    setMessages(m => [...m, { from: 'user', text: tile }])
-    setMessages(m => [...m, { from: 'bot', options: tiles[tile] }])
+  // Handle sample prompt click
+  const onPromptClick = (prompt) => {
+    send(prompt)
   }
 
-  const onOptionClick = opt => {
-    sendText(opt)
-  }
-
+  // Start recording
   const startRecording = async () => {
     setRecording(true)
     audioChunksRef.current = []
@@ -68,6 +60,7 @@ export default function Chatbot({ apiBase }) {
     }
   }
 
+  // Stop recording and upload for STT
   const stopRecording = () => {
     if (!mediaRecorderRef.current) return
     mediaRecorderRef.current.stop()
@@ -78,30 +71,36 @@ export default function Chatbot({ apiBase }) {
       form.append('file', blob, 'voice.webm')
       try {
         const sttRes = await axios.post(
-          `${apiBase}/speech-to-text`,
+          `${apiUrl.replace(/\/chat$/, '')}/speech-to-text`,
           form,
           { headers: { 'Content-Type': 'multipart/form-data' } }
         )
-        sendText(sttRes.data.text)
+        send(sttRes.data.text)
       } catch {
         setMessages(m => [...m, { from: 'bot', text: 'Voice‑to‑text failed.' }])
       }
     }
   }
 
-  const playAudio = async text => {
+  // Play TTS for a bot message
+  const playAudio = async (text) => {
     try {
       const audioRes = await axios.get(
-        `${apiBase}/text-to-speech`,
+        `${apiUrl.replace(/\/chat$/, '')}/text-to-speech`,
         { params: { text }, responseType: 'blob' }
       )
       const url = URL.createObjectURL(audioRes.data)
       new Audio(url).play()
-    } catch { /* ignore */ }
+    } catch {
+      // ignore
+    }
   }
 
   return (
-    <div className={`chatbot-widget ${open ? 'open' : ''}`}>
+    <div
+      className={`chatbot-widget ${open ? 'open' : ''}`}
+      style={{ backgroundImage: `url(${backgroundImage})` }}
+    >
       <div className="chat-header" onClick={() => setOpen(o => !o)}>
         {open ? '––' : '💬'}
       </div>
@@ -109,22 +108,29 @@ export default function Chatbot({ apiBase }) {
       {open && (
         <div className="chat-body">
           <div className="messages">
-            {messages.map((m, i) => (
-              m.options
-                ? <div key={i} className="bot-options">
-                    {m.options.map((opt, j) => (
-                      <button key={j} className="tile-btn" onClick={() => onOptionClick(opt)}>
-                        {opt}
-                      </button>
-                    ))}
-                  </div>
-                : <div key={i} className={m.from}>
-                    {m.text}
-                    {m.from === 'bot' && (
-                      <button className="read-btn" onClick={() => playAudio(m.text)}>🔊</button>
-                    )}
-                  </div>
-            ))}
+            {messages.map((m, i) =>
+              m.options ? (
+                <div key={i} className="bot-options">
+                  {m.options.map((opt, j) => (
+                    <button key={j} onClick={() => onPromptClick(opt)}>
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div key={i} className={m.from}>
+                  {m.text}
+                  {m.from === 'bot' && (
+                    <button
+                      className="read-button"
+                      onClick={() => playAudio(m.text)}
+                    >
+                      🔊
+                    </button>
+                  )}
+                </div>
+              )
+            )}
             <div ref={messagesEndRef} />
           </div>
 
@@ -134,139 +140,31 @@ export default function Chatbot({ apiBase }) {
               onMouseDown={startRecording}
               onMouseUp={stopRecording}
             >
-              {recording
-                ? <img src="/wave.gif" alt="recording…" className="wave-gif" />
-                : <span className="mic-icon">🎙️</span>
-              }
+              {recording ? (
+                <img src="/wave.gif" alt="Recording…" className="wave-gif" />
+              ) : (
+                <span className="mic-icon">🎙️</span>
+              )}
             </div>
+
             <input
-              type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && input.trim() && sendText(input)}
+              onKeyDown={e =>
+                e.key === 'Enter' && input.trim() && send(input)
+              }
               placeholder="Type your question…"
             />
-            <button className="send-btn" disabled={!input.trim()} onClick={() => sendText(input)}>
-              ➤
+
+            <button
+              disabled={!input.trim()}
+              onClick={() => send(input)}
+            >
+              Send
             </button>
           </div>
         </div>
       )}
     </div>
   )
-}
-#################
-.chatbot-widget {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  width: 320px;
-  max-height: 450px;
-  background: transparent;
-  overflow: hidden;
-  font-family: sans-serif;
-}
-
-.chat-header {
-  background: linear-gradient(135deg, #6c5ce7, #fd79a8);
-  color: white;
-  text-align: center;
-  padding: 8px;
-  border-radius: 20px;
-  cursor: pointer;
-}
-
-.chat-body {
-  background: rgba(255,255,255,0.95);
-  border-radius: 12px;
-  margin-top: 8px;
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-
-.messages {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-}
-
-.user {
-  text-align: right;
-  margin: 6px 0;
-}
-
-.bot {
-  text-align: left;
-  margin: 6px 0;
-  position: relative;
-}
-
-.read-btn {
-  background: none;
-  border: none;
-  cursor: pointer;
-  margin-left: 8px;
-}
-
-.bot-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 8px 0;
-}
-
-.tile-btn {
-  background: linear-gradient(135deg, #74b9ff, #a29bfe);
-  border: none;
-  border-radius: 20px;
-  padding: 6px 12px;
-  color: white;
-  cursor: pointer;
-  font-size: 0.9em;
-}
-
-.chat-input {
-  display: flex;
-  align-items: center;
-  border-top: 1px solid #ddd;
-  padding: 8px;
-}
-
-.mic-wrapper {
-  width: 36px;
-  height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-right: 8px;
-  cursor: pointer;
-}
-
-.mic-icon {
-  font-size: 1.4em;
-}
-
-.wave-gif {
-  width: 36px;
-  height: 36px;
-}
-
-.chat-input input {
-  flex: 1;
-  padding: 8px;
-  border: 1px solid #ccc;
-  border-radius: 18px;
-  margin-right: 8px;
-}
-
-.send-btn {
-  background: linear-gradient(135deg, #6c5ce7, #fd79a8);
-  border: none;
-  border-radius: 50%;
-  color: white;
-  width: 36px;
-  height: 36px;
-  cursor: pointer;
-  font-size: 1em;
 }
