@@ -4,16 +4,33 @@ import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './Chatbot.css'
 
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+
 export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
   const [open, setOpen] = useState(false)
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
-  const [recording, setRecording] = useState(false)
-  const mediaRecorderRef = useRef(null)
-  const audioChunksRef = useRef([])
+  const [listening, setListening] = useState(false)
+  const recognitionRef = useRef(null)
   const messagesEndRef = useRef(null)
 
-  // When widget opens for the first time, show greeting + samplePrompts
+  // Initialize recognition only once
+  useEffect(() => {
+    if (!SpeechRecognition) return
+    const recog = new SpeechRecognition()
+    recog.continuous = false
+    recog.interimResults = false
+    recog.lang = 'en-US'
+    recog.onstart = () => setListening(true)
+    recog.onend   = () => setListening(false)
+    recog.onresult = (e) => {
+      const transcript = e.results[0][0].transcript
+      send(transcript)
+    }
+    recognitionRef.current = recog
+  }, [])
+
+  // On open show greeting + prompts
   useEffect(() => {
     if (open && messages.length === 0) {
       setMessages([
@@ -23,12 +40,11 @@ export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
     }
   }, [open, samplePrompts, messages.length])
 
-  // Auto-scroll
+  // Auto scroll
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // Core send function
   const send = async (text) => {
     setMessages(m => [...m, { from: 'user', text }])
     setInput('')
@@ -40,60 +56,22 @@ export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
     }
   }
 
-  // Handle sample prompt click
-  const onPromptClick = (prompt) => {
-    send(prompt)
+  const handlePromptClick = (opt) => send(opt)
+
+  const startListening = () => {
+    if (!recognitionRef.current) return alert('Browser does not support SpeechRecognition.')
+    recognitionRef.current.start()
   }
 
-  // Start recording
-  const startRecording = async () => {
-    setRecording(true)
-    audioChunksRef.current = []
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mr = new MediaRecorder(stream)
-      mediaRecorderRef.current = mr
-      mr.ondataavailable = e => audioChunksRef.current.push(e.data)
-      mr.start()
-    } catch {
-      setRecording(false)
-    }
-  }
-
-  // Stop recording and upload for STT
-  const stopRecording = () => {
-    if (!mediaRecorderRef.current) return
-    mediaRecorderRef.current.stop()
-    mediaRecorderRef.current.onstop = async () => {
-      setRecording(false)
-      const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-      const form = new FormData()
-      form.append('file', blob, 'voice.webm')
-      try {
-        const sttRes = await axios.post(
-          `${apiUrl.replace(/\/chat$/, '')}/speech-to-text`,
-          form,
-          { headers: { 'Content-Type': 'multipart/form-data' } }
-        )
-        send(sttRes.data.text)
-      } catch {
-        setMessages(m => [...m, { from: 'bot', text: 'Voice‑to‑text failed.' }])
-      }
-    }
-  }
-
-  // Play TTS for a bot message
   const playAudio = async (text) => {
     try {
       const audioRes = await axios.get(
-        `${apiUrl.replace(/\/chat$/, '')}/text-to-speech`,
+        apiUrl.replace(/\/chat$/, '') + '/text-to-speech',
         { params: { text }, responseType: 'blob' }
       )
       const url = URL.createObjectURL(audioRes.data)
       new Audio(url).play()
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   return (
@@ -108,60 +86,39 @@ export default function Chatbot({ apiUrl, backgroundImage, samplePrompts }) {
       {open && (
         <div className="chat-body">
           <div className="messages">
-            {messages.map((m, i) =>
-              m.options ? (
-                <div key={i} className="bot-options">
-                  {m.options.map((opt, j) => (
-                    <button key={j} onClick={() => onPromptClick(opt)}>
-                      {opt}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div key={i} className={m.from}>
-                  {m.text}
-                  {m.from === 'bot' && (
-                    <button
-                      className="read-button"
-                      onClick={() => playAudio(m.text)}
-                    >
-                      🔊
-                    </button>
-                  )}
-                </div>
-              )
+            {messages.map((m,i) =>
+              m.options
+                ? <div key={i} className="bot-options">
+                    {m.options.map((opt,j)=>
+                      <button key={j} onClick={() => handlePromptClick(opt)}>
+                        {opt}
+                      </button>
+                    )}
+                  </div>
+                : <div key={i} className={m.from}>
+                    {m.text}
+                    {m.from==='bot' && (
+                      <button className="read-button" onClick={()=>playAudio(m.text)}>🔊</button>
+                    )}
+                  </div>
             )}
-            <div ref={messagesEndRef} />
+            <div ref={messagesEndRef}/>
           </div>
 
           <div className="chat-input">
-            <div
-              className="mic-wrapper"
-              onMouseDown={startRecording}
-              onMouseUp={stopRecording}
-            >
-              {recording ? (
-                <img src="/wave.gif" alt="Recording…" className="wave-gif" />
-              ) : (
-                <span className="mic-icon">🎙️</span>
-              )}
+            <div className="mic-wrapper" onClick={startListening}>
+              {listening
+                ? <img src="/wave.gif" alt="Listening…" className="wave-gif" />
+                : <span className="mic-icon">🎙️</span>
+              }
             </div>
-
             <input
               value={input}
-              onChange={e => setInput(e.target.value)}
-              onKeyDown={e =>
-                e.key === 'Enter' && input.trim() && send(input)
-              }
+              onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&input.trim()&&send(input)}
               placeholder="Type your question…"
             />
-
-            <button
-              disabled={!input.trim()}
-              onClick={() => send(input)}
-            >
-              Send
-            </button>
+            <button disabled={!input.trim()} onClick={()=>send(input)}>Send</button>
           </div>
         </div>
       )}
