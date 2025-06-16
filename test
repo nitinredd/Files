@@ -1,9 +1,10 @@
+// src/components/Chatbot.jsx
+
 import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
 import './Chatbot.css'
 
--export default function Chatbot({ apiUrl }) {
-+export default function Chatbot({ apiBase }) {
+export default function Chatbot({ apiBase }) {
   const [open, setOpen] = useState(false)
   const [tiles, setTiles] = useState({})
   const [selectedTile, setSelectedTile] = useState(null)
@@ -14,29 +15,73 @@ import './Chatbot.css'
   const audioChunksRef = useRef([])
   const messagesEndRef = useRef(null)
 
-  // Load sample‑prompt tiles
+  // 1. Load sample‑prompt tiles
   useEffect(() => {
--   axios.get(`${apiUrl}/sample-tiles`)
-+   axios.get(`${apiBase}/sample-tiles`)
+    axios.get(`${apiBase}/sample-tiles`)
       .then(res => setTiles(res.data))
-      .catch(console.error)
+      .catch(err => console.error("Failed to load tiles:", err))
   }, [apiBase])
 
-  // Send a text query
+  // 2. When opened, send greeting + list tile names
+  useEffect(() => {
+    if (open && messages.length === 0 && Object.keys(tiles).length > 0) {
+      setMessages([
+        { from: 'bot', text: 'Hi! How can I help?' },
+        { from: 'bot', options: Object.keys(tiles) }
+      ])
+    }
+  }, [open, tiles, messages.length])
+
+  // 3. Auto‑scroll on new message
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  // 4. Send a text query to /chat
   const sendText = async (text) => {
     setMessages(m => [...m, { from: 'user', text }])
     setInput('')
     try {
--     const res = await axios.post(`${apiUrl}/chat`, { message: text })
-+     const res = await axios.post(`${apiBase}/chat`, { message: text })
+      const res = await axios.post(`${apiBase}/chat`, { message: text })
       setMessages(m => [...m, { from: 'bot', text: res.data.response }])
-    } catch {
+    } catch (err) {
+      console.error("Chat error:", err)
       setMessages(m => [...m, { from: 'bot', text: 'Server error.' }])
     }
   }
 
-  // Voice recording stop & upload
+  // 5. Handle tile name click
+  const onTileClick = (tile) => {
+    setSelectedTile(tile)
+    setMessages(m => [...m, { from: 'user', text: tile }])
+    setMessages(m => [...m, { from: 'bot', options: tiles[tile] }])
+  }
+
+  // 6. Handle option under a tile
+  const onOptionClick = (opt) => {
+    sendText(opt)
+    setSelectedTile(null)
+  }
+
+  // 7. Start voice recording
+  const startRecording = async () => {
+    setRecording(true)
+    audioChunksRef.current = []
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      const mr = new MediaRecorder(stream)
+      mediaRecorderRef.current = mr
+      mr.ondataavailable = e => audioChunksRef.current.push(e.data)
+      mr.start()
+    } catch (err) {
+      console.error("Microphone access error:", err)
+      setRecording(false)
+    }
+  }
+
+  // 8. Stop recording and upload for STT
   const stopRecording = () => {
+    if (!mediaRecorderRef.current) return
     mediaRecorderRef.current.stop()
     mediaRecorderRef.current.onstop = async () => {
       setRecording(false)
@@ -44,34 +89,31 @@ import './Chatbot.css'
       const form = new FormData()
       form.append('file', blob, 'voice.webm')
       try {
--       const sttRes = await axios.post(
--         `${apiUrl}/speech-to-text`,
-+       const sttRes = await axios.post(
-+         `${apiBase}/speech-to-text`,
+        const sttRes = await axios.post(
+          `${apiBase}/speech-to-text`,
           form,
           { headers: { 'Content-Type': 'multipart/form-data' } }
         )
         const text = sttRes.data.text
         sendText(text)
-      } catch {
+      } catch (err) {
+        console.error("STT error:", err)
         setMessages(m => [...m, { from: 'bot', text: 'Voice‑to‑text failed.' }])
       }
     }
   }
 
-  // Play TTS for a bot message
+  // 9. Play TTS for bot messages
   const playAudio = async (text) => {
     try {
--     const audioRes = await axios.get(
--       `${apiUrl}/text-to-speech`,
-+     const audioRes = await axios.get(
-+       `${apiBase}/text-to-speech`,
+      const audioRes = await axios.get(
+        `${apiBase}/text-to-speech`,
         { params: { text }, responseType: 'blob' }
       )
       const url = URL.createObjectURL(audioRes.data)
       new Audio(url).play()
-    } catch {
-      // silently ignore
+    } catch (err) {
+      console.error("TTS error:", err)
     }
   }
 
@@ -83,58 +125,59 @@ import './Chatbot.css'
       <div className="chat-header" onClick={() => setOpen(o => !o)}>
         {open ? '––' : '💬'}
       </div>
+
       {open && (
         <div className="chat-body">
           <div className="messages">
-            {messages.map((m, i) =>
-              m.options ? (
-                <div key={i} className="bot-options">
-                  {m.options.map((opt, j) => (
-                    <button key={j} onClick={() => sendText(opt)}>
-                      {opt}
-                    </button>
-                  ))}
-                </div>
-              ) : (
-                <div key={i} className={m.from}>
-                  {m.text}
-                  {m.from === 'bot' && (
-                    <button
-                      className="read-button"
-                      onClick={() => playAudio(m.text)}
-                    >🔊</button>
-                  )}
-                </div>
-              )
-            )}
+            {messages.map((m, i) => (
+              m.options
+                ? (
+                  <div key={i} className="bot-options">
+                    {m.options.map((opt, j) => (
+                      <button key={j} onClick={() => onOptionClick(opt)}>
+                        {opt}
+                      </button>
+                    ))}
+                  </div>
+                )
+                : (
+                  <div key={i} className={m.from}>
+                    {m.text}
+                    {m.from === 'bot' && (
+                      <button
+                        className="read-button"
+                        onClick={() => playAudio(m.text)}
+                      >🔊</button>
+                    )}
+                  </div>
+                )
+            ))}
             <div ref={messagesEndRef} />
           </div>
+
           <div className="chat-input">
             <button
               className={`mic-button ${recording ? 'recording' : ''}`}
-              onMouseDown={async () => {
-                setRecording(true)
-                audioChunksRef.current = []
-                const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-                const mr = new MediaRecorder(stream)
-                mediaRecorderRef.current = mr
-                mr.ondataavailable = e => audioChunksRef.current.push(e.data)
-                mr.start()
-              }}
+              onMouseDown={startRecording}
               onMouseUp={stopRecording}
             >🎙️</button>
+
             <input
+              type="text"
               value={input}
               onChange={e => setInput(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && input.trim() && sendText(input)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && input.trim()) {
+                  sendText(input)
+                }
+              }}
               placeholder="Type your question…"
             />
+
             <button
               disabled={!input.trim()}
               onClick={() => sendText(input)}
-            >
-              Send
-            </button>
+            >Send</button>
           </div>
         </div>
       )}
