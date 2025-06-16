@@ -1,7 +1,285 @@
-| **Approach** | **Description** | **Pros** | **Cons** | **Accuracy & Relevance (1-5★)** |
-| :--- | :--- | :--- | :--- | :--- |
-| **RAG (Current Approach)**\<br\>:cite[2]:cite[5]:cite[8] | Uses GPT-4o + text/image embeddings to retrieve & generate context-aware responses. | ✅ **Excels in multimodal understanding** (e.g., CLIP embeddings match images/text) :cite[2]\<br\> ✅ **Handles "vanilla English" and technical jargon** via semantic search :cite[5]\<br\> ✅ **Generative flexibility**: Synthesizes answers from retrieved snippets/images | ⛔ **Computational cost**: High for image embeddings :cite[8]\<br\> ⛔ **Latency**: Real-time retrieval + generation delays\<br\> ⛔ **Hallucination risk** if retrieval fails :cite[5] | ★★★★★\<br\>(Best for chemistry context) |
-| **Hybrid Search**\<br\>:cite[6]:cite[1] | Combines keyword search (e.g., Elasticsearch) + vector search (e.g., OpenAI embeddings). | ✅ **Balances precision/recall**: Keywords for exact terms + vectors for semantics :cite[6]\<br\> ✅ **Reduces latency** vs. pure RAG\<br\> ✅ **Simpler integration** with existing databases | ⛔ **Weak image support**: Treats images as metadata, not content :cite[6]\<br\> ⛔ **Limited generative ability**: Returns raw snippets, not synthesized answers\<br\> ⛔ **Struggles with chemical synonyms** (e.g., "SN2" vs. "bimolecular substitution") | ★★★☆☆\<br\>(Good for text-only queries) |
-| **Fine-Tuned ML/DL Models**\<br\>:cite[9]:cite[4] | Trains domain-specific models (e.g., ChemBERTa) on chemistry data for classification/QA. | ✅ **High accuracy for known reactions** if trained robustly :cite[9]\<br\> ✅ **Fast inference** post-deployment\<br\> ✅ **Low hallucination risk** vs. generative models | ⛔ **Requires massive labeled data** (e.g., manually tagged reaction images) :cite[4]\<br\> ⛔ **Fragile with novel queries** (e.g., unseen reaction types)\<br\> ⛔ **No image understanding** without separate CNN pipelines | ★★★☆☆\<br\>(For narrow, predictable use cases) |
-| **Structured Database Queries**\<br\>:cite[3]:cite[7] | Leverages SQL/SPARQL + chemistry ontologies (e.g., RXNO) for precise retrieval. | ✅ **Perfect for exact-match queries** (e.g., "Show Suzuki couplings")\<br\> ✅ **Minimal latency** and resource usage\<br\> ✅ **Integrates tabular data** seamlessly | ⛔ **Fails with natural language** (e.g., "reactions with cyclic transition states")\<br\> ⛔ **Rigid schema**: Hard to adapt to new data types\<br\> ⛔ **Zero image comprehension** | ★★☆☆☆\<br\>(Only if users query with exact terms) |
-| **Hybrid Chatbots (AI + Human)**\<br\>:cite[1]:cite[3]:cite[10] | AI handles routine queries; humans step in for complex/ambiguous cases. | ✅ **Empathy for sensitive issues** (e.g., lab safety concerns) :cite[3]\<br\> ✅ **Reduces agent workload** by \~40% :cite[1]\<br\> ✅ **Adaptable to edge cases** via human fallback | ⛔ **High operational overhead**: Staffing/training humans :cite[10]\<br\> ⛔ **Inconsistent responses** if AI/human knowledge diverges\<br\> ⛔ **Slow for 24/7 coverage** | ★★★☆☆\<br\>(For user support, not data retrieval) |
+import os
+import json
+import pandas as pd
+import streamlit as st
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from gtts import gTTS
+import speech_recognition as sr
+import io
+import uuid
+recognizer = sr.Recognizer()
+# Azure GPT Configuration (unchanged)
+base_url=""
+api_version="2024-02-15-preview"
+
+api_key=""
+deployment_name="GPT4o"
+model_name="GPT4o"
+
+# Paths to embedded JSON files
+embedded_files = {
+    'data_1': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Test_1.json",
+    'data_2': None,  # optional field; this file is left empty
+    'data_3': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Formulas.json",
+    # additional files can be specified dynamically, and can be left None
+}
+
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment=""
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+#Voice#
+def recognize_google_stt():
+    with sr.Microphone() as source:
+        st.info("🎙️ Listening… speak now")
+        audio = recognizer.listen(source, phrase_time_limit=5)
+        st.success("🔍 Processing…")
+        try:
+            return recognizer.recognize_google(audio)
+        except sr.UnknownValueError:
+            return "Sorry, I couldn't understand your voice."
+        except sr.RequestError as e:
+            return f"Error: {e}"
+
+def tts_stream(text: str):
+    """Convert text to speech using gTTS and return as an audio stream."""
+    buf = io.BytesIO()  # Create an in-memory buffer for audio data
+    gTTS(text).write_to_fp(buf)  # Write the MP3 data to the buffer
+    buf.seek(0)  # Reset buffer pointer to the start for reading
+    return buf
+# ---------------------------------------------------------------------------
+# Multi-Agent Components
+# ---------------------------------------------------------------------------
+class ChildAgent:
+    def __init__(self, name, retriever):
+        self.name = name
+        self.chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=retriever,
+            return_source_documents=True
+        )
+
+    def ask(self, query):
+        try:
+            # Use the new `invoke` method to execute the chain
+            response = self.chain.invoke({"query": query})  # Pass the query as a dictionary
+            result = response.get("result", "")
+            docs = response.get("source_documents", [])
+
+            image_paths = [
+                f"{key}: {doc.metadata.get(key)}"
+                for doc in docs
+                for key in ['tables', 'synthetic_scheme']
+                if doc.metadata.get(key)
+            ]
+            if image_paths:
+                result += "\n\nRelated Images:\n" + "\n".join(image_paths)
+            return result
+        except Exception as e:
+            st.error(f"Error querying {self.name}: {e}")
+            return None
+
+
+class CoordinatorAgent:
+    def __init__(self, child_agents):
+        self.children = child_agents
+
+    def coordinate(self, query):
+        for child in self.children:  # Prioritize sequential querying
+            try:
+                resp = child.ask(query)
+                if resp and 'not found' not in resp.lower():  # If relevant information is found
+                    return [(child.name, resp)]
+            except Exception as e:
+                st.error(f"Error querying {child.name}: {e}")
+                continue
+        # If no relevant information found across all sources
+        return [("Coordinator", "No relevant information found across data sources.")]
+
+
+class OversightAgent:
+    def validate(self, answers):
+        if not answers:
+            return None
+        # Pick the best response (simplistic approach: first valid result)
+        return answers[0][1]
+
+
+class LearningAgent:
+    def __init__(self):
+        self.logs = []
+
+    def log(self, user_query, response):
+        self.logs.append({'query': user_query, 'response': response})
+
+
+class AgentManager:
+    def __init__(self, agents):
+        self.coordinator = CoordinatorAgent(agents)
+        self.oversight = OversightAgent()
+        self.learning = LearningAgent()
+
+    def handle_query(self, query):
+        raw_answers = self.coordinator.coordinate(query)
+        validated = self.oversight.validate(raw_answers)
+        if not validated:
+            answer = "Relevant information not found in the workbooks."
+        else:
+            answer = validated
+        self.learning.log(query, answer)
+        return answer
+
+# ---------------------------------------------------------------------------
+# Data & Vectorstore Setup
+# ---------------------------------------------------------------------------
+def load_json_data(file_paths):
+    dfs = {}
+    for name, path in file_paths.items():
+        if not path:  # Handle optional fields (empty or None)
+            # st.warning(f"No file path provided for '{name}', skipping.")
+            continue
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Convert problematic data (lists/dicts) into hashable string reps
+            if isinstance(data, list):
+                formatted_data = []
+                for item in data:
+                    # Stringify content
+                    content = json.dumps(item, sort_keys=True)
+                    # Extract image paths if present
+                    image_paths = {key: item.get(key, None) for key in ['tables', 'synthetic_scheme']}
+
+                    # Append content and image metadata
+                    formatted_data.append({'content': content, **image_paths})
+                
+                # Create DataFrame
+                df = pd.DataFrame(formatted_data)
+                dfs[name] = df
+
+            elif isinstance(data, dict):
+                content = json.dumps({**{'source': name}, **data}, sort_keys=True)
+                # Extract image paths if present
+                image_paths = {key: data.get(key, None) for key in ['tables', 'synthetic_scheme']}
+                
+                # Create DataFrame with content and images
+                df = pd.DataFrame([{'content': content, **image_paths}])
+                dfs[name] = df
+
+        except Exception as e:
+            st.error(f"Error loading JSON file '{name}': {e}")
+    return dfs
+
+
+def build_vectorstores(dfs):
+    agents = []
+    for key, df in dfs.items():
+        docs = []
+        for index, row in df.iterrows():
+            try:
+                if 'content' in row:
+                    text = row['content']
+                else:
+                    text_data = row.dropna().to_dict()
+                    if not text_data:
+                        continue
+                    text = json.dumps(text_data)
+                docs.append(Document(page_content=text, metadata={'source': key}))
+            except Exception as e:
+                pass  # Logging removed
+            
+        if not docs:
+            continue
+            
+        try:
+            store = FAISS.from_documents(docs, cached_embeddings)
+            retriever = store.as_retriever(search_kwargs={"k": 5})
+            agents.append(ChildAgent(name=key, retriever=retriever))
+        except Exception as e:
+            pass  # Logging removed
+    
+    return agents
+
+# ---------------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title="AI Chatbot", page_icon="", layout="wide")
+st.title("AI Chatbot")
+
+# Load JSON data and initialize agents
+with st.spinner("Loading data and building agents..."):
+    dfs = load_json_data(embedded_files)
+    child_agents = build_vectorstores(dfs)
+    manager = AgentManager(child_agents)
+
+# Ensure initialization of chat history only once
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = True
+    st.session_state.chat_history = [("bot", "Hi! I'm your AI Chatbot. Here are sample prompts to get you started:")]
+    st.session_state.chat_history_speaker = None
+    sample_prompts = [
+        f"Do we have Tapasya made with Capacity 600L in FTO-3?",
+        f"What is the impeller speed range in RMG for the Equipment Glatt in FTO-2?",
+        f"What are the various literature sources considered in RMG?"
+    ]
+    for prompt in sample_prompts:
+        st.session_state.chat_history.append(("bot", prompt))
+
+# Display chat history
+for idx, (sender, msg) in enumerate(st.session_state.chat_history):
+    if sender == "user":
+        st.chat_message("user").markdown(f"**You:** {msg}")
+    else:
+        st.chat_message("assistant").markdown(f"**Bot:** {msg}")
+        # Add "Read Aloud" capability for bot responses
+        if sender == "bot":
+            unique_key = f"read_aloud_{idx}"  # Generate a unique key for the Read Aloud button
+            if st.button("🔊 Read Aloud", key=unique_key):
+                try:
+                    mp3_bytes = tts_stream(msg)  # Convert bot response text into audio bytes
+                    st.audio(mp3_bytes, format="audio/mp3")  # Play audio using Streamlit
+                except Exception as e:
+                    st.error(f"⚠️ Could not process audio: {e}")
+
+# User input with microphone integration
+with st.container():
+    col1, col2 = st.columns([0.85, 0.15])  # Adjust column ratios
+    query = col1.text_input("Your question:", key="input_query", value="")
+    
+    # Microphone button beside the text box
+    if col2.button("🎙️ Speak", key="mic_button"):
+        recognized_query = recognize_google_stt()
+        if recognized_query:
+            st.session_state['temp_query'] = recognized_query  # Use a temporary session variable for the query
+            st.rerun()
+
+# Handle temporary microphone input update
+if 'temp_query' in st.session_state:
+    query = st.session_state.pop('temp_query')  # Get and clear the temporary query
+
+if query:  # Handle user query submission
+    response = manager.handle_query(query)
+    st.session_state.chat_history.append(("user", query))
+    st.session_state.chat_history.append(("bot", response))
+    st.rerun()
