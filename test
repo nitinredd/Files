@@ -1,3 +1,4 @@
+import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -5,261 +6,400 @@ import seaborn as sns
 import scipy.stats as stats
 from scipy.stats import norm
 from sklearn.utils import resample
-import warnings
-import os
 from matplotlib.ticker import MaxNLocator
+import warnings
+import rpy2.robjects as robjects
+from rpy2.robjects.packages import importr, data
+import os
 
-# Initialize global array for bootstrap results
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# Initialize R packages
+utils = importr('utils')
+base = importr('base')
+bootf2 = importr('bootf2')
+read = importr('readxl')
+open = importr('writexl')
+
+# Set random seed for reproducibility
+np.random.seed(306)
+
+# Initialize global array for bootstrap
 arrayboot = []
 
-def process_data_for_regulation(regulation, reference_df, test_df):
-    """Process data according to specific regulatory requirements"""
-    ref_df = reference_df.copy()
-    test = test_df.copy()
-    
-    # Remove zero time point if exists
-    if ref_df.iloc[0, 0] == 0 or ref_df.iloc[0, 0] == '0':
-        ref_df = ref_df.iloc[1:].reset_index(drop=True)
-    if test.iloc[0, 0] == 0 or test.iloc[0, 0] == '0':
-        test = test.iloc[1:].reset_index(drop=True)
-    
-    # Regulatory-specific processing
-    if regulation == "FDA":
-        # FDA: Use both >= 85% criteria
-        ref_index = next((i for i, val in enumerate(ref_df.iloc[:, 1:].mean(axis=1)) if val >= 85, len(ref_df)-1)
-        test_index = next((i for i, val in enumerate(test.iloc[:, 1:].mean(axis=1)) if val >= 85, len(test)-1)
-        final_index = max(ref_index, test_index)
-    else:
-        # EMA/WHO/Canada/ANVISA: Use either > 85% criteria
-        ref_index = next((i for i, val in enumerate(ref_df.iloc[:, 1:].mean(axis=1)) if val > 85, len(ref_df)-1)
-        test_index = next((i for i, val in enumerate(test.iloc[:, 1:].mean(axis=1)) if val > 85, len(test)-1)
-        final_index = min(ref_index, test_index)
-    
-    return ref_df.iloc[:final_index+1], test.iloc[:final_index+1]
+# --------------------------
+# Data Processing Functions
+# --------------------------
+def load_data(uploaded_file):
+    """Load reference and test data from uploaded Excel file"""
+    reference_df = pd.read_excel(uploaded_file, sheet_name=0)
+    test_df = pd.read_excel(uploaded_file, sheet_name=1)
+    return reference_df, test_df
 
-def calculate_f2(reference, test):
-    """Calculate conventional f2 similarity metric"""
-    ref_means = reference.iloc[:, 1:].mean(axis=1)
-    test_means = test.iloc[:, 1:].mean(axis=1)
-    diff_sqr = ((test_means - ref_means) ** 2).sum()
-    p = len(reference)
-    return 50 if diff_sqr == 0 else 100 - 25 * np.log10(1 + (1/p) * diff_sqr)
-
-def calculate_expected_f2(reference, test):
-    """Calculate expected f2 metric with variance adjustment"""
-    ref_means = reference.iloc[:, 1:].mean(axis=1)
-    test_means = test.iloc[:, 1:].mean(axis=1)
-    diff_sqr = ((test_means - ref_means) ** 2).sum()
+# --------------------------
+# Visualization Functions
+# --------------------------
+def dissolution_curve(reference_df, test_df):
+    """Plot dissolution curves"""
+    ref_data_means = pd.DataFrame(reference_df.iloc[:, 1:].mean(axis=1), columns=['Mean_Reference'])
+    test_data_means = pd.DataFrame(test_df.iloc[:, 1:].mean(axis=1), columns=['Mean_Test'])
     
-    ref_var = reference.iloc[:, 1:].var(axis=1, ddof=1)
-    test_var = test.iloc[:, 1:].var(axis=1, ddof=1)
-    sum_var = (ref_var + test_var).sum()
+    ref_data_means.insert(0, 'Time', reference_df.iloc[:, 0])
+    test_data_means.insert(0, 'Time', test_df.iloc[:, 0])
     
-    n = reference.shape[1] - 1  # Number of units
-    p = len(reference)
-    return 100 - 25 * np.log10(1 + (1/p) * (diff_sqr + (1/n) * sum_var))
-
-def calculate_bias_corrected_f2(reference, test):
-    """Calculate bias-corrected f2 metric"""
-    ref_means = reference.iloc[:, 1:].mean(axis=1)
-    test_means = test.iloc[:, 1:].mean(axis=1)
-    diff_sqr = ((test_means - ref_means) ** 2).sum()
+    plt.figure(figsize=(12, 6))
+    plt.plot(ref_data_means['Time'], ref_data_means['Mean_Reference'], label='Reference', marker='o')
+    plt.plot(test_data_means['Time'], test_data_means['Mean_Test'], label='Test', marker='o', linestyle='--')
     
-    ref_var = reference.iloc[:, 1:].var(axis=1, ddof=1)
-    test_var = test.iloc[:, 1:].var(axis=1, ddof=1)
-    sum_var = (ref_var + test_var).sum()
-    
-    n = reference.shape[1] - 1
-    p = len(reference)
-    left_side = (1/n) * sum_var
-    right_side = diff_sqr + p
-    
-    if left_side >= right_side:
-        return 100 - 25 * np.log10(1 + (1/p) * (diff_sqr - left_side))
-    return None  # Can't be calculated
-
-def bootstrap_f2(reference, test, metric_func, n_iterations=10000):
-    """Perform bootstrap resampling for f2 confidence intervals"""
-    results = []
-    n_units = reference.shape[1] - 1
-    
-    for _ in range(n_iterations):
-        # Resample with replacement
-        ref_sample = reference.iloc[:, 0].to_frame()
-        test_sample = test.iloc[:, 0].to_frame()
-        
-        for col in range(1, reference.shape[1]):
-            ref_col = reference.iloc[:, col].sample(n=len(reference), replace=True).reset_index(drop=True)
-            test_col = test.iloc[:, col].sample(n=len(test), replace=True).reset_index(drop=True)
-            ref_sample = pd.concat([ref_sample, ref_col], axis=1)
-            test_sample = pd.concat([test_sample, test_col], axis=1)
-        
-        # Calculate metric
-        results.append(metric_func(ref_sample, test_sample))
-    
-    return np.array(results)
-
-def generate_plots(results, regulation, metric_name):
-    """Generate diagnostic plots for bootstrap results"""
-    plt.figure(figsize=(12, 5))
-    
-    # Histogram
-    plt.subplot(121)
-    sns.histplot(results, kde=True, bins=20)
-    plt.title(f"{regulation} {metric_name} Distribution")
-    plt.xlabel("f2 Value")
-    
-    # QQ Plot
-    plt.subplot(122)
-    stats.probplot(results, dist="norm", plot=plt)
-    plt.title(f"{regulation} {metric_name} QQ Plot")
-    
-    plt.tight_layout()
-    plt.savefig(f"{regulation}_{metric_name}_bootstrap.png")
+    plt.xlabel('Time')
+    plt.ylabel('Dissolution (%)')
+    plt.title('Dissolution Curves')
+    plt.grid(True)
+    plt.gca().set_yticks(range(0, 101, 5))
+    plt.legend(loc='lower right')
+    st.pyplot(plt)
     plt.close()
 
-def calculate_confidence_interval(results, alpha=0.1):
-    """Calculate percentile-based confidence interval"""
-    lower = np.percentile(results, alpha/2 * 100)
-    upper = np.percentile(results, (1 - alpha/2) * 100)
-    return lower, upper
+def dissolution_curve_interval(reference_df, test_df):
+    """Plot dissolution curves with intervals"""
+    ref_data_means = pd.DataFrame(reference_df.iloc[:, 1:].mean(axis=1), columns=['Mean_Reference'])
+    ref_data_max = pd.DataFrame(reference_df.iloc[:, 1:].max(axis=1), columns=['Max_Reference'])
+    ref_data_min = pd.DataFrame(reference_df.iloc[:, 1:].min(axis=1), columns=['Min_Reference'])
+    
+    test_data_means = pd.DataFrame(test_df.iloc[:, 1:].mean(axis=1), columns=['Mean_Test'])
+    test_data_max = pd.DataFrame(test_df.iloc[:, 1:].max(axis=1), columns=['Max_Test'])
+    test_data_min = pd.DataFrame(test_df.iloc[:, 1:].min(axis=1), columns=['Min_Test'])
+    
+    ref_data_means.insert(0, 'Time', reference_df.iloc[:, 0])
+    ref_data_max.insert(0, 'Time', reference_df.iloc[:, 0])
+    ref_data_min.insert(0, 'Time', reference_df.iloc[:, 0])
+    
+    test_data_means.insert(0, 'Time', test_df.iloc[:, 0])
+    test_data_max.insert(0, 'Time', test_df.iloc[:, 0])
+    test_data_min.insert(0, 'Time', test_df.iloc[:, 0])
+    
+    plt.figure(figsize=(12, 6))
+    plt.errorbar(ref_data_means['Time'], ref_data_means['Mean_Reference'],
+                 yerr=[ref_data_means['Mean_Reference'] - ref_data_min['Min_Reference'],
+                       ref_data_max['Max_Reference'] - ref_data_means['Mean_Reference']],
+                 fmt='o', label='Reference Mean', color='blue', linestyle='-')
+    
+    plt.errorbar(test_data_means['Time'], test_data_means['Mean_Test'],
+                 yerr=[test_data_means['Mean_Test'] - test_data_min['Min_Test'],
+                       test_data_max['Max_Test'] - test_data_means['Mean_Test']],
+                 fmt='o', label='Test Mean', color='green', linestyle='--')
+    
+    for time, min_val, max_val in zip(ref_data_means['Time'], ref_data_min['Min_Reference'], ref_data_max['Max_Reference']):
+        plt.hlines(min_val, time - 0.2, time + 0.2, colors='blue', linestyles='--', alpha=0.5)
+        plt.hlines(max_val, time - 0.2, time + 0.2, colors='blue', linestyles='--', alpha=0.5)
+    
+    for time, min_val, max_val in zip(test_data_means['Time'], test_data_min['Min_Test'], test_data_max['Max_Test']):
+        plt.hlines(min_val, time - 0.2, time + 0.2, colors='green', linestyles='--', alpha=0.5)
+        plt.hlines(max_val, time - 0.2, time + 0.2, colors='green', linestyles='--', alpha=0.5)
+    
+    plt.xlabel('Time')
+    plt.ylabel('Dissolution (%)')
+    plt.title('Dissolution Curves with Intervals')
+    plt.grid(True)
+    plt.gca().set_yticks(range(0, 101, 5))
+    plt.legend(loc='lower right')
+    st.pyplot(plt)
+    plt.close()
 
-def calculate_bca_interval(results, original, alpha=0.1):
-    """Calculate bias-corrected accelerated confidence interval"""
-    # Bias correction
-    z0 = norm.ppf(np.mean(results < original))
-    
-    # Acceleration
-    jk_estimates = []
-    n = len(results)
-    for i in range(n):
-        jk_sample = np.delete(results, i)
-        jk_estimates.append(np.mean(jk_sample))
-    
-    jk_mean = np.mean(jk_estimates)
-    num = np.sum((jk_mean - jk_estimates) ** 3)
-    den = 6 * (np.sum((jk_mean - jk_estimates) ** 2) ** 1.5)
-    a = num / den if den != 0 else 0
-    
-    # Corrected percentiles
-    z_alpha = norm.ppf(alpha/2)
-    z_1alpha = norm.ppf(1 - alpha/2)
-    
-    alpha1 = norm.cdf(z0 + (z0 + z_alpha) / (1 - a * (z0 + z_alpha)))
-    alpha2 = norm.cdf(z0 + (z0 + z_1alpha) / (1 - a * (z0 + z_1alpha)))
-    
-    return np.percentile(results, alpha1 * 100), np.percentile(results, alpha2 * 100)
+# --------------------------
+# Validation Checks
+# --------------------------
+def check_time_points(df):
+    """Check minimum time points requirement"""
+    if df.iloc[0, 0] == 0 or df.iloc[0, 0] == '0':
+        return len(df.iloc[:, 0].values) - 1 >= 3
+    return len(df.iloc[:, 0].values) >= 3
 
-def run_regulatory_analysis(regulation, reference_df, test_df):
-    """Full analysis pipeline for a single regulation"""
-    print(f"\n{'='*40}")
-    print(f"Analyzing for {regulation} guidelines")
-    print(f"{'='*40}")
+def two_time_points(df):
+    """Check if first two time points exceed 85%"""
+    mean_values = df.iloc[:, 1:].mean(axis=1)
+    if mean_values[0] > 85 or mean_values[1] > 85:
+        return False
+    return True
+
+def min15__check(df):
+    """Check if dissolution exceeds 85% within 15 minutes"""
+    time_string = df.columns[0]
+    mean_values = df.iloc[:, 1:].mean(axis=1)
     
-    # Process data according to regulation
-    ref_processed, test_processed = process_data_for_regulation(regulation, reference_df, test_df)
+    if "min" in time_string.lower() or "minutes" in time_string.lower():
+        condition = df.iloc[:, 0] <= 15
+        indices = df.index[condition]
+        filtered_df = mean_values.loc[indices]
+        condition_other_columns = filtered_df > 85
+        final_indices = filtered_df.index[condition_other_columns].tolist()
+        return len(final_indices) > 0
+    return False
+
+def check_cv(df):
+    """Check coefficient of variation requirements"""
+    if df.iloc[0, 0] == 0 or df.iloc[0, 0] == '0':
+        cv_values = df.iloc[1:, 1:].std(axis=1) / df.iloc[1:, 1:].mean(axis=1) * 100
+        return cv_values.iloc[0] < 20 and (cv_values.iloc[1:] < 10).all()
+    cv_values = df.iloc[:, 1:].std(axis=1) / df.iloc[:, 1:].mean(axis=1) * 100
+    return cv_values.iloc[0] < 20 and (cv_values.iloc[1:] < 10).all()
+
+def check_same_time_points(df1, df2):
+    """Check if time points are the same for both products"""
+    return df1.iloc[:, 0].equals(df2.iloc[:, 0])
+
+def check_sample_units(df):
+    """Check minimum sample units requirement"""
+    return df.shape[1] - 1 >= 12
+
+# --------------------------
+# f2 Calculation Functions
+# --------------------------
+def row_variance(df):
+    """Calculate row-wise variance"""
+    return df.iloc[:, 1:].var(axis=1, ddof=1)
+
+def stand(p, sum_diff_df_sqr):
+    """Calculate conventional f2"""
+    return 100 - 25 * np.log10((1 + (1 / p) * sum_diff_df_sqr))
+
+def expected(p, sum_diff_df_sqr, left_side):
+    """Calculate expected f2"""
+    return 100 - 25 * np.log10((1 + (1 / p) * (sum_diff_df_sqr + left_side)))
+
+def BiasCor(p, sum_diff_df_sqr, left_side):
+    """Calculate bias-corrected f2"""
+    Right_side = sum_diff_df_sqr + p
+    if left_side >= Right_side:
+        return 100 - 25 * np.log10((1 + (1 / p) * (sum_diff_df_sqr - left_side)))
+    return "Bias Corrected f2 cannot be calculated"
+
+def f2s(reference_df, test_df):
+    """Calculate all f2 metrics"""
+    ref_data_means = reference_df.iloc[:, 1:].mean(axis=1)
+    test_data_means = test_df.iloc[:, 1:].mean(axis=1)
     
-    # Calculate point estimates
-    conv_f2 = calculate_f2(ref_processed, test_processed)
-    exp_f2 = calculate_expected_f2(ref_processed, test_processed)
-    bc_f2 = calculate_bias_corrected_f2(ref_processed, test_processed)
+    diff_df = test_data_means - ref_data_means
+    diff_df_sqr = diff_df ** 2
+    sum_diff_df_sqr = diff_df_sqr.sum()
     
-    print(f"\nPoint Estimates:")
-    print(f"Conventional f2: {conv_f2:.2f}")
-    print(f"Expected f2: {exp_f2:.2f}")
-    print(f"Bias-Corrected f2: {bc_f2 if bc_f2 is not None else 'N/A'}")
+    ref_data_var = row_variance(reference_df)
+    test_data_var = row_variance(test_df)
     
-    # Bootstrap analysis
-    print("\nBootstrapping...")
+    addition_df = test_data_var + ref_data_var
+    sum_addition_df = addition_df.sum()
     
-    # Conventional f2
-    conv_results = bootstrap_f2(ref_processed, test_processed, calculate_f2, 1000)
-    conv_lower, conv_upper = calculate_confidence_interval(conv_results)
-    conv_bca_lower, conv_bca_upper = calculate_bca_interval(conv_results, conv_f2)
-    generate_plots(conv_results, regulation, "Conventional_f2")
+    n_r, n_c = reference_df.shape
+    n = n_c - 1
+    p = len(reference_df)
     
-    # Expected f2
-    exp_results = bootstrap_f2(ref_processed, test_processed, calculate_expected_f2, 1000)
-    exp_lower, exp_upper = calculate_confidence_interval(exp_results)
-    exp_bca_lower, exp_bca_upper = calculate_bca_interval(exp_results, exp_f2)
-    generate_plots(exp_results, regulation, "Expected_f2")
+    left_side = (1 / n) * sum_addition_df
     
-    # Bias-Corrected f2 (if applicable)
-    if bc_f2 is not None:
-        bc_results = bootstrap_f2(ref_processed, test_processed, calculate_bias_corrected_f2, 1000)
-        bc_results = bc_results[~np.isnan(bc_results)]  # Remove invalid calculations
-        if len(bc_results) > 0:
-            bc_lower, bc_upper = calculate_confidence_interval(bc_results)
-            bc_bca_lower, bc_bca_upper = calculate_bca_interval(bc_results, bc_f2)
-            generate_plots(bc_results, regulation, "BiasCorrected_f2")
+    results = {
+        "Conventional f2": stand(p, sum_diff_df_sqr),
+        "Expected f2": expected(p, sum_diff_df_sqr, left_side),
+        "Bias Corrected f2": BiasCor(p, sum_diff_df_sqr, left_side)
+    }
+    return results
+
+# --------------------------
+# Bootstrap Functions
+# --------------------------
+def cal_f2(resampled_test, resampled_reference):
+    """Calculate f2 for bootstrap samples"""
+    ref_data_means = resampled_reference.iloc[:, 1:].mean(axis=1)
+    test_data_means = resampled_test.iloc[:, 1:].mean(axis=1)
+    
+    diff = test_data_means - ref_data_means
+    sum_sq_diff = (diff ** 2).sum()
+    
+    p = len(resampled_reference)
+    f2 = 100 - 25 * np.log10(1 + (1 / p) * sum_sq_diff)
+    
+    arrayboot.append(f2)
+    return f2
+
+def bca(test_data, ref_data, alpha=0.1):
+    """Bias-Corrected and Accelerated Bootstrap"""
+    arrayboot.clear()
+    original_f2 = cal_f2(test_data, ref_data)
+    n_iterations = 10000
+    n_size = ref_data.shape[1]
+    f2_values = np.zeros(n_iterations)
+    
+    for i in range(n_iterations):
+        indices = np.random.choice(range(1, n_size), n_size - 1, replace=True)
+        time_C = ref_data.iloc[:, 0]
+        
+        dfr = ref_data.iloc[:, indices]
+        dft = test_data.iloc[:, indices]
+        
+        dfr.insert(0, time_C.name, time_C)
+        dft.insert(0, time_C.name, time_C)
+        
+        f2_values[i] = cal_f2(dft, dfr)
+    
+    # BCa calculations
+    B = len(f2_values)
+    count_less_than = np.sum(f2_values < original_f2)
+    z0 = norm.ppf(count_less_than / B)
+    
+    f2_m = np.mean(f2_values)
+    numerator = np.sum((f2_m - f2_values) ** 3)
+    denominator = 6 * (np.sum((f2_m - f2_values) ** 2) ** (3 / 2))
+    a_hat = numerator / denominator
+    
+    z_alpha = norm.ppf(alpha / 2)
+    z_1_alpha = norm.ppf(1 - alpha / 2)
+    
+    alpha1 = norm.cdf(z0 + (z0 + z_alpha) / (1 - a_hat * (z0 + z_alpha)))
+    alpha2 = norm.cdf(z0 + (z0 + z_1_alpha) / (1 - a_hat * (z0 + z_1_alpha)))
+    
+    lower_percentile = np.percentile(f2_values, alpha1 * 100)
+    upper_percentile = np.percentile(f2_values, alpha2 * 100)
+    
+    return {
+        "CI Lower": lower_percentile,
+        "CI Upper": upper_percentile,
+        "Original f2": original_f2,
+        "Bootstrap Values": f2_values
+    }
+
+# --------------------------
+# Streamlit App
+# --------------------------
+def main():
+    st.title("Dissolution Profile Similarity Analyzer")
+    st.markdown("### Upload your dissolution data")
+    
+    # File upload
+    uploaded_file = st.file_uploader("Upload Excel file with two sheets (Reference and Test)", type=["xlsx"])
+    
+    if uploaded_file is not None:
+        reference_df, test_df = load_data(uploaded_file)
+        
+        st.success("Data loaded successfully!")
+        st.subheader("Data Validation Checks")
+        
+        # Perform checks
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Reference Product Checks:**")
+            st.write(f"- Minimum 3 time points: {'PASS' if check_time_points(reference_df) else 'FAIL'}")
+            st.write(f"- First two points ≤85%: {'PASS' if two_time_points(reference_df) else 'FAIL'}")
+            st.write(f"- >85% in 15min: {'FAIL (No f2)' if min15__check(reference_df) else 'PASS'}")
+            st.write(f"- CV requirements: {'PASS' if check_cv(reference_df) else 'FAIL'}")
+            st.write(f"- ≥12 units: {'PASS' if check_sample_units(reference_df) else 'FAIL'}")
+        
+        with col2:
+            st.write("**Test Product Checks:**")
+            st.write(f"- Minimum 3 time points: {'PASS' if check_time_points(test_df) else 'FAIL'}")
+            st.write(f"- First two points ≤85%: {'PASS' if two_time_points(test_df) else 'FAIL'}")
+            st.write(f"- >85% in 15min: {'FAIL (No f2)' if min15__check(test_df) else 'PASS'}")
+            st.write(f"- CV requirements: {'PASS' if check_cv(test_df) else 'FAIL'}")
+            st.write(f"- ≥12 units: {'PASS' if check_sample_units(test_df) else 'FAIL'}")
+        
+        st.write(f"- Same time points: {'PASS' if check_same_time_points(reference_df, test_df) else 'FAIL'}")
+        
+        # Show dissolution profiles
+        st.subheader("Dissolution Profiles")
+        dissolution_curve(reference_df, test_df)
+        dissolution_curve_interval(reference_df, test_df)
+        
+        # Agency selection
+        st.subheader("Regulatory Agency Selection")
+        agency = st.selectbox("Select Regulatory Agency", 
+                             ["FDA", "EMA", "China", "ASEAN", "ANVISA", "Other"])
+        
+        # f2 calculation options with recommendations
+        st.subheader("f2 Calculation Method")
+        
+        # Agency recommendations
+        recommendations = {
+            "FDA": ["Conventional", "Conventional Bootstrap"],
+            "EMA": ["Expected Bootstrap"],
+            "China": ["Conventional", "Expected", "Bias Corrected", "All Bootstrap Methods"],
+            "ASEAN": ["Conventional", "Expected", "Bias Corrected", "All Bootstrap Methods"],
+            "ANVISA": ["Conventional", "Expected", "Bias Corrected", "All Bootstrap Methods"],
+            "Other": ["All Methods"]
+        }
+        
+        # Show recommendation
+        rec = recommendations[agency]
+        st.info(f"Recommended for {agency}: {', '.join(rec)}")
+        
+        # Calculation options
+        options = [
+            "Conventional f2",
+            "Expected f2",
+            "Bias Corrected f2",
+            "Conventional Bootstrap",
+            "Expected Bootstrap",
+            "Bias Corrected Bootstrap"
+        ]
+        
+        # Set default based on recommendation
+        if agency == "FDA":
+            default = [options[0], options[3]]
+        elif agency == "EMA":
+            default = [options[4]]
         else:
-            bc_lower, bc_upper, bc_bca_lower, bc_bca_upper = np.nan, np.nan, np.nan, np.nan
-    else:
-        bc_results = np.array([])
-        bc_lower, bc_upper, bc_bca_lower, bc_bca_upper = np.nan, np.nan, np.nan, np.nan
-    
-    # Print results
-    print("\nBootstrap Results (90% Confidence Intervals):")
-    print(f"{'Metric':<20} | {'Point Estimate':<15} | {'Percentile CI':<20} | {'BCa CI':<20}")
-    print(f"{'-'*70}")
-    print(f"{'Conventional f2':<20} | {conv_f2:15.2f} | ({conv_lower:.2f}, {conv_upper:.2f}) | ({conv_bca_lower:.2f}, {conv_bca_upper:.2f})")
-    print(f"{'Expected f2':<20} | {exp_f2:15.2f} | ({exp_lower:.2f}, {exp_upper:.2f}) | ({exp_bca_lower:.2f}, {exp_bca_upper:.2f})")
-    
-    if bc_f2 is not None and len(bc_results) > 0:
-        print(f"{'Bias-Corrected f2':<20} | {bc_f2:15.2f} | ({bc_lower:.2f}, {bc_upper:.2f}) | ({bc_bca_lower:.2f}, {bc_bca_upper:.2f})")
-    else:
-        print(f"{'Bias-Corrected f2':<20} | {'N/A':<15} | {'N/A':<20} | {'N/A':<20}")
-    
-    # Save numerical results
-    results_df = pd.DataFrame({
-        'Regulation': [regulation],
-        'Conventional_f2': [conv_f2],
-        'Conv_Percentile_CI_Lower': [conv_lower],
-        'Conv_Percentile_CI_Upper': [conv_upper],
-        'Conv_BCa_CI_Lower': [conv_bca_lower],
-        'Conv_BCa_CI_Upper': [conv_bca_upper],
-        'Expected_f2': [exp_f2],
-        'Exp_Percentile_CI_Lower': [exp_lower],
-        'Exp_Percentile_CI_Upper': [exp_upper],
-        'Exp_BCa_CI_Lower': [exp_bca_lower],
-        'Exp_BCa_CI_Upper': [exp_bca_upper],
-        'BiasCorrected_f2': [bc_f2 if bc_f2 is not None else np.nan],
-        'BC_Percentile_CI_Lower': [bc_lower if bc_f2 is not None else np.nan],
-        'BC_Percentile_CI_Upper': [bc_upper if bc_f2 is not None else np.nan],
-        'BC_BCa_CI_Lower': [bc_bca_lower if bc_f2 is not None else np.nan],
-        'BC_BCa_CI_Upper': [bc_bca_upper if bc_f2 is not None else np.nan]
-    })
-    
-    return results_df
+            default = options
+        
+        selected_methods = st.multiselect("Select calculation methods:", options, default=default)
+        
+        # Process data - remove time zero if needed
+        if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
+            reference_df = reference_df.iloc[1:]
+        if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
+            test_df = test_df.iloc[1:]
+        
+        # Results container
+        results_container = st.container()
+        
+        # Perform selected calculations
+        with results_container:
+            st.subheader("Calculation Results")
+            
+            if "Conventional f2" in selected_methods:
+                st.markdown("**Conventional f2 Calculation**")
+                results = f2s(reference_df, test_df)
+                st.write(f"Conventional f2: {results['Conventional f2']:.3f}")
+            
+            if "Expected f2" in selected_methods:
+                st.markdown("**Expected f2 Calculation**")
+                results = f2s(reference_df, test_df)
+                st.write(f"Expected f2: {results['Expected f2']:.3f}")
+            
+            if "Bias Corrected f2" in selected_methods:
+                st.markdown("**Bias Corrected f2 Calculation**")
+                results = f2s(reference_df, test_df)
+                st.write(f"Bias Corrected f2: {results['Bias Corrected f2']}")
+            
+            if "Conventional Bootstrap" in selected_methods:
+                st.markdown("**Conventional Bootstrap (BCa)**")
+                with st.spinner("Running bootstrap (10,000 iterations)..."):
+                    bootstrap_results = bca(test_df, reference_df)
+                st.write(f"Original f2: {bootstrap_results['Original f2']:.3f}")
+                st.write(f"90% Confidence Interval: [{bootstrap_results['CI Lower']:.3f}, {bootstrap_results['CI Upper']:.3f}]")
+                
+                # Plot histogram
+                plt.figure(figsize=(10, 6))
+                sns.histplot(bootstrap_results['Bootstrap Values'], kde=True, bins=30)
+                plt.title("Bootstrap f2 Distribution")
+                plt.xlabel("f2 Value")
+                plt.ylabel("Frequency")
+                st.pyplot(plt)
+                plt.close()
+            
+            if "Expected Bootstrap" in selected_methods:
+                st.markdown("**Expected Bootstrap**")
+                st.warning("Implementation pending - requires extended bootstrap logic")
+            
+            if "Bias Corrected Bootstrap" in selected_methods:
+                st.markdown("**Bias Corrected Bootstrap**")
+                st.warning("Implementation pending - requires extended bootstrap logic")
 
-def R_all_Regulation(file_path):
-    """Python implementation of all regulatory analyses"""
-    # Load data
-    reference_df = pd.read_excel(file_path, sheet_name=0)
-    test_df = pd.read_excel(file_path, sheet_name=1)
-    
-    # Run analyses for all regulations
-    regulations = ["EMA", "FDA", "WHO", "Canada", "ANVISA"]
-    all_results = []
-    
-    for regulation in regulations:
-        try:
-            results_df = run_regulatory_analysis(regulation, reference_df, test_df)
-            all_results.append(results_df)
-        except Exception as e:
-            print(f"Error processing {regulation}: {str(e)}")
-    
-    # Combine and save results
-    if all_results:
-        final_results = pd.concat(all_results, ignore_index=True)
-        final_results.to_excel("All_Regulatory_Results.xlsx", index=False)
-        print("\nAll regulatory analyses completed successfully!")
-        print("Results saved to All_Regulatory_Results.xlsx")
-        print("Diagnostic plots saved as PNG files")
-    else:
-        print("No valid results generated")
-
-# Example usage
 if __name__ == "__main__":
-    file_path = r"C:\Users\p00095189\Desktop\WORK\Formulations\Similarity_Analyzer\SIMILARITY_ANALYZER\SIMILARITY_ANALYZER\Phase3_Validation\70-80\70-80_Test2_vs_ref4.xlsx"
-    R_all_Regulation(file_path)
+    main()
