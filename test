@@ -1,5 +1,3 @@
-# reaction_database_app.py
-
 import os
 import io
 import json
@@ -24,28 +22,35 @@ from langchain.schema import Document, HumanMessage, SystemMessage
 # --- STREAMLIT CONFIG -------------------------------------------------------
 
 st.set_page_config(
-    page_title="🔬 Reaction Database AI", 
+    page_title="🔬 Reaction Database AI",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# --- AZURE & MODEL SETTINGS ------------------------------------------------
+# --- AZURE & MODEL SETTINGS (explicit, like your original) -------------------
 
-AZURE_ENDPOINT      = os.getenv("AZURE_ENDPOINT", "<YOUR_AZURE_ENDPOINT>")
-AZURE_API_KEY       = os.getenv("AZURE_API_KEY", "<YOUR_API_KEY>")
-CHAT_DEPLOYMENT     = "GPT4o"
-EMBED_DEPLOYMENT    = "Def_data_qa"
-EMBED_MODEL         = "text-embedding-ada-002"
-PDF_TEXT_CHUNK_SIZE = 5000     # chars per embedding
-TOP_K_TEXT          = 5
-TOP_K_IMAGES        = 3
+base_url        = ""  # your Azure endpoint
+api_version     = "2024-02-15-preview"
+api_key         = ""  # your Azure API key
+deployment_name = "GPT4o"
+model_name      = "GPT4o"
+
+# Embedding model config
+embed_model      = "text-embedding-ada-002"
+embed_api_version= "2023-07-01-preview"
+embed_deployment = "Def_data_qa"
+
+# PDF processing & retrieval
+PDF_CHUNK_SIZE = 5000
+TOP_K_TEXT     = 5
+TOP_K_IMAGES   = 3
 
 # --- YOUR REACTION FOLDERS --------------------------------------------------
 
-REACTION_FOLDERS = {
-    "C-N Bond Formation": r"/absolute/path/to/C-N_Bond_Formation",
-    # Add other classes here, e.g.:
-    # "Oxidation Reactions": r"/path/to/Oxidation",
+embedded_folders = {
+    'C-N_Bond_Formation': r"C:\Users\Desktop\C-N_Bond_Formation",
+    # add more as needed
 }
 
 # --- LOAD & CACHE MODELS ----------------------------------------------------
@@ -60,26 +65,26 @@ clip_model, clip_preprocess, clip_device = load_clip_model()
 
 @st.cache_resource(show_spinner=False)
 def get_text_embedder():
-    store = LocalFileStore("langchain-embeddings")
-    base  = AzureOpenAIEmbeddings(
-        model=EMBED_MODEL,
-        api_version="2023-07-01-preview",
-        azure_endpoint=AZURE_ENDPOINT,
-        api_key=AZURE_API_KEY,
-        azure_deployment=EMBED_DEPLOYMENT
+    file_store = LocalFileStore('langchain-embeddings')
+    base = AzureOpenAIEmbeddings(
+        model=embed_model,
+        api_version=embed_api_version,
+        azure_endpoint=base_url,
+        api_key=api_key,
+        azure_deployment=embed_deployment
     )
-    return CacheBackedEmbeddings.from_bytes_store(base, store, namespace=base.model)
+    return CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
 text_embedder = get_text_embedder()
 
 @st.cache_resource(show_spinner=False)
 def get_chat_model():
     return AzureChatOpenAI(
-        azure_deployment=CHAT_DEPLOYMENT,
-        model="GPT4o",
-        api_version="2024-02-15-preview",
-        api_key=AZURE_API_KEY,
-        azure_endpoint=AZURE_ENDPOINT
+        azure_deployment=deployment_name,
+        model=model_name,
+        api_version=api_version,
+        api_key=api_key,
+        azure_endpoint=base_url
     )
 
 chat_model = get_chat_model()
@@ -87,11 +92,9 @@ chat_model = get_chat_model()
 # --- UTILITIES --------------------------------------------------------------
 
 def chunk_text(text: str, max_chars: int):
-    """Split a long string into chunks of ≤ max_chars."""
     return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
 
 def extract_tables_from_pdf(pdf_path: str):
-    """Extract tables via Camelot and Tabula, return list of DataFrames."""
     tables = []
     try:
         tables += [t.df for t in camelot.read_pdf(pdf_path, pages="all", flavor="stream")]
@@ -104,21 +107,16 @@ def extract_tables_from_pdf(pdf_path: str):
     return tables
 
 def extract_images_and_schemes(pdf_path: str):
-    """
-    Return list of dicts:
-      - {"type":"image", "page":int, "img":PIL.Image, "emb":np.ndarray}
-      - {"type":"caption", "page":int}
-    """
     out = []
     doc = fitz.open(pdf_path)
     for p in range(len(doc)):
         blocks = doc[p].get_text("blocks")
-        # detect any "Scheme" captions
+        # detect "scheme" captions
         for b in blocks:
             if "scheme" in b[4].lower():
                 out.append({"type":"caption", "page": p+1})
                 break
-        # extract all images
+        # extract images
         for img_idx, img_obj in enumerate(doc[p].get_images(full=True)):
             xref = img_obj[0]
             img_bytes = doc.extract_image(xref)["image"]
@@ -130,7 +128,6 @@ def extract_images_and_schemes(pdf_path: str):
     return out
 
 def build_faiss_index(embs: np.ndarray):
-    """Create an L2 FAISS index from (N, D) numpy array."""
     dim = embs.shape[1]
     idx = faiss.IndexFlatL2(dim)
     idx.add(embs.astype("float32"))
@@ -140,12 +137,10 @@ def build_faiss_index(embs: np.ndarray):
 
 @st.cache_data(show_spinner=True)
 def initialize_indices():
-    text_indices  = {}
-    text_docs     = {}
-    image_indices = {}
-    image_meta    = {}
+    text_idxs, text_docs = {}, {}
+    img_idxs, img_meta    = {}, {}
 
-    for cls, folder in REACTION_FOLDERS.items():
+    for cls, folder in embedded_folders.items():
         txt_embs, docs = [], []
         img_embs, meta  = [], []
 
@@ -154,44 +149,40 @@ def initialize_indices():
                 continue
             path = os.path.join(folder, fname)
 
-            # --- TEXT & TABLE EXTRACTION ---
+            # TEXT
             reader = PdfReader(path)
             raw = "\n".join(p.extract_text() or "" for p in reader.pages)
-            chunks = chunk_text(raw, PDF_TEXT_CHUNK_SIZE)
+            chunks = chunk_text(raw, PDF_CHUNK_SIZE)
             docs.extend([Document(page_content=c, metadata={"source":fname, "chunk":i})
                          for i,c in enumerate(chunks)])
             txt_embs.extend(text_embedder.embed_documents(chunks))
 
-            # --- TABLES ---
+            # TABLES
             for tbl in extract_tables_from_pdf(path):
-                docs.append(Document(
-                    page_content=tbl.to_csv(index=False),
-                    metadata={"source":fname, "chunk":"table"}
-                ))
-                txt_embs.append(text_embedder.embed_documents([tbl.to_csv(index=False)])[0])
+                csv = tbl.to_csv(index=False)
+                docs.append(Document(page_content=csv, metadata={"source":fname, "chunk":"table"}))
+                txt_embs.append(text_embedder.embed_documents([csv])[0])
 
-            # --- IMAGES & SCHEMES ---
+            # IMAGES & SCHEMES
             for item in extract_images_and_schemes(path):
                 if item["type"] == "image":
                     img_embs.append(item["emb"])
                     meta.append({"source":fname, "page":item["page"], "type":"image"})
                 else:
-                    # caption placeholder: zero vector
-                    emb_dim = img_embs[0].shape[0] if img_embs else 512
-                    img_embs.append(np.zeros(emb_dim))
+                    dim = img_embs[0].shape[0] if img_embs else 512
+                    img_embs.append(np.zeros(dim))
                     meta.append({"source":fname, "page":item["page"], "type":"caption"})
 
-        # build and store
-        text_indices[cls]  = build_faiss_index(np.vstack(txt_embs))
-        text_docs[cls]     = docs
-        image_indices[cls] = build_faiss_index(np.vstack(img_embs))
-        image_meta[cls]    = meta
+        text_idxs[cls]  = build_faiss_index(np.vstack(txt_embs))
+        text_docs[cls]  = docs
+        img_idxs[cls]   = build_faiss_index(np.vstack(img_embs))
+        img_meta[cls]   = meta
 
-    return text_indices, text_docs, image_indices, image_meta
+    return text_idxs, text_docs, img_idxs, img_meta
 
 text_idxs, text_ds, img_idxs, img_meta = initialize_indices()
 
-# --- QUERY FUNCTIONS --------------------------------------------------------
+# --- RETRIEVAL ---------------------------------------------------------------
 
 def retrieve_text_chunks(cls: str, q: str, k: int):
     q_emb = text_embedder.embed_query(q).reshape(1,-1).astype("float32")
@@ -208,38 +199,37 @@ def retrieve_image_hits(cls: str, q: str, k: int):
 # --- STREAMLIT UI -----------------------------------------------------------
 
 st.sidebar.title("⚙️ Settings")
-st.sidebar.markdown("Configure your query and model behavior here.")
-
-reaction_class = st.sidebar.selectbox("Reaction Class", list(REACTION_FOLDERS.keys()))
-user_query     = st.text_input("🔎 Ask about this reaction:")
+reaction_class = st.sidebar.selectbox("Reaction Chemistry", list(embedded_folders.keys()))
+user_query     = st.text_input("Ask about this reaction:")
 
 if user_query:
-    st.header("📝 Retrieved Procedure, Yield & Tables")
+    st.header("📝 Procedures, Yields & Tables")
     chunks = retrieve_text_chunks(reaction_class, user_query, TOP_K_TEXT)
     for doc in chunks:
         st.markdown(f"**Source:** {doc.metadata['source']} — Chunk `{doc.metadata['chunk']}`")
-        # detect CSV tables
-        if doc.page_content.lstrip().startswith(("sep=", "col1")) or "\n" in doc.page_content and doc.page_content.count(",")>3:
-            df = pd.read_csv(io.StringIO(doc.page_content))
+        content = doc.page_content
+        if content.strip().startswith(("sep=",)) or content.count(",")>3:
+            df = pd.read_csv(io.StringIO(content))
             st.dataframe(df)
         else:
-            st.text_area("", doc.page_content, height=200)
+            st.text_area("", content, height=200)
 
-    st.header("🔎 Retrieved Schemes & Figures")
+    st.header("🔎 Schemes & Figures")
     hits = retrieve_image_hits(reaction_class, user_query, TOP_K_IMAGES)
     for m in hits:
         if m["type"] == "caption":
-            st.markdown(f"*📑 Synthetic Scheme caption detected on page {m['page']} of {m['source']}*")
+            st.markdown(f"*📑 Synthetic Scheme caption on page {m['page']} of {m['source']}*")
         else:
-            # reopen PDF and display the actual image
-            pdf = fitz.open(os.path.join(REACTION_FOLDERS[reaction_class], m["source"]))
+            pdf = fitz.open(os.path.join(embedded_folders[reaction_class], m["source"]))
             img_obj = pdf[m["page"]-1].get_images(full=True)[0]
             xref = img_obj[0]
             img = Image.open(io.BytesIO(pdf.extract_image(xref)["image"]))
             st.image(img, caption=f"{m['source']} — page {m['page']}", use_column_width=True)
 
-    st.header("🤖 AI Summary & Correlation")
-    system_msg = SystemMessage(content="You are a world-class synthetic chemist. Summarize the retrieved procedures, yields, tables, and schemes, and explain how they relate.")
-    human_msg  = HumanMessage(content=user_query)
-    answer     = chat_model([system_msg, human_msg])
-    st.markdown(answer.content)
+    st.header("🤖 AI Summary")
+    system_msg = SystemMessage(
+        content="You are an expert synthetic chemist. Summarize and correlate the retrieved procedures, yields, tables, and schemes."
+    )
+    human_msg = HumanMessage(content=user_query)
+    answer = chat_model([system_msg, human_msg])
+    st.write(answer.content)
