@@ -1,527 +1,245 @@
+# reaction_database_app.py
+
 import os
+import io
 import json
-import pandas as pd
-import streamlit as st
-from langchain_openai import AzureChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
+import faiss
 import torch
 import clip
-from PIL import Image
+import camelot
+import tabula
 import numpy as np
-import faiss
+import pandas as pd
+import streamlit as st
+from PIL import Image
 from PyPDF2 import PdfReader
 import fitz  # PyMuPDF
-import io
-import base64
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTFigure
-import re
-import tempfile
 
-# Set Streamlit page config
-st.set_page_config(page_title="Reaction Database", page_icon="🧪", layout="wide")
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain.schema import Document, HumanMessage, SystemMessage
 
-# Configuration - Replace with your actual credentials
-base_url = "YOUR_AZURE_ENDPOINT"
-api_version = "2024-02-15-preview"
-api_key = "YOUR_API_KEY"
-deployment_name = "GPT4o"
-model_name = "GPT4o"
+# --- STREAMLIT CONFIG -------------------------------------------------------
 
-embedded_folders = {
-    'C-N_Bond_Formation': r"C:\Users\Desktop\C-N_Bond_Formation",
-    # Add more reaction-specific folders as needed
+st.set_page_config(
+    page_title="🔬 Reaction Database AI", 
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# --- AZURE & MODEL SETTINGS ------------------------------------------------
+
+AZURE_ENDPOINT      = os.getenv("AZURE_ENDPOINT", "<YOUR_AZURE_ENDPOINT>")
+AZURE_API_KEY       = os.getenv("AZURE_API_KEY", "<YOUR_API_KEY>")
+CHAT_DEPLOYMENT     = "GPT4o"
+EMBED_DEPLOYMENT    = "Def_data_qa"
+EMBED_MODEL         = "text-embedding-ada-002"
+PDF_TEXT_CHUNK_SIZE = 5000     # chars per embedding
+TOP_K_TEXT          = 5
+TOP_K_IMAGES        = 3
+
+# --- YOUR REACTION FOLDERS --------------------------------------------------
+
+REACTION_FOLDERS = {
+    "C-N Bond Formation": r"/absolute/path/to/C-N_Bond_Formation",
+    # Add other classes here, e.g.:
+    # "Oxidation Reactions": r"/path/to/Oxidation",
 }
 
-# Initialize services
-file_store = LocalFileStore('langchain-embeddings')
-base_embeddings = AzureOpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_version="2023-07-01-preview",
-    azure_endpoint=base_url,
-    api_key=api_key,
-    azure_deployment="Def_data_qa"
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base_embeddings, file_store, namespace=base_embeddings.model)
+# --- LOAD & CACHE MODELS ----------------------------------------------------
 
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-
-# Load CLIP model for image processing
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_clip_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = clip.load("ViT-B/32", device=device)
     return model, preprocess, device
 
-model, preprocess, device = load_clip_model()
+clip_model, clip_preprocess, clip_device = load_clip_model()
 
-# Initialize session state variables
-if "faiss_image_index" not in st.session_state:
-    st.session_state.faiss_image_index = None
+@st.cache_resource(show_spinner=False)
+def get_text_embedder():
+    store = LocalFileStore("langchain-embeddings")
+    base  = AzureOpenAIEmbeddings(
+        model=EMBED_MODEL,
+        api_version="2023-07-01-preview",
+        azure_endpoint=AZURE_ENDPOINT,
+        api_key=AZURE_API_KEY,
+        azure_deployment=EMBED_DEPLOYMENT
+    )
+    return CacheBackedEmbeddings.from_bytes_store(base, store, namespace=base.model)
 
-if "image_metadata" not in st.session_state:
-    st.session_state.image_metadata = []
+text_embedder = get_text_embedder()
 
-if "synthetic_schemes" not in st.session_state:
-    st.session_state.synthetic_schemes = {}
+@st.cache_resource(show_spinner=False)
+def get_chat_model():
+    return AzureChatOpenAI(
+        azure_deployment=CHAT_DEPLOYMENT,
+        model="GPT4o",
+        api_version="2024-02-15-preview",
+        api_key=AZURE_API_KEY,
+        azure_endpoint=AZURE_ENDPOINT
+    )
 
-if "tables_data" not in st.session_state:
-    st.session_state.tables_data = {}
+chat_model = get_chat_model()
 
-# Improved text chunking with context preservation
-def chunk_text(text, max_tokens=4000):
-    """Chunk text intelligently while preserving context and structure"""
-    chunks = []
-    
-    # First try splitting by major sections
-    sections = re.split(r'\n\s*(?:RESULTS|DISCUSSION|EXPERIMENTAL|SYNTHESIS|SCHEME)\s*\n', text, flags=re.IGNORECASE)
-    if len(sections) > 1:
-        for section in sections:
-            if len(section) > max_tokens:
-                # Split large sections by paragraphs
-                paragraphs = section.split('\n\n')
-                current_chunk = ""
-                for para in paragraphs:
-                    if len(current_chunk) + len(para) < max_tokens:
-                        current_chunk += para + "\n\n"
-                    else:
-                        if current_chunk:
-                            chunks.append(current_chunk.strip())
-                        current_chunk = para + "\n\n"
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-            else:
-                chunks.append(section.strip())
-    else:
-        # Fallback to paragraph-based splitting
-        paragraphs = text.split('\n\n')
-        current_chunk = ""
-        for para in paragraphs:
-            if len(current_chunk) + len(para) < max_tokens:
-                current_chunk += para + "\n\n"
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = para + "\n\n"
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-            
-    return chunks
+# --- UTILITIES --------------------------------------------------------------
 
-# Improved synthetic scheme extraction
-def extract_synthetic_schemes(pdf_path):
-    """Extract synthetic schemes from PDFs using layout analysis"""
-    synthetic_schemes = []
-    try:
-        doc = fitz.open(pdf_path)
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            blocks = page.get_text("blocks")
-            
-            for block in blocks:
-                x0, y0, x1, y1, text, block_no, block_type = block
-                # Look for scheme indicators in text
-                if "scheme" in text.lower() or "synthetic" in text.lower():
-                    # Capture the scheme content - next 3 blocks
-                    scheme_content = text + "\n"
-                    next_blocks = blocks[blocks.index(block)+1:blocks.index(block)+4]
-                    
-                    for nb in next_blocks:
-                        scheme_content += nb[4] + "\n"
-                    
-                    # Also extract images on the same page
-                    image_list = page.get_images(full=True)
-                    images = []
-                    for img_index, img in enumerate(image_list):
-                        base_image = doc.extract_image(img[0])
-                        image_bytes = base_image["image"]
-                        images.append({
-                            "image_index": img_index,
-                            "image_bytes": image_bytes,
-                            "bbox": (x0, y0, x1, y1)
-                        })
-                    
-                    synthetic_schemes.append({
-                        "page": page_num + 1,
-                        "text": scheme_content.strip(),
-                        "source": pdf_path,
-                        "images": images
-                    })
-                    
-        doc.close()
-    except Exception as e:
-        st.error(f"Error extracting synthetic schemes from PDF '{pdf_path}': {e}")
-    return synthetic_schemes
+def chunk_text(text: str, max_chars: int):
+    """Split a long string into chunks of ≤ max_chars."""
+    return [text[i:i+max_chars] for i in range(0, len(text), max_chars)]
 
-# Robust image extraction and processing
-def extract_images_from_pdf(pdf_path):
-    """Extract images from a PDF and create embeddings"""
-    images = []
-    try:
-        pdf_document = fitz.open(pdf_path)
-        
-        for page_number in range(len(pdf_document)):
-            image_list = pdf_document[page_number].get_images(full=True)
-            
-            for image_index, image_obj in enumerate(image_list):
-                xref = image_obj[0]
-                base_image = pdf_document.extract_image(xref)
-                img_bytes = base_image.get("image", None)
-                
-                if img_bytes:
-                    try:
-                        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-                        
-                        # Resize large images to manage memory
-                        if img.size[0] > 1000 or img.size[1] > 1000:
-                            img.thumbnail((1000, 1000))
-                        
-                        # Create embedding
-                        image_input = preprocess(img).unsqueeze(0).to(device)
-                        with torch.no_grad():
-                            embedding = model.encode_image(image_input).cpu().numpy().astype("float32")[0]
-                        
-                        metadata = {
-                            "source": pdf_path,
-                            "page": page_number + 1,
-                            "image_index": image_index,
-                            "image_bytes": img_bytes,
-                            "width": img.width,
-                            "height": img.height
-                        }
-                        images.append((embedding, metadata))
-                    except Exception as e:
-                        st.error(f"Error processing image on page {page_number + 1}: {e}")
-        
-        pdf_document.close()
-    except Exception as e:
-        st.error(f"Error extracting images from PDF '{pdf_path}': {e}")
-    
-    return images
-
-# Tabular data extraction
-def extract_tables(pdf_path):
-    """Extract tabular data from PDFs"""
+def extract_tables_from_pdf(pdf_path: str):
+    """Extract tables via Camelot and Tabula, return list of DataFrames."""
     tables = []
     try:
-        pdf_document = fitz.open(pdf_path)
-        
-        for page_number in range(len(pdf_document)):
-            page = pdf_document[page_number]
-            tables_on_page = page.find_tables()
-            
-            if tables_on_page.tables:
-                for table_index, table in enumerate(tables_on_page.tables):
-                    df = table.to_pandas()
-                    tables.append({
-                        "page": page_number + 1,
-                        "source": pdf_path,
-                        "table_index": table_index,
-                        "dataframe": df
-                    })
-        
-        pdf_document.close()
-    except Exception as e:
-        st.error(f"Error extracting tables from PDF '{pdf_path}': {e}")
-    
+        tables += [t.df for t in camelot.read_pdf(pdf_path, pages="all", flavor="stream")]
+    except Exception:
+        pass
+    try:
+        tables += tabula.read_pdf(pdf_path, pages="all", multiple_tables=True)
+    except Exception:
+        pass
     return tables
 
-# Main PDF processing function
-def load_pdf_data(folder_path):
-    """Load and process all PDFs in the specified folder"""
-    text_docs = []
-    image_embeddings = []
-    synthetic_schemes = []
-    tables_data = []
-    
-    for file_name in os.listdir(folder_path):
-        file_path = os.path.join(folder_path, file_name)
-        if not file_path.lower().endswith('.pdf'):
-            continue
-        
-        try:
-            # Process textual content
-            pdf_reader = PdfReader(file_path)
-            text_content = ""
-            for page in pdf_reader.pages:
-                text_content += page.extract_text() + "\n"
-            
-            # Chunk the text intelligently
-            chunks = chunk_text(text_content)
-            for i, chunk in enumerate(chunks):
-                text_docs.append(Document(
-                    page_content=chunk,
-                    metadata={
-                        "source": file_name,
-                        "chunk": i,
-                        "type": "text"
-                    }
-                ))
-            
-            # Extract synthetic schemes
-            schemes = extract_synthetic_schemes(file_path)
-            for scheme in schemes:
-                text_docs.append(Document(
-                    page_content=scheme["text"],
-                    metadata={
-                        "source": file_name,
-                        "page": scheme["page"],
-                        "type": "scheme"
-                    }
-                ))
-                synthetic_schemes.append(scheme)
-            
-            # Extract images
-            images = extract_images_from_pdf(file_path)
-            image_embeddings.extend(images)
-            
-            # Extract tables
-            tables = extract_tables(file_path)
-            for table in tables:
-                # Convert table to markdown for storage
-                table_md = table["dataframe"].to_markdown(index=False)
-                text_docs.append(Document(
-                    page_content=table_md,
-                    metadata={
-                        "source": file_name,
-                        "page": table["page"],
-                        "type": "table"
-                    }
-                ))
-                tables_data.append(table)
-                
-        except Exception as e:
-            st.error(f"Error processing PDF file '{file_name}': {e}")
-    
-    return text_docs, image_embeddings, synthetic_schemes, tables_data
+def extract_images_and_schemes(pdf_path: str):
+    """
+    Return list of dicts:
+      - {"type":"image", "page":int, "img":PIL.Image, "emb":np.ndarray}
+      - {"type":"caption", "page":int}
+    """
+    out = []
+    doc = fitz.open(pdf_path)
+    for p in range(len(doc)):
+        blocks = doc[p].get_text("blocks")
+        # detect any "Scheme" captions
+        for b in blocks:
+            if "scheme" in b[4].lower():
+                out.append({"type":"caption", "page": p+1})
+                break
+        # extract all images
+        for img_idx, img_obj in enumerate(doc[p].get_images(full=True)):
+            xref = img_obj[0]
+            img_bytes = doc.extract_image(xref)["image"]
+            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            inp = clip_preprocess(img).unsqueeze(0).to(clip_device)
+            with torch.no_grad():
+                emb = clip_model.encode_image(inp).cpu().numpy().reshape(-1)
+            out.append({"type":"image", "page":p+1, "img":img, "emb":emb})
+    return out
 
-# Build vector stores
-def build_vectorstores_with_pdfs(folder_paths):
-    agents = []
-    
-    # Initialize session state dictionaries
-    if "image_metadata" not in st.session_state:
-        st.session_state.image_metadata = {}
-    if "faiss_image_index" not in st.session_state:
-        st.session_state.faiss_image_index = {}
-    if "synthetic_schemes" not in st.session_state:
-        st.session_state.synthetic_schemes = {}
-    if "tables_data" not in st.session_state:
-        st.session_state.tables_data = {}
-    
-    for reaction_type, folder_path in folder_paths.items():
-        with st.spinner(f"Processing {reaction_type} PDFs..."):
-            text_docs, image_embeddings, synthetic_schemes, tables_data = load_pdf_data(folder_path)
-            
-            # Build agents for PDF textual data
-            if text_docs:
-                pdf_store = FAISS.from_documents(text_docs, cached_embeddings)
-                pdf_retriever = pdf_store.as_retriever(search_kwargs={"k": 5})
-                agents.append(ChildAgent(name=reaction_type, retriever=pdf_retriever))
-            
-            # Handle image embeddings
-            if image_embeddings:
-                try:
-                    # Filter for valid embeddings
-                    valid_embeddings = [e[0] for e in image_embeddings]
-                    metadata_list = [e[1] for e in image_embeddings]
-                    
-                    if valid_embeddings:
-                        # Create FAISS index
-                        index = faiss.IndexFlatL2(valid_embeddings[0].shape[0])
-                        embeddings_array = np.array(valid_embeddings).astype('float32')
-                        index.add(embeddings_array)
-                        
-                        # Store in session state
-                        st.session_state.image_metadata[reaction_type] = metadata_list
-                        st.session_state.faiss_image_index[reaction_type] = index
-            
-                except Exception as e:
-                    st.error(f"Error creating image index for {reaction_type}: {e}")
-            
-            # Store synthetic schemes and tables
-            st.session_state.synthetic_schemes[reaction_type] = synthetic_schemes
-            st.session_state.tables_data[reaction_type] = tables_data
-    
-    return agents
+def build_faiss_index(embs: np.ndarray):
+    """Create an L2 FAISS index from (N, D) numpy array."""
+    dim = embs.shape[1]
+    idx = faiss.IndexFlatL2(dim)
+    idx.add(embs.astype("float32"))
+    return idx
 
-# Agent classes
-class ChildAgent:
-    def __init__(self, name, retriever):
-        self.name = name
-        self.retriever = retriever
+# --- BUILD INDICES (CACHED) -----------------------------------------------
 
-    def ask(self, query):
-        try:
-            prompt = (
-                "You are an expert chemistry assistant specialized in reaction data extraction. "
-                "When answering user queries, follow these guidelines:\n"
-                "1. **API Details**: Provide the API name if available\n"
-                "2. **Reaction Chemistry**: Describe the reaction chemistry\n"
-                "3. **Yield**: Report the yield\n"
-                "4. **Procedure**: Present the complete experimental procedure EXACTLY as written. "
-                "Preserve all details, measurements, and formatting. Do NOT summarize or modify.\n"
-                "5. **Tabular Data**: For any tables, present them COMPLETELY in markdown format with ALL data. "
-                "Do NOT omit any rows, columns, or values.\n\n"
-                "Prioritize completeness and fidelity to the original source material. "
-                "Include all relevant details while excluding unrelated content."
-            )
-            full_query = f"{prompt}\n\n{query}"
+@st.cache_data(show_spinner=True)
+def initialize_indices():
+    text_indices  = {}
+    text_docs     = {}
+    image_indices = {}
+    image_meta    = {}
 
-            result = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=self.retriever,
-                return_source_documents=True
-            ).invoke({"query": full_query})
+    for cls, folder in REACTION_FOLDERS.items():
+        txt_embs, docs = [], []
+        img_embs, meta  = [], []
 
-            return {
-                "result": result["result"],
-                "source_documents": result["source_documents"]
-            }
-
-        except Exception as e:
-            st.error(f"Error querying {self.name}: {e}")
-            return None
-
-class CoordinatorAgent:
-    def __init__(self, child_agents):
-        self.children = child_agents
-
-    def coordinate(self, query):
-        answers = []
-        for child in self.children:
-            try:
-                resp = child.ask(query)
-                if resp and resp["result"]:
-                    answers.append((child.name, resp))
-            except Exception as e:
-                st.error(f"Error querying {child.name}: {e}")
+        for fname in sorted(os.listdir(folder)):
+            if not fname.lower().endswith(".pdf"):
                 continue
-        return answers
+            path = os.path.join(folder, fname)
 
-class AgentManager:
-    def __init__(self, agents):
-        self.coordinator = CoordinatorAgent(agents)
-        self.reaction_types = list(embedded_folders.keys())
+            # --- TEXT & TABLE EXTRACTION ---
+            reader = PdfReader(path)
+            raw = "\n".join(p.extract_text() or "" for p in reader.pages)
+            chunks = chunk_text(raw, PDF_TEXT_CHUNK_SIZE)
+            docs.extend([Document(page_content=c, metadata={"source":fname, "chunk":i})
+                         for i,c in enumerate(chunks)])
+            txt_embs.extend(text_embedder.embed_documents(chunks))
 
-    def handle_query(self, query):
-        raw_answers = self.coordinator.coordinate(query)
-        if not raw_answers:
-            return "Relevant information not found.", [], [], []
-        
-        # Find best answer
-        best_answer = max(raw_answers, key=lambda x: len(x[1]["result"]))
-        reaction_type = best_answer[0]
-        answer_data = best_answer[1]
-        
-        # Extract source documents for display
-        source_docs = answer_data.get("source_documents", [])
-        
-        # Find relevant schemes and tables
-        schemes = st.session_state.synthetic_schemes.get(reaction_type, [])
-        tables = st.session_state.tables_data.get(reaction_type, [])
-        
-        # Find relevant images
-        relevant_images = []
-        if query and st.session_state.faiss_image_index.get(reaction_type):
-            try:
-                # Embed the query text
-                text_input = clip.tokenize([query]).to(device)
-                with torch.no_grad():
-                    text_embedding = model.encode_text(text_input).cpu().numpy().astype("float32")
-                
-                # Search the FAISS index
-                index = st.session_state.faiss_image_index[reaction_type]
-                D, I = index.search(text_embedding, 3)  # Get top 3 images
-                
-                # Retrieve the images
-                metadata_list = st.session_state.image_metadata.get(reaction_type, [])
-                for idx in I[0]:
-                    if 0 <= idx < len(metadata_list):
-                        relevant_images.append(metadata_list[idx])
-            except Exception as e:
-                st.error(f"Image search error: {e}")
-        
-        return answer_data["result"], source_docs, schemes, tables, relevant_images
+            # --- TABLES ---
+            for tbl in extract_tables_from_pdf(path):
+                docs.append(Document(
+                    page_content=tbl.to_csv(index=False),
+                    metadata={"source":fname, "chunk":"table"}
+                ))
+                txt_embs.append(text_embedder.embed_documents([tbl.to_csv(index=False)])[0])
 
-# Streamlit UI
-st.title("🧪 Reaction Database AI")
-st.markdown("Search chemical reaction databases for API details, procedures, yields, and synthetic schemes")
+            # --- IMAGES & SCHEMES ---
+            for item in extract_images_and_schemes(path):
+                if item["type"] == "image":
+                    img_embs.append(item["emb"])
+                    meta.append({"source":fname, "page":item["page"], "type":"image"})
+                else:
+                    # caption placeholder: zero vector
+                    emb_dim = img_embs[0].shape[0] if img_embs else 512
+                    img_embs.append(np.zeros(emb_dim))
+                    meta.append({"source":fname, "page":item["page"], "type":"caption"})
 
-# Build agents only once
-if "agents_built" not in st.session_state:
-    with st.spinner("Initializing database. This may take several minutes..."):
-        child_agents = build_vectorstores_with_pdfs(embedded_folders)
-        manager = AgentManager(child_agents)
-        st.session_state.manager = manager
-        st.session_state.agents_built = True
-else:
-    manager = st.session_state.manager
+        # build and store
+        text_indices[cls]  = build_faiss_index(np.vstack(txt_embs))
+        text_docs[cls]     = docs
+        image_indices[cls] = build_faiss_index(np.vstack(img_embs))
+        image_meta[cls]    = meta
 
-# Search interface
-query = st.text_input("Search Reaction Database:", key="input_query", 
-                      placeholder="Enter reaction type, API name, or chemical query")
+    return text_indices, text_docs, image_indices, image_meta
 
-if st.button("Search") or query:
-    with st.spinner("Searching database..."):
-        response, source_docs, schemes, tables, images = manager.handle_query(query)
-        
-        # Display main response
-        st.subheader("Query Results")
-        st.write(response)
-        
-        # Display source documents
-        if source_docs:
-            st.subheader("Source Documents")
-            for i, doc in enumerate(source_docs):
-                with st.expander(f"Source Document {i+1} - {doc.metadata['source']}"):
-                    st.write(f"**Document Type:** {doc.metadata.get('type', 'text')}")
-                    st.write(doc.page_content)
-        
-        # Display synthetic schemes
-        if schemes:
-            st.subheader("Synthetic Schemes")
-            for scheme in schemes:
-                with st.expander(f"Scheme from {scheme['source']} - Page {scheme['page']}"):
-                    st.write(scheme["text"])
-                    
-                    # Display scheme images
-                    for img_data in scheme["images"]:
-                        img = Image.open(io.BytesIO(img_data["image_bytes"]))
-                        st.image(img, caption=f"Scheme Image - Page {scheme['page']}", 
-                                 use_column_width=True)
-        
-        # Display tables
-        if tables:
-            st.subheader("Tabular Data")
-            for table in tables:
-                with st.expander(f"Table from {table['source']} - Page {table['page']}"):
-                    st.dataframe(table["dataframe"])
-        
-        # Display relevant images
-        if images:
-            st.subheader("Relevant Images")
-            cols = st.columns(3)
-            for i, img_meta in enumerate(images):
-                img = Image.open(io.BytesIO(img_meta["image_bytes"]))
-                with cols[i % 3]:
-                    st.image(img, caption=f"Page {img_meta['page']} - {img_meta['source']}", 
-                             use_column_width=True)
+text_idxs, text_ds, img_idxs, img_meta = initialize_indices()
 
-# Add footer
-st.markdown("---")
-st.caption("Reaction Database AI | Powered by Azure OpenAI and CLIP models")
+# --- QUERY FUNCTIONS --------------------------------------------------------
+
+def retrieve_text_chunks(cls: str, q: str, k: int):
+    q_emb = text_embedder.embed_query(q).reshape(1,-1).astype("float32")
+    D, I = text_idxs[cls].search(q_emb, k)
+    return [ text_ds[cls][i] for i in I[0] ]
+
+def retrieve_image_hits(cls: str, q: str, k: int):
+    tok = clip.tokenize([q]).to(clip_device)
+    with torch.no_grad():
+        q_emb = clip_model.encode_text(tok).cpu().numpy().reshape(1,-1)
+    D, I = img_idxs[cls].search(q_emb.astype("float32"), k)
+    return [ img_meta[cls][i] for i in I[0] ]
+
+# --- STREAMLIT UI -----------------------------------------------------------
+
+st.sidebar.title("⚙️ Settings")
+st.sidebar.markdown("Configure your query and model behavior here.")
+
+reaction_class = st.sidebar.selectbox("Reaction Class", list(REACTION_FOLDERS.keys()))
+user_query     = st.text_input("🔎 Ask about this reaction:")
+
+if user_query:
+    st.header("📝 Retrieved Procedure, Yield & Tables")
+    chunks = retrieve_text_chunks(reaction_class, user_query, TOP_K_TEXT)
+    for doc in chunks:
+        st.markdown(f"**Source:** {doc.metadata['source']} — Chunk `{doc.metadata['chunk']}`")
+        # detect CSV tables
+        if doc.page_content.lstrip().startswith(("sep=", "col1")) or "\n" in doc.page_content and doc.page_content.count(",")>3:
+            df = pd.read_csv(io.StringIO(doc.page_content))
+            st.dataframe(df)
+        else:
+            st.text_area("", doc.page_content, height=200)
+
+    st.header("🔎 Retrieved Schemes & Figures")
+    hits = retrieve_image_hits(reaction_class, user_query, TOP_K_IMAGES)
+    for m in hits:
+        if m["type"] == "caption":
+            st.markdown(f"*📑 Synthetic Scheme caption detected on page {m['page']} of {m['source']}*")
+        else:
+            # reopen PDF and display the actual image
+            pdf = fitz.open(os.path.join(REACTION_FOLDERS[reaction_class], m["source"]))
+            img_obj = pdf[m["page"]-1].get_images(full=True)[0]
+            xref = img_obj[0]
+            img = Image.open(io.BytesIO(pdf.extract_image(xref)["image"]))
+            st.image(img, caption=f"{m['source']} — page {m['page']}", use_column_width=True)
+
+    st.header("🤖 AI Summary & Correlation")
+    system_msg = SystemMessage(content="You are a world-class synthetic chemist. Summarize the retrieved procedures, yields, tables, and schemes, and explain how they relate.")
+    human_msg  = HumanMessage(content=user_query)
+    answer     = chat_model([system_msg, human_msg])
+    st.markdown(answer.content)
