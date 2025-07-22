@@ -1,37 +1,363 @@
-The pricing for a chatbot system as described—ingesting 400 documents for chat queries, using Azure GPT-4o for the embedding model, text-embedding-ada for text embeddings, and Gemini 2.0 Flash for OCR on scanned documents, supporting 500 users per month—depends on several variable factors. These include the total tokens processed for embeddings and queries, image sizes for OCR, and actual usage patterns. Costs are typically divided into one-time ingestion/setup fees and ongoing monthly usage fees.
-I’ll break this down by component based on available pricing data. Note that exact totals require precise usage metrics (e.g., tokens per document or queries per user), which aren’t specified. If these details are unavailable, estimates can be calculated by multiplying per-unit rates by your expected volumes. All figures are in USD and sourced from provider documentation as of the current date (July 22, 2025). Prices may vary by region, volume discounts, or updates—always verify with providers.
-1. Document Ingestion and Embedding Costs (One-Time or Initial)
-This covers processing 400 documents for embeddings using Azure GPT-4o and text-embedding-ada models. These are typically one-time costs unless documents are frequently re-ingested.
-	•	Azure GPT-4o Embedding Model:
-	•	Input tokens: $2.50 per 1,000 tokens.
-	•	Output tokens: $10.00 per 1,000 tokens.
-	•	To estimate: Multiply by the total input/output tokens across all 400 documents. For example, if each document averages a certain token count (not specified here), scale accordingly. This model handles multimodal embeddings, but costs scale with data volume.
-	•	Text-Embedding-Ada Model:
-	•	Embedding cost: $0.10 per 1,000,000 tokens.
-	•	To estimate: Determine total tokens in the 400 documents and apply the rate. This is used for efficient text vectorization.
-Total ingestion cost would be the sum of these, potentially ranging from low hundreds to thousands depending on document size and complexity. Without specific token counts, a precise figure isn’t possible—use provider calculators for simulations.
-2. OCR for Scanned Documents (Using Gemini 2.0 Flash)
-Assuming the 400 documents are scanned images requiring OCR, Gemini 2.0 Flash processes them as image or multimodal inputs.
-	•	Gemini 2.0 Flash Pricing:
-	•	Input tokens: $1.00 per 1,000,000 tokens (text/audio).
-	•	Per image (e.g., 1024x1024 resolution): Approximately $0.00129.
-	•	Input audio tokens (if applicable): $0.25 per 1,000,000 tokens.
-	•	For OCR on scanned documents, costs are based on image resolution and any extracted text tokens. Grounding or additional requests may add $35 per 1,000 requests beyond free tiers.
-For 400 images, base cost could start around $0.516 (at $0.00129 per image), but this increases with higher resolutions or additional token processing. This is likely a one-time cost per batch of documents.
-General OCR services (not specific to Gemini) range from $0.006 per minute for transcription to $1.50 per 1,000 pages in comparable tools, but Gemini’s modality-based pricing applies here.
-3. Monthly Chat Query Costs for 500 Users
-This covers ongoing usage for chat interactions, primarily using Azure GPT-4o for query handling. Costs depend on the number of queries, tokens per query, and user activity.
-	•	Azure GPT-4o for Chat Queries:
-	•	Input tokens: $2.50 per 1,000 tokens.
-	•	Output tokens: $10.00 per 1,000 tokens.
-	•	For 500 users, estimate total monthly tokens (input + output) based on average queries per user. Without exact usage, multiply per-token rates by projected volumes.
-	•	Overall Chatbot Platform Costs:
-	•	Basic AI chatbot plans (suitable for 500 users): $20–$150 per month, covering hosting and basic integrations.
-	•	Mid-market plans (with advanced AI like GPT models): $800–$1,200 per month.
-	•	Enterprise plans (custom for high volume): $3,000–$10,000+ per month, including scalability for 500 users.
-	•	Consumption-based: $0.006–$1 per text/audio request, scaling with user interactions.
-For 500 users, monthly costs could range from $625+ (assuming moderate token usage) to several thousand, depending on query volume. Tools like Helicone provide calculators for precise Azure/OpenAI estimations.
-Total Estimated Pricing and Considerations
-	•	One-Time Costs: Primarily ingestion/embeddings ($0.40–$10,000+ depending on tokens) + OCR ($0.52+ for 400 documents).
-	•	Monthly Costs: $625–$5,000+ for 500 users, driven by query tokens and platform fees.
-	•	Key Variables and Limitations: Total depends on document token counts, image resolutions, queries per user, and whether costs are pay-as-you-go or subscription-based. If data volumes are high, volume discounts may apply. I couldn’t find exact bundled pricing for this exact combination, so consult Azure, OpenAI, and Google Cloud for integrated quotes. Additional fees may include storage ($0.10/GB/day for files) or fine-tuning ($3.00–$100.00 per model/hour). For a custom setup, development could add $1,000–$10,000 initially.
+import os
+import json
+import pandas as pd
+import streamlit as st
+from langchain_openai import AzureChatOpenAI
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+import torch
+import clip
+from PIL import Image
+import numpy as np
+import faiss
+from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
+import io
+
+# Set Streamlit page config
+st.set_page_config(page_title="Reaction Database", page_icon="", layout="wide")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+base_url=""
+api_version="2024-02-15-preview"
+
+api_key=""
+deployment_name="GPT4o"
+model_name="GPT4o"
+
+embedded_folders = {
+    # 'C-N_Bond': r"C:\Users\p00095189\Desktop\WORK\API\Reaction_Database\Dataset\Chemistry Database API\C-N Bond Formation",
+    'C-N_Bond_Formation': r"C:\Users\Desktop\C-N_Bond_Formation",
+    # Add more reaction-specific folders as needed
+}
+
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="Def_data_qa"
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+@st.cache_resource
+def load_clip_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    return model, preprocess, device
+
+
+model, preprocess, device = load_clip_model()
+
+if "faiss_image_index" not in st.session_state:
+    st.session_state.faiss_image_index = None
+
+if "image_metadata" not in st.session_state:
+    st.session_state.image_metadata = []
+
+
+def extract_synthetic_schemes(pdf_path):
+    """Extract synthetic schemes from PDFs as selectable sketch elements."""
+    synthetic_schemes = []
+    try:
+        pdf_document = fitz.open(pdf_path)
+        for page_number in range(len(pdf_document)):
+            # Check for synthetic scheme conditions (add your own logic here)
+            textblocks = pdf_document[page_number].get_text("blocks")
+            
+            page_has_scheme = False  # Flag to determine if the page contains schemes
+            
+            for block in textblocks:
+                try:
+                    # Extract text and bounding boxes
+                    x0, y0, x1, y1, text = block[:5]  # Only first 5 values are relevant
+                    if text.strip() and "Synthetic Scheme" in text:  # Customize condition
+                        synthetic_schemes.append(
+                            (page_number + 1, text.strip(), pdf_path, (x0, y0, x1, y1))
+                        )
+                        page_has_scheme = True
+                except ValueError as ve:
+                    st.warning(f"Block parsing issue: {ve}, Block: {block}")
+            
+            # Log relevant pages
+            if page_has_scheme:
+                st.write(f"Page {page_number + 1} contains synthetic scheme.")
+
+    except Exception as e:
+        st.error(f"Error extracting synthetic schemes from PDF '{pdf_path}': {e}")
+    return synthetic_schemes
+
+def image_to_embedding(image):
+    """Convert image to embedding using the CLIP model."""
+    try:
+        image = preprocess(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            embedding = model.encode_image(image).cpu().numpy().astype("float32")
+
+        # Ensure the embedding is 1D
+        if embedding.ndim != 1:
+            raise ValueError(f"Expected 1D embedding but got shape {embedding.shape}")
+        
+        return embedding
+    except Exception as e:
+        st.error(f"Error creating embedding for image: {e}")
+        return None
+
+def extract_images_from_pdf(pdf_path):
+    """Extract images from a PDF and create embeddings."""
+    images = []
+    try:
+        pdf_document = fitz.open(pdf_path)  # open the PDF
+        for page_number in range(len(pdf_document)):
+            for image_index, image_obj in enumerate(pdf_document[page_number].get_images(full=True)):
+                # Extract the image data
+                xref = image_obj[0]
+                base_image = pdf_document.extract_image(xref)
+                img_bytes = base_image.get("image", None)
+
+                if img_bytes:  # Ensure image data exists
+                    try:
+                        # Process the image and generate embedding
+                        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        embedding = image_to_embedding(img)
+
+                        # Validate embedding shape and type
+                        if isinstance(embedding, np.ndarray):
+                            if embedding.ndim != 1:  # Ensure embedding is 1D
+                                st.warning(
+                                    f"Image embedding is not 1D for page {page_number + 1}, image {image_index}."
+                                )
+                                continue
+
+                            # Add valid embedding and metadata
+                            metadata = {
+                                "source": pdf_path,
+                                "page": page_number + 1,
+                                "image_index": image_index,
+                            }
+                            images.append((embedding, metadata))
+                        else:
+                            st.warning(f"Embedding is not a valid numpy array for page {page_number + 1}.")
+                            continue
+
+                    except Exception as e:
+                        st.error(f"Error processing image on page {page_number + 1}: {e}")
+                else:
+                    st.warning(f"No image bytes found for image {image_index} on page {page_number + 1}.")
+    except Exception as e:
+        st.error(f"Error extracting images from PDF '{pdf_path}': {e}")
+
+    return images
+
+
+def chunk_text(text, max_tokens=8192):
+    """Chunk text intelligently, splitting paragraphs while ensuring token limits."""
+    chunks = []
+    words = text.split()
+    chunk = []
+
+    for word in words:
+        chunk.append(word)
+        if len(' '.join(chunk)) >= max_tokens:
+            chunks.append(' '.join(chunk))
+            chunk = []
+
+    if chunk:
+        chunks.append(' '.join(chunk))
+    return chunks
+
+
+def load_pdf_data(folder_path):
+    """Load and process all PDFs in the specified folder."""
+    text_docs = []
+    image_embeddings = []
+    synthetic_schemes = []
+
+    for file_name in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, file_name)
+        if not file_path.endswith('.pdf'):
+            continue
+        
+        try:
+            # Process textual content
+            pdf_reader = PdfReader(file_path)
+            text_content = ""
+            for page in pdf_reader.pages:
+                text_content += page.extract_text() + "\n"
+
+            # Chunk the text into smaller parts based on token limits
+            chunks = chunk_text(text_content)
+            for i, chunk in enumerate(chunks):
+                text_docs.append(Document(page_content=chunk, metadata={"source": file_name, "chunk": i}))
+
+            # Process images
+            image_data = extract_images_from_pdf(file_path)
+            image_embeddings.extend(image_data)
+
+            # Process synthetic schemes
+            schemes_data = extract_synthetic_schemes(file_path)
+            synthetic_schemes.extend(schemes_data)
+
+        except Exception as e:
+            st.error(f"Error processing PDF file '{file_name}': {e}")
+
+    return text_docs, image_embeddings, synthetic_schemes
+
+
+def build_vectorstores_with_pdfs(folder_paths):
+    # Ensure session state variables are dictionaries
+    if "image_metadata" not in st.session_state:
+        st.session_state.image_metadata = {}
+    if "faiss_image_index" not in st.session_state:
+        st.session_state.faiss_image_index = {}
+    if "synthetic_schemes" not in st.session_state:
+        st.session_state.synthetic_schemes = {}
+
+    agents = []
+    for reaction_type, folder_path in folder_paths.items():
+        text_docs, image_embeddings, synthetic_schemes = load_pdf_data(folder_path)
+
+        # Build agents for PDF textual data
+        if text_docs:
+            pdf_store = FAISS.from_documents(text_docs, cached_embeddings)
+            pdf_retriever = pdf_store.as_retriever(search_kwargs={"k": 5})
+            agents.append(ChildAgent(name=reaction_type, retriever=pdf_retriever))
+        
+        # Handle image embeddings
+        if image_embeddings:
+            try:
+                # Filter for valid embeddings
+                valid_image_embeddings = [
+                    item for item in image_embeddings
+                    if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], np.ndarray) and item[0].ndim == 1
+                ]
+
+                if not valid_image_embeddings:
+                    st.error(f"No valid image embeddings found for {reaction_type}. Skipping FAISS index creation.")
+                    continue
+
+                # Create FAISS index
+                image_vectors = np.array([item[0] for item in valid_image_embeddings], dtype="float32")
+                metadata = [item[1] for item in valid_image_embeddings]
+
+                if len(image_vectors) == 0 or image_vectors.ndim != 2:
+                    st.error("Invalid image vector data. Unable to add vectors to FAISS index.")
+                    continue
+
+                # Create FAISS index
+                index = faiss.IndexFlatL2(image_vectors.shape[1])  # Vector dimensionality must match
+                index.add(image_vectors)
+
+                # Store in session state
+                st.session_state.image_metadata[reaction_type] = metadata
+                st.session_state.faiss_image_index[reaction_type] = index
+
+            except Exception as e:
+                st.error(f"Error adding image vectors to FAISS index for {reaction_type}: {e}")
+
+        # Add synthetic schemes to session state
+        st.session_state.synthetic_schemes[reaction_type] = synthetic_schemes
+
+    return agents
+
+
+class ChildAgent:
+    def __init__(self, name, retriever):
+        self.name = name
+        self.retriever = retriever
+
+    def ask(self, query):
+        try:
+            prompt = (
+                "You are a helpful assistant that answers user queries about reaction chemistry with relevant data. "
+                "Your response must include:\n"
+                "1. **API**: Provide the API name if available.\n"
+                "2. **Reaction Chemistry**\n"
+                "3. **Yield**\n"
+                "4. **Procedure**: ONLY display the complete procedure *exactly as written in the original source*. Do NOT summarize, transform, or modify it in any way. "
+                "Preserve paragraph formatting, punctuation, and structure entirely.\n"
+                "5. **Tabular Data**: give the complete table by Providing ALL tabular data exactly and in full; do not omit rows, columns, or content. Do NOT transform, abbreviate, or summarize the table—display it verbatim as-is.\n\n"
+                "Your response should focus solely on the relevant reaction information and exclude all unrelated or extraneous content by Always prioritizing and maintaining the full fidelity of original paragraphs and tabular content without any alterations.\n"
+            )
+            full_query = f"{prompt}\n\n{query}"
+
+            result = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=self.retriever,
+                return_source_documents=False
+            ).run(full_query)
+
+            return {"result": result}
+
+        except Exception as e:
+            st.error(f"Error querying {self.name}: {e}")
+            return None
+
+
+class AgentManager:
+    def __init__(self, agents):
+        self.coordinator = CoordinatorAgent(agents)
+
+    def handle_query(self, query):
+        raw_answers = self.coordinator.coordinate(query)
+        if not raw_answers or not isinstance(raw_answers[0][1], dict):
+            return "Relevant information not found.", None
+
+        validated = raw_answers[0][1]
+        return validated.get("result", "Relevant information not found.")
+
+
+class CoordinatorAgent:
+    def __init__(self, child_agents):
+        self.children = child_agents
+
+    def coordinate(self, query):
+        for child in self.children:
+            try:
+                resp = child.ask(query)
+                if resp["result"]:
+                    return [(child.name, resp)]
+            except Exception as e:
+                st.error(f"Error querying {child.name}: {e}")
+                continue
+        return [("Coordinator", {"result": "Relevant information not found."})]
+
+
+child_agents = build_vectorstores_with_pdfs(embedded_folders)
+manager = AgentManager(child_agents)
+
+
+st.markdown("""
+    <style>
+        body { font-family: Arial, sans-serif; }
+        input.s-input { display: block; width: 100%; padding: 10px; margin-top: 20px; margin-bottom: 20px; font-size: 18px; border-radius: 5px; }
+    </style>
+""", unsafe_allow_html=True)
+
+query = st.text_input("Search Reaction Database:", key="input_query")
+
+if query:
+    response = manager.handle_query(query)
+    st.write(response)
+
+    # Display synthetic schemes if matched
+    for reaction_type, synthetic_schemes in st.session_state.synthetic_schemes.items():
+        if reaction_type in query.lower():
+            for scheme in synthetic_schemes:
+                page, content, source_file, bbox = scheme
+                st.markdown(f"### Synthetic Scheme from {source_file}, Page {page}")
+                st.text(content)
