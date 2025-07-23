@@ -1,234 +1,57 @@
-import os
-import io
-import faiss
-import torch
-import clip
-import camelot
-import tabula
-import numpy as np
-import pandas as pd
+pip install streamlit img2mol rdkit-pypi pillow
 import streamlit as st
 from PIL import Image
-from PyPDF2 import PdfReader
-import fitz  # PyMuPDF
+import img2mol
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import tempfile
+import os
+import base64
 
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain.schema import Document, SystemMessage, HumanMessage
+def image_to_smiles(uploaded_image):
+    img = Image.open(uploaded_image).convert("RGB")
+    arr = img2mol.preprocess_image(img)
+    result = img2mol.core.predict(arr, input_type='pixel', output_type='smiles')
+    if not result:
+        raise ValueError("img2mol couldn't extract SMILES from image.")
+    return result
 
-# --- STREAMLIT CONFIG -------------------------------------------------------
-st.set_page_config(page_title="Reaction Database", layout="wide")
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+def smiles_to_mol_block(smiles):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("Invalid SMILES structure.")
+    mol = Chem.AddHs(mol)
+    AllChem.EmbedMolecule(mol)
+    return Chem.MolToMolBlock(mol)
 
-# --- YOUR ORIGINAL AZURE & EMBEDDING CONFIG ---------------------------------
-base_url        = ""  
-api_version     = "2024-02-15-preview"
+def get_mol_download_link(molblock, filename="structure.mol"):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mol") as tmp_file:
+        tmp_file.write(molblock.encode("utf-8"))
+        tmp_file_path = tmp_file.name
 
-api_key         = ""
-deployment_name = "GPT4o"
-model_name      = "GPT4o"
+    with open(tmp_file_path, "rb") as file:
+        b64 = base64.b64encode(file.read()).decode()
+        href = f'<a href="data:chemical/x-mdl-molfile;base64,{b64}" download="{filename}">📥 Download MOL file</a>'
+    os.remove(tmp_file_path)
+    return href
 
-embedded_folders = {
-    # 'C-N_Bond': r"C:\Users\p00095189\Desktop\WORK\API\Reaction_Database\Dataset\Chemistry Database API\C-N Bond Formation",
-    'C-N_Bond_Formation': r"C:\Users\Desktop\C-N_Bond_Formation",
-    # Add more reaction-specific folders as needed
-}
+# Streamlit UI
+st.set_page_config(page_title="Image to MOL", layout="centered")
+st.title("🧪 Convert Chemical Image → MOL File")
+st.markdown("Upload a chemical structure image. You'll get a `.mol` file you can open in ChemDraw or any molecular editor.")
 
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_version="2023-07-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment="Def_data_qa"
-)
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+uploaded_file = st.file_uploader("Upload JPEG/PNG/TIFF", type=["jpg", "jpeg", "png", "tiff"])
 
-# --- CONSTANTS --------------------------------------------------------------
-PDF_CHUNK_SIZE = 5000
-TOP_K_TEXT     = 5
-TOP_K_IMAGES   = 3
+if uploaded_file is not None:
+    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
 
-# --- PROMPT TEMPLATE --------------------------------------------------------
-PROMPT_TEMPLATE = (
-    "You are an expert chemistry assistant specialized in reaction data extraction. "
-    "When answering user queries, follow these guidelines strictly:\n"
-    "1. **API Details**: Provide the API name if available.\n"
-    "2. **Reaction Chemistry**: Describe the reaction chemistry.\n"
-    "3. **Yield**: Report the yield.\n"
-    "4. **Procedure**: Present the complete experimental procedure **EXACTLY** as written in the source document—do NOT summarize or paraphrase.\n"
-    "5. **Tabular Data**: Include any tables **verbatim**.\n\n"
-    "Your answers must draw **only** from the ingested documents. Do **not** introduce any outside information.\n"
-)
-
-# --- LOAD & CACHE CLIP -----------------------------------------------------
-@st.cache_resource(show_spinner=False)
-def load_clip_model():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    return model, preprocess, device
-
-clip_model, clip_preprocess, clip_device = load_clip_model()
-
-# --- UTILITIES --------------------------------------------------------------
-def chunk_text(text: str, size: int):
-    return [text[i:i+size] for i in range(0, len(text), size)]
-
-def extract_tables(pdf_path: str):
-    tables = []
     try:
-        tables += [t.df for t in camelot.read_pdf(pdf_path, pages="all", flavor="stream")]
-    except Exception:
-        pass
-    try:
-        tables += tabula.read_pdf(pdf_path, pages="all", multiple_tables=True)
-    except Exception:
-        pass
-    return tables
-
-def extract_synthetic_schemes(pdf_path: str):
-    """Crop regions containing 'Synthetic Scheme' and return PIL images + metadata."""
-    crops = []
-    doc = fitz.open(pdf_path)
-    for p in range(len(doc)):
-        page = doc[p]
-        for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
-            if "synthetic scheme" in text.lower():
-                rect = fitz.Rect(x0, y0, x1, y1)
-                pix = page.get_pixmap(clip=rect, dpi=200)
-                img = Image.open(io.BytesIO(pix.png)).convert("RGB")
-                crops.append({
-                    "type": "scheme",
-                    "page": p + 1,
-                    "image": img,
-                    "metadata": {"source": os.path.basename(pdf_path), "bbox": (x0, y0, x1, y1)}
-                })
-    return crops
-
-def extract_generic_images(pdf_path: str):
-    """Extract all other images from the PDF."""
-    images = []
-    doc = fitz.open(pdf_path)
-    for p in range(len(doc)):
-        for img_obj in doc[p].get_images(full=True):
-            xref = img_obj[0]
-            img_bytes = doc.extract_image(xref)["image"]
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            images.append({
-                "type": "image",
-                "page": p + 1,
-                "image": img,
-                "metadata": {"source": os.path.basename(pdf_path)}
-            })
-    return images
-
-def image_to_embedding(img: Image.Image):
-    inp = clip_preprocess(img).unsqueeze(0).to(clip_device)
-    with torch.no_grad():
-        emb = clip_model.encode_image(inp).cpu().numpy().reshape(-1)
-    return emb
-
-def build_faiss(embs: np.ndarray):
-    dim = embs.shape[1]
-    idx = faiss.IndexFlatL2(dim)
-    idx.add(embs.astype("float32"))
-    return idx
-
-# --- BUILD & CACHE INDICES -------------------------------------------------
-@st.cache_data(show_spinner=True)
-def initialize_indices():
-    text_idxs, text_docs = {}, {}
-    img_idxs, img_entries = {}, {}
-
-    for cls, folder in embedded_folders.items():
-        txt_embs, docs = [], []
-        img_embs, entries = [], []
-
-        for fname in sorted(os.listdir(folder)):
-            if not fname.lower().endswith(".pdf"):
-                continue
-            path = os.path.join(folder, fname)
-
-            # --- TEXT & TABLES ---
-            reader = PdfReader(path)
-            raw = "\n".join(p.extract_text() or "" for p in reader.pages)
-            chunks = chunk_text(raw, PDF_CHUNK_SIZE)
-            for i, c in enumerate(chunks):
-                docs.append(Document(page_content=c, metadata={"source": fname, "chunk": i}))
-                txt_embs.append(cached_embeddings.embed_documents([c])[0])
-            for tbl in extract_tables(path):
-                csv = tbl.to_csv(index=False)
-                docs.append(Document(page_content=csv, metadata={"source": fname, "chunk": "table"}))
-                txt_embs.append(cached_embeddings.embed_documents([csv])[0])
-
-            # --- SCHEMES & IMAGES ---
-            for item in extract_synthetic_schemes(path) + extract_generic_images(path):
-                img = item["image"]
-                emb = image_to_embedding(img)
-                img_embs.append(emb)
-                entries.append(item)
-
-        text_idxs[cls]      = build_faiss(np.vstack(txt_embs))
-        text_docs[cls]      = docs
-        img_idxs[cls]       = build_faiss(np.vstack(img_embs))
-        img_entries[cls]    = entries
-
-    return text_idxs, text_docs, img_idxs, img_entries
-
-text_idxs, text_ds, img_idxs, img_entries = initialize_indices()
-
-# --- RETRIEVAL --------------------------------------------------------------
-def retrieve_text(cls: str, q: str, k: int):
-    q_emb = cached_embeddings.embed_query(q).reshape(1, -1).astype("float32")
-    _, I = text_idxs[cls].search(q_emb, k)
-    return [text_ds[cls][i] for i in I[0]]
-
-def retrieve_images(cls: str, q: str, k: int):
-    tok = clip.tokenize([q]).to(clip_device)
-    with torch.no_grad():
-        q_emb = clip_model.encode_text(tok).cpu().numpy().reshape(1, -1)
-    _, I = img_idxs[cls].search(q_emb.astype("float32"), k)
-    return [img_entries[cls][i] for i in I[0]]
-
-# --- STREAMLIT UI -----------------------------------------------------------
-st.title("🔬 Reaction Database AI")
-
-reaction = st.selectbox("Reaction Chemistry", list(embedded_folders.keys()))
-query    = st.text_input("Search Reaction Database:")
-
-if query:
-    st.header("📝 Procedure, Yield & Tables")
-    for doc in retrieve_text(reaction, query, TOP_K_TEXT):
-        st.markdown(f"**Source:** {doc.metadata['source']} — Chunk `{doc.metadata['chunk']}`")
-        content = doc.page_content
-        if content.strip().startswith(("sep=",)) or content.count(",") > 3:
-            df = pd.read_csv(io.StringIO(content))
-            st.dataframe(df)
-        else:
-            st.text_area("", content, height=200)
-
-    st.header("🔎 Synthetic Schemes & Figures")
-    for item in retrieve_images(reaction, query, TOP_K_IMAGES):
-        if item["type"] == "scheme":
-            st.image(item["image"], caption=f"Synthetic Scheme — {item['metadata']['source']} page {item['page']}", use_column_width=True)
-        else:
-            st.image(item["image"], caption=f"Figure — {item['metadata']['source']} page {item['page']}", use_column_width=True)
-
-    st.header("🤖 AI Structured Answer")
-    # Combine retrieved texts into one context block
-    context = "\n\n".join(
-        f"[Source: {d.metadata['source']} chunk {d.metadata['chunk']}]\n{d.page_content}"
-        for d in retrieve_text(reaction, query, TOP_K_TEXT)
-    )
-    system_msg = SystemMessage(content=PROMPT_TEMPLATE)
-    human_msg  = HumanMessage(content=f"Context:\n{context}\n\nUser Query: {query}")
-    answer     = chat_model([system_msg, human_msg])
-    st.markdown(answer.content)
+        with st.spinner("🔬 Converting image to molecule..."):
+            smiles = image_to_smiles(uploaded_file)
+            mol_block = smiles_to_mol_block(smiles)
+        st.success("✅ Structure converted!")
+        st.markdown("### SMILES:")
+        st.code(smiles, language="none")
+        st.markdown(get_mol_download_link(mol_block), unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
