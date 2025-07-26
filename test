@@ -2,74 +2,156 @@ import os
 import subprocess
 import json
 import streamlit as st
-from pydantic import BaseModel, Field
 from langchain.chat_models import AzureChatOpenAI
 from langchain_core.tools import tool
-from langchain.schema import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_core.agents import AgentActionMessageLog
 
-# --- Azure settings exactly as provided ---
-base_url        = ""
-api_version     = "2024-02-15-preview"
-api_key         = ""
+# --- Azure settings ---
+base_url = "https://your-resource.openai.azure.com/"  # Replace with your endpoint
+api_version = "2024-02-15-preview"
+api_key = "your_api_key_here"  # Replace with your key
 deployment_name = "GPT4o"
-model_name      = "GPT4o"
+model_name = "GPT4o"
 
+# Initialize Azure Chat
 chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
     api_version=api_version,
     api_key=api_key,
-    azure_endpoint=base_url
+    azure_endpoint=base_url,
+    temperature=0
 )
 
 # === Python executor tool ===
 @tool
-class ExecutePython(BaseModel):
-    """
-    Executes arbitrary Python code that prints or assigns `result`.
-    """
-    code: str = Field(..., description="Python code snippet to execute.")
-
 def execute_python(code: str) -> str:
-    script = f"""
+    """
+    Executes Python code and returns the output. The code must either:
+    1. Print the final result to stdout
+    2. Assign the result to a variable named 'result'
+    
+    Always include error handling in the code.
+    """
+    try:
+        # Wrap code in a function to prevent global scope issues
+        wrapped_code = f"""
 import sys
 def safe_exec():
-{code.replace(chr(10), chr(10) + '    ')}
-
+    try:
+        {code}
+    except Exception as e:
+        print(f"ERROR: {{e}}", file=sys.stderr)
+        
 if __name__ == "__main__":
     safe_exec()
 """
-    proc = subprocess.run(["python3", "-c", script], capture_output=True, text=True, timeout=10)
-    if proc.returncode != 0:
-        return f"Error:\\n{proc.stderr}"
-    return proc.stdout.strip()
+        proc = subprocess.run(
+            ["python3", "-c", wrapped_code],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if proc.returncode != 0:
+            return f"⛔ Execution Error (code {proc.returncode}):\n{proc.stderr.strip()}"
+        return proc.stdout.strip() or "✅ Executed successfully (no output)"
+    
+    except subprocess.TimeoutExpired:
+        return "⏰ Timeout Error: Code took too long to execute"
+    except Exception as e:
+        return f"🔥 System Error: {str(e)}"
 
-# === Bind tool properly ===
-tool_instance = ExecutePython()
-llm = chat_model.bind_tools(tools=[tool_instance], tool_choice="auto")
+# Bind tool to model
+tools = [execute_python]
+llm = chat_model.bind_tools(tools=tools, tool_choice="auto")
 
 # === Streamlit UI ===
 st.title("Azure GPT‑4o + Python Sandbox")
+st.caption("This agent can execute Python code for calculations and data processing")
 
-prompt = st.text_area("Enter prompt:")
+# Initialize session state
+if "history" not in st.session_state:
+    st.session_state.history = []
 
-if st.button("Submit"):
-    sys_msg = SystemMessage(content=(
-        "You are an assistant. For any math/tables/data operations, call the tool "
-        "`execute_python` with Python code. Otherwise answer normally."
+# Display chat history
+for msg in st.session_state.history:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+        if "code" in msg:
+            with st.expander("Generated Python Code"):
+                st.code(msg["code"], language="python")
+        if "execution" in msg:
+            with st.expander("Execution Result"):
+                st.text(msg["execution"])
+
+# Handle user input
+if prompt := st.chat_input("What would you like to compute?"):
+    # Add user message to history
+    st.session_state.history.append({"role": "user", "content": prompt})
+    
+    # Display user message
+    with st.chat_message("user"):
+        st.write(prompt)
+    
+    # Prepare system message
+    system_message = SystemMessage(content=(
+        "You are a Python expert. Follow these rules:\n"
+        "1. For ANY math, data processing, or calculations, ALWAYS use execute_python\n"
+        "2. Generate COMPLETE, READY-TO-RUN Python code\n"
+        "3. Assign final results to 'result' OR print them\n"
+        "4. Include error handling in the code\n\n"
+        "Example format for tool use:\n"
+        "```json\n"
+        "{{\"code\": \"result = 5 * 10\"}}\n"
+        "```"
     ))
-    user_msg = HumanMessage(content=prompt)
-
-    response = llm([sys_msg, user_msg])
-    # LangChain returns a BaseMessage; tool calls in response.tool_calls
-    if hasattr(response, "tool_calls") and response.tool_calls:
-        call = response.tool_calls[0]
-        args = json.loads(call["arguments"])
-        code = args["code"]
-        with st.expander("🔍 Generated code", expanded=False):
-            st.code(code, language="python")
-        output = execute_python(code)
-        st.markdown("**Execution Result:**")
-        st.text(output)
+    
+    # Create messages list
+    messages = [system_message] + [
+        HumanMessage(content=msg["content"]) if msg["role"] == "user"
+        else AIMessage(content=msg["content"])
+        for msg in st.session_state.history
+    ]
+    
+    # Get AI response
+    with st.spinner("Analyzing request..."):
+        response = llm.invoke(messages)
+    
+    # Process tool calls
+    if response.tool_calls:
+        tool_call = response.tool_calls[0]
+        args = tool_call["args"]
+        code = args.get("code", "")
+        
+        # Add AI message to history
+        st.session_state.history.append({
+            "role": "assistant",
+            "content": "Generated Python code",
+            "code": code
+        })
+        
+        # Display code
+        with st.chat_message("assistant"):
+            st.write("Executing Python code...")
+            with st.expander("Generated Code", expanded=False):
+                st.code(code, language="python")
+            
+            # Execute code
+            with st.spinner("Running code..."):
+                execution_result = execute_python(code)
+            
+            # Display execution result
+            st.session_state.history[-1]["execution"] = execution_result
+            with st.expander("Execution Result", expanded=True):
+                st.text(execution_result)
+    
+    # Handle regular response
     else:
-        st.markdown("**Assistant Response:**")
-        st.write(response.content or "")
+        ai_content = response.content
+        st.session_state.history.append({"role": "assistant", "content": ai_content})
+        with st.chat_message("assistant"):
+            st.write(ai_content)
+
+    # Rerun to update UI
+    st.rerun()
