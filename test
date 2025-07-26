@@ -12,6 +12,11 @@ from langchain.docstore.document import Document
 from langchain.chains import RetrievalQA
 import base64
 import glob
+import fitz  # PyMuPDF
+import time
+import re
+from tqdm import tqdm
+import hashlib
 
 # Configuration - Replace with your Azure credentials
 st.set_page_config(page_title="PharmaReaction AI", page_icon="🧪", layout="wide")
@@ -46,6 +51,10 @@ chat_model = AzureChatOpenAI(
 # Product Database Configuration
 PRODUCTS_DIR = r"C:\Reaction_Database\Products"
 SCHEMES_DIR = r"C:\Reaction_Database\Synthetic_Schemes"
+
+# Create directories if they don't exist
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
 
 # Custom CSS for professional UI
 st.markdown("""
@@ -98,11 +107,7 @@ st.markdown("""
             font-weight: 600;
             font-size: 1.2rem;
             text-decoration: none;
-        }
-        
-        .product-link:hover {
-            color: var(--accent);
-            text-decoration: underline;
+            cursor: pointer;
         }
         
         .btn {
@@ -114,42 +119,16 @@ st.markdown("""
             cursor: pointer;
             font-weight: 600;
             transition: background 0.3s ease;
+            display: inline-block;
+            margin: 0.5rem;
         }
         
         .btn:hover {
             background: var(--primary);
         }
         
-        .tabs {
-            display: flex;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-        }
-        
-        .tab {
-            padding: 0.8rem 1.5rem;
-            background: #e0e0e0;
-            border-radius: 5px;
-            cursor: pointer;
-            font-weight: 600;
-        }
-        
-        .tab.active {
-            background: var(--secondary);
-            color: white;
-        }
-        
-        .scheme-container {
-            background: var(--light);
-            border-radius: 10px;
-            padding: 1.5rem;
-            text-align: center;
-            margin-top: 1.5rem;
-        }
-        
         .download-btn {
             background: var(--accent);
-            margin-top: 1rem;
         }
         
         .search-bar {
@@ -160,87 +139,157 @@ st.markdown("""
             width: 100%;
             box-shadow: 0 2px 4px rgba(0,0,0,0.05);
         }
+        
+        .progress-container {
+            margin: 2rem 0;
+            background: #e0e0e0;
+            border-radius: 10px;
+            height: 20px;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: var(--secondary);
+            border-radius: 10px;
+            transition: width 0.4s ease;
+        }
+        
+        .error {
+            color: var(--accent);
+            padding: 1rem;
+            background: #fdecea;
+            border-radius: 5px;
+            margin: 1rem 0;
+        }
+        
+        .success {
+            color: #2e7d32;
+            padding: 1rem;
+            background: #edf7ed;
+            border-radius: 5px;
+            margin: 1rem 0;
+        }
     </style>
 """, unsafe_allow_html=True)
 
 # Product Database
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_product_database():
     products = []
     # Load all PDFs from products directory
     pdf_files = glob.glob(os.path.join(PRODUCTS_DIR, "*.pdf"))
     
+    st.info(f"Found {len(pdf_files)} PDF files in {PRODUCTS_DIR}")
+    
     for pdf_path in pdf_files:
-        product_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        reaction_type = "Unknown"
-        
-        # Extract reaction type from filename (customize as needed)
-        if "Hydrolysis" in product_name:
-            reaction_type = "Hydrolysis"
-        elif "Oxidation" in product_name:
-            reaction_type = "Oxidation"
-        elif "Reduction" in product_name:
-            reaction_type = "Reduction"
-        elif "Synthesis" in product_name:
-            reaction_type = "Synthesis"
-        
-        # Find associated scheme files
-        scheme_jpeg = os.path.join(SCHEMES_DIR, f"{product_name}.jpeg")
-        scheme_xml = os.path.join(SCHEMES_DIR, f"{product_name}.xml")
-        scheme_cdx = os.path.join(SCHEMES_DIR, f"{product_name}.cdx")
-        
-        products.append({
-            "name": product_name,
-            "reaction_type": reaction_type,
-            "pdf_path": pdf_path,
-            "scheme_jpeg": scheme_jpeg if os.path.exists(scheme_jpeg) else None,
-            "scheme_xml": scheme_xml if os.path.exists(scheme_xml) else None,
-            "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
-        })
+        try:
+            product_name = os.path.splitext(os.path.basename(pdf_path))[0]
+            reaction_type = "Unknown"
+            
+            # Extract reaction type from filename (customize as needed)
+            if re.search(r"hydrolysis", product_name, re.IGNORECASE):
+                reaction_type = "Hydrolysis"
+            elif re.search(r"oxidation", product_name, re.IGNORECASE):
+                reaction_type = "Oxidation"
+            elif re.search(r"reduction", product_name, re.IGNORECASE):
+                reaction_type = "Reduction"
+            elif re.search(r"synthesis", product_name, re.IGNORECASE):
+                reaction_type = "Synthesis"
+            
+            # Find associated scheme files
+            scheme_jpeg = os.path.join(SCHEMES_DIR, f"{product_name}.jpeg")
+            scheme_xml = os.path.join(SCHEMES_DIR, f"{product_name}.xml")
+            scheme_cdx = os.path.join(SCHEMES_DIR, f"{product_name}.cdx")
+            
+            # Generate unique ID for each product
+            unique_id = hashlib.md5(product_name.encode()).hexdigest()[:8]
+            
+            products.append({
+                "id": unique_id,
+                "name": product_name,
+                "reaction_type": reaction_type,
+                "pdf_path": pdf_path,
+                "scheme_jpeg": scheme_jpeg if os.path.exists(scheme_jpeg) else None,
+                "scheme_xml": scheme_xml if os.path.exists(scheme_xml) else None,
+                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+            })
+        except Exception as e:
+            st.error(f"Error processing file {pdf_path}: {str(e)}")
     
     return products
 
-# Load all products
-all_products = load_product_database()
-
-# Extract text from PDF
+# Robust PDF text extraction using PyMuPDF
 def extract_pdf_text(pdf_path):
-    from PyPDF2 import PdfReader
     text = ""
     try:
-        pdf_reader = PdfReader(pdf_path)
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
     except Exception as e:
-        st.error(f"Error reading PDF: {e}")
-    return text
+        st.error(f"Error reading PDF {pdf_path}: {str(e)}")
+        return ""
 
-# Build vector database
-@st.cache_resource
-def build_vector_database():
+# Build vector database with progress tracking
+def build_vector_database(products):
     documents = []
+    errors = []
     
-    for product in all_products:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, product in enumerate(products):
         try:
+            status_text.text(f"Processing {i+1}/{len(products)}: {product['name']}")
+            progress_bar.progress((i + 1) / len(products))
+            
             text = extract_pdf_text(product["pdf_path"])
-            if text:
+            if text and len(text.strip()) > 100:  # Ensure meaningful content
                 documents.append(Document(
                     page_content=text,
                     metadata={
+                        "product_id": product["id"],
                         "product_name": product["name"],
                         "reaction_type": product["reaction_type"],
                         "source": product["pdf_path"]
                     }
                 ))
+            else:
+                errors.append(f"Skipped {product['name']} (insufficient text)")
         except Exception as e:
-            st.error(f"Error processing {product['name']}: {e}")
+            errors.append(f"Error processing {product['name']}: {str(e)}")
+    
+    status_text.empty()
+    progress_bar.empty()
+    
+    if errors:
+        st.warning(f"Encountered {len(errors)} errors during processing")
+        for error in errors:
+            st.error(error)
     
     if documents:
-        return FAISS.from_documents(documents, cached_embeddings)
-    return None
-
-# Initialize vector database
-vector_db = build_vector_database()
+        try:
+            st.info(f"Building vector database with {len(documents)} documents...")
+            
+            # Create FAISS index in chunks to avoid memory issues
+            chunk_size = 100
+            chunks = [documents[i:i + chunk_size] for i in range(0, len(documents), chunk_size)]
+            
+            # Initialize with first chunk
+            vector_db = FAISS.from_documents(chunks[0], cached_embeddings)
+            
+            # Add remaining chunks
+            for chunk in tqdm(chunks[1:], desc="Indexing documents"):
+                vector_db.add_documents(chunk)
+            
+            st.success("Vector database built successfully!")
+            return vector_db
+        except Exception as e:
+            st.error(f"Error building vector database: {str(e)}")
+            return None
+    else:
+        st.error("No valid documents to process")
+        return None
 
 # Child Agent for QA
 class ChildAgent:
@@ -276,7 +325,7 @@ class ChildAgent:
             }
 
         except Exception as e:
-            st.error(f"Error querying {self.name}: {e}")
+            st.error(f"Error querying {self.name}: {str(e)}")
             return None
 
 # Agent Manager
@@ -291,35 +340,10 @@ class AgentManager:
         
         source_products = set()
         for doc in response.get("source_documents", []):
-            if "product_name" in doc.metadata:
-                source_products.add(doc.metadata["product_name"])
+            if "product_id" in doc.metadata:
+                source_products.add(doc.metadata["product_id"])
         
         return response["result"], None, list(source_products)
-
-# Initialize agent
-if vector_db:
-    retriever = vector_db.as_retriever(search_kwargs={"k": 10})
-    agent = ChildAgent(name="reaction_agent", retriever=retriever)
-    manager = AgentManager(agent)
-else:
-    st.error("Failed to initialize vector database. Check PDF files and embeddings setup.")
-    st.stop()
-
-# Session state for navigation
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "search"
-if "selected_product" not in st.session_state:
-    st.session_state.selected_product = None
-if "search_results" not in st.session_state:
-    st.session_state.search_results = []
-
-# Navigation functions
-def navigate_to_search():
-    st.session_state.current_page = "search"
-
-def navigate_to_product(product_name):
-    st.session_state.current_page = "product"
-    st.session_state.selected_product = product_name
 
 # File download helper
 def get_binary_file_downloader_html(file_path, label="Download"):
@@ -328,26 +352,57 @@ def get_binary_file_downloader_html(file_path, label="Download"):
     b64 = base64.b64encode(data).decode()
     return f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(file_path)}" class="btn download-btn">{label}</a>'
 
+# Session state for navigation
+if "current_page" not in st.session_state:
+    st.session_state.current_page = "search"
+if "selected_product" not in st.session_state:
+    st.session_state.selected_product = None
+if "search_results" not in st.session_state:
+    st.session_state.search_results = []
+if "all_products" not in st.session_state:
+    st.session_state.all_products = []
+if "vector_db" not in st.session_state:
+    st.session_state.vector_db = None
+
+# Navigation functions
+def navigate_to_search():
+    st.session_state.current_page = "search"
+
+def navigate_to_product(product_id):
+    st.session_state.current_page = "product"
+    st.session_state.selected_product = product_id
+
 # Main App
 def main():
     # Navigation Header
-    st.markdown('<div class="header"><h1>Pharmaceutical Reaction Database</h1><p>AI-powered chemistry knowledge base with 400+ APIs</p></div>', unsafe_allow_html=True)
+    st.markdown('<div class="header"><h1>Pharmaceutical Reaction Database</h1><p>AI-powered chemistry knowledge base</p></div>', unsafe_allow_html=True)
     
-    # Navigation Tabs
-    st.markdown('<div class="tabs">', unsafe_allow_html=True)
-    if st.button("🔍 Search Database", use_container_width=True):
-        navigate_to_search()
-    if st.button("🧪 About", use_container_width=True):
-        st.session_state.current_page = "about"
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Initialize database
+    if not st.session_state.all_products:
+        with st.spinner("Loading product database..."):
+            st.session_state.all_products = load_product_database()
+    
+    # Initialize vector database if not already loaded
+    if st.session_state.all_products and not st.session_state.vector_db:
+        st.info("Building vector database for the first time. This may take several minutes...")
+        st.session_state.vector_db = build_vector_database(st.session_state.all_products)
     
     # Page Routing
+    if st.session_state.vector_db is None:
+        st.error("""
+            ## Failed to initialize vector database
+            Possible causes:
+            1. Invalid Azure credentials - check your API key and endpoint
+            2. PDF files not found - verify the PRODUCTS_DIR path
+            3. Text extraction failed - ensure PDFs are readable
+            4. Embedding generation issue - check Azure embedding service status
+        """)
+        return
+    
     if st.session_state.current_page == "search":
         render_search_page()
     elif st.session_state.current_page == "product":
         render_product_page()
-    elif st.session_state.current_page == "about":
-        render_about_page()
 
 # Search Page
 def render_search_page():
@@ -358,11 +413,16 @@ def render_search_page():
                               placeholder="Search by reaction type, API name, yield, or conditions...",
                               key="search_input")
         
-        if st.form_submit_button("Search", use_container_width=True):
+        if st.form_submit_button("🔍 Search", use_container_width=True):
             if query:
-                with st.spinner("Searching across 400+ pharmaceutical reactions..."):
-                    response, _, products = manager.handle_query(query)
-                    st.session_state.search_results = products
+                with st.spinner("Searching across pharmaceutical reactions..."):
+                    # Initialize agent
+                    retriever = st.session_state.vector_db.as_retriever(search_kwargs={"k": 10})
+                    agent = ChildAgent(name="reaction_agent", retriever=retriever)
+                    manager = AgentManager(agent)
+                    
+                    response, _, product_ids = manager.handle_query(query)
+                    st.session_state.search_results = product_ids
             else:
                 st.warning("Please enter a search query")
     
@@ -371,39 +431,66 @@ def render_search_page():
         st.subheader("Matching Products")
         st.info(f"Found {len(st.session_state.search_results)} products matching your query")
         
-        for product_name in st.session_state.search_results:
-            product = next((p for p in all_products if p["name"] == product_name), None)
+        cols = st.columns(3)
+        col_index = 0
+        
+        for product_id in st.session_state.search_results:
+            product = next((p for p in st.session_state.all_products if p["id"] == product_id), None)
             if product:
-                with st.container():
-                    st.markdown(f'<div class="card">', unsafe_allow_html=True)
-                    st.markdown(f'<a class="product-link" onclick="navigateToProduct(\'{product_name}\')">{product["name"]}</a>', unsafe_allow_html=True)
-                    st.caption(f"Reaction Type: {product['reaction_type']}")
-                    
-                    # JavaScript for navigation
-                    st.markdown(f"""
-                        <script>
-                            function navigateToProduct(productName) {{
-                                let data = {{"product": productName}};
-                                window.parent.postMessage(data, "*");
-                            }}
-                        </script>
-                    """, unsafe_allow_html=True)
-                    
-                    st.markdown('</div>', unsafe_allow_html=True)
+                with cols[col_index]:
+                    with st.container():
+                        st.markdown(f'<div class="card">', unsafe_allow_html=True)
+                        st.markdown(f'<div class="product-link" onclick="navigateToProduct(\'{product["id"]}\')">{product["name"]}</div>', 
+                                    unsafe_allow_html=True)
+                        st.caption(f"Reaction Type: {product['reaction_type']}")
+                        
+                        # Preview first 100 characters of text
+                        with open(product["pdf_path"], "rb") as f:
+                            text = extract_pdf_text(product["pdf_path"])
+                            preview = (text[:150] + '...') if len(text) > 150 else text
+                            st.caption(f"Preview: {preview}")
+                        
+                        st.markdown('</div>', unsafe_allow_html=True)
+                
+                col_index = (col_index + 1) % 3
     
     # Reaction Type Quick Filters
     st.subheader("Browse by Reaction Type")
-    reaction_types = sorted(set(p["reaction_type"] for p in all_products))
+    reaction_types = sorted(set(p["reaction_type"] for p in st.session_state.all_products))
     cols = st.columns(4)
     
     for i, rtype in enumerate(reaction_types):
         with cols[i % 4]:
-            if st.button(f"{rtype} ({sum(1 for p in all_products if p['reaction_type'] == rtype)})", use_container_width=True):
-                st.session_state.search_input = rtype
+            if st.button(f"{rtype} ({sum(1 for p in st.session_state.all_products if p['reaction_type'] == rtype)})", 
+                         use_container_width=True):
+                # Initialize agent
+                retriever = st.session_state.vector_db.as_retriever(search_kwargs={"k": 50})
+                agent = ChildAgent(name="reaction_agent", retriever=retriever)
+                manager = AgentManager(agent)
+                
                 with st.spinner(f"Searching {rtype} reactions..."):
-                    response, _, products = manager.handle_query(rtype)
-                    st.session_state.search_results = products
-                st.experimental_rerun()
+                    response, _, product_ids = manager.handle_query(rtype)
+                    st.session_state.search_results = product_ids
+    
+    # JavaScript for navigation
+    st.markdown("""
+        <script>
+            function navigateToProduct(productId) {
+                Streamlit.setComponentValue({
+                    type: "navigate",
+                    page: "product",
+                    productId: productId
+                });
+            }
+            
+            // Listen for Streamlit events
+            Streamlit.on('message', function(event) {
+                if (event.data.type === "navigate") {
+                    Streamlit.setComponentValue(event.data);
+                }
+            });
+        </script>
+    """, unsafe_allow_html=True)
 
 # Product Detail Page
 def render_product_page():
@@ -411,7 +498,7 @@ def render_product_page():
         navigate_to_search()
         return
     
-    product = next((p for p in all_products if p["name"] == st.session_state.selected_product), None)
+    product = next((p for p in st.session_state.all_products if p["id"] == st.session_state.selected_product), None)
     if not product:
         st.error("Product not found")
         navigate_to_search()
@@ -424,6 +511,11 @@ def render_product_page():
     
     st.markdown(f'<div class="card"><h2>{product["name"]}</h2><p>Reaction Type: {product["reaction_type"]}</p></div>', unsafe_allow_html=True)
     
+    # Initialize agent for this product
+    retriever = st.session_state.vector_db.as_retriever(search_kwargs={"k": 1, "filter": {"product_id": product["id"]}})
+    agent = ChildAgent(name="product_agent", retriever=retriever)
+    manager = AgentManager(agent)
+    
     # Product Information
     with st.spinner(f"Retrieving details for {product['name']}..."):
         query = f"Provide complete details for {product['name']} including API, reaction chemistry, yield, procedure, and tabular data"
@@ -434,12 +526,17 @@ def render_product_page():
     
     with tab1:
         if response:
-            st.markdown(response)
+            # Display with proper formatting
+            st.markdown(response.replace("**API**", "## API")
+                      .replace("**Reaction Chemistry**", "## Reaction Chemistry")
+                      .replace("**Yield**", "## Yield")
+                      .replace("**Procedure**", "## Procedure")
+                      .replace("**Tabular Data**", "## Tabular Data"))
         else:
             st.warning("No detailed information found for this product")
     
     with tab2:
-        if product["scheme_jpeg"]:
+        if product["scheme_jpeg"] and os.path.exists(product["scheme_jpeg"]):
             st.image(product["scheme_jpeg"], caption=f"{product['name']} Synthetic Scheme", use_column_width=True)
             
             # CDX download
@@ -459,59 +556,29 @@ def render_product_page():
     
     with tab3:
         st.info(f"Source document: {os.path.basename(product['pdf_path'])}")
-        if st.button("View Full PDF Document", key="view_pdf"):
+        if os.path.exists(product["pdf_path"]):
             with open(product["pdf_path"], "rb") as f:
                 pdf_bytes = f.read()
+            
             st.download_button(
-                label="Download PDF",
+                label="Download Full PDF",
                 data=pdf_bytes,
                 file_name=os.path.basename(product["pdf_path"]),
-                mime="application/pdf"
+                mime="application/pdf",
+                use_container_width=True
             )
-        
-        # Display first page of PDF
-        try:
-            from PyPDF2 import PdfReader
-            import fitz
             
-            doc = fitz.open(product["pdf_path"])
-            page = doc.load_page(0)
-            pix = page.get_pixmap()
-            img_bytes = pix.tobytes("jpg")
-            st.image(img_bytes, caption="First Page Preview", use_column_width=True)
-        except:
-            st.warning("Could not load PDF preview")
-
-# About Page
-def render_about_page():
-    st.subheader("About PharmaReaction AI")
-    st.markdown("""
-        <div class="card">
-            <h3>Comprehensive Pharmaceutical Reaction Database</h3>
-            <p>This AI-powered platform provides instant access to detailed reaction chemistry information for 400+ APIs.</p>
-            
-            <h4>Key Features:</h4>
-            <ul>
-                <li>Instant search across 400+ pharmaceutical products</li>
-                <li>Detailed reaction chemistry information</li>
-                <li>Complete synthetic schemes with ChemDraw downloads</li>
-                <li>Structured data extraction from technical documents</li>
-            </ul>
-            
-            <h4>Technology Stack:</h4>
-            <ul>
-                <li>Azure OpenAI (GPT-4o for natural language processing)</li>
-                <li>FAISS vector database for efficient similarity search</li>
-                <li>Streamlit for web application framework</li>
-                <li>CLIP for image understanding (when enabled)</li>
-            </ul>
-            
-            <p>For support or additional information, contact: research@pharmareactions.com</p>
-        </div>
-    """, unsafe_allow_html=True)
-
-    if st.button("Back to Search", use_container_width=True):
-        navigate_to_search()
+            # Display first page of PDF
+            try:
+                doc = fitz.open(product["pdf_path"])
+                page = doc.load_page(0)
+                pix = page.get_pixmap(dpi=150)
+                img_bytes = pix.tobytes("png")
+                st.image(img_bytes, caption="First Page Preview", use_column_width=True)
+            except Exception as e:
+                st.warning(f"Could not load PDF preview: {str(e)}")
+        else:
+            st.error("PDF file not found")
 
 # Run the app
 if __name__ == "__main__":
