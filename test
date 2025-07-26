@@ -2,11 +2,12 @@ import os
 import subprocess
 import json
 import streamlit as st
-from langchain.chat_models import AzureChatOpenAI
-from langchain.schema import SystemMessage, HumanMessage
 from pydantic import BaseModel, Field
+from langchain.chat_models import AzureChatOpenAI
+from langchain_core.tools import tool
+from langchain.schema import SystemMessage, HumanMessage
 
-# === Azure config exactly as provided ===
+# --- Azure settings exactly as provided ---
 base_url        = ""
 api_version     = "2024-02-15-preview"
 api_key         = ""
@@ -15,78 +16,60 @@ model_name      = "GPT4o"
 
 chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
-    model=model_name,
     api_version=api_version,
     api_key=api_key,
     azure_endpoint=base_url
 )
 
-# === Python executor function ===
+# === Python executor tool ===
+@tool
+class ExecutePython(BaseModel):
+    """
+    Executes arbitrary Python code that prints or assigns `result`.
+    """
+    code: str = Field(..., description="Python code snippet to execute.")
+
 def execute_python(code: str) -> str:
     script = f"""
 import sys
 def safe_exec():
 {code.replace(chr(10), chr(10) + '    ')}
+
 if __name__ == "__main__":
     safe_exec()
 """
-    proc = subprocess.run(
-        ["python3", "-c", script],
-        capture_output=True,
-        text=True,
-        timeout=10
-    )
+    proc = subprocess.run(["python3", "-c", script], capture_output=True, text=True, timeout=10)
     if proc.returncode != 0:
         return f"Error:\\n{proc.stderr}"
     return proc.stdout.strip()
 
-# === Function schema ===
-class ExecutePythonSchema(BaseModel):
-    code: str = Field(..., description="Python code snippet printing or populating `result`.")
-
-function_def = {
-    "name": "execute_python",
-    "description": "Executes Python code in a sandbox and returns stdout.",
-    "parameters": {
-        "type": "object",
-        "properties": ExecutePythonSchema.schema()["properties"],
-        "required": ["code"]
-    }
-}
+# === Bind tool properly ===
+tool_instance = ExecutePython()
+llm = chat_model.bind_tools(tools=[tool_instance], tool_choice="auto")
 
 # === Streamlit UI ===
-st.set_page_config(page_title="Azure GPT4o + Python Sandbox", layout="wide")
-st.title("Azure GPT4o + Generic Python Tool")
+st.title("Azure GPT‑4o + Python Sandbox")
 
-prompt = st.text_area("Enter your prompt (math, tables, data, etc):", height=150)
+prompt = st.text_area("Enter prompt:")
 
 if st.button("Submit"):
-    system_msg = SystemMessage(content=(
-        "You are an assistant. For any math, data processing, plotting, or table generation, "
-        "call the function `execute_python` with a code snippet that prints or defines `result`. "
-        "If no function needed, just answer normally."
+    sys_msg = SystemMessage(content=(
+        "You are an assistant. For any math/tables/data operations, call the tool "
+        "`execute_python` with Python code. Otherwise answer normally."
     ))
     user_msg = HumanMessage(content=prompt)
 
-    # Send messages and tools
-    resp = chat_model(
-        [system_msg, user_msg],
-        tools=[function_def],
-        tool_choice="auto"
-    )
-
-    # LangChain returns a BaseMessage object
-    # Function calls appear in resp.additional_kwargs["tool_calls"]
-    tool_calls = resp.additional_kwargs.get("tool_calls", [])
-    if tool_calls:
-        first_call = tool_calls[0]
-        code = json.loads(first_call["function"]["arguments"])["code"]
-
-        with st.expander("🔍 View generated Python code", expanded=False):
+    response = llm([sys_msg, user_msg])
+    # LangChain returns a BaseMessage; tool calls in response.tool_calls
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        call = response.tool_calls[0]
+        args = json.loads(call["arguments"])
+        code = args["code"]
+        with st.expander("🔍 Generated code", expanded=False):
             st.code(code, language="python")
         output = execute_python(code)
         st.markdown("**Execution Result:**")
         st.text(output)
     else:
-        st.markdown("**Response:**")
-        st.write(resp.content)
+        st.markdown("**Assistant Response:**")
+        st.write(response.content or "")
