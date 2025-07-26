@@ -1,6 +1,6 @@
 import os
 import subprocess
-import json
+import tempfile
 import streamlit as st
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -21,53 +21,64 @@ chat_model = AzureChatOpenAI(
     temperature=0
 )
 
-# === Improved Python execution function ===
-def execute_python(code: str) -> str:
-    """Executes Python code safely and returns output"""
+# === Robust Python execution function ===
+def execute_python(code: str, attempt: int = 1) -> str:
+    """Executes Python code safely using temporary files"""
+    MAX_ATTEMPTS = 3
+    
     try:
-        # Remove leading/trailing whitespace and triple backticks
-        cleaned_code = code.strip().strip('`').strip()
-        if cleaned_code.startswith('python'):
+        # Clean the code while preserving original formatting
+        cleaned_code = code.strip().strip('`')
+        if cleaned_code.lower().startswith('python'):
             cleaned_code = cleaned_code[6:].strip()
+        
+        # Create temporary Python file
+        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmpfile:
+            tmpfile.write(cleaned_code)
+            tmpfile_path = tmpfile.name
+        
+        try:
+            # Execute the file
+            proc = subprocess.run(
+                ["python", tmpfile_path],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
             
-        # Properly indent the code for our wrapper
-        indented_code = "\n".join(f"    {line}" for line in cleaned_code.splitlines())
+            # Clean up
+            os.unlink(tmpfile_path)
+            
+            if proc.returncode != 0:
+                error_output = f"⛔ Execution Error (code {proc.returncode}):\n"
+                if proc.stderr:
+                    error_output += proc.stderr.strip()
+                if proc.stdout:
+                    error_output += "\n\nOutput:\n" + proc.stdout.strip()
+                return error_output
+                
+            return proc.stdout.strip() or "✅ Executed successfully (no output)"
         
-        # Create the safe execution wrapper
-        wrapped_code = f"""import sys
-def safe_exec():
-    try:
-{indented_code}
-    except Exception as e:
-        print(f"ERROR: {{e}}", file=sys.stderr)
-        
-if __name__ == "__main__":
-    safe_exec()
-"""
-        # Debug: Uncomment to see the actual executed code
-        # print("Executing code:\n", wrapped_code)
-        
-        proc = subprocess.run(
-            ["python", "-c", wrapped_code],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if proc.returncode != 0:
-            return f"⛔ Execution Error (code {proc.returncode}):\n{proc.stderr.strip()}"
-        return proc.stdout.strip() or "✅ Executed successfully (no output)"
+        except Exception as e:
+            # Clean up even if execution fails
+            if os.path.exists(tmpfile_path):
+                os.unlink(tmpfile_path)
+            raise
     
     except subprocess.TimeoutExpired:
         return "⏰ Timeout Error: Code took too long to execute"
     except Exception as e:
+        if attempt < MAX_ATTEMPTS:
+            # Try to fix common issues automatically
+            fixed_code = cleaned_code.replace("\t", "    ")  # Convert tabs to spaces
+            return execute_python(fixed_code, attempt + 1)
         return f"🔥 System Error: {str(e)}"
 
 # === Define structured output schema ===
 class CodeExecutor(BaseModel):
     """Schema for Python code execution"""
     code: str = Field(..., 
-        description="Python code to execute. Must assign final result to 'result' variable or print it."
+        description="Complete, runnable Python code. Must be properly formatted."
     )
     
     def execute(self):
@@ -83,6 +94,10 @@ st.caption("This agent can execute Python code for calculations and data process
 # Initialize session state
 if "history" not in st.session_state:
     st.session_state.history = []
+    st.session_state.debug_mode = False
+
+# Toggle for debug mode
+st.session_state.debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 
 # Display chat history
 for msg in st.session_state.history:
@@ -92,8 +107,11 @@ for msg in st.session_state.history:
             with st.expander("Generated Python Code"):
                 st.code(msg["code"], language="python")
         if "execution" in msg:
-            with st.expander("Execution Result"):
+            with st.expander("Execution Result", expanded=st.session_state.debug_mode):
                 st.text(msg["execution"])
+        if "debug" in msg and st.session_state.debug_mode:
+            with st.expander("Debug Info", expanded=True):
+                st.json(msg["debug"])
 
 # Handle user input
 if prompt := st.chat_input("What would you like to compute?"):
@@ -109,47 +127,92 @@ if prompt := st.chat_input("What would you like to compute?"):
         ("system", 
          "You are a Python coding expert. Strictly follow these rules:\n"
          "1. Generate COMPLETE, READY-TO-RUN Python code for any math/data operations\n"
-         "2. Code MUST be properly indented with 4 spaces\n"
-         "3. Assign final result to 'result' OR print it\n"
+         "2. Code MUST be properly indented with 4 spaces (NO tabs)\n"
+         "3. Final result MUST be printed to stdout\n"
          "4. DO NOT include markdown code blocks (```python or ```)\n"
          "5. Use only built-in Python modules\n"
-         "6. Include error handling with try/except blocks\n\n"
+         "6. Include error handling with try/except blocks\n"
+         "7. Add comments to explain complex logic\n"
+         "8. Test your code before outputting\n\n"
          "Example for calculating factorial:\n"
-         "def factorial(n):\n    if n == 0:\n        return 1\n    else:\n        return n * factorial(n-1)\nresult = factorial(5)"),
+         "def factorial(n):\n    if n == 0:\n        return 1\n    else:\n        return n * factorial(n-1)\n\n"
+         "try:\n    result = factorial(5)\n    print(result)\nexcept Exception as e:\n    print(f'Error: {e}')"),
         ("human", "{input}")
     ])
     
     # Get AI response
+    debug_info = {}
     with st.spinner("Analyzing request..."):
         try:
             chain = prompt_template | structured_llm
             response = chain.invoke({"input": prompt})
             code = response.code
+            debug_info["generated_code"] = code
         except Exception as e:
-            st.error(f"❌ AI Error: {str(e)}")
+            st.error(f"❌ AI Generation Error: {str(e)}")
             st.stop()
     
     # Add AI message to history
     st.session_state.history.append({
         "role": "assistant",
         "content": "Generated Python code",
-        "code": code
+        "code": code,
+        "debug": debug_info
     })
     
     # Display code
     with st.chat_message("assistant"):
         st.write("Executing Python code...")
-        with st.expander("Generated Code", expanded=False):
+        with st.expander("Generated Code", expanded=st.session_state.debug_mode):
             st.code(code, language="python")
         
         # Execute code
         with st.spinner("Running code..."):
             execution_result = execute_python(code)
         
-        # Display execution result
+        # Add execution result to history
         st.session_state.history[-1]["execution"] = execution_result
+        
+        # Display execution result
         with st.expander("Execution Result", expanded=True):
             st.text(execution_result)
+            
+        # Add debug info if needed
+        if "ERROR" in execution_result and st.session_state.debug_mode:
+            st.session_state.history[-1]["debug"]["execution_error"] = execution_result
+            with st.expander("Debug Analysis", expanded=True):
+                st.write("Attempting to fix code...")
+                fix_prompt = f"""
+Original code that failed:
+{code}
+
+Execution error:
+{execution_result}
+
+Please fix the code while following these rules:
+1. Keep the same functionality
+2. Fix any syntax or runtime errors
+3. Maintain proper indentation
+4. Add comments explaining fixes
+"""
+                try:
+                    fix_chain = ChatPromptTemplate.from_messages([
+                        ("system", "You are a Python debugging expert. Fix the provided code based on the error."),
+                        ("human", "{input}")
+                    ]) | structured_llm
+                    fix_response = fix_chain.invoke({"input": fix_prompt})
+                    fixed_code = fix_response.code
+                    
+                    st.code(fixed_code, language="python")
+                    st.session_state.history[-1]["debug"]["fixed_code"] = fixed_code
+                    
+                    with st.spinner("Running fixed code..."):
+                        fixed_result = execute_python(fixed_code)
+                    st.text(fixed_result)
+                    st.session_state.history[-1]["debug"]["fixed_result"] = fixed_result
+                    
+                except Exception as e:
+                    st.error(f"❌ Debug Failed: {str(e)}")
 
     # Rerun to update UI
     st.rerun()
