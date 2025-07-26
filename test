@@ -1,218 +1,310 @@
 import os
-import subprocess
-import tempfile
+import json
+import pandas as pd
 import streamlit as st
 from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain.schema import HumanMessage, SystemMessage
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+import torch
+import clip
+from PIL import Image
+import numpy as np
+import faiss
+from PyPDF2 import PdfReader
+import fitz  # PyMuPDF
+import io
 
-# --- Azure settings ---
-base_url = "https://your-resource.openai.azure.com/"  # Replace with your endpoint
-api_version = "2024-02-15-preview"
-api_key = "your_api_key_here"  # Replace with your key
-deployment_name = "GPT4o"
+st.set_page_config(page_title="Reaction Database", page_icon="", layout="wide")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Initialize Azure Chat
+base_url=""
+api_version="2024-02-15-preview"
+
+api_key=""
+deployment_name="GPT4o"
+model_name="GPT4o"
+
+embedded_files = {
+     'pdf_1': r"C:\Users\Desktop\Hydrolysis\Divalproex_C-C Bond Formation_Hydrolysis_DIV1.pdf",
+     
+
+}
+
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="Def_data_qa"
+)
 chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
+    model=model_name,
     api_version=api_version,
     api_key=api_key,
-    azure_endpoint=base_url,
-    temperature=0
+    azure_endpoint=base_url
 )
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-# === Robust Python execution function ===
-def execute_python(code: str, attempt: int = 1) -> str:
-    """Executes Python code safely using temporary files"""
-    MAX_ATTEMPTS = 3
-    
+@st.cache_resource
+def load_clip_model():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    return model, preprocess, device
+
+
+model, preprocess, device = load_clip_model()
+
+# Initialize session state for FAISS index for image embeddings
+if "faiss_image_index" not in st.session_state:
+    st.session_state.faiss_image_index = None
+
+if "image_metadata" not in st.session_state:
+    st.session_state.image_metadata = []
+
+def image_to_embedding(image):
+    image = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        embedding = model.encode_image(image)
+    return embedding.cpu().numpy().astype('float32')
+
+
+def extract_images_from_pdf(pdf_path):
+    images = []
     try:
-        # Clean the code while preserving original formatting
-        cleaned_code = code.strip().strip('`')
-        if cleaned_code.lower().startswith('python'):
-            cleaned_code = cleaned_code[6:].strip()
-        
-        # Create temporary Python file
-        with tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w") as tmpfile:
-            tmpfile.write(cleaned_code)
-            tmpfile_path = tmpfile.name
-        
-        try:
-            # Execute the file
-            proc = subprocess.run(
-                ["python", tmpfile_path],
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
-            
-            # Clean up
-            os.unlink(tmpfile_path)
-            
-            if proc.returncode != 0:
-                error_output = f"⛔ Execution Error (code {proc.returncode}):\n"
-                if proc.stderr:
-                    error_output += proc.stderr.strip()
-                if proc.stdout:
-                    error_output += "\n\nOutput:\n" + proc.stdout.strip()
-                return error_output
-                
-            return proc.stdout.strip() or "✅ Executed successfully (no output)"
-        
-        except Exception as e:
-            # Clean up even if execution fails
-            if os.path.exists(tmpfile_path):
-                os.unlink(tmpfile_path)
-            raise
-    
-    except subprocess.TimeoutExpired:
-        return "⏰ Timeout Error: Code took too long to execute"
+        pdf_document = fitz.open(pdf_path)
+        for page_number in range(len(pdf_document)):
+            for image_index, image_obj in enumerate(pdf_document[page_number].get_images(full=True)):
+                xref = image_obj[0]
+                base_image = pdf_document.extract_image(xref)
+                img_bytes = base_image["image"]
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                embedding = image_to_embedding(img)
+                images.append((embedding, {"source": pdf_path, "page": page_number + 1, "image_index": image_index}))
     except Exception as e:
-        if attempt < MAX_ATTEMPTS:
-            # Try to fix common issues automatically
-            fixed_code = cleaned_code.replace("\t", "    ")  # Convert tabs to spaces
-            return execute_python(fixed_code, attempt + 1)
-        return f"🔥 System Error: {str(e)}"
+        st.error(f"Error extracting images from PDF '{pdf_path}': {e}")
+    return images
 
-# === Define structured output schema ===
-class CodeExecutor(BaseModel):
-    """Schema for Python code execution"""
-    code: str = Field(..., 
-        description="Complete, runnable Python code. Must be properly formatted."
-    )
-    
-    def execute(self):
-        return execute_python(self.code)
 
-# Create structured model
-structured_llm = chat_model.with_structured_output(CodeExecutor)
+def load_pdf_data(file_paths):
+    text_docs = []
+    image_embeddings = []
 
-# === Streamlit UI ===
-st.title("Azure GPT‑4o + Python Sandbox")
-st.caption("This agent can execute Python code for calculations and data processing")
-
-# Initialize session state
-if "history" not in st.session_state:
-    st.session_state.history = []
-    st.session_state.debug_mode = False
-
-# Toggle for debug mode
-st.session_state.debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
-
-# Display chat history
-for msg in st.session_state.history:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
-        if "code" in msg:
-            with st.expander("Generated Python Code"):
-                st.code(msg["code"], language="python")
-        if "execution" in msg:
-            with st.expander("Execution Result", expanded=st.session_state.debug_mode):
-                st.text(msg["execution"])
-        if "debug" in msg and st.session_state.debug_mode:
-            with st.expander("Debug Info", expanded=True):
-                st.json(msg["debug"])
-
-# Handle user input
-if prompt := st.chat_input("What would you like to compute?"):
-    # Add user message to history
-    st.session_state.history.append({"role": "user", "content": prompt})
-    
-    # Display user message
-    with st.chat_message("user"):
-        st.write(prompt)
-    
-    # Create prompt template with stronger instructions
-    prompt_template = ChatPromptTemplate.from_messages([
-        ("system", 
-         "You are a Python coding expert. Strictly follow these rules:\n"
-         "1. Generate COMPLETE, READY-TO-RUN Python code for any math/data operations\n"
-         "2. Code MUST be properly indented with 4 spaces (NO tabs)\n"
-         "3. Final result MUST be printed to stdout\n"
-         "4. DO NOT include markdown code blocks (```python or ```)\n"
-         "5. Use only built-in Python modules\n"
-         "6. Include error handling with try/except blocks\n"
-         "7. Add comments to explain complex logic\n"
-         "8. Test your code before outputting\n\n"
-         "Example for calculating factorial:\n"
-         "def factorial(n):\n    if n == 0:\n        return 1\n    else:\n        return n * factorial(n-1)\n\n"
-         "try:\n    result = factorial(5)\n    print(result)\nexcept Exception as e:\n    print(f'Error: {e}')"),
-        ("human", "{input}")
-    ])
-    
-    # Get AI response
-    debug_info = {}
-    with st.spinner("Analyzing request..."):
+    for name, path in file_paths.items():
+        if not path.endswith('.pdf'):
+            continue
+        
         try:
-            chain = prompt_template | structured_llm
-            response = chain.invoke({"input": prompt})
-            code = response.code
-            debug_info["generated_code"] = code
+            # Process textual content
+            pdf_reader = PdfReader(path)
+            text_content = ""
+            for page in pdf_reader.pages:
+                text_content += page.extract_text() + "\n"
+
+            text_docs.append(Document(page_content=text_content, metadata={"source": name}))
+
+            # Process images
+            image_data = extract_images_from_pdf(path)
+            image_embeddings.extend(image_data)
+
         except Exception as e:
-            st.error(f"❌ AI Generation Error: {str(e)}")
-            st.stop()
-    
-    # Add AI message to history
-    st.session_state.history.append({
-        "role": "assistant",
-        "content": "Generated Python code",
-        "code": code,
-        "debug": debug_info
-    })
-    
-    # Display code
-    with st.chat_message("assistant"):
-        st.write("Executing Python code...")
-        with st.expander("Generated Code", expanded=st.session_state.debug_mode):
-            st.code(code, language="python")
+            st.error(f"Error processing PDF file '{name}': {e}")
+
+    return text_docs, image_embeddings
+
+
+def build_vectorstores_with_pdfs(json_dfs, pdf_text_docs, pdf_image_embeddings):
+    agents = []
+    try:
+        # Build agents for JSON data
+        for key, df in json_dfs.items():
+            docs = [Document(page_content=row['content'], metadata={'source': key}) for _, row in df.iterrows()]
+            if docs:
+                store = FAISS.from_documents(docs, cached_embeddings)
+                retriever = store.as_retriever(search_kwargs={"k": 5})
+                agents.append(ChildAgent(name=key, retriever=retriever))
+
+        # Build agents for PDF textual data
+        if pdf_text_docs:
+            pdf_store = FAISS.from_documents(pdf_text_docs, cached_embeddings)
+            pdf_retriever = pdf_store.as_retriever(search_kwargs={"k": 5})
+            agents.append(ChildAgent(name="pdf", retriever=pdf_retriever))
+
+        # Handle image embeddings
+        if pdf_image_embeddings:
+            image_vectors = np.array([item[0] for item in pdf_image_embeddings], dtype='float32')
+            metadata = [item[1] for item in pdf_image_embeddings]
+            index = faiss.IndexFlatL2(image_vectors.shape[1])
+            index.add(image_vectors)
+            st.session_state.image_metadata = metadata
+            st.session_state.faiss_image_index = index
+
+    except Exception:
+        pass
+
+    return agents
+
+class ChildAgent:
+    def __init__(self, name, retriever):
+        self.name = name
+        self.retriever = retriever
+
+    def ask(self, query):
+        try:
+            prompt = (
+                "You are a helpful assistant that answers user queries about reaction chemistry with relevant data. "
+                "Your response must include:\n"
+                "1. **API**: Provide the API name if available.\n"
+                "2. **Reaction Chemistry**\n"
+                "3. **Yield**\n"
+                "4. **Procedure**: ONLY display the complete procedure *exactly as written in the original source*. Do NOT summarize, transform, or modify it in any way. "
+                "Preserve paragraph formatting, punctuation, and structure entirely.\n"
+                "5. **Tabular Data**: give the complete table by Providing ALL tabular data exactly and in full; do not omit rows, columns, or content. Do NOT transform, abbreviate, or summarize the table display it verbatim as-is.\n\n"
+                "Your response should focus solely on the relevant reaction information and exclude all unrelated or extraneous content by Always prioritizing and maintaining the full fidelity of original paragraphs and tabular content without any alterations.\n"
+            )
+            full_query = f"{prompt}\n\n{query}"
+
+            result = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=self.retriever,
+                return_source_documents=False
+            ).run(full_query)
+
+            return {"result": result, "images": None}
+
+        except Exception as e:
+            st.error(f"Error querying {self.name}: {e}")
+            return None
+
+
+class AgentManager:
+    def __init__(self, agents):
+        self.coordinator = CoordinatorAgent(agents)
+
+    def handle_query(self, query):
+        raw_answers = self.coordinator.coordinate(query)
+        if not raw_answers or not isinstance(raw_answers[0][1], dict):
+            return "Relevant information not found.", None
+
+        validated = raw_answers[0][1]
+        return validated.get("result", "Relevant information not found."), validated.get("images", None)
+
+
+class CoordinatorAgent:
+    def __init__(self, child_agents):
+        self.children = child_agents
+
+    def coordinate(self, query):
+        for child in self.children:
+            try:
+                resp = child.ask(query)
+                if resp["result"]:
+                    return [(child.name, resp)]
+            except Exception as e:
+                st.error(f"Error querying {child.name}: {e}")
+                continue
+        return [("Coordinator", {"result": "Relevant information not found.", "images": None})]
+
+
+def load_json_data(file_paths):
+    dfs = {}
+    for name, path in file_paths.items():
+        if not path.endswith('.json'):
+            continue
         
-        # Execute code
-        with st.spinner("Running code..."):
-            execution_result = execute_python(code)
-        
-        # Add execution result to history
-        st.session_state.history[-1]["execution"] = execution_result
-        
-        # Display execution result
-        with st.expander("Execution Result", expanded=True):
-            st.text(execution_result)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            if isinstance(data, list):
+                dfs[name] = pd.DataFrame({'content': [json.dumps(item) for item in data]})
+            elif isinstance(data, dict):
+                dfs[name] = pd.DataFrame({'content': [json.dumps(data)]})
+        except Exception as e:
+            st.error(f"Error loading JSON file '{name}': {e}")
+    return dfs
+
+
+json_dfs = load_json_data(embedded_files)
+
+pdf_text_docs, pdf_image_embeddings = load_pdf_data({
+    key: path for key, path in embedded_files.items() if path and path.endswith('.pdf')
+})
+
+child_agents = build_vectorstores_with_pdfs(json_dfs, pdf_text_docs, pdf_image_embeddings)
+manager = AgentManager(child_agents)
+
+
+st.markdown("""
+    <style>
+        body { font-family: Arial, sans-serif; }
+        input.s-input { display: block; width: 100%; padding: 10px; margin-top: 20px; margin-bottom: 20px; font-size: 18px; border-radius: 5px; }
+    </style>
+""", unsafe_allow_html=True)
+
+query = st.text_input("Search Reaction Database:", key="input_query")
+
+if query:
+    response, images = manager.handle_query(query)
+
+    # Handling large tabular data with pagination
+    if "Tabular Data:" in response:
+        try:
+            # Extract tabular data
+            table_start = response.index("Tabular Data:")
+            table_content = response[table_start:].split("\n")[1:]  # Skip "Tabular Data:" header
             
-        # Add debug info if needed
-        if "ERROR" in execution_result and st.session_state.debug_mode:
-            st.session_state.history[-1]["debug"]["execution_error"] = execution_result
-            with st.expander("Debug Analysis", expanded=True):
-                st.write("Attempting to fix code...")
-                fix_prompt = f"""
-Original code that failed:
-{code}
+            rows = [line.split("\t") for line in table_content if "\t" in line]
+            if rows:
+                columns = rows[0]  # First row as header
+                data = rows[1:]    # Remaining rows as data
+                df = pd.DataFrame(data, columns=columns)
+                
+                # Define pagination
+                items_per_page = 20  # Number of rows per page
+                total_pages = (len(df) + items_per_page - 1) // items_per_page  # Total page count
+                selected_page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+                
+                # Paginate table
+                start_idx = (selected_page - 1) * items_per_page
+                end_idx = start_idx + items_per_page
+                paginated_df = df.iloc[start_idx:end_idx]
+                
+                # Display paginated DataFrame
+                st.dataframe(paginated_df, use_container_width=True)
+                st.write(f"Page {selected_page}/{total_pages} (Rows {start_idx + 1}-{min(len(df), end_idx)})")
+            else:
+                st.write(response)  # Fallback to plain response if table extraction fails
+        except Exception as e:
+            st.error(f"Error processing tabular data: {e}")
+            st.write(response)  # Fallback for any unexpected errors
+    else:
+        # Regular response display
+        st.write(response)
 
-Execution error:
-{execution_result}
+    # Handle images normally
+    if images:
+        valid_images = [img for img in images if img is not None]
+        if valid_images:
+            st.image(valid_images, caption=["Extracted Image"], use_container_width=True)
+        else:
+            st.warning("No images found for this query.")
 
-Please fix the code while following these rules:
-1. Keep the same functionality
-2. Fix any syntax or runtime errors
-3. Maintain proper indentation
-4. Add comments explaining fixes
-"""
-                try:
-                    fix_chain = ChatPromptTemplate.from_messages([
-                        ("system", "You are a Python debugging expert. Fix the provided code based on the error."),
-                        ("human", "{input}")
-                    ]) | structured_llm
-                    fix_response = fix_chain.invoke({"input": fix_prompt})
-                    fixed_code = fix_response.code
-                    
-                    st.code(fixed_code, language="python")
-                    st.session_state.history[-1]["debug"]["fixed_code"] = fixed_code
-                    
-                    with st.spinner("Running fixed code..."):
-                        fixed_result = execute_python(fixed_code)
-                    st.text(fixed_result)
-                    st.session_state.history[-1]["debug"]["fixed_result"] = fixed_result
-                    
-                except Exception as e:
-                    st.error(f"❌ Debug Failed: {str(e)}")
 
-    # Rerun to update UI
-    st.rerun()
+
+
+
+So the above is a skeleton code for my Reaction Database AI Application where I want ingest 400 product or API (Active Pharmaceutical ingredient) documents (pdf’s) and use will ask relevant reaction chemistry information and it should give all the products relevant to the reaction chemistry using GPT4o and Text embedding Large models. For example, The user asks Give me relevant information for Oxidation under oxidation there will products whose pdfs will be loaded the products under oxidation for example Finasteride, Dutasteride are the pdfs loaded it will go give the user  "1. **API**: Provide the API name if available.\n  "2. **Reaction Chemistry**\n" "3. **Yield**\n "4. **Procedure**: ONLY display the complete procedure *exactly as written in the original source*. Do NOT summarize, transform, or modify it in any way. Preserve paragraph formatting, punctuation, and structure entirely.\n" "5. **Tabular Data**: give the complete table by Providing ALL tabular data exactly and in full; do not omit rows, columns, or content. Do NOT transform, abbreviate, or summarize the table display it verbatim as-is.\n\n"
+And finally the synthetic scheme of it which we will load separately this is something I want to figure out I have the synthetic schemes as jpeg and as xml files now while displaying the user wants it in .cdx format so that he can open it in the chemdraw application as a structure this is something I want and also loading these synthetic schemes in the code and the model should exactly give the relevant synthetic scheme relevant to that product not any other this is something the user wants and figure this out
+Secondly loading 400 pdfs if u see in my code I loaded 1 pdf 'pdf_1': r"C:\Users \Desktop\Hydrolysis\Divalproex_C-C Bond Formation_Hydrolysis_DIV1.pdf", which is working fine but I want to load 400 pdfs based on their reaction chemistry to the model this is something you need to figure out and integrate.
+
+Finally I want a Production Ready complete end to end react application similar to google webpage where user will go ask his query based on the reaction chemistry or any query relevant to those pdfs it should open a new page with all the relevant api products those pdfs as links and once the user clicks on one of the link it should open the relevant details of that product its API, Reaction Chemistry, Yield, Procedure, Tabular Data, and finally its synthetic scheme. Do not change the azure configuration from the sample code I gave you above keep the azure models configuration as-is Build this react application beautifully it should be magnificent I don’t want skeletons give me production ready bug free code without any errors entirely robustly please
+
+
