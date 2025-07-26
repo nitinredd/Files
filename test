@@ -1,57 +1,98 @@
-pip install streamlit img2mol rdkit-pypi pillow
-import streamlit as st
-from PIL import Image
-import img2mol
-from rdkit import Chem
-from rdkit.Chem import AllChem
-import tempfile
 import os
-import base64
+import subprocess
+import json
+import streamlit as st
+from langchain.chat_models import AzureChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
+from pydantic import BaseModel, Field
 
-def image_to_smiles(uploaded_image):
-    img = Image.open(uploaded_image).convert("RGB")
-    arr = img2mol.preprocess_image(img)
-    result = img2mol.core.predict(arr, input_type='pixel', output_type='smiles')
-    if not result:
-        raise ValueError("img2mol couldn't extract SMILES from image.")
-    return result
+# --- Azure/OpenAI configuration (exactly as provided) ---
+base_url        = ""
+api_version     = "2024-02-15-preview"
+api_key         = ""
+deployment_name = "GPT4o"
+model_name      = "GPT4o"
 
-def smiles_to_mol_block(smiles):
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError("Invalid SMILES structure.")
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMolecule(mol)
-    return Chem.MolToMolBlock(mol)
+# --- Initialize AzureChatOpenAI with the given config ---
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
 
-def get_mol_download_link(molblock, filename="structure.mol"):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mol") as tmp_file:
-        tmp_file.write(molblock.encode("utf-8"))
-        tmp_file_path = tmp_file.name
+# --- 1) Generic Python executor ---
+def execute_python(code: str) -> str:
+    """
+    Execute the given Python code snippet in a sandboxed subprocess
+    and return stdout. The snippet should print or populate `result`.
+    """
+    script = f"""
+import sys
+def safe_exec():
+{code.replace(chr(10), chr(10) + '    ')}
+if __name__ == "__main__":
+    safe_exec()
+"""
+    proc = subprocess.run(
+        ["python3", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+    if proc.returncode != 0:
+        return f"Error:\\n{proc.stderr}"
+    return proc.stdout.strip()
 
-    with open(tmp_file_path, "rb") as file:
-        b64 = base64.b64encode(file.read()).decode()
-        href = f'<a href="data:chemical/x-mdl-molfile;base64,{b64}" download="{filename}">📥 Download MOL file</a>'
-    os.remove(tmp_file_path)
-    return href
+# --- 2) Define function schema for GPT function-calling ---
+class ExecutePythonSchema(BaseModel):
+    code: str = Field(..., description="Python code snippet printing or populating `result`.")
 
-# Streamlit UI
-st.set_page_config(page_title="Image to MOL", layout="centered")
-st.title("🧪 Convert Chemical Image → MOL File")
-st.markdown("Upload a chemical structure image. You'll get a `.mol` file you can open in ChemDraw or any molecular editor.")
+function_def = {
+    "name": "execute_python",
+    "description": "Executes Python code in a sandbox and returns stdout.",
+    "parameters": {
+        "type": "object",
+        "properties": ExecutePythonSchema.schema()["properties"],
+        "required": ["code"]
+    }
+}
 
-uploaded_file = st.file_uploader("Upload JPEG/PNG/TIFF", type=["jpg", "jpeg", "png", "tiff"])
+# --- 3) Streamlit UI setup ---
+st.set_page_config(page_title="Azure GPT4o + Python Sandbox", layout="wide")
+st.title("Azure GPT4o + Generic Python Tool")
 
-if uploaded_file is not None:
-    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+prompt = st.text_area("Enter your prompt (math, tables, data, etc):", height=150)
 
-    try:
-        with st.spinner("🔬 Converting image to molecule..."):
-            smiles = image_to_smiles(uploaded_file)
-            mol_block = smiles_to_mol_block(smiles)
-        st.success("✅ Structure converted!")
-        st.markdown("### SMILES:")
-        st.code(smiles, language="none")
-        st.markdown(get_mol_download_link(mol_block), unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"❌ Error: {e}")
+if st.button("Submit"):
+    # System message instructing function-calling
+    system_msg = SystemMessage(content=(
+        "You are an assistant. For precise math, data processing, or plotting, "
+        "call the function `execute_python` with a code snippet that prints or defines `result`. "
+        "If no calculations are needed, respond directly."
+    ))
+    user_msg = HumanMessage(content=prompt)
+
+    # Send to Azure GPT4o with function schema
+    response = chat_model.generate(
+        messages=[system_msg, user_msg],
+        functions=[function_def],
+        function_call="auto"
+    )
+
+    msg = response.generations[0][0].message
+
+    if msg.function_call:
+        args = json.loads(msg.function_call.arguments)
+        code = args["code"]
+        # Show code in a collapsible expander
+        with st.expander("🔍 View generated Python code", expanded=False):
+            st.code(code, language="python")
+        # Execute and display result
+        output = execute_python(code)
+        st.markdown("**Execution Result:**")
+        st.text(output)
+    else:
+        st.markdown("**Response:**")
+        st.write(msg.content)
