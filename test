@@ -1,41 +1,46 @@
-import io
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
-def display_structured_content(content):
-    # … [other expanders] …
+# 1) In build_product_vector_store(), chunk the text:
+def build_product_vector_store(product):
+    text = extract_pdf_text(product["pdf_path"])
+    if not text or len(text.strip()) < 100:
+        return None
 
-    # Tabular Data (robust handling of multiple tables)
-    table_section_match = re.search(
-        r"### Tabular Data\n(.*?)(?=(?:###\s)|\Z)",
-        content, re.DOTALL
+    # split into ~1.5k‑char chunks with 200 overlap
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1500,
+        chunk_overlap=200
     )
-    if table_section_match:
-        raw = table_section_match.group(1).strip()
-        # Regex to capture each markdown table (header, separator, and rows)
-        table_patterns = re.findall(
-            r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)",
-            raw, re.DOTALL
-        )
-        if table_patterns:
-            for idx, tbl_md in enumerate(table_patterns, start=1):
-                with st.expander(f"Table {idx}", expanded=True):
-                    try:
-                        # Clean up each line: strip leading/trailing pipes & spaces
-                        lines = [
-                            line.strip().strip("|")
-                            for line in tbl_md.splitlines()
-                            if line.strip()
-                        ]
-                        cleaned = "\n".join(lines)
-                        # Use pandas to parse as CSV with '|' delimiter
-                        df = pd.read_csv(
-                            io.StringIO(cleaned),
-                            sep="\\|",
-                            engine="python"
-                        )
-                        st.dataframe(df, use_container_width=True)
-                    except Exception as e:
-                        # Fallback: show raw markdown if parsing fails
-                        st.markdown(f"<pre>{tbl_md}</pre>", unsafe_allow_html=True)
-        else:
-            # No tables detected, just render whatever is there
-            st.markdown(raw)
+    chunks = splitter.split_text(text)
+    docs = [
+        Document(page_content=chunk, metadata={
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        })
+        for chunk in chunks
+    ]
+    return FAISS.from_documents(docs, cached_embeddings)
+
+# 2) When you create your QA chain, switch to map_reduce and bump k:
+def process_product_query(product):
+    # … after you have vector_store …
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="map_reduce",             # ← aggregate multiple chunks
+        retriever=retriever,
+        chain_type_kwargs={
+            "prompt": PROMPT,                # your existing “stuff” prompt
+            # Optionally supply a shorter “reduce” prompt if you want finer control
+            # "reduce_prompt": REDUCE_PROMPT
+        },
+        return_source_documents=False
+    )
+    response = qa_chain.invoke({"query": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"})["result"]
+    st.session_state.product_details[product["id"]] = response
+    return response, None
