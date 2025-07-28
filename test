@@ -13,6 +13,8 @@ from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from PIL import Image
+import io
 
 # Configuration - Replace with your Azure credentials
 st.set_page_config(page_title="PharmaReaction AI", page_icon="🧪", layout="wide")
@@ -237,6 +239,14 @@ st.markdown("""
             border-radius: 5px;
             margin-top: 1rem;
             border: 1px solid #eee;
+            white-space: pre-wrap;
+        }
+        
+        .product-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 1rem;
+            margin-top: 1rem;
         }
     </style>
 """, unsafe_allow_html=True)
@@ -291,36 +301,32 @@ def extract_pdf_text(pdf_path):
         st.error(f"Error reading PDF {pdf_path}: {str(e)}")
         return ""
 
-# Build vector database with reaction type filtering
-@st.cache_resource(show_spinner="Building knowledge base...")
-def build_vector_database(products):
-    documents = []
+# Build vector database for a single product
+def build_product_vector_store(product):
+    # Extract text from PDF
+    text = extract_pdf_text(product["pdf_path"])
     
-    for product in products:
-        try:
-            text = extract_pdf_text(product["pdf_path"])
-            if text and len(text.strip()) > 100:  # Ensure meaningful content
-                # Include reaction type in metadata for filtering
-                documents.append(Document(
-                    page_content=text,
-                    metadata={
-                        "product_id": product["id"],
-                        "product_name": product["name"],
-                        "reaction_type": product["reaction_type"],
-                        "source": product["pdf_path"]
-                    }
-                ))
-        except Exception:
-            continue
+    if not text or len(text.strip()) < 100:
+        return None
     
-    if documents:
-        return FAISS.from_documents(documents, cached_embeddings)
-    return None
+    # Create document with metadata
+    doc = Document(
+        page_content=text,
+        metadata={
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        }
+    )
+    
+    # Create FAISS vector store
+    return FAISS.from_documents([doc], cached_embeddings)
 
 # Custom prompt template for precise answers
 PROMPT_TEMPLATE = """
 You are a pharmaceutical chemistry expert specializing in reaction chemistry. 
-When answering questions, you MUST provide the following information if available:
+Extract the following information from the document:
 
 1. **API Name**: The active pharmaceutical ingredient
 2. **Reaction Chemistry**: Type and description
@@ -330,10 +336,9 @@ When answering questions, you MUST provide the following information if availabl
 5. **Tabular Data**: Provide COMPLETE tabular data verbatim. 
    Do NOT omit, summarize, or transform any content.
 
-If the question is about a specific product, provide detailed information for that product.
-If the question is general, provide an overview and list relevant products.
+Document Content:
+{context}
 
-Context: {context}
 Question: {question}
 Answer:
 """
@@ -348,19 +353,22 @@ def init_session_state():
     if "all_products" not in st.session_state:
         st.session_state.all_products = load_product_database()
     
-    if "vector_db" not in st.session_state:
-        st.session_state.vector_db = build_vector_database(st.session_state.all_products)
-    
     if "messages" not in st.session_state:
         st.session_state.messages = [
-            {"role": "assistant", "content": "Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry or pharmaceutical product."}
+            {"role": "assistant", "content": "Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry."}
         ]
     
     if "current_product" not in st.session_state:
         st.session_state.current_product = None
     
-    if "search_results" not in st.session_state:
-        st.session_state.search_results = []
+    if "current_reaction" not in st.session_state:
+        st.session_state.current_reaction = None
+    
+    if "reaction_products" not in st.session_state:
+        st.session_state.reaction_products = []
+    
+    if "product_details" not in st.session_state:
+        st.session_state.product_details = {}
     
     if "user_query" not in st.session_state:
         st.session_state.user_query = ""
@@ -372,6 +380,10 @@ def get_product_by_id(product_id):
             return product
     return None
 
+# Get products by reaction type
+def get_products_by_reaction(reaction_type):
+    return [p for p in st.session_state.all_products if p["reaction_type"] == reaction_type]
+
 # File download helper
 def get_binary_file_downloader_html(file_path, label="Download"):
     if not os.path.exists(file_path):
@@ -382,71 +394,48 @@ def get_binary_file_downloader_html(file_path, label="Download"):
     b64 = base64.b64encode(data).decode()
     return f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(file_path)}" class="download-btn">{label}</a>'
 
-# Process user query
-def process_query(query):
-    if not query.strip():
-        return "Please enter a valid question."
+# Process reaction type query
+def process_reaction_query(reaction_type):
+    # Get all products for this reaction type
+    products = get_products_by_reaction(reaction_type)
     
-    # Clear previous search results
-    st.session_state.search_results = []
+    if not products:
+        return f"No products found for {reaction_type}", []
     
-    # Check if we have a vector database
-    if st.session_state.vector_db is None:
-        return "Knowledge base is not ready. Please try again later."
+    return f"Found {len(products)} products for {reaction_type}:", products
+
+# Process product query
+def process_product_query(product):
+    # Check if we already have details for this product
+    if product["id"] in st.session_state.product_details:
+        return st.session_state.product_details[product["id"]]
     
-    try:
-        # Check for greeting
-        if re.search(r"\b(hi|hello|hey)\b", query, re.IGNORECASE):
-            return "Hello! I'm your Pharma Reaction Expert. How can I assist you with reaction chemistry today?"
-        
-        # Check if query mentions a specific reaction type
-        reaction_filter = None
-        for rtype in REACTION_TYPES:
-            if re.search(rtype, query, re.IGNORECASE):
-                reaction_filter = rtype
-                break
-        
-        # Create retriever with potential filter
-        search_kwargs = {"k": 5}
-        if reaction_filter:
-            search_kwargs["filter"] = {"reaction_type": reaction_filter}
-        
-        retriever = st.session_state.vector_db.as_retriever(search_kwargs=search_kwargs)
-        
-        # Create QA chain
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=retriever,
-            chain_type_kwargs={"prompt": PROMPT},
-            return_source_documents=True
-        )
-        
-        # Run the query
-        result = qa_chain.invoke({"query": query})
-        
-        # Extract source products
-        source_products = set()
-        for doc in result["source_documents"]:
-            if "product_id" in doc.metadata:
-                source_products.add(doc.metadata["product_id"])
-        
-        st.session_state.search_results = list(source_products)
-        
-        # Format the response
-        response = result["result"]
-        
-        # If we found products, mention them
-        if st.session_state.search_results:
-            if reaction_filter:
-                response += f"\n\n**Relevant Products for {reaction_filter}:**"
-            else:
-                response += "\n\n**Relevant Products Found:**"
-            
-        return response
-        
-    except Exception as e:
-        return f"Error processing your query: {str(e)}"
+    # Build vector store for this product
+    vector_store = build_product_vector_store(product)
+    
+    if not vector_store:
+        return "Failed to process product document", None
+    
+    # Create retriever
+    retriever = vector_store.as_retriever(search_kwargs={"k": 1})
+    
+    # Create QA chain
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=False
+    )
+    
+    # Query for product details
+    query = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+    response = qa_chain.invoke({"query": query})["result"]
+    
+    # Cache the response
+    st.session_state.product_details[product["id"]] = response
+    
+    return response, None
 
 # Render chat message
 def render_message(message):
@@ -468,24 +457,8 @@ def render_product_card(product):
 
 # Render product detail view
 def render_product_detail(product):
-    # Initialize agent for this product
-    retriever = st.session_state.vector_db.as_retriever(
-        search_kwargs={"k": 1, "filter": {"product_id": product["id"]}}
-    )
-    
-    # Create QA chain
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=chat_model,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=False
-    )
-    
     # Get product details
-    with st.spinner(f"Retrieving details for {product['name']}..."):
-        query = f"Provide complete details for {product['name']} including API, reaction chemistry, yield, procedure, and tabular data"
-        response = qa_chain.invoke({"query": query})["result"]
+    details = st.session_state.product_details.get(product["id"], "")
     
     # Display details
     st.markdown(f'<div class="detail-view">', unsafe_allow_html=True)
@@ -493,7 +466,7 @@ def render_product_detail(product):
     # Back button
     st.markdown("""
         <button class="back-button" onclick="goBack()">
-            &larr; Back to Chat
+            &larr; Back to Products
         </button>
     """, unsafe_allow_html=True)
     
@@ -502,31 +475,31 @@ def render_product_detail(product):
     st.markdown(f'<div class="reaction-type">{product["reaction_type"]}</div>', unsafe_allow_html=True)
     
     # API Name
-    api_match = re.search(r"\*\*API Name\*\*:(.*?)(?=\n\*\*|\Z)", response, re.DOTALL)
+    api_match = re.search(r"\*\*API Name\*\*:(.*?)(?=\n\*\*|\Z)", details, re.DOTALL)
     if api_match:
         st.markdown(f'<div class="section-title">API Name</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="tab-content">{api_match.group(1).strip()}</div>', unsafe_allow_html=True)
     
     # Reaction Chemistry
-    rxn_match = re.search(r"\*\*Reaction Chemistry\*\*:(.*?)(?=\n\*\*|\Z)", response, re.DOTALL)
+    rxn_match = re.search(r"\*\*Reaction Chemistry\*\*:(.*?)(?=\n\*\*|\Z)", details, re.DOTALL)
     if rxn_match:
         st.markdown(f'<div class="section-title">Reaction Chemistry</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="tab-content">{rxn_match.group(1).strip()}</div>', unsafe_allow_html=True)
     
     # Yield
-    yield_match = re.search(r"\*\*Yield\*\*:(.*?)(?=\n\*\*|\Z)", response, re.DOTALL)
+    yield_match = re.search(r"\*\*Yield\*\*:(.*?)(?=\n\*\*|\Z)", details, re.DOTALL)
     if yield_match:
         st.markdown(f'<div class="section-title">Yield</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="tab-content">{yield_match.group(1).strip()}</div>', unsafe_allow_html=True)
     
     # Procedure
-    proc_match = re.search(r"\*\*Procedure\*\*:(.*?)(?=\n\*\*|\Z)", response, re.DOTALL)
+    proc_match = re.search(r"\*\*Procedure\*\*:(.*?)(?=\n\*\*|\Z)", details, re.DOTALL)
     if proc_match:
         st.markdown(f'<div class="section-title">Procedure</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="tab-content">{proc_match.group(1).strip()}</div>', unsafe_allow_html=True)
     
     # Tabular Data
-    table_match = re.search(r"\*\*Tabular Data\*\*:(.*?)(?=\n\*\*|\Z)", response, re.DOTALL)
+    table_match = re.search(r"\*\*Tabular Data\*\*:(.*?)(?=\n\*\*|\Z)", details, re.DOTALL)
     if table_match:
         st.markdown(f'<div class="section-title">Tabular Data</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="tab-content">{table_match.group(1).strip()}</div>', unsafe_allow_html=True)
@@ -534,18 +507,20 @@ def render_product_detail(product):
     # Synthetic scheme
     st.markdown(f'<div class="section-title">Synthetic Scheme</div>', unsafe_allow_html=True)
     if product["scheme_jpeg"] and os.path.exists(product["scheme_jpeg"]):
-        st.markdown(f'<div class="scheme-container">', unsafe_allow_html=True)
-        st.image(product["scheme_jpeg"], use_column_width=True)
-        
-        if product["scheme_cdx"] and os.path.exists(product["scheme_cdx"]):
-            st.markdown(get_binary_file_downloader_html(
-                product["scheme_cdx"], 
-                f"Download {product['name']} for ChemDraw"
-            ), unsafe_allow_html=True)
-        else:
-            st.warning("CDX format not available for this product")
-        
-        st.markdown(f'</div>', unsafe_allow_html=True)
+        try:
+            # Open and resize image for better display
+            img = Image.open(product["scheme_jpeg"])
+            st.image(img, use_column_width=True, caption="Synthetic Scheme")
+            
+            if product["scheme_cdx"] and os.path.exists(product["scheme_cdx"]):
+                st.markdown(get_binary_file_downloader_html(
+                    product["scheme_cdx"], 
+                    f"Download {product['name']} for ChemDraw"
+                ), unsafe_allow_html=True)
+            else:
+                st.warning("CDX format not available for this product")
+        except Exception as e:
+            st.error(f"Error loading synthetic scheme: {str(e)}")
     else:
         st.warning("Synthetic scheme not available for this product")
     
@@ -562,6 +537,16 @@ def render_product_detail(product):
             mime="application/pdf",
             use_container_width=True
         )
+        
+        # Display first page preview
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page = doc.load_page(0)
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            st.image(img_bytes, caption="First Page Preview", use_column_width=True)
+        except:
+            st.warning("Could not generate PDF preview")
     else:
         st.error("PDF file not found")
     
@@ -576,18 +561,41 @@ def main():
     st.markdown("""
         <div class="header">
             <h1>PharmaReaction AI</h1>
-            <p>Chatbot for Reaction Chemistry Knowledge Base</p>
+            <p>Reaction Chemistry Knowledge Base</p>
         </div>
     """, unsafe_allow_html=True)
     
+    # Handle product selection from query params
+    query_params = st.experimental_get_query_params()
+    if "product" in query_params:
+        product_id = query_params["product"][0]
+        product = get_product_by_id(product_id)
+        if product:
+            st.session_state.current_product = product
+            st.session_state.current_reaction = product["reaction_type"]
+    
     # If we're viewing a product detail, show that
     if st.session_state.current_product:
-        product = get_product_by_id(st.session_state.current_product)
-        if product:
-            render_product_detail(product)
+        render_product_detail(st.session_state.current_product)
+        return
+    
+    # If we're viewing a reaction type, show products
+    if st.session_state.current_reaction:
+        st.markdown(f'<h2>{st.session_state.current_reaction} Products</h2>', unsafe_allow_html=True)
+        
+        # Back button
+        if st.button("← Back to Chat", key="back_button"):
+            st.session_state.current_reaction = None
+            st.rerun()
+        
+        # Display products in a grid
+        if st.session_state.reaction_products:
+            st.markdown('<div class="product-grid">', unsafe_allow_html=True)
+            for product in st.session_state.reaction_products:
+                st.markdown(render_product_card(product), unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
         else:
-            st.error("Product not found")
-            st.session_state.current_product = None
+            st.warning(f"No products found for {st.session_state.current_reaction}")
         return
     
     # Chat interface
@@ -597,21 +605,13 @@ def main():
     for message in st.session_state.messages:
         st.markdown(render_message(message), unsafe_allow_html=True)
     
-    # Display search results if any
-    if st.session_state.search_results:
-        st.markdown('<div class="section-title">Relevant Products</div>', unsafe_allow_html=True)
-        for product_id in st.session_state.search_results:
-            product = get_product_by_id(product_id)
-            if product:
-                st.markdown(render_product_card(product), unsafe_allow_html=True)
-    
     st.markdown('</div>', unsafe_allow_html=True)  # Close chat container
     
     # Input area
     st.markdown('<div class="input-container">', unsafe_allow_html=True)
     user_input = st.text_input("Type your message...", st.session_state.user_query, 
                               key="user_input", 
-                              placeholder="Ask about reaction chemistry or products...",
+                              placeholder="Ask about reaction chemistry...",
                               label_visibility="collapsed")
     st.markdown('</div>', unsafe_allow_html=True)
     
@@ -626,28 +626,13 @@ def main():
             
             // Select product
             function selectProduct(productId) {
-                Streamlit.setComponentValue({
-                    type: "select_product",
-                    productId: productId
-                });
+                window.location.href = window.location.href + "?product=" + productId;
             }
             
             // Go back to chat
             function goBack() {
-                Streamlit.setComponentValue({
-                    type: "go_back"
-                });
+                window.history.back();
             }
-            
-            // Handle messages
-            Streamlit.on('message', function(event) {
-                if (event.data.type === "select_product") {
-                    Streamlit.setComponentValue(event.data);
-                }
-                if (event.data.type === "go_back") {
-                    Streamlit.setComponentValue(event.data);
-                }
-            });
             
             // Scroll to bottom on load
             window.addEventListener('load', scrollToBottom);
@@ -662,12 +647,27 @@ def main():
                 # Add user message to chat
                 st.session_state.messages.append({"role": "user", "content": st.session_state.user_input})
                 
-                # Process query and get response
-                with st.spinner("Analyzing reaction chemistry..."):
-                    response = process_query(st.session_state.user_input)
+                # Check if it's a reaction type query
+                reaction_match = None
+                for rtype in REACTION_TYPES:
+                    if re.search(r"\b" + re.escape(rtype) + r"\b", st.session_state.user_input, re.IGNORECASE):
+                        reaction_match = rtype
+                        break
                 
-                # Add bot response to chat
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                if reaction_match:
+                    # Process reaction type
+                    response, products = process_reaction_query(reaction_match)
+                    
+                    # Add bot response to chat
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    
+                    # Set reaction products
+                    st.session_state.current_reaction = reaction_match
+                    st.session_state.reaction_products = products
+                else:
+                    # Process general query
+                    response = "Please ask about a specific reaction chemistry type."
+                    st.session_state.messages.append({"role": "assistant", "content": response})
                 
                 # Clear input
                 st.session_state.user_query = ""
@@ -676,25 +676,11 @@ def main():
     with col2:
         if st.button("Clear Chat", key="clear_button", use_container_width=True):
             st.session_state.messages = [
-                {"role": "assistant", "content": "Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry or pharmaceutical product."}
+                {"role": "assistant", "content": "Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry."}
             ]
-            st.session_state.search_results = []
             st.session_state.user_query = ""
             st.rerun()
 
 # Run the app
 if __name__ == "__main__":
-    # Handle component messages
-    query_params = st.experimental_get_query_params()
-    
-    if "select_product" in query_params:
-        st.session_state.current_product = query_params["select_product"][0]
-        st.experimental_set_query_params()
-        st.rerun()
-    
-    if "go_back" in query_params:
-        st.session_state.current_product = None
-        st.experimental_set_query_params()
-        st.rerun()
-    
     main()
