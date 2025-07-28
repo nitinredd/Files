@@ -1,18 +1,164 @@
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+import os
+import re
+import glob
+import base64
+import io
+import fitz  # PyMuPDF
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-# 1) In build_product_vector_store(), chunk the text:
+# ───────────────────────────────────────────────────────────────────────────────
+# Configuration – replace these with your actual Azure values and local paths
+st.set_page_config(page_title="PharmaReaction AI", page_icon="🧪", layout="wide")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+base_url       = "https://your-azure-openai-service.openai.azure.com/"
+api_version    = "2024-02-15-preview"
+api_key        = "your-azure-api-key"
+deployment_name= "GPT4o"
+model_name     = "GPT4o"
+
+BASE_DIR   = r"C:\Reaction_Database"
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR  = os.path.join(BASE_DIR, "Synthetic_Schemes")
+
+# ─── Initialize Azure embeddings & chat model ───────────────────────────────────
+file_store = LocalFileStore('langchain-embeddings')
+base_embeddings = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint=base_url,
+    api_key=api_key,
+    azure_deployment="Def_data_qa"
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
+    base_embeddings, file_store, namespace=base_embeddings.model
+)
+
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+
+# ─── Reaction Chemistry Categories ─────────────────────────────────────────────
+REACTION_TYPES = [
+    "C-C Bond Formation", "C-N Bond Formation", "Salt Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal mediated-catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+# ─── Ensure dirs exist ─────────────────────────────────────────────────────────
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+
+# ─── Custom CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+    <style> /* ... your existing CSS here ... */ </style>
+""", unsafe_allow_html=True)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Map‑Reduce prompts
+PROMPT = PromptTemplate(
+    template="""
+You are a pharmaceutical chemistry expert specializing in reaction chemistry.
+Extract the following information in structured form from the combined context:
+
+1. API Name
+2. Reaction Chemistry
+3. Yield
+4. Procedure
+5. Tabular Data (markdown tables)
+
+Answer:
+""",
+    input_variables=["context"]
+)
+
+MAP_PROMPT = PromptTemplate(
+    template="""
+You are a pharmaceutical chemistry expert. From this excerpt, extract:
+1. API Name
+2. Reaction Chemistry
+3. Yield
+4. Procedure
+5. Any tabular data (as markdown)
+
+Excerpt:
+{context}
+
+Answer:
+""",
+    input_variables=["context"],
+)
+
+COMBINE_PROMPT = PromptTemplate(
+    template="""
+You are an expert at merging partial chemistry‐extraction results.
+Here are the partial outputs:
+{context}
+
+Produce one final report with all five sections, preserving original formatting and removing duplicates.
+""",
+    input_variables=["context"],
+)
+
+# ───────────────────────────────────────────────────────────────────────────────
+def find_scheme_image(reaction_type, product_name):
+    for ext in ('.jpeg', '.jpg', '.png', '.gif'):
+        path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+@st.cache_resource(show_spinner=False)
+def load_product_database():
+    products = []
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+        for pdf_path in glob.glob(os.path.join(reaction_dir, "*.pdf")):
+            name = os.path.splitext(os.path.basename(pdf_path))[0]
+            img = find_scheme_image(reaction_type, name)
+            cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{name}.cdx")
+            products.append({
+                "id": f"{reaction_type}_{name}",
+                "name": name,
+                "reaction_type": reaction_type,
+                "pdf_path": pdf_path,
+                "scheme_image": img,
+                "scheme_cdx": cdx if os.path.exists(cdx) else None
+            })
+    return products
+
+def extract_pdf_text(pdf_path):
+    try:
+        doc = fitz.open(pdf_path)
+        return "\n".join([page.get_text() for page in doc])
+    except Exception as e:
+        st.error(f"Error reading PDF {pdf_path}: {e}")
+        return ""
+
 def build_product_vector_store(product):
     text = extract_pdf_text(product["pdf_path"])
     if not text or len(text.strip()) < 100:
         return None
-
-    # split into ~1.5k‑char chunks with 200 overlap
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=200
-    )
+    # ─── Chunking ─────────────────────────────────────────────────────────────
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
     chunks = splitter.split_text(text)
     docs = [
         Document(page_content=chunk, metadata={
@@ -25,22 +171,224 @@ def build_product_vector_store(product):
     ]
     return FAISS.from_documents(docs, cached_embeddings)
 
-# 2) When you create your QA chain, switch to map_reduce and bump k:
 def process_product_query(product):
-    # … after you have vector_store …
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+    # cached?
+    if product["id"] in st.session_state.product_details:
+        return st.session_state.product_details[product["id"]], None
 
-    qa_chain = RetrievalQA.from_chain_type(
+    store = build_product_vector_store(product)
+    if not store:
+        return "Failed to process product document", None
+
+    retriever = store.as_retriever(search_kwargs={"k": 5})
+    qa = RetrievalQA.from_chain_type(
         llm=chat_model,
-        chain_type="map_reduce",             # ← aggregate multiple chunks
+        chain_type="map_reduce",
         retriever=retriever,
         chain_type_kwargs={
-            "prompt": PROMPT,                # your existing “stuff” prompt
-            # Optionally supply a shorter “reduce” prompt if you want finer control
-            # "reduce_prompt": REDUCE_PROMPT
+            "map_prompt": MAP_PROMPT,
+            "combine_prompt": COMBINE_PROMPT,
         },
         return_source_documents=False
     )
-    response = qa_chain.invoke({"query": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"})["result"]
-    st.session_state.product_details[product["id"]] = response
-    return response, None
+    result = qa.invoke({
+        "query": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+    })["result"]
+    st.session_state.product_details[product["id"]] = result
+    return result, None
+
+def get_binary_file_downloader_html(file_path, label="Download"):
+    if not os.path.exists(file_path):
+        return f'<span class="error">File not found: {os.path.basename(file_path)}</span>'
+    data = base64.b64encode(open(file_path, "rb").read()).decode()
+    return f'<a href="data:application/octet-stream;base64,{data}" download="{os.path.basename(file_path)}" class="download-btn">{label}</a>'
+
+def display_structured_content(content):
+    # API Name
+    m = re.search(r"###?\s*API Name\n(.*?)(?=\n###?|\Z)", content, re.DOTALL)
+    if m:
+        with st.expander("API Name", expanded=True): st.info(m.group(1).strip())
+
+    # Reaction Chemistry
+    m = re.search(r"###?\s*Reaction Chemistry\n(.*?)(?=\n###?|\Z)", content, re.DOTALL)
+    if m:
+        with st.expander("Reaction Chemistry", expanded=True): st.info(m.group(1).strip())
+
+    # Yield
+    m = re.search(r"###?\s*Yield\n(.*?)(?=\n###?|\Z)", content, re.DOTALL)
+    if m:
+        with st.expander("Yield", expanded=True): st.success(m.group(1).strip())
+
+    # Procedure
+    m = re.search(r"###?\s*Procedure\n(.*?)(?=\n###?|\Z)", content, re.DOTALL)
+    if m:
+        with st.expander("Procedure", expanded=True):
+            st.markdown(f"```{m.group(1).strip()}```")
+
+    # Tabular Data – capture all markdown tables
+    section = re.search(r"###?\s*Tabular Data\n(.*?)(?=\n###?|\Z)", content, re.DOTALL)
+    if section:
+        raw = section.group(1).strip()
+        tables = re.findall(
+            r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)",
+            raw, re.DOTALL
+        )
+        if tables:
+            for i, tbl in enumerate(tables, start=1):
+                with st.expander(f"Table {i}", expanded=True):
+                    try:
+                        lines = [ln.strip().strip("|") for ln in tbl.splitlines() if ln.strip()]
+                        df = pd.read_csv(io.StringIO("\n".join(lines)), sep="|", engine="python")
+                        st.dataframe(df, use_container_width=True)
+                    except:
+                        st.markdown(f"<pre>{tbl}</pre>", unsafe_allow_html=True)
+        else:
+            st.markdown(raw)
+
+def get_product_by_id(pid):
+    return next((p for p in st.session_state.all_products if p["id"] == pid), None)
+
+def get_products_by_reaction(rt):
+    return [p for p in st.session_state.all_products if p["reaction_type"] == rt]
+
+def init_session_state():
+    if "all_products" not in st.session_state:
+        st.session_state.all_products = load_product_database()
+    if "product_details" not in st.session_state:
+        st.session_state.product_details = {}
+    if "messages" not in st.session_state:
+        st.session_state.messages = [{"role":"assistant","content":"Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry."}]
+    for var in ("current_product","current_reaction","reaction_products","selected_product_id","user_query"):
+        if var not in st.session_state:
+            st.session_state[var] = None
+
+def render_message(msg):
+    css = "user-message" if msg["role"]=="user" else "bot-message"
+    content = msg["content"].replace("\n", "<br>")
+    return f'<div class="message {css}">{content}</div>'
+
+def render_product_grid(products):
+    st.markdown('<div class="product-grid">', unsafe_allow_html=True)
+    for p in products:
+        st.markdown(f"""
+            <div class="product-card">
+              <div class="product-title">{p['name']}</div>
+              <div class="reaction-type">{p['reaction_type']}</div>
+              <div class="product-select-target" onclick="selectProduct('{p['id']}')"></div>
+            </div>
+        """, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def render_product_detail(prod):
+    details, _ = process_product_query(prod)
+    st.markdown('<div class="detail-view">', unsafe_allow_html=True)
+    if st.button("← Back to Products"):
+        st.session_state.current_product = None
+        st.rerun()
+    st.markdown(f'<h2>{prod["name"]}</h2><div class="reaction-type">{prod["reaction_type"]}</div>', unsafe_allow_html=True)
+    display_structured_content(details)
+    st.markdown('<div class="info-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Synthetic Scheme</div>', unsafe_allow_html=True)
+    if prod["scheme_image"] and os.path.exists(prod["scheme_image"]):
+        st.image(Image.open(prod["scheme_image"]), use_column_width=True, caption="Synthetic Scheme")
+        if prod["scheme_cdx"]:
+            st.markdown(get_binary_file_downloader_html(prod["scheme_cdx"], "📥 Download ChemDraw"), unsafe_allow_html=True)
+        else:
+            st.warning("CDX not available")
+    else:
+        st.warning("Scheme image not found")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="info-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Source Document</div>', unsafe_allow_html=True)
+    if os.path.exists(prod["pdf_path"]):
+        pdf_bytes = open(prod["pdf_path"], "rb").read()
+        st.download_button("📥 Download PDF", pdf_bytes, prod["pdf_path"].split(os.sep)[-1], mime="application/pdf")
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            pix = doc.load_page(0).get_pixmap(dpi=150)
+            st.image(pix.tobytes("png"), caption="First Page Preview")
+        except:
+            st.warning("No preview available")
+    else:
+        st.error("PDF missing")
+    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+def main():
+    init_session_state()
+    st.markdown("""
+      <div class="header">
+        <h1>PharmaReaction AI</h1>
+        <p>Reaction Chemistry Knowledge Base</p>
+      </div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.selected_product_id:
+        st.session_state.current_product = get_product_by_id(st.session_state.selected_product_id)
+        st.session_state.selected_product_id = None
+
+    if st.session_state.current_product:
+        render_product_detail(st.session_state.current_product)
+        return
+
+    if st.session_state.current_reaction:
+        st.markdown(f"<h2>{st.session_state.current_reaction} Products</h2>", unsafe_allow_html=True)
+        if st.button("← Back to Chat"):
+            st.session_state.current_reaction = None
+            st.session_state.reaction_products = []
+            st.rerun()
+        if st.session_state.reaction_products:
+            render_product_grid(st.session_state.reaction_products)
+        else:
+            st.warning("No products found.")
+        return
+
+    # Chat interface
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    for m in st.session_state.messages:
+        st.markdown(render_message(m), unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # JS for clicking
+    st.markdown("""
+    <script>
+      function selectProduct(id) {
+        Streamlit.setComponentValue({type:"select_product",productId:id});
+      }
+    </script>
+    """, unsafe_allow_html=True)
+
+    # Input row
+    user_input = st.text_input("", st.session_state.user_query, placeholder="Ask about a reaction…")
+    col1, col2 = st.columns([1,3])
+    with col1:
+        if st.button("Send"):
+            if user_input.strip():
+                st.session_state.messages.append({"role":"user","content":user_input})
+                match = next((r for r in REACTION_TYPES if re.search(rf"\b{re.escape(r)}\b", user_input, re.IGNORECASE)), None)
+                if match:
+                    resp, prods = process_reaction_query(match)
+                    st.session_state.messages.append({"role":"assistant","content":resp})
+                    st.session_state.current_reaction = match
+                    st.session_state.reaction_products = prods
+                else:
+                    st.session_state.messages.append({"role":"assistant","content":"Please ask about a specific reaction chemistry type."})
+                st.session_state.user_query = ""
+                st.rerun()
+    with col2:
+        if st.button("Clear Chat"):
+            st.session_state.messages = [{"role":"assistant","content":"Hello! I'm your Pharma Reaction Expert. Ask me about any reaction chemistry."}]
+            st.session_state.user_query = ""
+            st.rerun()
+
+def handle_component_message():
+    params = st.experimental_get_query_params()
+    if "select_product" in params:
+        st.session_state.selected_product_id = params["select_product"][0]
+        st.experimental_set_query_params()
+        st.rerun()
+
+if __name__ == "__main__":
+    handle_component_message()
+    main()
