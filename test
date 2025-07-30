@@ -6,10 +6,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from zipfile import ZipFile
 from scipy.stats import skew, kurtosis, probplot
+import warnings
 
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 # ----------------------------------------
-# Required Helper Functions
+# Required Helper Functions (Improved)
 # ----------------------------------------
 
 def prepare_data(reference_df, test_df):
@@ -18,26 +21,22 @@ def prepare_data(reference_df, test_df):
     if reference_df.empty or test_df.empty:
         raise ValueError("Reference or test DataFrame is empty.")
 
+    # Convert first column to numeric, handling errors
+    for df in [reference_df, test_df]:
+        first_col = df.columns[0]
+        df[first_col] = pd.to_numeric(df[first_col], errors='coerce')
+        df.dropna(subset=[first_col], inplace=True)
+
     # Debug log for data inspection
     st.write("Reference DataFrame (first 5 rows):")
     st.write(reference_df.head())
     st.write("Test DataFrame (first 5 rows):")
     st.write(test_df.head())
 
-    # Validate that the first column contains numeric or valid scalar values
-    if not np.isscalar(reference_df.iloc[0, 0]):
-        st.error(f"Invalid value in reference DataFrame first column: {reference_df.iloc[0, 0]}")
-        raise ValueError("Reference DataFrame contains non-scalar values in the time column.")
-
-    if not np.isscalar(test_df.iloc[0, 0]):
-        st.error(f"Invalid value in test DataFrame first column: {test_df.iloc[0, 0]}")
-        raise ValueError("Test DataFrame contains non-scalar values in the time column.")
-
     # Strip potential "time zero" rows
-    if reference_df.iloc[0, 0] == 0 or str(reference_df.iloc[0, 0]).strip() in ['0', '0.0']:
+    if reference_df.iloc[0, 0] == 0:
         reference_df = reference_df.iloc[1:].reset_index(drop=True)
-
-    if test_df.iloc[0, 0] == 0 or str(test_df.iloc[0, 0]).strip() in ['0', '0.0']:
+    if test_df.iloc[0, 0] == 0:
         test_df = test_df.iloc[1:].reset_index(drop=True)
 
     return reference_df, test_df
@@ -47,7 +46,9 @@ def conventional_f2(ref_means, test_means):
     diff = test_means - ref_means
     sum_sq_diff = (diff ** 2).sum()
     p = len(ref_means)
-    return 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
+    if p == 0:
+        return 50
+    return 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
 
 def expected_f2(ref_df, test_df):
     """Calculate expected f2"""
@@ -88,7 +89,11 @@ def bias_corrected_f2(ref_df, test_df):
         adjustment = (1 / n) * sum_var
         right_side = sum_sq_diff + p
         
-        if adjustment >= right_side:
+        # Handle scalar comparisons only
+        if isinstance(adjustment, (int, float)) and isinstance(right_side, (int, float)):
+            if adjustment >= right_side:
+                return "Invalid"
+        else:
             return "Invalid"
         
         adjusted_diff = sum_sq_diff - adjustment
@@ -97,7 +102,8 @@ def bias_corrected_f2(ref_df, test_df):
         else:
             return "Invalid"
 
-    except Exception:
+    except Exception as e:
+        st.error(f"Error in bias_corrected_f2: {e}")
         return "Error"
 
 def row_variance(df):
@@ -121,7 +127,7 @@ def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
 
         f2_val = calc_func(ref_sample, test_sample)
 
-        if f2_val is not None and isinstance(f2_val, (int, float)):
+        if isinstance(f2_val, (int, float)) and not np.isnan(f2_val):
             f2_values.append(f2_val)
     
     if not f2_values:
@@ -151,11 +157,12 @@ def plot_bootstrap_distribution(f2_values, title):
     axes[1].set_title(f"Histogram: {title}")
     axes[1].set_xlabel("f2 Values")
     
+    plt.tight_layout()
     return fig
 
 
 # ----------------------------------------
-# Batch and Single File Processing Functions
+# Batch and Single File Processing Functions (Improved)
 # ----------------------------------------
 
 def load_batch_data(folder_path):
@@ -163,14 +170,25 @@ def load_batch_data(folder_path):
     workbook_data = {}
     
     for file_name in os.listdir(folder_path):
-        if file_name.endswith(".xlsx"):
+        if file_name.endswith((".xlsx", ".xls")):
             file_path = os.path.join(folder_path, file_name)
             try:
-                reference_df = pd.read_excel(file_path, sheet_name=0)
-                test_df = pd.read_excel(file_path, sheet_name=1)
-                workbook_data[file_name] = (reference_df, test_df)
+                # Read all sheets and find reference/test sheets
+                xl = pd.ExcelFile(file_path)
+                sheet_names = xl.sheet_names
+                
+                # Find reference and test sheets (case-insensitive)
+                ref_sheet = next((s for s in sheet_names if 'reference' in s.lower()), None)
+                test_sheet = next((s for s in sheet_names if 'test' in s.lower()), None)
+                
+                if ref_sheet and test_sheet:
+                    reference_df = pd.read_excel(file_path, sheet_name=ref_sheet)
+                    test_df = pd.read_excel(file_path, sheet_name=test_sheet)
+                    workbook_data[file_name] = (reference_df, test_df)
+                else:
+                    st.warning(f"Skipping file `{file_name}` - could not find reference/test sheets")
             except Exception as e:
-                st.warning(f"Skipping file `{file_name}` due to error: {e}")
+                st.warning(f"Skipping file `{file_name}` due to error: {str(e)}")
     
     return workbook_data
 
@@ -180,7 +198,7 @@ def process_batch(workbook_data, methods, n_iterations=10000):
     
     for file_name, (reference_df, test_df) in workbook_data.items():
         try:
-            ref_clean, test_clean = prepare_data(reference_df, test_df)
+            ref_clean, test_clean = prepare_data(reference_df.copy(), test_df.copy())
             
             results = {"File Name": file_name}
             
@@ -192,8 +210,11 @@ def process_batch(workbook_data, methods, n_iterations=10000):
                             r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1)
                         ),
                         "Expected Bootstrap": expected_f2,
-                        "Bias Corrected Bootstrap": lambda r, t: bias_corrected_f2(r, t)
+                        "Bias Corrected Bootstrap": bias_corrected_f2
                     }.get(method)
+                    
+                    if calc_func is None:
+                        continue
                     
                     orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
                         ref_clean, test_clean, calc_func, n_iterations
@@ -201,7 +222,7 @@ def process_batch(workbook_data, methods, n_iterations=10000):
 
                     # Store results
                     results[f"{method} f2"] = orig
-                    results[f"{method} CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                    results[f"{method} CI"] = f"{lower:.2f} - {upper:.2f}" if isinstance(lower, float) and isinstance(upper, float) else "N/A"
                     results[f"{method} Mean"] = mean
                     results[f"{method} Median"] = median
                     results[f"{method} Skewness"] = skewness
@@ -215,7 +236,7 @@ def process_batch(workbook_data, methods, n_iterations=10000):
             all_results.append(results)
         
         except Exception as e:
-            st.warning(f"Error processing file `{file_name}`: {e}")
+            st.warning(f"Error processing file `{file_name}`: {str(e)}")
     
     return pd.DataFrame(all_results)
 
@@ -224,11 +245,23 @@ def process_single_file(file_buffer, methods, n_iterations=10000):
     workbook_data = {}
 
     try:
-        reference_df = pd.read_excel(file_buffer, sheet_name=0)
-        test_df = pd.read_excel(file_buffer, sheet_name=1)
+        # Read all sheets
+        xl = pd.ExcelFile(file_buffer)
+        sheet_names = xl.sheet_names
+        
+        # Find reference and test sheets
+        ref_sheet = next((s for s in sheet_names if 'reference' in s.lower()), sheet_names[0])
+        test_sheet = next((s for s in sheet_names if 'test' in s.lower()), sheet_names[1] if len(sheet_names) > 1 else None)
+        
+        if test_sheet is None:
+            st.error("Could not find test sheet in the Excel file")
+            return None
+        
+        reference_df = pd.read_excel(file_buffer, sheet_name=ref_sheet)
+        test_df = pd.read_excel(file_buffer, sheet_name=test_sheet)
         workbook_data["uploaded_file.xlsx"] = (reference_df, test_df)
     except Exception as e:
-        st.error(f"Error loading file: {e}")
+        st.error(f"Error loading file: {str(e)}")
         return None
 
     return process_batch(workbook_data, methods, n_iterations)
@@ -243,71 +276,84 @@ def create_zip_report(report_df):
     with ZipFile(zip_file, "w") as zipf:
         zipf.write(report_file)
     
+    # Clean up
+    if os.path.exists(report_file):
+        os.remove(report_file)
+    
     return zip_file
 
 
 # ----------------------------------------
-# Streamlit App Code
+# Streamlit App Code (Improved)
 # ----------------------------------------
 
 def main():
     st.set_page_config(page_title="Batch Similarity Analyzer", layout="wide")
-    st.title("Batch Similarity Analyzer")
+    st.title("📊 Batch Similarity Analyzer")
     st.markdown("""
     This tool calculates f2 similarity for multiple Excel workbooks at once or for a single workbook.
     You can upload a folder containing Excel files or a single Excel file for analysis.
     """)
     
-    options = ["Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
-    selected_methods = st.multiselect("Select calculation methods:", options)
-
     with st.sidebar:
+        st.subheader("Configuration")
         upload_type = st.radio("Select upload type:", ["Folder Upload", "Single File Upload"])
+        n_iterations = st.slider("Number of Bootstrap Iterations", 1000, 50000, 10000, 1000)
+        st.markdown("---")
+        st.info("Ensure Excel files have sheets named 'Reference' and 'Test'")
+    
+    options = ["Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
+    selected_methods = st.multiselect("Select calculation methods:", options, default=options)
 
     if upload_type == "Folder Upload":
+        st.subheader("Folder Upload")
         folder_path = st.text_input("Enter path to folder containing Excel files:", "")
         if st.button("Calculate and Generate Report") and selected_methods:
             if os.path.isdir(folder_path):
                 with st.spinner("Processing files..."):
                     workbook_data = load_batch_data(folder_path)
                     if workbook_data:
-                        report_df = process_batch(workbook_data, selected_methods)
-                        st.subheader("📊 Results Preview")
-                        st.dataframe(report_df.head())
-                        zip_file_path = create_zip_report(report_df)
+                        report_df = process_batch(workbook_data, selected_methods, n_iterations)
+                        st.subheader("📊 Results Summary")
+                        st.dataframe(report_df)
                         
-                        with open(zip_file_path, "rb") as f:
-                            st.download_button(
-                                label="Download Report (ZIP)",
-                                data=f,
-                                file_name="f2_similarities_report.zip",
-                                mime="application/zip"
-                            )
+                        if not report_df.empty:
+                            zip_file_path = create_zip_report(report_df)
+                            
+                            with open(zip_file_path, "rb") as f:
+                                st.download_button(
+                                    label="Download Full Report (ZIP)",
+                                    data=f,
+                                    file_name="f2_similarities_report.zip",
+                                    mime="application/zip"
+                                )
                     else:
                         st.warning("No valid Excel files found in selected folder.")
             else:
                 st.error("Invalid folder path. Please check the path and try again.")
 
     elif upload_type == "Single File Upload":
-        uploaded_file = st.file_uploader("Upload a Single Excel File:", type=["xlsx"])
-        if st.button("Calculate and Generate Report") and selected_methods:
-            if uploaded_file is not None:
+        st.subheader("Single File Upload")
+        uploaded_file = st.file_uploader("Upload an Excel File:", type=["xlsx", "xls"])
+        if uploaded_file is not None and selected_methods:
+            if st.button("Calculate and Generate Report"):
                 with st.spinner("Processing file..."):
-                    report_df = process_single_file(uploaded_file, selected_methods)
-                    if report_df is not None:
-                        st.subheader("📊 Results Preview")
-                        st.dataframe(report_df.head())
+                    report_df = process_single_file(uploaded_file, selected_methods, n_iterations)
+                    if report_df is not None and not report_df.empty:
+                        st.subheader("📊 Results Summary")
+                        st.dataframe(report_df)
+                        
                         zip_file_path = create_zip_report(report_df)
                         
                         with open(zip_file_path, "rb") as f:
                             st.download_button(
-                                label="Download Report (ZIP)",
+                                label="Download Full Report (ZIP)",
                                 data=f,
                                 file_name="f2_similarities_report.zip",
                                 mime="application/zip"
                             )
-            else:
-                st.warning("Please upload an Excel file.")
+                    else:
+                        st.warning("No valid results generated. Please check your file format.")
 
 if __name__ == "__main__":
     main()
