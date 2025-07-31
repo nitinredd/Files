@@ -1,86 +1,50 @@
-import time
-import asyncio
-import logging
+def stream_json_data(path: str) -> List[Dict]:
+    """Load a JSON file that may be:
+       - a single JSON object ({}),
+       - a JSON array ([]), or
+       - newline-delimited JSON (JSONL).
+    """
+    if not os.path.exists(path):
+        logger.error(f"File not found: {path}")
+        return []
 
-logger = logging.getLogger(__name__)
+    data: List[Dict] = []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+            # Strip any BOM then whitespace
+            stripped = text.lstrip('\ufeff').strip()
 
-class AppState:
-    def __init__(self):
-        self.ready = False
-        self.initializing = False
-        self.manager = None
-        self.last_update = 0
-        self.data_stats = {}
+            # Try parsing as a full JSON document
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    data = [parsed]
+                elif isinstance(parsed, list):
+                    data = parsed
+                else:
+                    logger.warning(f"Unexpected JSON root type: {type(parsed)}")
+                logger.info(f"Loaded {len(data)} record(s) from full-JSON parse of {path}")
+                return data
+            except json.JSONDecodeError:
+                # Not a single JSON doc → maybe JSONL
+                logger.info(f"Full-JSON parse failed, falling back to JSONL for {path}")
+                f.seek(0)
 
-    async def initialize(self):
-        """Kick off initialization in the background (non-blocking)."""
-        # If we’re already ready or in the middle of initializing, do nothing
-        if self.ready or self.initializing:
-            return
-        self.initializing = True
-        # Fire-and-forget the heavy-lifting coroutine
-        asyncio.create_task(self._initialize_background())
-
-    async def _initialize_background(self):
-        """Background initialization with progress tracking."""
-        try:
-            logger.info("Starting data loading process...")
-            agents = []
-
-            for name, path in EMBEDDED_FILES.items():
-                if not path:
-                    logger.warning(f"Skipping empty path for {name}")
+            # JSONL branch
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
+                try:
+                    record = json.loads(line)
+                    data.append(record)
+                except json.JSONDecodeError:
+                    logger.warning(f"Invalid JSON line in {path}: {line[:100]}...")
 
-                logger.info(f"Processing {name}: {path}")
-                start_time = time.time()
+        logger.info(f"Loaded {len(data)} record(s) from JSONL of {path}")
+        return data
 
-                # Load and process data
-                data = stream_json_data(path)
-                if not data:
-                    logger.warning(f"No data loaded for {name}")
-                    continue
-
-                documents = process_data_chunks(data, name)
-                if not documents:
-                    logger.warning(f"No documents created for {name}")
-                    continue
-
-                # Create vector store
-                store = create_vectorstore(documents)
-                if store is None:
-                    logger.error(f"Vectorstore creation failed for {name}")
-                    continue
-
-                # Instantiate the child agent
-                agent = ChildAgent(
-                    name=name,
-                    retriever=store.as_retriever(search_kwargs={"k": 5})
-                )
-                agents.append(agent)
-
-                # Record stats
-                self.data_stats[name] = {
-                    "records": len(data),
-                    "chunks": len(documents),
-                    "load_time": time.time() - start_time
-                }
-                logger.info(
-                    f"Created agent for {name} in {self.data_stats[name]['load_time']:.1f}s"
-                )
-
-            # Finalize
-            self.manager = AgentManager(agents)
-            self.ready = True
-            self.initializing = False
-            self.last_update = time.time()
-            logger.info(f"Application initialized with {len(agents)} agents")
-
-        except Exception as e:
-            logger.critical(f"Initialization failed: {e}")
-            self.ready = False
-            self.initializing = False
-
-
-# Instantiate once (outside any function)
-app_state = AppState()
+    except Exception as e:
+        logger.error(f"Error loading {path}: {e}")
+        return []
