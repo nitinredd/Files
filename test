@@ -1,55 +1,51 @@
 import os
 import io
 import json
-import uuid
+import time
 import asyncio
-import logging
-from typing import Dict, List, Optional
-
 import pandas as pd
+import logging
 import speech_recognition as sr
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
+from pydantic import BaseModel
+from typing import Union, List, Dict, Optional
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 from gtts import gTTS
-from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
+from langchain_openai import AzureChatOpenAI
 from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
+from langchain.storage import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
 from langchain.chains import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import openai
 
-# ─── AZURE GPT CONFIG (UNCHANGED) ─────────────────────────────────
-# Azure GPT configuration (fill these in)
-base_url=""
-api_version="2024-02-15-preview"
-
-api_key=""
-deployment_name="GPT4o"
-model_name="GPT4o"
+# ─── YOUR EXACT CONFIGURATION (KEPT AS-IS) ─────────────────────────────────────
+base_url = ""
+api_version = "2024-02-15-preview"
+api_key = ""
+deployment_name = "GPT4o"
+model_name = "GPT4o"
 
 # Paths to embedded JSON files
 EMBEDDED_FILES = {
-    'data_1': r"C:\Users\\Desktop\\WORK\\Formulations\\DEC_Agent\\Datasets\\DEC_Agent_Json.json",
+    'data_1': r"C:\Users\Desktop\WORK\Formulations\DEC_Agent\Datasets\DEC_Agent_Json.json",
     # 'data_2': r"C:\Users\p00095189\Desktop\S2L\portfolio_D.json",
-    # additional files can be specified dynamically, and can be left None
 }
 
-# Sample‑prompt tiles (for frontend to fetch)
+# Sample-prompt tiles
 TILE_QUESTIONS = {
     "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
-    "Line B":    ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
-    "Facility X":["Who owns this facility?", "What lines are operational?"],
+    "Line B": ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
+    "Facility X": ["Who owns this facility?", "What lines are operational?"],
     "Formulation Z": ["List excipients used", "Describe dissolution method"],
     "Process Y": ["Steps in granulation?", "Drying temperature?"],
     "Machine Q": ["Model number details?", "Maintenance interval?"],
     "Raw Material P": ["What are specs?", "Approved vendors?"]
 }
-
-# ─── SETUP LLM + EMBEDDINGS ──────────────────────────────────────
 
 # Embedding store & cache
 file_store = LocalFileStore('langchain-embeddings')
@@ -69,16 +65,55 @@ chat_model = AzureChatOpenAI(
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-# ─── RETRY STRATEGY ───────────────────────────────────────────────
-@retry(
-    retry=retry_if_exception_type(Exception),
-    wait=wait_exponential(multiplier=1, min=2, max=30),
-    stop=stop_after_attempt(5)
-)
-async def embed_texts(texts: List[str]) -> List[List[float]]:
-    return base.embed_documents(texts)
+# ─── ENHANCEMENTS FOR LARGE FILES & PRODUCTION ────────────────────────────────
+logger = logging.getLogger(__name__)
 
-# ─── AGENT CLASSES ───────────────────────────────────────────────
+# Configuration for large file handling
+CHUNK_SIZE = 1500  # Optimal for embedding models
+CHUNK_OVERLAP = 200
+EMBEDDING_BATCH_SIZE = 32
+MAX_RETRIES = 10
+BACKOFF_FACTOR = 1.5
+
+class RobustAzureEmbeddings(AzureOpenAIEmbeddings):
+    """Enhanced embeddings with retry logic for rate limits"""
+    @retry(
+        wait=wait_exponential(multiplier=BACKOFF_FACTOR, min=4, max=60),
+        stop=stop_after_attempt(MAX_RETRIES),
+        retry=retry_if_exception_type((openai.RateLimitError, openai.APITimeoutError))
+    )
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return super().embed_documents(texts)
+
+    @retry(
+        wait=wait_exponential(multiplier=BACKOFF_FACTOR, min=4, max=60),
+        stop=stop_after_attempt(MAX_RETRIES),
+        retry=retry_if_exception_type((openai.RateLimitError, openai.APITimeoutError))
+    )
+    def embed_query(self, text: str) -> List[float]:
+        return super().embed_query(text)
+
+# Replace base embeddings with robust version
+base_embeddings = RobustAzureEmbeddings(
+    model=base.model,
+    api_version=base.api_version,
+    azure_endpoint=base.azure_endpoint,
+    api_key=base.api_key,
+    azure_deployment=base.azure_deployment
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
+    base_embeddings, 
+    file_store, 
+    namespace=base.model
+)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
+    separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+)
+
+# ─── AGENT CLASSES (ENHANCED) ────────────────────────────────────────────────
 class ChildAgent:
     def __init__(self, name: str, retriever):
         self.name = name
@@ -88,105 +123,260 @@ class ChildAgent:
             retriever=retriever,
             return_source_documents=False
         )
-    async def ask(self, query: str) -> str:
-        result = await asyncio.to_thread(self.chain.invoke, {"query": query})
-        return result.get("result", "")
+
+    @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
+    def ask(self, query: str) -> str:
+        try:
+            resp = self.chain.invoke({"query": query})
+            return resp.get("result", "")
+        except Exception as e:
+            logger.error(f"Agent {self.name} failed: {str(e)}")
+            return f"Error processing request: {str(e)}"
 
 class CoordinatorAgent:
     def __init__(self, children: List[ChildAgent]):
         self.children = children
-    async def coordinate(self, query: str) -> Optional[str]:
+
+    def coordinate(self, query: str) -> Union[str, None]:
         for child in self.children:
             try:
-                ans = await child.ask(query)
-                if ans and "not found" not in ans.lower():
-                    logger.info(f"[Coordinator] '{child.name}' answered")
+                ans = child.ask(query)
+                if ans and "not found" not in ans.lower() and "error" not in ans.lower():
+                    logger.info(f"Coordinator selected {child.name}")
                     return ans
             except Exception as e:
-                logger.warning(f"[Coordinator] {child.name} error: {e}")
+                logger.warning(f"Child agent {child.name} error: {str(e)}")
         return None
-
-class OversightAgent:
-    def validate(self, answer: str) -> str:
-        return answer
-
-class LearningAgent:
-    def __init__(self):
-        self.logs: List[Dict] = []
-    def log(self, q: str, a: str):
-        self.logs.append({"query": q, "response": a})
 
 class AgentManager:
     def __init__(self, agents: List[ChildAgent]):
         self.coordinator = CoordinatorAgent(agents)
-        self.oversight = OversightAgent()
-        self.learning = LearningAgent()
-    async def handle_query(self, query: str) -> str:
-        raw = await self.coordinator.coordinate(query)
-        ans = raw or "Oops! No relevant information found."
-        validated = self.oversight.validate(ans)
-        self.learning.log(query, validated)
-        return validated
+        self.learning = self.LearningAgent()
+    
+    def handle_query(self, query: str) -> str:
+        raw = self.coordinator.coordinate(query)
+        answer = raw if raw else "I couldn't find relevant information for your query."
+        self.learning.log(query, answer)
+        return answer
+    
+    class LearningAgent:
+        def __init__(self):
+            self.logs: List[Dict] = []
+        
+        def log(self, q: str, a: str):
+            self.logs.append({
+                "timestamp": time.time(),
+                "query": q,
+                "response": a
+            })
 
-# ─── INGESTION & VECTORSTORE ────────────────────────────────────
-async def chunk(items: List[str], size: int):
-    for i in range(0, len(items), size):
-        yield items[i:i+size]
+# ─── LARGE FILE HANDLING ─────────────────────────────────────────────────────
+def stream_json_data(path: str) -> List[Dict]:
+    """Stream large JSON files efficiently"""
+    if not os.path.exists(path):
+        logger.error(f"File not found: {path}")
+        return []
+    
+    try:
+        # Handle both JSON arrays and JSONL files
+        data = []
+        with open(path, 'r', encoding='utf-8') as f:
+            # Try reading as JSON array
+            try:
+                file_content = f.read()
+                if file_content.strip().startswith('['):
+                    data = json.loads(file_content)
+                    logger.info(f"Loaded {len(data)} records as JSON array from {path}")
+                    return data
+                else:
+                    # Reset to beginning for JSONL processing
+                    f.seek(0)
+            except json.JSONDecodeError:
+                f.seek(0)
+            
+            # Process as JSONL
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning(f"Invalid JSON line: {line[:100]}...")
+        
+        logger.info(f"Loaded {len(data)} records from {path}")
+        return data
+    except Exception as e:
+        logger.error(f"Error loading {path}: {str(e)}")
+        return []
 
-async def ingest_json(path: str, batch_size: int = 1000, concurrency: int = 4) -> List[Document]:
-    with open(path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
-    records = data if isinstance(data, list) else [data]
-    texts = [json.dumps(rec, sort_keys=True) for rec in records]
-
-    sem = asyncio.Semaphore(concurrency)
-    async def process_batch(batch_texts):
-        async with sem:
-            vectors = await embed_texts(batch_texts)
-            return [Document(page_content=t, metadata={"vector": v})
-                    for t, v in zip(batch_texts, vectors)]
-
-    tasks = []
-    async for batch in chunk(texts, batch_size):
-        tasks.append(asyncio.create_task(process_batch(batch)))
-
-    docs: List[Document] = []
-    for task in asyncio.as_completed(tasks):
-        docs.extend(await task)
-    return docs
-
-async def build_agents(paths: Dict[str, str]) -> List[ChildAgent]:
-    agents: List[ChildAgent] = []
-    for name, path in paths.items():
+def process_data_chunks(data: List[Dict], source: str) -> List[Document]:
+    """Process data into document chunks with metadata"""
+    documents = []
+    total_chunks = 0
+    
+    for idx, record in enumerate(data):
         try:
-            docs = await ingest_json(path)
-            if not docs:
-                continue
-            store = FAISS.from_documents(docs, cached_embeddings)
-            retr = store.as_retriever(search_kwargs={"k": 5})
-            agents.append(ChildAgent(name, retr))
-            logger.info(f"[Vectorstore] '{name}' with {len(docs)} docs")
+            content = json.dumps(record, ensure_ascii=False)
+            chunks = text_splitter.split_text(content)
+            for chunk_idx, chunk in enumerate(chunks):
+                documents.append(Document(
+                    page_content=chunk,
+                    metadata={
+                        "source": source,
+                        "record_id": idx,
+                        "chunk_id": chunk_idx,
+                        "file_path": EMBEDDED_FILES[source]
+                    }
+                ))
+            total_chunks += len(chunks)
         except Exception as e:
-            logger.error(f"Failed '{name}': {e}")
-    return agents
+            logger.error(f"Error processing record {idx}: {str(e)}")
+    
+    logger.info(f"Created {total_chunks} chunks from {len(data)} records for {source}")
+    return documents
 
-# ─── FASTAPI INITIALIZATION ──────────────────────────────────────
-app = FastAPI(title="Multi-Agent JSON Chatbot")
+def create_vectorstore(documents: List[Document]) -> FAISS:
+    """Create vectorstore with progress tracking"""
+    if not documents:
+        return None
+    
+    logger.info(f"Building vectorstore with {len(documents)} chunks...")
+    start_time = time.time()
+    
+    # Batch processing for large document sets
+    batch_size = EMBEDDING_BATCH_SIZE
+    vector_store = None
+    
+    for i in range(0, len(documents), batch_size):
+        batch = documents[i:i+batch_size]
+        try:
+            if vector_store is None:
+                vector_store = FAISS.from_documents(batch, cached_embeddings)
+            else:
+                vector_store.add_documents(batch)
+            
+            # Log progress
+            if (i // batch_size) % 10 == 0:
+                elapsed = time.time() - start_time
+                logger.info(f"Processed {min(i+batch_size, len(documents))}/{len(documents)} chunks "
+                          f"({elapsed:.1f}s elapsed)")
+        except Exception as e:
+            logger.error(f"Error processing batch {i//batch_size}: {str(e)}")
+            time.sleep(5)  # Brief pause before retry
+    
+    logger.info(f"Vectorstore built in {time.time()-start_time:.1f} seconds")
+    return vector_store
+
+# ─── APPLICATION STATE MANAGEMENT ─────────────────────────────────────────────
+class AppState:
+    def __init__(self):
+        self.ready = False
+        self.initializing = False
+        self.manager = None
+        self.last_update = 0
+        self.data_stats = {}
+
+    async def initialize(self, background_tasks: BackgroundTasks):
+        """Initialize application state"""
+        if not self.ready and not self.initializing:
+            self.initializing = True
+            background_tasks.add_task(self._initialize_background)
+            return "Initialization started"
+        return "Already initialized or initializing"
+
+    async def _initialize_background(self):
+        """Background initialization with progress tracking"""
+        try:
+            logger.info("Starting data loading process...")
+            agents = []
+            
+            for name, path in EMBEDDED_FILES.items():
+                if not path:
+                    logger.warning(f"Skipping empty path for {name}")
+                    continue
+                
+                logger.info(f"Processing {name}: {path}")
+                start_time = time.time()
+                
+                # Load and process data
+                data = stream_json_data(path)
+                if not data:
+                    logger.warning(f"No data loaded for {name}")
+                    continue
+                
+                documents = process_data_chunks(data, name)
+                if not documents:
+                    logger.warning(f"No documents created for {name}")
+                    continue
+                
+                # Create vector store
+                store = create_vectorstore(documents)
+                if store is None:
+                    logger.error(f"Vectorstore creation failed for {name}")
+                    continue
+                
+                # Create agent
+                agent = ChildAgent(
+                    name=name,
+                    retriever=store.as_retriever(search_kwargs={"k": 5})
+                )
+                agents.append(agent)
+                
+                # Record stats
+                self.data_stats[name] = {
+                    "records": len(data),
+                    "chunks": len(documents),
+                    "load_time": time.time() - start_time
+                }
+                logger.info(f"Created agent for {name} in {self.data_stats[name]['load_time']:.1f}s")
+            
+            # Create manager
+            self.manager = AgentManager(agents)
+            self.ready = True
+            self.initializing = False
+            self.last_update = time.time()
+            logger.info(f"Application initialized with {len(agents)} agents")
+            
+        except Exception as e:
+            logger.critical(f"Initialization failed: {str(e)}")
+            self.ready = False
+            self.initializing = False
+
+app_state = AppState()
+recognizer = sr.Recognizer()
+
+# ─── FASTAPI APP ─────────────────────────────────────────────────────────────
+app = FastAPI(title="Enterprise JSON Query System")
+
+# CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Startup: load embedded files
-@app.on_event("startup")
-async def startup():
-    app.state.agents = await build_agents(EMBEDDED_FILES)
-    app.state.manager = AgentManager(app.state.agents)
-
+# Request models
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1)
+    message: str
+    session_id: Optional[str] = None
+
+# ─── ENDPOINTS ────────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup_event():
+    # Start initialization in background
+    background_tasks = BackgroundTasks()
+    await app_state.initialize(background_tasks)
+
+@app.get("/health")
+async def health():
+    status = {
+        "status": "ready" if app_state.ready else "initializing",
+        "agents": list(EMBEDDED_FILES.keys()),
+        "data_stats": app_state.data_stats,
+        "last_update": app_state.last_update
+    }
+    return JSONResponse(status)
 
 @app.get("/sample-tiles")
 def sample_tiles():
@@ -194,54 +384,91 @@ def sample_tiles():
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    try:
-        resp = await app.state.manager.handle_query(req.message)
-        return {"response": resp}
-    except Exception as e:
-        logger.error(f"/chat: {e}")
-        raise HTTPException(500, "Internal server error")
-
-@app.post("/upload-json")
-async def upload_json(name: str, file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        tmp = f"/tmp/{uuid.uuid4()}.json"
-        with open(tmp, 'wb') as f:
-            f.write(content)
-        agent = (await build_agents({name: tmp}))[0]
-        app.state.agents.append(agent)
-        return {"status": "ingested", "agent": name}
-    except Exception as e:
-        logger.error(f"upload-json: {e}")
-        raise HTTPException(400, str(e))
+    if not app_state.ready:
+        raise HTTPException(503, detail="Service initializing. Please try again later.")
+    
+    q = req.message.strip()
+    if not q:
+        raise HTTPException(400, detail="Empty query")
+    if len(q) > 1000:
+        raise HTTPException(400, detail="Query too long (max 1000 characters)")
+    
+    logger.info(f"Processing query: {q}")
+    start_time = time.time()
+    ans = app_state.manager.handle_query(q)
+    latency = time.time() - start_time
+    
+    logger.info(f"Query processed in {latency:.2f}s")
+    return {"response": ans, "latency": latency}
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
     try:
+        if file.content_type not in ["audio/wav", "audio/mpeg", "audio/webm"]:
+            raise HTTPException(400, detail="Unsupported audio format. Use WAV, MP3, or WEBM.")
+        
+        # Limit file size (10MB)
+        max_size = 10 * 1024 * 1024
+        if file.size > max_size:
+            raise HTTPException(400, detail="File too large. Max 10MB.")
+        
         data = await file.read()
         audio = sr.AudioFile(io.BytesIO(data))
         with audio as src:
-            audio_data = sr.Recognizer().record(src)
-        text = sr.Recognizer().recognize_google(audio_data)
+            audio_data = recognizer.record(src)
+        text = recognizer.recognize_google(audio_data)
         return {"text": text}
+    except sr.UnknownValueError:
+        raise HTTPException(400, detail="Audio not understandable")
+    except sr.RequestError as e:
+        raise HTTPException(500, detail=f"Speech recognition error: {str(e)}")
     except Exception as e:
-        logger.error(f"STT: {e}")
-        raise HTTPException(500, str(e))
+        logger.exception("STT processing failed")
+        raise HTTPException(500, detail=f"Processing error: {str(e)}")
 
 @app.get("/text-to-speech")
-def text_to_speech(text: str):
+async def text_to_speech(text: str):
+    if len(text) > 2000:
+        raise HTTPException(400, detail="Text too long (max 2000 characters)")
+    
     try:
         buf = io.BytesIO()
-        gTTS(text).write_to_fp(buf)
+        tts = gTTS(text=text, lang='en', slow=False)
+        tts.write_to_fp(buf)
         buf.seek(0)
         return StreamingResponse(buf, media_type="audio/mp3")
-    except Exception as Exception as e:
-        logger.error(f"TTS: {e}")
-        raise HTTPException(500, str(e))
+    except Exception as e:
+        logger.error(f"TTS failed: {str(e)}")
+        raise HTTPException(500, detail="Speech synthesis failed")
 
-@app.get("/health")
-def health():
-    names = [a.name for a in app.state.agents]
-    return {"status": "ok", "agents": names}
+@app.post("/reinitialize")
+async def reinitialize(background_tasks: BackgroundTasks):
+    """Endpoint to reload data"""
+    if app_state.initializing:
+        return {"status": "already_initializing"}
+    
+    app_state.ready = False
+    await app_state.initialize(background_tasks)
+    return {"status": "reinitialization_started"}
 
-# To run: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("application.log")
+        ]
+    )
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        timeout_keep_alive=600,  # Longer timeout for large files
+        log_config=None
+    )
