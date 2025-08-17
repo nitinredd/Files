@@ -1,149 +1,873 @@
-// src/App.jsx
-import React, { useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import ChatWindow from "./components/ChatWindow";
-import ChatInput from "./components/ChatInput";
-import ChatHistory from "./components/ChatHistory";
-import ProductGrid from "./components/ProductGrid";
-import ProductDetailDrawer from "./components/ProductDetailDrawer";
+import os
+import re
+import glob
+import base64
+import fitz 
+import pandas as pd
+import streamlit as st
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from PIL import Image
+import io
 
-import { USE_MOCK } from "./config";
-import { REACTION_TYPES, MOCK_PRODUCTS } from "./mockData";
+# Configuration - Replace with your Azure credentials
+st.set_page_config(page_title="Reaction Database AI", page_icon="", layout="wide")
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-export default function App() {
-  const [messages, setMessages] = useState([]);
-  const [threads, setThreads] = useState([]);
-  const [currentProducts, setCurrentProducts] = useState([]);
-  const [selectedProduct, setSelectedProduct] = useState(null);
+# Azure Configuration
+base_url=""
+api_version="2025-01-01-preview"
 
-  useEffect(() => {
-    const saved = localStorage.getItem("pharma_threads");
-    if (saved) setThreads(JSON.parse(saved));
-  }, []);
+api_key=""
+deployment_name="api-ai4o"
+model_name="gpt-4o"
 
-  useEffect(() => {
-    localStorage.setItem("pharma_threads", JSON.stringify(threads));
-  }, [threads]);
+# Initialize Azure services
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_version="2025-01-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="api-ai-3l"
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-  async function handleSend(text) {
-    const userMsg = { role: "user", content: text };
-    setMessages(prev => [...prev, userMsg]);
+# Reaction Chemistry Categories (folder names)
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
 
-    const matched = REACTION_TYPES.find(rt => new RegExp("\\b" + rt + "\\b", "i").test(text));
-    if (matched) {
-      if (USE_MOCK) {
-        const found = MOCK_PRODUCTS.filter(p => p.reaction_type === matched);
-        setCurrentProducts(found);
-        setMessages(prev => [...prev, { role: "assistant", content: `Found ${found.length} products for ${matched}` }]);
-      } else {
-        try {
-          const res = await fetch(`${API_BASE_URL}/api/reaction?type=${encodeURIComponent(matched)}`);
-          const data = await res.json();
-          setCurrentProducts(data.products || []);
-          setMessages(prev => [...prev, { role: "assistant", content: `Found ${data.products?.length || 0} products for ${matched}` }]);
-        } catch (err) {
-          setMessages(prev => [...prev, { role: "assistant", content: `Error fetching products for ${matched}` }]);
+# Base directories
+BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+
+# Create directories if they don't exist
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+
+# Custom CSS for professional UI
+st.markdown("""
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --secondary: #3498db;
+            --accent: #e74c3c;
+            --light: #ecf0f1;
+            --dark: #2c3e50;
         }
-      }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f8f9fa;
+            color: #333;
+        }
+        
+        .stApp {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 1rem;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        
+        .chat-container {
+            display: flex;
+            flex-direction: column;
+            min-height: 5vh;
+            max-height: 65vh;
+            border: 1px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 1rem;
+            background: white;
+            margin-bottom: 1rem;
+            overflow-y: auto;
+        }
+        
+        .message {
+            max-width: 80%;
+            padding: 0.8rem 1.2rem;
+            margin-bottom: 1rem;
+            border-radius: 18px;
+            line-height: 1.4;
+        }
+        
+        .user-message {
+            background: var(--secondary);
+            color: white;
+            align-self: flex-end;
+            border-bottom-right-radius: 5px;
+        }
+        
+        .bot-message {
+            background: var(--light);
+            align-self: flex-start;
+            border-bottom-left-radius: 5px;
+        }
+        
+        .product-card {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            padding: 1rem;
+            margin: 0.5rem 0;
+            cursor: pointer;
+            border: 1px solid #e0e0e0;
+            transition: all 0.2s ease;
+            position: relative;
+        }
+        
+        .product-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+            border-color: var(--secondary);
+        }
+        
+        .product-title {
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 0.3rem;
+        }
+        
+        .reaction-type {
+            font-size: 0.85rem;
+            color: var(--accent);
+            background: #fdecea;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        
+        .input-container {
+            display: flex;
+            gap: 0.5rem;
+        }
+        
+        .chat-input {
+            flex: 1;
+            padding: 0.8rem 1.2rem;
+            border-radius: 25px;
+            border: 2px solid var(--secondary);
+            font-size: 1rem;
+        }
+        
+        .send-button {
+            background: var(--secondary);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            padding: 0 1.5rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        
+        .send-button:hover {
+            background: var(--primary);
+        }
+        
+        .detail-view {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            padding: 1.5rem;
+            margin-top: 1rem;
+        }
+        
+        .back-button {
+            background: #f0f0f0;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-bottom: 1rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .section-title {
+            color: var(--primary);
+            border-bottom: 2px solid var(--secondary);
+            padding-bottom: 0.5rem;
+            margin-top: 1.5rem;
+        }
+        
+        .scheme-container {
+            text-align: center;
+            margin: 1.5rem 0;
+        }
+        
+        .download-btn {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 5px;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-top: 1rem;
+            text-decoration: none;
+        }
+        
+        .tab-content {
+            padding: 1rem;
+            background: #f9f9f9;
+            border-radius: 5px;
+            margin-top: 1rem;
+            border: 1px solid #eee;
+            white-space: pre-wrap;
+        }
+        
+        .product-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 1.5rem;
+            margin-top: 1.5rem;
+        }
+        
+        .info-card {
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            padding: 1.5rem;
+            margin: 1rem 0;
+        }
+        
+        .table-container {
+            overflow-x: auto;
+            margin: 1.5rem 0;
+            border: 1px solid #e0e0e0;
+            border-radius: 5px;
+        }
+        
+        .stDataFrame {
+            width: 100%;
+        }
+        
+        .product-select-target {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+            z-index: 1;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-      setThreads(prev => [{ id: "t-" + Date.now(), title: matched, snippet: text }, ...prev].slice(0, 10));
-    } else {
-      setMessages(prev => [...prev, { role: "assistant", content: "Please ask about a specific reaction chemistry type (e.g. Amidation, Reduction, C-C Bond Formation)." }]);
-    }
-  }
+# Find scheme image with multiple extensions
+def find_scheme_image(reaction_type, product_name):
+    extensions = ['.jpeg', '.jpg', '.png', '.gif']
+    for ext in extensions:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
+    return None
 
-  const onSelectProduct = (product) => {
-    setSelectedProduct(product);
-  };
+# Product Database
+@st.cache_resource(show_spinner=False)
+def load_product_database():
+    products = []
+    
+    # Load products organized by reaction type folders
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+            
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
+        
+        for pdf_path in pdf_files:
+            try:
+                filename = os.path.basename(pdf_path)
+                product_name = os.path.splitext(filename)[0]
+                
+                # Find associated scheme files
+                scheme_image = find_scheme_image(reaction_type, product_name)
+                scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+                
+                # Create unique ID based on reaction type and product name
+                product_id = f"{reaction_type}_{product_name}"
+                
+                products.append({
+                    "id": product_id,
+                    "name": product_name,
+                    "reaction_type": reaction_type,
+                    "pdf_path": pdf_path,
+                    "scheme_image": scheme_image if scheme_image else None,
+                    "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+                })
+            except Exception as e:
+                st.error(f"Error processing file {pdf_path}: {str(e)}")
+    
+    return products
 
-  return (
-    // Center the whole app on the page, constrain width, but keep chat-history at the right
-    <div className="min-h-screen bg-gradient-to-b from-white to-gray-50 flex items-start py-8">
-      <div className="w-full max-w-7xl mx-auto px-4">
-        <div className="grid grid-cols-1 md:grid-cols-[1fr_320px] gap-6">
-          {/* Main content column */}
-          <div className="flex flex-col gap-4">
-            <header className="bg-gradient-to-r from-brandPurple-300 to-brandPurple-500 rounded-2xl p-6 text-white shadow-soft-lg">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h1 className="text-2xl font-bold">PharmaReaction AI</h1>
-                  <p className="text-sm mt-1 opacity-90">Reaction Chemistry Knowledge Base — demo frontend</p>
+# Robust PDF text extraction using PyMuPDF
+def extract_pdf_text(pdf_path):
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        st.error(f"Error reading PDF {pdf_path}: {str(e)}")
+        return ""
+
+# Build vector database for a single product
+def build_product_vector_store(product):
+    # Extract text from PDF
+    text = extract_pdf_text(product["pdf_path"])
+    
+    if not text or len(text.strip()) < 100:
+        return None
+    
+    # Create document with metadata
+    doc = Document(
+        page_content=text,
+        metadata={
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        }
+    )
+    
+    # Create FAISS vector store
+    return FAISS.from_documents([doc], cached_embeddings)
+
+# Custom prompt template for precise answers
+PROMPT_TEMPLATE = """
+You are a pharmaceutical chemistry expert specializing in reaction chemistry. 
+Extract the following information from the document in a structured format:
+
+1. **API Name**: The active pharmaceutical ingredient
+2. **Reaction Chemistry**: Type and description
+3. **Yield**: Exact yield percentage or value
+4. **Procedure**: Complete procedure EXACTLY as written in the source. 
+   Preserve all formatting, punctuation, and structure. Do NOT modify or summarize.
+5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. 
+   Do NOT omit, summarize, or transform any content.
+
+Structure your response as follows:
+
+### API Name
+[API name here]
+
+### Reaction Chemistry
+[Reaction chemistry description here]
+
+### Yield
+[Yield value here]
+
+### Procedure
+[Complete procedure here]
+
+### Tabular Data
+[Markdown table here]
+
+Document Content:
+{context}
+
+Question: {question}
+Answer:
+"""
+
+PROMPT = PromptTemplate(
+    template=PROMPT_TEMPLATE,
+    input_variables=["context", "question"]
+)
+
+# Session state initialization
+def init_session_state():
+    if "all_products" not in st.session_state:
+        st.session_state.all_products = load_product_database()
+    
+    if "messages" not in st.session_state:
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hello! I'm your expert assistant. How are you doing today? Feel free to ask me any query!"}
+        ]
+    
+    if "current_product" not in st.session_state:
+        st.session_state.current_product = None
+    
+    if "current_reaction" not in st.session_state:
+        st.session_state.current_reaction = None
+    
+    if "reaction_products" not in st.session_state:
+        st.session_state.reaction_products = []
+    
+    if "product_details" not in st.session_state:
+        st.session_state.product_details = {}
+    
+    if "user_query" not in st.session_state:
+        st.session_state.user_query = ""
+    
+    if "selected_product_id" not in st.session_state:
+        st.session_state.selected_product_id = None
+
+# Get product by ID
+def get_product_by_id(product_id):
+    for product in st.session_state.all_products:
+        if product["id"] == product_id:
+            return product
+    return None
+
+# Get products by reaction type
+def get_products_by_reaction(reaction_type):
+    return [p for p in st.session_state.all_products if p["reaction_type"] == reaction_type]
+
+# File download helper
+def get_binary_file_downloader_html(file_path, label="Download"):
+    if not os.path.exists(file_path):
+        return f'<span class="error">File not found: {os.path.basename(file_path)}</span>'
+    
+    with open(file_path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    return f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(file_path)}" class="download-btn">{label}</a>'
+
+# Process reaction type query
+def process_reaction_query(reaction_type):
+    # Get all products for this reaction type
+    products = get_products_by_reaction(reaction_type)
+    
+    if not products:
+        return f"No products found for {reaction_type}", []
+    
+    return f"Found {len(products)} products for {reaction_type}:", products
+
+# Process product query
+def process_product_query(product):
+    # Check if we already have details for this product
+    if product["id"] in st.session_state.product_details:
+        return st.session_state.product_details[product["id"]]
+    
+    # Build vector store for this product
+    vector_store = build_product_vector_store(product)
+    
+    if not vector_store:
+        return "Failed to process product document", None
+    
+    # Create retriever
+    retriever = vector_store.as_retriever(search_kwargs={"k": 1})
+    
+    # Create QA chain
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=False
+    )
+    
+    # Query for product details
+    query = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+    response = qa_chain.invoke({"query": query})["result"]
+    
+    # Cache the response
+    st.session_state.product_details[product["id"]] = response
+    
+    return response, None
+
+# Render chat message
+def render_message(message):
+    if message["role"] == "user":
+        return f'<div class="message user-message">{message["content"]}</div>'
+    else:
+        # Convert newlines to HTML breaks
+        content = message["content"].replace('\n', '<br>')
+        return f'<div class="message bot-message">{content}</div>'
+
+# Render product grid with clickable tiles
+def render_product_grid(products):
+    # Render product grid using Streamlit buttons
+    for product in products:
+        with st.container():
+            # Display product details
+            st.markdown(f"""
+                <div class="product-card">
+                    <div class="product-title">{product['name']}</div>
+                    <div class="reaction-type">{product['reaction_type']}</div>
                 </div>
-                <div className="flex items-center gap-3">
-                  <button className="bg-white/20 px-3 py-2 rounded-md">Demo</button>
-                  <div className="text-xs text-white/90">Light violet theme</div>
-                </div>
-              </div>
-            </header>
+            """, unsafe_allow_html=True)
+            
+            # Create a button for the product
+            if st.button(f"View {product['name']}", key=f"view_{product['id']}"):
+                # Store the selected product ID in session state
+                st.session_state.selected_product_id = product["id"]
+                st.session_state.current_product = product  # Save product info
+                st.rerun()
 
-            {/* Main Body */}
-            <div className="flex-1 relative">
-              <AnimatePresence>
-                {messages.length === 0 && (
-                  <motion.div
-                    key="center-input"
-                    initial={{ opacity: 0, y: -20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 20 }}
-                    transition={{ type: "spring", stiffness: 300, damping: 28 }}
-                    className="absolute inset-0 flex items-center justify-center"
-                  >
-                    <div className="w-full max-w-2xl p-8 bg-white rounded-2xl shadow-soft-lg border">
-                      <h2 className="text-xl font-semibold text-brandPurple-700 text-center">Start a conversation</h2>
-                      <p className="text-sm text-gray-400 text-center mt-2">Ask about any reaction chemistry — e.g. "Amidation"</p>
+# Parse and display structured content
+def display_structured_content(content):
+    # API Name
+    api_match = re.search(r"### API Name\n(.*?)(?=###|\Z)", content, re.DOTALL)
+    if api_match:
+        with st.expander("API Name", expanded=True):
+            st.info(api_match.group(1).strip())
+    
+    # Reaction Chemistry
+    rxn_match = re.search(r"### Reaction Chemistry\n(.*?)(?=###|\Z)", content, re.DOTALL)
+    if rxn_match:
+        with st.expander("Reaction Chemistry", expanded=True):
+            st.info(rxn_match.group(1).strip())
+    
+    # Yield
+    yield_match = re.search(r"### Yield\n(.*?)(?=###|\Z)", content, re.DOTALL)
+    if yield_match:
+        with st.expander("Yield", expanded=True):
+            st.success(yield_match.group(1).strip())
+    
+    # Procedure
+    proc_match = re.search(r"### Procedure\n(.*?)(?=###|\Z)", content, re.DOTALL)
+    if proc_match:
+        with st.expander("Procedure", expanded=True):
+            st.markdown(f"```\n{proc_match.group(1).strip()}\n```")
+    
+    # Tabular Data (robust handling of multiple tables)
+    table_section_match = re.search(
+        r"### Tabular Data\n(.*?)(?=(?:###\s)|\Z)",
+        content, re.DOTALL
+    )
+    if table_section_match:
+        raw = table_section_match.group(1).strip()
+        # Regex to capture each markdown table (header, separator, and rows)
+        table_patterns = re.findall(
+            r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)",
+            raw, re.DOTALL
+        )
+        if table_patterns:
+            for idx, tbl_md in enumerate(table_patterns, start=1):
+                with st.expander(f"Table {idx}", expanded=True):
+                    try:
+                        # Clean up each line: strip leading/trailing pipes & spaces
+                        lines = [
+                            line.strip().strip("|")
+                            for line in tbl_md.splitlines()
+                            if line.strip()
+                        ]
+                        cleaned = "\n".join(lines)
+                        # Use pandas to parse as CSV with '|' delimiter
+                        df = pd.read_csv(
+                            io.StringIO(cleaned),
+                            sep="\\|",
+                            engine="python"
+                        )
+                        st.dataframe(df, use_container_width=True)
+                    except Exception as e:
+                        # Fallback: show raw markdown if parsing fails
+                        st.markdown(f"<pre>{tbl_md}</pre>", unsafe_allow_html=True)
+        else:
+            # No tables detected, just render whatever is there
+            st.markdown(raw)
 
-                      <div className="mt-6">
-                        <ChatInput onSend={handleSend} placeholder="Ask about reaction chemistry (e.g. Amidation, Reduction)..." />
-                      </div>
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
+# Render product detail view
+def render_product_detail(product):
+    # Process the product if not already done
+    if product["id"] not in st.session_state.product_details:
+        with st.spinner(f"Extracting details from {product['name']} document..."):
+            details, _ = process_product_query(product)
+            st.session_state.product_details[product["id"]] = details
+    
+    details = st.session_state.product_details[product["id"]]
+    
+    # Display details
+    st.markdown(f'<div class="detail-view">', unsafe_allow_html=True)
+    
+    # Back button
+    if st.button("← Back to Products", key="back_button"):
+        st.session_state.current_product = None
+        st.session_state.selected_product_id = None
+        st.rerun()
+    
+    # Product header
+    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
+    st.markdown(f'<h2>{product["name"]}</h2>', unsafe_allow_html=True)
+    st.markdown(f'<div class="reaction-type">{product["reaction_type"]}</div>', unsafe_allow_html=True)
+    st.markdown('</div>')
+    
+    # Display structured content
+    display_structured_content(details)
+    
+    # Synthetic scheme
+    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">Synthetic Scheme</div>', unsafe_allow_html=True)
+    if product["scheme_image"] and os.path.exists(product["scheme_image"]):
+        try:
+            # Open and display the image
+            img = Image.open(product["scheme_image"])
+            st.image(img, use_container_width=True, caption="Synthetic Scheme")
+            
+            if product["scheme_cdx"] and os.path.exists(product["scheme_cdx"]):
+                st.markdown(get_binary_file_downloader_html(
+                    product["scheme_cdx"], 
+                    f" Download {product['name']} for ChemDraw"
+                ), unsafe_allow_html=True)
+            else:
+                st.warning("CDX format not available for this product")
+        except Exception as e:
+            st.error(f"Error loading synthetic scheme: {str(e)}")
+    else:
+        st.warning(f"Synthetic scheme image not found at: {product['scheme_image']}")
+    st.markdown('</div>')
+    
+    # Source document
+    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title">Source Document</div>', unsafe_allow_html=True)
+    if os.path.exists(product["pdf_path"]):
+        with open(product["pdf_path"], "rb") as f:
+            pdf_bytes = f.read()
+        
+        st.download_button(
+            label="Download Complete PDF",
+            data=pdf_bytes,
+            file_name=os.path.basename(product["pdf_path"]),
+            mime="application/pdf",
+            use_container_width=True
+        )
+        
+        # Display first page preview
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            # You can process the PDF or extract specific data here if needed.
+        except:
+            st.warning("Could not process the PDF file")
 
-              <AnimatePresence>
-                {messages.length > 0 && (
-                  <motion.div
-                    key="chat-window"
-                    initial={{ opacity: 0, y: 30 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: 30 }}
-                    transition={{ type: "spring", stiffness: 300, damping: 28 }}
-                    className="flex flex-col h-full"
-                  >
-                    <ChatWindow messages={messages} />
-                    <div>
-                      <ChatInput onSend={handleSend} placeholder="Type your message..." />
-                    </div>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
+        st.markdown('</div>')
+        st.markdown(f'</div>', unsafe_allow_html=True)
 
-            {/* Products result area */}
-            <div className="mt-4">
-              {currentProducts.length > 0 && (
-                <div className="bg-white p-4 rounded-xl border">
-                  <div className="flex items-center justify-between">
-                    <h3 className="font-semibold text-brandPurple-700">Products</h3>
-                    <div className="text-sm text-gray-500">{currentProducts.length} results</div>
-                  </div>
-                  <div className="mt-4">
-                    <ProductGrid products={currentProducts} onSelect={onSelectProduct} />
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-
-          {/* Right column: chat history */}
-          <div>
-            <ChatHistory threads={threads} onSelect={(id) => alert("Thread selected: " + id)} />
-          </div>
-
-          {/* Product drawer */}
-          <ProductDetailDrawer product={selectedProduct} onClose={() => setSelectedProduct(null)} />
-        </div>
-      </div>
+# Main App
+def main():
+    # Initialize session state
+    init_session_state()
+    
+    # Navigation Header
+    st.markdown("""
+        <div class="header" style="text-align: center;">
+        <h1>Reaction Database AI</h1>
+        <p>Where Chemistry Meets Intelligence</p>
     </div>
-  );
-}
+    """, unsafe_allow_html=True)
+    
+    # Handle product selection
+    if st.session_state.selected_product_id:
+        product = get_product_by_id(st.session_state.selected_product_id)
+        if product:
+            st.session_state.current_product = product
+            st.session_state.selected_product_id = None
+    
+    # If we're viewing a product detail, show that
+    if st.session_state.current_product:
+        render_product_detail(st.session_state.current_product)
+        return
+    
+    # If we're viewing a reaction type, show products
+    if st.session_state.current_reaction:
+        st.markdown(f'<h2>{st.session_state.current_reaction} Products</h2>', unsafe_allow_html=True)
+        
+        # Back button
+        if st.button("← Back to Chat", key="back_button"):
+            st.session_state.current_reaction = None
+            st.session_state.reaction_products = []
+            st.rerun()
+        
+        # Display products in a grid
+        if st.session_state.reaction_products:
+            render_product_grid(st.session_state.reaction_products)
+        else:
+            st.warning(f"No products found for {st.session_state.current_reaction}")
+        return
+    
+    # Chat interface
+    st.markdown('<div class="chat-container" id="chat-container">', unsafe_allow_html=True)
+    
+    # Display chat messages
+    for message in st.session_state.messages:
+        st.markdown(render_message(message), unsafe_allow_html=True)
+    
+    st.markdown('</div>', unsafe_allow_html=True)  # Close chat container
+    
+    # JavaScript for product selection
+    st.markdown("""
+        <script>
+            function selectProduct(productId) {
+                Streamlit.setComponentValue({
+                    type: "select_product",
+                    productId: productId
+                });
+            }
+            
+            // Scroll to bottom of chat
+            function scrollToBottom() {
+                const container = document.getElementById("chat-container");
+                if (container) {
+                    container.scrollTop = container.scrollHeight;
+                }
+            }
+            
+            // Scroll to bottom on load
+            window.addEventListener('load', scrollToBottom);
+        </script>
+    """, unsafe_allow_html=True)
+    
+    # Input area
+    st.markdown('<div class="input-container">', unsafe_allow_html=True)
+    user_input = st.text_input("Type your message...", st.session_state.user_query, 
+                              key="user_input", 
+                              placeholder="Ask about reaction chemistry...",
+                              label_visibility="collapsed")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Send button
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("Send", key="send_button", use_container_width=True):
+            if st.session_state.user_input.strip():
+                # Add user message to chat
+                st.session_state.messages.append({"role": "user", "content": st.session_state.user_input})
+                
+                # Check if it's a reaction type query
+                reaction_match = None
+                for rtype in REACTION_TYPES:
+                    if re.search(r"\b" + re.escape(rtype) + r"\b", st.session_state.user_input, re.IGNORECASE):
+                        reaction_match = rtype
+                        break
+                
+                if reaction_match:
+                    # Process reaction type
+                    response, products = process_reaction_query(reaction_match)
+                    
+                    # Add bot response to chat
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                    
+                    # Set reaction products
+                    st.session_state.current_reaction = reaction_match
+                    st.session_state.reaction_products = products
+                else:
+                    # Process general query
+                    response = "Please ask about a specific reaction chemistry type."
+                    st.session_state.messages.append({"role": "assistant", "content": response})
+                
+                # Clear input
+                st.session_state.user_query = ""
+                st.rerun()
+    
+    with col2:
+        if st.button("Clear Chat", key="clear_button", use_container_width=True):
+            st.session_state.messages = [
+                {"role": "assistant", "content": "Hello! I'm your AI Assistant. How are you doing today? Feel free to ask me any query!"}
+            ]
+            st.session_state.user_query = ""
+            st.rerun()
+
+# Handle component messages
+def handle_component_message():
+    query_params = st.query_params
+    
+    if "select_product" in query_params:
+        st.session_state.selected_product_id = query_params["select_product"][0]
+        st.experimental_set_query_params()
+        st.rerun()
+
+# Run the app
+if __name__ == "__main__":
+    handle_component_message()
+    main()
+####################3
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic
+from datetime import datetime, timedelta
+from jose import jwt
+from pydantic import BaseModel
+from pymongo import MongoClient
+import config
+import os
+from typing import Optional
+
+# 🔐 JWT Config
+SECRET_KEY = "myFAV"
+ALGORITHM = ""
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# 🧬 MongoDB Setup
+
+
+# 🚀 FastAPI App Setup
+app = FastAPI(
+    title="ChemHub",
+    redoc_url=None,
+    root_path="/chemhub/api",
+)
+
+# 🔐 Security
+security = HTTPBasic()
+
+# 🔁 CORS Setup
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# 🔐 JWT Token Creation Function
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# 🔓 Login Endpoint
+@app.post("/login")
+async def login(user_info: dict = Depends(config.check_ldap_auth)):
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Invalid Credentials")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_info["first_name"]},
+        expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "firstname": user_info["first_name"],
+        "lastname": user_info["last_name"],
+    }
+
+import uvicorn
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
