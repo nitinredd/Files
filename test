@@ -1,37 +1,261 @@
-(async ()=>{
-  const bases = [
-    "http://localhost:8000",
-    "http://localhost:8000/chemhub/api",
-    "http://127.0.0.1:8000",
-    "http://127.0.0.1:8000/chemhub/api"
-  ];
-  const endpoints = ["/api/health","/health","/openapi.json","/api/reactions","/api/products","/api/reaction?type=Amidation","/login"];
-  for (const b of bases){
-    for (const e of endpoints){
-      const url = b.replace(/\/$/,"") + e;
-      try {
-        const res = await fetch(url, { method: "GET", mode: "cors" });
-        let text = "(non-text body)";
-        try { text = await res.text(); } catch(err) { text = "(error reading body)"; }
-        console.log("✔", url, "=>", res.status, res.statusText, "| body:", text.slice(0,200));
-      } catch (err) {
-        console.log("✖", url, "=> ERROR:", err && err.message ? err.message : err);
-      }
-    }
-  }
+import os
+import re
+import glob
+import base64
+import fitz
+import pandas as pd
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+from pydantic import BaseModel
+import uvicorn
+from typing import List, Dict, Any, Optional
 
-  // Test login with Basic header (doesn't send real creds; just checks CORS/preflight + route)
-  try {
-    const testLoginUrl = bases[0].replace(/\/$/,"") + "/login";
-    console.log("\nTesting POST (Basic auth) to", testLoginUrl);
-    const r = await fetch(testLoginUrl, {
-      method: "POST",
-      mode: "cors",
-      headers: { Authorization: "Basic " + btoa("dummy:dummy") }
-    });
-    try { const txt = await r.text(); console.log("LOGIN POST", r.status, txt.slice(0,400)); }
-    catch(e){ console.log("LOGIN POST", r.status, "(couldn't read body)"); }
-  } catch(e) {
-    console.log("LOGIN POST ERROR:", e.message);
-  }
-})();
+app = FastAPI()
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Azure Configuration - Replace with your credentials
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+base_url = ""
+api_version = "2025-01-01-preview"
+api_key = ""
+deployment_name = "api-ai4o"
+model_name = "gpt-4o"
+
+# Initialize Azure services
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_version="2025-01-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="api-ai-3l"
+)
+
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+# Reaction Chemistry Categories
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+# Base directories
+BASE_DIR = os.path.join(os.getcwd(), "Reaction_Database")
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+
+# Create directories if needed
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+
+# Pydantic models
+class Product(BaseModel):
+    id: str
+    name: str
+    reaction_type: str
+    pdf_path: str
+    scheme_image: Optional[str] = None
+    scheme_cdx: Optional[str] = None
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    product_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    products: Optional[List[Product]] = None
+
+# Global cache
+product_cache = {}
+product_details_cache = {}
+vector_store_cache = {}
+
+# Utility functions
+def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
+    extensions = ['.jpeg', '.jpg', '.png', '.gif']
+    for ext in extensions:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
+    return None
+
+def extract_pdf_text(pdf_path: str) -> str:
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading PDF: {str(e)}")
+
+def build_product_vector_store(product: Product) -> FAISS:
+    if product.id in vector_store_cache:
+        return vector_store_cache[product.id]
+    
+    text = extract_pdf_text(product.pdf_path)
+    if not text or len(text.strip()) < 100:
+        return None
+    
+    doc = Document(
+        page_content=text,
+        metadata={
+            "product_id": product.id,
+            "product_name": product.name,
+            "reaction_type": product.reaction_type,
+            "source": product.pdf_path
+        }
+    )
+    
+    vector_store = FAISS.from_documents([doc], cached_embeddings)
+    vector_store_cache[product.id] = vector_store
+    return vector_store
+
+# API endpoints
+@app.get("/reaction_types", response_model=List[str])
+async def get_reaction_types():
+    return REACTION_TYPES
+
+@app.get("/products", response_model=List[Product])
+async def get_all_products():
+    if product_cache:
+        return list(product_cache.values())
+    
+    products = []
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+            
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
+        for pdf_path in pdf_files:
+            try:
+                filename = os.path.basename(pdf_path)
+                product_name = os.path.splitext(filename)[0]
+                product_id = f"{reaction_type}_{product_name}"
+                
+                scheme_image = find_scheme_image(reaction_type, product_name)
+                scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+                
+                product = Product(
+                    id=product_id,
+                    name=product_name,
+                    reaction_type=reaction_type,
+                    pdf_path=pdf_path,
+                    scheme_image=scheme_image if scheme_image else None,
+                    scheme_cdx=scheme_cdx if os.path.exists(scheme_cdx) else None
+                )
+                
+                products.append(product)
+                product_cache[product_id] = product
+            except Exception as e:
+                print(f"Error processing file {pdf_path}: {str(e)}")
+    
+    return products
+
+@app.get("/products/{reaction_type}", response_model=List[Product])
+async def get_products_by_reaction(reaction_type: str):
+    products = await get_all_products()
+    return [p for p in products if p.reaction_type == reaction_type]
+
+@app.get("/product/{product_id}", response_model=Product)
+async def get_product(product_id: str):
+    products = await get_all_products()
+    product = next((p for p in products if p.id == product_id), None)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return product
+
+@app.post("/process_product/{product_id}")
+async def process_product(product_id: str):
+    product = await get_product(product_id)
+    
+    if product_id in product_details_cache:
+        return product_details_cache[product_id]
+    
+    vector_store = build_product_vector_store(product)
+    if not vector_store:
+        raise HTTPException(status_code=500, detail="Failed to process document")
+    
+    PROMPT_TEMPLATE = """..."""  # Same as original
+    
+    retriever = vector_store.as_retriever(search_kwargs={"k": 1})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PromptTemplate.from_template(PROMPT_TEMPLATE)},
+        return_source_documents=False
+    )
+    
+    response = qa_chain.invoke({"query": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"})["result"]
+    product_details_cache[product_id] = response
+    return response
+
+@app.post("/chat", response_model=ChatResponse)
+async def handle_chat(request: ChatRequest):
+    products = await get_all_products()
+    
+    # Check for reaction type query
+    for rtype in REACTION_TYPES:
+        if re.search(r"\b" + re.escape(rtype) + r"\b", request.message, re.IGNORECASE):
+            reaction_products = [p for p in products if p.reaction_type == rtype]
+            return ChatResponse(
+                response=f"Found {len(reaction_products)} products for {rtype}",
+                products=reaction_products
+            )
+    
+    # Handle product-specific query
+    if request.product_id:
+        try:
+            vector_store = build_product_vector_store(await get_product(request.product_id))
+            if not vector_store:
+                return ChatResponse(response="Failed to process document")
+            
+            retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=False
+            )
+            
+            response = qa_chain.invoke({"query": request.message})["result"]
+            return ChatResponse(response=response)
+        except Exception as e:
+            return ChatResponse(response=f"Error processing query: {str(e)}")
+    
+    # General query
+    return ChatResponse(response="Please ask about a specific reaction chemistry type or select a product")
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
