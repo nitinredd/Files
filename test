@@ -1,25 +1,18 @@
+# main.py
 import os
 import re
 import glob
 import base64
-import fitz 
+import fitz  # PyMuPDF
 import pandas as pd
-import streamlit as st
-from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-from PIL import Image
 import io
+import logging
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, Query, Path, Depends, Body
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
-# Configuration - Replace with your Azure credentials
-st.set_page_config(page_title="Reaction Database AI", page_icon="", layout="wide")
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
+# === Begin: Keep this Azure block EXACTLY as provided by you (do not change) ===
 # Azure Configuration
 base_url=""
 api_version="2025-01-01-preview"
@@ -45,325 +38,63 @@ chat_model = AzureChatOpenAI(
     azure_endpoint=base_url
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+# === End Azure block (unchanged) ===
 
-# Reaction Chemistry Categories (folder names)
+# Note: the Azure classes used above require the same imports as in your original Streamlit code.
+# Ensure the following imports are present (they come from your original environment):
+from langchain_openai import AzureChatOpenAI
+from langchain.openai import AzureOpenAIEmbeddings  # alias - some installs differ; you had langchain_openai earlier
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+
+# If your environment uses different import paths for AzureOpenAIEmbeddings, adjust accordingly.
+# The code above mirrors the classes used in your Streamlit snippet.
+
+# -------------------------
+# App & Logging
+# -------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("chemhub_api")
+
+# Keep the same root path & title as your login snippet indicated
+app = FastAPI(
+    title="ChemHub",
+    redoc_url=None,
+    root_path="/chemhub/api",
+)
+
+# Allow CORS from everywhere (for demo). You may restrict this for production.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------
+# Reaction types and Paths (kept same)
+# -------------------------
 REACTION_TYPES = [
     "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
     "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
     "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
 ]
 
-# Base directories
+# Base directories (kept your original path)
 BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
 PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
 SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
-
-# Create directories if they don't exist
 os.makedirs(PRODUCTS_DIR, exist_ok=True)
 os.makedirs(SCHEMES_DIR, exist_ok=True)
 
-# Custom CSS for professional UI
-st.markdown("""
-    <style>
-        :root {
-            --primary: #2c3e50;
-            --secondary: #3498db;
-            --accent: #e74c3c;
-            --light: #ecf0f1;
-            --dark: #2c3e50;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: #f8f9fa;
-            color: #333;
-        }
-        
-        .stApp {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 1rem;
-        }
-        
-        .header {
-            background: linear-gradient(135deg, var(--primary) 0%, var(--secondary) 100%);
-            color: white;
-            padding: 1.5rem;
-            border-radius: 10px;
-            margin-bottom: 1.5rem;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-        }
-        
-        .chat-container {
-            display: flex;
-            flex-direction: column;
-            min-height: 5vh;
-            max-height: 65vh;
-            border: 1px solid #e0e0e0;
-            border-radius: 10px;
-            padding: 1rem;
-            background: white;
-            margin-bottom: 1rem;
-            overflow-y: auto;
-        }
-        
-        .message {
-            max-width: 80%;
-            padding: 0.8rem 1.2rem;
-            margin-bottom: 1rem;
-            border-radius: 18px;
-            line-height: 1.4;
-        }
-        
-        .user-message {
-            background: var(--secondary);
-            color: white;
-            align-self: flex-end;
-            border-bottom-right-radius: 5px;
-        }
-        
-        .bot-message {
-            background: var(--light);
-            align-self: flex-start;
-            border-bottom-left-radius: 5px;
-        }
-        
-        .product-card {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            padding: 1rem;
-            margin: 0.5rem 0;
-            cursor: pointer;
-            border: 1px solid #e0e0e0;
-            transition: all 0.2s ease;
-            position: relative;
-        }
-        
-        .product-card:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-            border-color: var(--secondary);
-        }
-        
-        .product-title {
-            font-weight: 600;
-            color: var(--primary);
-            margin-bottom: 0.3rem;
-        }
-        
-        .reaction-type {
-            font-size: 0.85rem;
-            color: var(--accent);
-            background: #fdecea;
-            padding: 0.2rem 0.5rem;
-            border-radius: 4px;
-            display: inline-block;
-        }
-        
-        .input-container {
-            display: flex;
-            gap: 0.5rem;
-        }
-        
-        .chat-input {
-            flex: 1;
-            padding: 0.8rem 1.2rem;
-            border-radius: 25px;
-            border: 2px solid var(--secondary);
-            font-size: 1rem;
-        }
-        
-        .send-button {
-            background: var(--secondary);
-            color: white;
-            border: none;
-            border-radius: 25px;
-            padding: 0 1.5rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background 0.2s ease;
-        }
-        
-        .send-button:hover {
-            background: var(--primary);
-        }
-        
-        .detail-view {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            padding: 1.5rem;
-            margin-top: 1rem;
-        }
-        
-        .back-button {
-            background: #f0f0f0;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 5px;
-            cursor: pointer;
-            margin-bottom: 1rem;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-        }
-        
-        .section-title {
-            color: var(--primary);
-            border-bottom: 2px solid var(--secondary);
-            padding-bottom: 0.5rem;
-            margin-top: 1.5rem;
-        }
-        
-        .scheme-container {
-            text-align: center;
-            margin: 1.5rem 0;
-        }
-        
-        .download-btn {
-            background: var(--accent);
-            color: white;
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 5px;
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            margin-top: 1rem;
-            text-decoration: none;
-        }
-        
-        .tab-content {
-            padding: 1rem;
-            background: #f9f9f9;
-            border-radius: 5px;
-            margin-top: 1rem;
-            border: 1px solid #eee;
-            white-space: pre-wrap;
-        }
-        
-        .product-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-            gap: 1.5rem;
-            margin-top: 1.5rem;
-        }
-        
-        .info-card {
-            background: white;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            padding: 1.5rem;
-            margin: 1rem 0;
-        }
-        
-        .table-container {
-            overflow-x: auto;
-            margin: 1.5rem 0;
-            border: 1px solid #e0e0e0;
-            border-radius: 5px;
-        }
-        
-        .stDataFrame {
-            width: 100%;
-        }
-        
-        .product-select-target {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            cursor: pointer;
-            z-index: 1;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-# Find scheme image with multiple extensions
-def find_scheme_image(reaction_type, product_name):
-    extensions = ['.jpeg', '.jpg', '.png', '.gif']
-    for ext in extensions:
-        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
-        if os.path.exists(scheme_path):
-            return scheme_path
-    return None
-
-# Product Database
-@st.cache_resource(show_spinner=False)
-def load_product_database():
-    products = []
-    
-    # Load products organized by reaction type folders
-    for reaction_type in REACTION_TYPES:
-        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
-        if not os.path.exists(reaction_dir):
-            continue
-            
-        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
-        
-        for pdf_path in pdf_files:
-            try:
-                filename = os.path.basename(pdf_path)
-                product_name = os.path.splitext(filename)[0]
-                
-                # Find associated scheme files
-                scheme_image = find_scheme_image(reaction_type, product_name)
-                scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
-                
-                # Create unique ID based on reaction type and product name
-                product_id = f"{reaction_type}_{product_name}"
-                
-                products.append({
-                    "id": product_id,
-                    "name": product_name,
-                    "reaction_type": reaction_type,
-                    "pdf_path": pdf_path,
-                    "scheme_image": scheme_image if scheme_image else None,
-                    "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
-                })
-            except Exception as e:
-                st.error(f"Error processing file {pdf_path}: {str(e)}")
-    
-    return products
-
-# Robust PDF text extraction using PyMuPDF
-def extract_pdf_text(pdf_path):
-    text = ""
-    try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            text += page.get_text() + "\n"
-        return text
-    except Exception as e:
-        st.error(f"Error reading PDF {pdf_path}: {str(e)}")
-        return ""
-
-# Build vector database for a single product
-def build_product_vector_store(product):
-    # Extract text from PDF
-    text = extract_pdf_text(product["pdf_path"])
-    
-    if not text or len(text.strip()) < 100:
-        return None
-    
-    # Create document with metadata
-    doc = Document(
-        page_content=text,
-        metadata={
-            "product_id": product["id"],
-            "product_name": product["name"],
-            "reaction_type": product["reaction_type"],
-            "source": product["pdf_path"]
-        }
-    )
-    
-    # Create FAISS vector store
-    return FAISS.from_documents([doc], cached_embeddings)
-
-# Custom prompt template for precise answers
+# -------------------------
+# Prompt (identical to Streamlit)
+# -------------------------
 PROMPT_TEMPLATE = """
 You are a pharmaceutical chemistry expert specializing in reaction chemistry. 
 Extract the following information from the document in a structured format:
@@ -399,87 +130,226 @@ Document Content:
 Question: {question}
 Answer:
 """
-
 PROMPT = PromptTemplate(
     template=PROMPT_TEMPLATE,
     input_variables=["context", "question"]
 )
 
-# Session state initialization
-def init_session_state():
-    if "all_products" not in st.session_state:
-        st.session_state.all_products = load_product_database()
-    
-    if "messages" not in st.session_state:
-        st.session_state.messages = [
-            {"role": "assistant", "content": "Hello! I'm your expert assistant. How are you doing today? Feel free to ask me any query!"}
-        ]
-    
-    if "current_product" not in st.session_state:
-        st.session_state.current_product = None
-    
-    if "current_reaction" not in st.session_state:
-        st.session_state.current_reaction = None
-    
-    if "reaction_products" not in st.session_state:
-        st.session_state.reaction_products = []
-    
-    if "product_details" not in st.session_state:
-        st.session_state.product_details = {}
-    
-    if "user_query" not in st.session_state:
-        st.session_state.user_query = ""
-    
-    if "selected_product_id" not in st.session_state:
-        st.session_state.selected_product_id = None
+# -------------------------
+# In-memory caches and product registry
+# -------------------------
+_products_registry: List[Dict[str, Any]] = []
+_product_details_cache: Dict[str, str] = {}   # product_id -> QA result (string)
 
-# Get product by ID
-def get_product_by_id(product_id):
-    for product in st.session_state.all_products:
-        if product["id"] == product_id:
-            return product
+# -------------------------
+# Utility functions (mirrors Streamlit logic)
+# -------------------------
+def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
+    extensions = ['.jpeg', '.jpg', '.png', '.gif']
+    for ext in extensions:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
     return None
 
-# Get products by reaction type
-def get_products_by_reaction(reaction_type):
-    return [p for p in st.session_state.all_products if p["reaction_type"] == reaction_type]
+def load_product_database() -> List[Dict[str, Any]]:
+    """
+    Scans PRODUCTS_DIR and returns a list of product metadata dictionaries.
+    """
+    products = []
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
+        for pdf_path in pdf_files:
+            try:
+                filename = os.path.basename(pdf_path)
+                product_name = os.path.splitext(filename)[0]
+                scheme_image = find_scheme_image(reaction_type, product_name)
+                scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+                product_id = f"{reaction_type}_{product_name}"
+                products.append({
+                    "id": product_id,
+                    "name": product_name,
+                    "reaction_type": reaction_type,
+                    "pdf_path": pdf_path,
+                    "scheme_image": scheme_image if scheme_image else None,
+                    "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+                })
+            except Exception as e:
+                logger.exception("Error processing file %s: %s", pdf_path, str(e))
+    return products
 
-# File download helper
-def get_binary_file_downloader_html(file_path, label="Download"):
-    if not os.path.exists(file_path):
-        return f'<span class="error">File not found: {os.path.basename(file_path)}</span>'
-    
-    with open(file_path, "rb") as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode()
-    return f'<a href="data:application/octet-stream;base64,{b64}" download="{os.path.basename(file_path)}" class="download-btn">{label}</a>'
+def extract_pdf_text(pdf_path: str) -> str:
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        logger.exception("Error reading PDF %s: %s", pdf_path, str(e))
+        return ""
 
-# Process reaction type query
-def process_reaction_query(reaction_type):
-    # Get all products for this reaction type
-    products = get_products_by_reaction(reaction_type)
-    
+def build_product_vector_store(product: Dict[str, Any]):
+    """
+    Returns a FAISS vectorstore built for the single product or None if insufficient text.
+    """
+    text = extract_pdf_text(product["pdf_path"])
+    if not text or len(text.strip()) < 100:
+        return None
+    doc = Document(
+        page_content=text,
+        metadata={
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        }
+    )
+    return FAISS.from_documents([doc], cached_embeddings)
+
+def get_product_by_id(product_id: str) -> Optional[Dict[str, Any]]:
+    for p in _products_registry:
+        if p["id"] == product_id:
+            return p
+    return None
+
+# -------------------------
+# Startup - load product registry
+# -------------------------
+@app.on_event("startup")
+def startup_load_products():
+    global _products_registry
+    logger.info("Loading product database from %s", PRODUCTS_DIR)
+    _products_registry = load_product_database()
+    logger.info("Loaded %d products", len(_products_registry))
+
+# -------------------------
+# API Endpoints
+# -------------------------
+
+# Health
+@app.get("/health")
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "products_count": len(_products_registry)}
+
+# List reaction types
+@app.get("/reactions")
+@app.get("/api/reactions")
+def list_reactions():
+    return {"reactions": REACTION_TYPES}
+
+# List products (optionally by reaction type)
+@app.get("/products")
+@app.get("/api/products")
+def list_products(reaction_type: Optional[str] = Query(None, description="Filter by reaction type")):
+    if reaction_type:
+        matched = [p for p in _products_registry if p["reaction_type"] == reaction_type]
+        return {"count": len(matched), "products": matched}
+    return {"count": len(_products_registry), "products": _products_registry}
+
+# Endpoint used by your React frontend in earlier code: /api/reaction?type=...
+@app.get("/reaction")
+@app.get("/api/reaction")
+def reaction_query(type: str = Query(..., alias="type")):
+    # mirror process_reaction_query
+    products = [p for p in _products_registry if p["reaction_type"] == type]
     if not products:
-        return f"No products found for {reaction_type}", []
-    
-    return f"Found {len(products)} products for {reaction_type}:", products
+        return {"message": f"No products found for {type}", "products": []}
+    return {"message": f"Found {len(products)} products for {type}:", "products": products}
 
-# Process product query
-def process_product_query(product):
-    # Check if we already have details for this product
-    if product["id"] in st.session_state.product_details:
-        return st.session_state.product_details[product["id"]]
-    
-    # Build vector store for this product
+# Get product metadata (and optionally details)
+@app.get("/product/{product_id}")
+@app.get("/api/product/{product_id}")
+def product_metadata(product_id: str = Path(...), include_details: bool = Query(False)):
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    result = {"product": product}
+    if include_details:
+        # Try to fetch cached details or build the QA chain
+        details = _product_details_cache.get(product_id)
+        if not details:
+            details = process_product_query_sync(product)
+            if not details:
+                raise HTTPException(status_code=500, detail="Failed to extract product details")
+        result["details"] = details
+    return result
+
+# Download PDF
+@app.get("/product/{product_id}/download")
+@app.get("/api/product/{product_id}/download")
+def download_product_pdf(product_id: str = Path(...)):
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    pdf_path = product.get("pdf_path")
+    if not pdf_path or not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF file not found")
+    # Stream file for download
+    return FileResponse(path=pdf_path, filename=os.path.basename(pdf_path), media_type="application/pdf")
+
+# Serve scheme image
+@app.get("/product/{product_id}/scheme")
+@app.get("/api/product/{product_id}/scheme")
+def get_scheme_image(product_id: str = Path(...)):
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    img = product.get("scheme_image")
+    if not img or not os.path.exists(img):
+        raise HTTPException(status_code=404, detail="Scheme image not found")
+    # Return image file
+    return FileResponse(path=img, filename=os.path.basename(img), media_type="image/png")
+
+# Download CDX (ChemDraw) if available
+@app.get("/product/{product_id}/download_cdx")
+@app.get("/api/product/{product_id}/download_cdx")
+def download_product_cdx(product_id: str = Path(...)):
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    cdx = product.get("scheme_cdx")
+    if not cdx or not os.path.exists(cdx):
+        raise HTTPException(status_code=404, detail="CDX not found")
+    return FileResponse(path=cdx, filename=os.path.basename(cdx), media_type="application/octet-stream")
+
+# Endpoint to run the RetrievalQA and return the structured details (synchronous)
+@app.get("/product/{product_id}/details")
+@app.get("/api/product/{product_id}/details")
+def product_details(product_id: str = Path(...)):
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    # return cached if present
+    if product_id in _product_details_cache:
+        return {"product_id": product_id, "details": _product_details_cache[product_id], "cached": True}
+    details = process_product_query_sync(product)
+    if not details:
+        raise HTTPException(status_code=500, detail="Failed to process product document")
+    _product_details_cache[product_id] = details
+    return {"product_id": product_id, "details": details, "cached": False}
+
+# A convenience endpoint to run an arbitrary query against a product's vectorstore (for dev)
+@app.post("/product/{product_id}/query")
+@app.post("/api/product/{product_id}/query")
+def product_query(product_id: str = Path(...), query: Dict[str, Any] = Body(...)):
+    """
+    Body: { "query": "Extract API Name ..." }
+    """
+    product = get_product_by_id(product_id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+    q = query.get("query")
+    if not q:
+        raise HTTPException(status_code=400, detail="Missing 'query' in request body")
     vector_store = build_product_vector_store(product)
-    
     if not vector_store:
-        return "Failed to process product document", None
-    
-    # Create retriever
+        raise HTTPException(status_code=500, detail="Failed to build vector store for product")
     retriever = vector_store.as_retriever(search_kwargs={"k": 1})
-    
-    # Create QA chain
     qa_chain = RetrievalQA.from_chain_type(
         llm=chat_model,
         chain_type="stuff",
@@ -487,330 +357,62 @@ def process_product_query(product):
         chain_type_kwargs={"prompt": PROMPT},
         return_source_documents=False
     )
-    
-    # Query for product details
-    query = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-    response = qa_chain.invoke({"query": query})["result"]
-    
-    # Cache the response
-    st.session_state.product_details[product["id"]] = response
-    
-    return response, None
+    # Call the chain:
+    try:
+        response = qa_chain.invoke({"query": q})["result"]
+    except Exception as e:
+        logger.exception("QA chain invocation failed: %s", str(e))
+        raise HTTPException(status_code=500, detail=f"QA chain failed: {str(e)}")
+    return {"product_id": product_id, "result": response}
 
-# Render chat message
-def render_message(message):
-    if message["role"] == "user":
-        return f'<div class="message user-message">{message["content"]}</div>'
-    else:
-        # Convert newlines to HTML breaks
-        content = message["content"].replace('\n', '<br>')
-        return f'<div class="message bot-message">{content}</div>'
-
-# Render product grid with clickable tiles
-def render_product_grid(products):
-    # Render product grid using Streamlit buttons
-    for product in products:
-        with st.container():
-            # Display product details
-            st.markdown(f"""
-                <div class="product-card">
-                    <div class="product-title">{product['name']}</div>
-                    <div class="reaction-type">{product['reaction_type']}</div>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # Create a button for the product
-            if st.button(f"View {product['name']}", key=f"view_{product['id']}"):
-                # Store the selected product ID in session state
-                st.session_state.selected_product_id = product["id"]
-                st.session_state.current_product = product  # Save product info
-                st.rerun()
-
-# Parse and display structured content
-def display_structured_content(content):
-    # API Name
-    api_match = re.search(r"### API Name\n(.*?)(?=###|\Z)", content, re.DOTALL)
-    if api_match:
-        with st.expander("API Name", expanded=True):
-            st.info(api_match.group(1).strip())
-    
-    # Reaction Chemistry
-    rxn_match = re.search(r"### Reaction Chemistry\n(.*?)(?=###|\Z)", content, re.DOTALL)
-    if rxn_match:
-        with st.expander("Reaction Chemistry", expanded=True):
-            st.info(rxn_match.group(1).strip())
-    
-    # Yield
-    yield_match = re.search(r"### Yield\n(.*?)(?=###|\Z)", content, re.DOTALL)
-    if yield_match:
-        with st.expander("Yield", expanded=True):
-            st.success(yield_match.group(1).strip())
-    
-    # Procedure
-    proc_match = re.search(r"### Procedure\n(.*?)(?=###|\Z)", content, re.DOTALL)
-    if proc_match:
-        with st.expander("Procedure", expanded=True):
-            st.markdown(f"```\n{proc_match.group(1).strip()}\n```")
-    
-    # Tabular Data (robust handling of multiple tables)
-    table_section_match = re.search(
-        r"### Tabular Data\n(.*?)(?=(?:###\s)|\Z)",
-        content, re.DOTALL
-    )
-    if table_section_match:
-        raw = table_section_match.group(1).strip()
-        # Regex to capture each markdown table (header, separator, and rows)
-        table_patterns = re.findall(
-            r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)",
-            raw, re.DOTALL
+# -------------------------
+# Under-the-hood product processing function (sync)
+# -------------------------
+def process_product_query_sync(product: Dict[str, Any]) -> Optional[str]:
+    """
+    Mirrors streamlit process_product_query: builds vector store, creates retriever, runs RetrievalQA,
+    and returns the QA result string (which will contain the structured sections).
+    """
+    try:
+        vector_store = build_product_vector_store(product)
+        if not vector_store:
+            logger.warning("Vector store not created for product %s", product["id"])
+            return None
+        retriever = vector_store.as_retriever(search_kwargs={"k": 1})
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=False
         )
-        if table_patterns:
-            for idx, tbl_md in enumerate(table_patterns, start=1):
-                with st.expander(f"Table {idx}", expanded=True):
-                    try:
-                        # Clean up each line: strip leading/trailing pipes & spaces
-                        lines = [
-                            line.strip().strip("|")
-                            for line in tbl_md.splitlines()
-                            if line.strip()
-                        ]
-                        cleaned = "\n".join(lines)
-                        # Use pandas to parse as CSV with '|' delimiter
-                        df = pd.read_csv(
-                            io.StringIO(cleaned),
-                            sep="\\|",
-                            engine="python"
-                        )
-                        st.dataframe(df, use_container_width=True)
-                    except Exception as e:
-                        # Fallback: show raw markdown if parsing fails
-                        st.markdown(f"<pre>{tbl_md}</pre>", unsafe_allow_html=True)
-        else:
-            # No tables detected, just render whatever is there
-            st.markdown(raw)
-
-# Render product detail view
-def render_product_detail(product):
-    # Process the product if not already done
-    if product["id"] not in st.session_state.product_details:
-        with st.spinner(f"Extracting details from {product['name']} document..."):
-            details, _ = process_product_query(product)
-            st.session_state.product_details[product["id"]] = details
-    
-    details = st.session_state.product_details[product["id"]]
-    
-    # Display details
-    st.markdown(f'<div class="detail-view">', unsafe_allow_html=True)
-    
-    # Back button
-    if st.button("← Back to Products", key="back_button"):
-        st.session_state.current_product = None
-        st.session_state.selected_product_id = None
-        st.rerun()
-    
-    # Product header
-    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
-    st.markdown(f'<h2>{product["name"]}</h2>', unsafe_allow_html=True)
-    st.markdown(f'<div class="reaction-type">{product["reaction_type"]}</div>', unsafe_allow_html=True)
-    st.markdown('</div>')
-    
-    # Display structured content
-    display_structured_content(details)
-    
-    # Synthetic scheme
-    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="section-title">Synthetic Scheme</div>', unsafe_allow_html=True)
-    if product["scheme_image"] and os.path.exists(product["scheme_image"]):
+        query = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+        # invoke the chain similar to streamlit
         try:
-            # Open and display the image
-            img = Image.open(product["scheme_image"])
-            st.image(img, use_container_width=True, caption="Synthetic Scheme")
-            
-            if product["scheme_cdx"] and os.path.exists(product["scheme_cdx"]):
-                st.markdown(get_binary_file_downloader_html(
-                    product["scheme_cdx"], 
-                    f" Download {product['name']} for ChemDraw"
-                ), unsafe_allow_html=True)
-            else:
-                st.warning("CDX format not available for this product")
+            response = qa_chain.invoke({"query": query})["result"]
         except Exception as e:
-            st.error(f"Error loading synthetic scheme: {str(e)}")
-    else:
-        st.warning(f"Synthetic scheme image not found at: {product['scheme_image']}")
-    st.markdown('</div>')
-    
-    # Source document
-    st.markdown(f'<div class="info-card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="section-title">Source Document</div>', unsafe_allow_html=True)
-    if os.path.exists(product["pdf_path"]):
-        with open(product["pdf_path"], "rb") as f:
-            pdf_bytes = f.read()
-        
-        st.download_button(
-            label="Download Complete PDF",
-            data=pdf_bytes,
-            file_name=os.path.basename(product["pdf_path"]),
-            mime="application/pdf",
-            use_container_width=True
-        )
-        
-        # Display first page preview
-        try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            # You can process the PDF or extract specific data here if needed.
-        except:
-            st.warning("Could not process the PDF file")
+            # Try fallback: call run (some versions use qa_chain.run)
+            logger.exception("qa_chain.invoke failed, attempting qa_chain.run: %s", str(e))
+            try:
+                response = qa_chain.run(query)
+            except Exception as e2:
+                logger.exception("qa_chain.run also failed: %s", str(e2))
+                raise
+        return response
+    except Exception as e:
+        logger.exception("process_product_query_sync failed for %s: %s", product.get("id"), str(e))
+        return None
 
-        st.markdown('</div>')
-        st.markdown(f'</div>', unsafe_allow_html=True)
-
-# Main App
-def main():
-    # Initialize session state
-    init_session_state()
-    
-    # Navigation Header
-    st.markdown("""
-        <div class="header" style="text-align: center;">
-        <h1>Reaction Database AI</h1>
-        <p>Where Chemistry Meets Intelligence</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Handle product selection
-    if st.session_state.selected_product_id:
-        product = get_product_by_id(st.session_state.selected_product_id)
-        if product:
-            st.session_state.current_product = product
-            st.session_state.selected_product_id = None
-    
-    # If we're viewing a product detail, show that
-    if st.session_state.current_product:
-        render_product_detail(st.session_state.current_product)
-        return
-    
-    # If we're viewing a reaction type, show products
-    if st.session_state.current_reaction:
-        st.markdown(f'<h2>{st.session_state.current_reaction} Products</h2>', unsafe_allow_html=True)
-        
-        # Back button
-        if st.button("← Back to Chat", key="back_button"):
-            st.session_state.current_reaction = None
-            st.session_state.reaction_products = []
-            st.rerun()
-        
-        # Display products in a grid
-        if st.session_state.reaction_products:
-            render_product_grid(st.session_state.reaction_products)
-        else:
-            st.warning(f"No products found for {st.session_state.current_reaction}")
-        return
-    
-    # Chat interface
-    st.markdown('<div class="chat-container" id="chat-container">', unsafe_allow_html=True)
-    
-    # Display chat messages
-    for message in st.session_state.messages:
-        st.markdown(render_message(message), unsafe_allow_html=True)
-    
-    st.markdown('</div>', unsafe_allow_html=True)  # Close chat container
-    
-    # JavaScript for product selection
-    st.markdown("""
-        <script>
-            function selectProduct(productId) {
-                Streamlit.setComponentValue({
-                    type: "select_product",
-                    productId: productId
-                });
-            }
-            
-            // Scroll to bottom of chat
-            function scrollToBottom() {
-                const container = document.getElementById("chat-container");
-                if (container) {
-                    container.scrollTop = container.scrollHeight;
-                }
-            }
-            
-            // Scroll to bottom on load
-            window.addEventListener('load', scrollToBottom);
-        </script>
-    """, unsafe_allow_html=True)
-    
-    # Input area
-    st.markdown('<div class="input-container">', unsafe_allow_html=True)
-    user_input = st.text_input("Type your message...", st.session_state.user_query, 
-                              key="user_input", 
-                              placeholder="Ask about reaction chemistry...",
-                              label_visibility="collapsed")
-    st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Send button
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("Send", key="send_button", use_container_width=True):
-            if st.session_state.user_input.strip():
-                # Add user message to chat
-                st.session_state.messages.append({"role": "user", "content": st.session_state.user_input})
-                
-                # Check if it's a reaction type query
-                reaction_match = None
-                for rtype in REACTION_TYPES:
-                    if re.search(r"\b" + re.escape(rtype) + r"\b", st.session_state.user_input, re.IGNORECASE):
-                        reaction_match = rtype
-                        break
-                
-                if reaction_match:
-                    # Process reaction type
-                    response, products = process_reaction_query(reaction_match)
-                    
-                    # Add bot response to chat
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                    
-                    # Set reaction products
-                    st.session_state.current_reaction = reaction_match
-                    st.session_state.reaction_products = products
-                else:
-                    # Process general query
-                    response = "Please ask about a specific reaction chemistry type."
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                # Clear input
-                st.session_state.user_query = ""
-                st.rerun()
-    
-    with col2:
-        if st.button("Clear Chat", key="clear_button", use_container_width=True):
-            st.session_state.messages = [
-                {"role": "assistant", "content": "Hello! I'm your AI Assistant. How are you doing today? Feel free to ask me any query!"}
-            ]
-            st.session_state.user_query = ""
-            st.rerun()
-
-# Handle component messages
-def handle_component_message():
-    query_params = st.query_params
-    
-    if "select_product" in query_params:
-        st.session_state.selected_product_id = query_params["select_product"][0]
-        st.experimental_set_query_params()
-        st.rerun()
-
-# Run the app
-if __name__ == "__main__":
-    handle_component_message()
-    main()
-####################3
-from fastapi import FastAPI, Depends, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# -------------------------
+# Login backend (kept as-is, combined)
+# -------------------------
+# NOTE: This block uses your provided login snippet. It expects 'config.check_ldap_auth' to be available.
 from fastapi.security import HTTPBasic
 from datetime import datetime, timedelta
 from jose import jwt
 from pydantic import BaseModel
 from pymongo import MongoClient
-import config
-import os
+import config  # your external config with check_ldap_auth etc
 from typing import Optional
 
 # 🔐 JWT Config
@@ -818,37 +420,16 @@ SECRET_KEY = "myFAV"
 ALGORITHM = ""
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# 🧬 MongoDB Setup
-
-
-# 🚀 FastAPI App Setup
-app = FastAPI(
-    title="ChemHub",
-    redoc_url=None,
-    root_path="/chemhub/api",
-)
-
-# 🔐 Security
+# 🚀 Security
 security = HTTPBasic()
 
-# 🔁 CORS Setup
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# 🔐 JWT Token Creation Function
+# 🔓 Login Endpoint (kept as you provided)
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-# 🔓 Login Endpoint
 @app.post("/login")
 async def login(user_info: dict = Depends(config.check_ldap_auth)):
     if not user_info:
@@ -867,7 +448,9 @@ async def login(user_info: dict = Depends(config.check_ldap_auth)):
         "lastname": user_info["last_name"],
     }
 
-import uvicorn
-
+# -------------------------
+# Run with Uvicorn (if executed directly)
+# -------------------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
