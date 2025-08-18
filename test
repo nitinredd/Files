@@ -1,206 +1,389 @@
-import React, { useState, useEffect, useContext } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { AppProvider, useAppContext } from './contexts/AppContext';
-import ChatMessage from './components/ChatMessage';
-import ProductGrid from './components/ProductGrid';
-import ProductDetail from './components/ProductDetail';
-import Sidebar from './components/Sidebar';
-import SpeechRecognition from './components/SpeechRecognition';
-import { FaBars } from 'react-icons/fa';
+# main.py
+"""
+FastAPI backend for Reaction Database AI
+Single-file deployment as requested.
 
-const ChatInterface = () => {
-  const { 
-    messages, 
-    setMessages, // Now properly exposed from context
-    addMessage, 
-    products, 
-    setProducts,
-    currentProduct,
-    setCurrentProduct,
-    reactionType,
-    setReactionType,
-    isLoading,
-    setIsLoading,
-    sidebarOpen,
-    setSidebarOpen
-  } = useAppContext();
-  
-  const [inputValue, setInputValue] = useState('');
-  const [interimText, setInterimText] = useState('');
+Install requirements:
+pip install fastapi uvicorn python-multipart pydantic "python-multipart" PyMuPDF pandas langchain faiss-cpu pillow pydantic[dotenv] google-cloud-speech
 
-  useEffect(() => {
-    // Scroll to bottom of chat when messages change
-    const chatContainer = document.getElementById('chat-container');
-    if (chatContainer) {
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-    }
-  }, [messages]);
+(You may not need google-cloud-speech if you only use browser speech.)
+"""
 
-  const handleSendMessage = async () => {
-    if (!inputValue.trim()) return;
-    
-    // Add user message
-    addMessage({ role: 'user', content: inputValue });
-    setInputValue('');
-    setInterimText('');
-    
-    try {
-      setIsLoading(true);
-      
-      const response = await fetch('http://localhost:8000/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: inputValue,
-          product_id: currentProduct?.id 
+import os
+import re
+import glob
+import base64
+import io
+import json
+import threading
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+import pandas as pd
+from PIL import Image
+
+# LangChain & Azure imports (kept as your original block, unchanged)
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+
+# ---------------------------
+# Configuration (as provided by you — DO NOT CHANGE unless you need to)
+# ---------------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Azure Configuration (kept exactly as requested)
+base_url="" 
+api_version="2025-01-01-preview"
+api_key=""
+deployment_name="api-ai4o"
+model_name="gpt-4o"
+
+# Initialize Azure services (kept as-is; fill azure_endpoint/api_key etc. with real values)
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_version="2025-01-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="api-ai-3l"
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+# ---------------------------
+
+# Reaction types and filesystem layout (kept from your code)
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+
+# Ensure dirs exist (idempotent)
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+
+# Prompt template (kept largely the same)
+PROMPT_TEMPLATE = """
+You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format:
+1. **API Name**: The active pharmaceutical ingredient
+2. **Reaction Chemistry**: Type and description
+3. **Yield**: Exact yield percentage or value
+4. **Procedure**: Complete procedure EXACTLY as written in the source. Preserve all formatting, punctuation, and structure. Do NOT modify or summarize.
+5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
+
+Structure your response as follows (literal headers must appear in the LLM output exactly like below):
+
+### API Name
+[API name here]
+### Reaction Chemistry
+[Reaction chemistry description here]
+### Yield
+[Yield value here]
+### Procedure
+[Complete procedure here]
+### Tabular Data
+[Markdown table here]
+
+Document Content:
+{context}
+Question: {question}
+Answer:
+"""
+PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+# ------------------------------
+# Helper functions
+# ------------------------------
+def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
+    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
+    return None
+
+def list_products() -> List[Dict[str, Any]]:
+    products = []
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
+        for pdf_path in pdf_files:
+            filename = os.path.basename(pdf_path)
+            product_name = os.path.splitext(filename)[0]
+            scheme_image = find_scheme_image(reaction_type, product_name)
+            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+            product_id = f"{reaction_type}_{product_name}"
+            products.append({
+                "id": product_id,
+                "name": product_name,
+                "reaction_type": reaction_type,
+                "pdf_path": pdf_path,
+                "scheme_image": scheme_image if scheme_image else None,
+                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+            })
+    return products
+
+def extract_pdf_text(pdf_path: str) -> str:
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
+
+# Cache for vectorstores and product details
+_vectorstore_cache: Dict[str, FAISS] = {}
+_product_details_cache: Dict[str, Dict[str, Any]] = {}
+_vectorstore_lock = threading.Lock()
+
+def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
+    pid = product["id"]
+    with _vectorstore_lock:
+        if pid in _vectorstore_cache:
+            return _vectorstore_cache[pid]
+        text = extract_pdf_text(product["pdf_path"])
+        if not text or len(text.strip()) < 50:
+            return None
+        doc = Document(page_content=text, metadata={
+            "product_id": pid,
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
         })
-      });
-      
-      const data = await response.json();
-      
-      if (data.products && data.products.length > 0) {
-        setProducts(data.products);
-        setReactionType(inputValue);
-      } else {
-        addMessage({ role: 'assistant', content: data.response });
-      }
-    } catch (error) {
-      addMessage({ 
-        role: 'assistant', 
-        content: 'Sorry, I encountered an error processing your request.' 
-      });
-    } finally {
-      setIsLoading(false);
-    }
-  };
+        vs = FAISS.from_documents([doc], cached_embeddings)
+        _vectorstore_cache[pid] = vs
+        return vs
 
-  const handleSpeechResult = (transcript) => {
-    setInputValue(transcript);
-  };
+def parse_structured_response(text: str) -> Dict[str, Any]:
+    """
+    Parse the LLM output (which we instructed to use literal '### API Name', etc.)
+    Return JSON with keys: api_name, reaction_chemistry, yield, procedure, tables (list)
+    Each table is {headers: [], rows: [[], [], ...]}
+    """
+    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
+    def grab(section):
+        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else None
 
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSendMessage();
-    }
-  };
+    result["api_name"] = grab("API Name")
+    result["reaction_chemistry"] = grab("Reaction Chemistry")
+    result["yield"] = grab("Yield")
+    result["procedure"] = grab("Procedure")
+    tab_raw = grab("Tabular Data")
+    if tab_raw:
+        # find markdown tables starting with |...|
+        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
+        if table_patterns:
+            for tbl_md in table_patterns:
+                # normalize lines
+                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    # header line and separator
+                    header = [h.strip() for h in lines[0].split("|")]
+                    rows = []
+                    for rowline in lines[2:]:
+                        cols = [c.strip() for c in rowline.split("|")]
+                        rows.append(cols)
+                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
+        else:
+            # fallback: provide the raw block
+            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
+    return result
 
-  return (
-    <div className="flex h-screen max-h-screen overflow-hidden bg-gradient-to-br from-violet-50 to-purple-100">
-      <Sidebar 
-        isOpen={sidebarOpen} 
-        onClose={() => setSidebarOpen(false)}
-        chats={[1, 2, 3]} 
-        onNewChat={() => {
-          setMessages([]);
-          setProducts([]);
-          setCurrentProduct(null);
-          setReactionType('');
-        }}
-      />
-      
-      <div className="flex-1 flex flex-col h-full">
-        <header className="bg-gradient-to-r from-violet-600 to-purple-500 text-white p-4 flex items-center justify-between shadow-md">
-          <button 
-            onClick={() => setSidebarOpen(true)}
-            className="p-2 rounded-full hover:bg-violet-700 transition-colors"
-          >
-            <FaBars size={20} />
-          </button>
-          <h1 className="text-xl font-bold">Reaction Chemistry AI</h1>
-          <div className="w-10"></div> {/* Spacer */}
-        </header>
-        
-        <main className="flex-1 overflow-hidden p-4">
-          {currentProduct ? (
-            <ProductDetail 
-              product={currentProduct} 
-              onBack={() => setCurrentProduct(null)} 
-            />
-          ) : products.length > 0 ? (
-            <ProductGrid 
-              products={products} 
-              onSelectProduct={setCurrentProduct} 
-            />
-          ) : (
-            <div className="h-full flex flex-col max-w-4xl mx-auto">
-              <div 
-                id="chat-container"
-                className="flex-1 overflow-y-auto mb-4 p-4 bg-white/50 backdrop-blur-sm rounded-xl shadow-inner"
-              >
-                <AnimatePresence>
-                  {messages.map((message, index) => (
-                    <ChatMessage key={index} message={message} />
-                  ))}
-                  
-                  {isLoading && (
-                    <motion.div
-                      initial={{ opacity: 0 }}
-                      animate={{ opacity: 1 }}
-                      className="flex justify-start mb-4"
-                    >
-                      <div className="flex items-start">
-                        <div className="w-10 h-10 rounded-full flex items-center justify-center bg-purple-500">
-                          <div className="bg-white w-5 h-5 rounded-full animate-pulse" />
-                        </div>
-                        <div className="mx-3 px-4 py-3 bg-white shadow-md rounded-2xl rounded-tl-none w-24">
-                          <div className="flex space-x-1">
-                            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
-                            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
-                            <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></div>
-                          </div>
-                        </div>
-                      </div>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-              
-              <div className="mt-auto bg-white rounded-xl shadow-lg p-4">
-                <div className="flex items-end gap-3">
-                  <div className="flex-1 bg-violet-50 rounded-lg border border-violet-200">
-                    <textarea
-                      value={inputValue}
-                      onChange={(e) => setInputValue(e.target.value)}
-                      onKeyDown={handleKeyDown}
-                      placeholder="Ask about reaction chemistry..."
-                      className="w-full bg-transparent p-3 resize-none focus:outline-none min-h-[60px] max-h-32"
-                    />
-                    {interimText && (
-                      <div className="p-3 pt-0 text-gray-500 italic text-sm">
-                        {interimText}
-                      </div>
-                    )}
-                  </div>
-                  
-                  <div className="flex gap-2">
-                    <SpeechRecognition onResult={setInterimText} />
-                    <button
-                      onClick={handleSendMessage}
-                      disabled={isLoading || !inputValue.trim()}
-                      className={`px-5 py-3 rounded-lg font-medium ${
-                        inputValue.trim()
-                          ? 'bg-violet-600 text-white hover:bg-violet-700'
-                          : 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                      } transition-colors`}
-                    >
-                      Send
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-        </main>
-      </div>
-    </div>
-  );
-};
+# ------------------------------
+# FastAPI app
+# ------------------------------
+app = FastAPI(title="Reaction Database AI (FastAPI)")
 
-export default function App() {
-  return (
-    <AppProvider>
-      <ChatInterface />
-    </AppProvider>
-  );
-}
+# Allow the React dev server origin (adjust if you host differently)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # add your host/origin if different
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------
+# Pydantic models
+# ------------------------------
+class ProductOut(BaseModel):
+    id: str
+    name: str
+    reaction_type: str
+    has_scheme_image: bool
+    has_scheme_cdx: bool
+
+class QARequest(BaseModel):
+    product_id: str
+    question: Optional[str] = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+
+# ------------------------------
+# Endpoints
+# ------------------------------
+@app.get("/reactions", response_model=List[str])
+def get_reactions():
+    return REACTION_TYPES
+
+@app.get("/products", response_model=List[ProductOut])
+def get_products(reaction_type: Optional[str] = None):
+    allp = list_products()
+    if reaction_type:
+        allp = [p for p in allp if p["reaction_type"] == reaction_type]
+    out = []
+    for p in allp:
+        out.append(ProductOut(
+            id=p["id"],
+            name=p["name"],
+            reaction_type=p["reaction_type"],
+            has_scheme_image=bool(p["scheme_image"]),
+            has_scheme_cdx=bool(p["scheme_cdx"])
+        ))
+    return out
+
+@app.get("/product/{product_id}/meta")
+def product_meta(product_id: str):
+    products = list_products()
+    for p in products:
+        if p["id"] == product_id:
+            return {
+                "id": p["id"],
+                "name": p["name"],
+                "reaction_type": p["reaction_type"],
+                "pdf_path": p["pdf_path"],
+                "scheme_image": p["scheme_image"],
+                "scheme_cdx": p["scheme_cdx"]
+            }
+    raise HTTPException(status_code=404, detail="Product not found")
+
+@app.get("/product/{product_id}/pdf")
+def product_pdf(product_id: str):
+    meta = product_meta(product_id)
+    pdf_path = meta["pdf_path"]
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
+    raise HTTPException(status_code=404, detail="PDF not found")
+
+@app.get("/product/{product_id}/scheme-image")
+def product_scheme_image(product_id: str):
+    meta = product_meta(product_id)
+    path = meta.get("scheme_image")
+    if path and os.path.exists(path):
+        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
+    raise HTTPException(status_code=404, detail="Scheme image not found")
+
+@app.post("/product/details")
+def product_details(req: QARequest):
+    # Lookup product meta
+    products = list_products()
+    product = next((p for p in products if p["id"] == req.product_id), None)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # If already cached, return
+    if req.product_id in _product_details_cache:
+        return _product_details_cache[req.product_id]
+
+    # Build vectorstore (may take time)
+    vs = build_product_vector_store(product)
+    if not vs:
+        raise HTTPException(status_code=500, detail="Failed to build vector store (empty/invalid PDF)")
+
+    retriever = vs.as_retriever(search_kwargs={"k": 1})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=False
+    )
+
+    # Run QA
+    try:
+        raw_response = qa_chain.run(req.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+    parsed = parse_structured_response(raw_response)
+    # Cache
+    _product_details_cache[req.product_id] = parsed
+    return parsed
+
+# ------------------------------
+# Transcription endpoint (optional Google Cloud)
+# ------------------------------
+# If you want server-side Google STT you can paste your credentials JSON string into
+# GOOGLE_CREDENTIALS_JSON below (NOT recommended for public repos). For demos, prefer browser Web Speech API.
+GOOGLE_CREDENTIALS_JSON = ""  # <<< If you want to enable server-side Google STT, paste credentials JSON string here.
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
+    """
+    Accept an audio file (wav/webm/mp3) and return a transcript.
+    By default this endpoint will only provide a simple error unless GOOGLE_CREDENTIALS_JSON is provided.
+    The recommended demo approach is to use the browser Web Speech API for instant transcripts.
+    """
+    content = await file.read()
+    if not use_google:
+        # We recommend using browser speech API — but if user uploaded audio anyway, we can attempt a naive fallback:
+        # Try to return an error telling front-end to use browser API.
+        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
+
+    # If user wants Google transcription server-side:
+    if not GOOGLE_CREDENTIALS_JSON:
+        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
+
+    # Server-side Google Cloud Speech-to-Text usage (if enabled)
+    try:
+        from google.cloud import speech_v1p1beta1 as speech
+        from google.oauth2 import service_account
+    except Exception as e:
+        return {"error": f"google-cloud-speech library not installed: {e}"}
+
+    # Create credentials from JSON string (in-memory)
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(creds_info)
+    client = speech.SpeechClient(credentials=credentials)
+
+    audio = speech.RecognitionAudio(content=content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+    )
+
+    response = client.recognize(config=config, audio=audio)
+    transcripts = [r.alternatives[0].transcript for r in response.results]
+    return {"transcript": " ".join(transcripts)}
+
+# ------------------------------
+# Health
+# ------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# Run uvicorn via CLI: uvicorn main:app --host 0.0.0.0 --port 8000
