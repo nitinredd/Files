@@ -1,401 +1,181 @@
-app.jsx
+// src/components/ProductDetail.jsx
 import React, { useEffect, useState } from 'react';
-import ChatWindow from './components/ChatWindow';
-import ProductTabs from './components/ProductTabs';
-import ProductDetailModal from './components/ProductDetailModal';
-import SidebarHistory from './components/SidebarHistory';
-import { fetchReactions, fetchProducts, fetchProductMeta, fetchProductDetails, fetchSchemeImageUrl } from './api';
+import { downloadPdfUrl, fetchSchemeImageUrl } from '../api';
 
-export default function App(){
-  const [reactions, setReactions] = useState([]);
-  const [products, setProducts] = useState([]);
-  const [selectedReaction, setSelectedReaction] = useState(null);
-  const [selectedProduct, setSelectedProduct] = useState(null); // meta
-  const [productDetails, setProductDetails] = useState(null);
-  const [productListVisible, setProductListVisible] = useState(false);
-  const [detailModalOpen, setDetailModalOpen] = useState(false);
-  const [messages, setMessages] = useState([]); // start empty; chat bar only
-  const [history, setHistory] = useState([]);
-  const [loadingDetails, setLoadingDetails] = useState(false);
-  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
+export default function ProductDetail({ meta, details }) {
+  const [schemeUrl, setSchemeUrl] = useState(null);
+  const [imgStatus, setImgStatus] = useState('idle'); // 'idle' | 'checking' | 'ok' | 'error' 
+  const [imgError, setImgError] = useState('');
 
   useEffect(() => {
-    fetchReactions().then(setReactions).catch(e=>console.error(e));
-  }, []);
+    setSchemeUrl(null);
+    setImgStatus('idle');
+    setImgError('');
 
-  const pushMessage = (m) => setMessages(prev => [...prev, m]);
+    if (!meta) return;
 
-  const normalize = s => (s||'').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    // Choose URL:
+    // - if backend meta includes an http(s) url already, use it
+    // - else build from fetchSchemeImageUrl(meta.id)
+    const candidate = meta.scheme_image && typeof meta.scheme_image === 'string' && meta.scheme_image.match(/^https?:\/\//i)
+      ? meta.scheme_image
+      : fetchSchemeImageUrl(meta.id);
 
-  const handleUserSend = async (text) => {
-    pushMessage({ role: 'user', content: text });
+    console.log('[ProductDetail] scheme candidate url:', candidate);
+    setSchemeUrl(candidate);
 
-    const norm = normalize(text);
-    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g,'_')));
-    if (match) {
-      setSelectedReaction(match);
+    // Quick HEAD/GET check to surface status early
+    (async () => {
       try {
-        const prods = await fetchProducts(match);
-        setProducts(prods || []);
-        setProductListVisible(true);
-        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
-      } catch (e) {
-        console.error(e);
-        pushMessage({ role:'assistant', content: 'Error loading products for that reaction.' });
-      }
-      return;
-    }
-
-    const prefix = text.match(/(?:show|list|find).{0,20}for\s+(.+)/i);
-    if (prefix && prefix[1]) {
-      const candidate = prefix[1].trim();
-      const found = reactions.find(r => normalize(r).includes(normalize(candidate)) || normalize(candidate).includes(normalize(r)));
-      if (found) {
-        setSelectedReaction(found);
-        try {
-          const prods = await fetchProducts(found);
-          setProducts(prods || []);
-          setProductListVisible(true);
-          pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')}. Select below.`});
-        } catch (e) {
-          console.error(e);
-          pushMessage({ role:'assistant', content: 'Error fetching products.'});
+        setImgStatus('checking');
+        // Use GET because some servers don't allow HEAD; we won't read full body if not needed
+        const res = await fetch(candidate, { method: 'GET' });
+        if (!res.ok) {
+          setImgStatus('error');
+          setImgError(`HTTP ${res.status} ${res.statusText}`);
+          console.warn('[ProductDetail] scheme image fetch failed:', res.status, res.statusText);
+          return;
         }
-        return;
+        const ct = res.headers.get('content-type') || '';
+        if (!ct.startsWith('image/')) {
+          setImgStatus('error');
+          setImgError(`Not an image (content-type: ${ct})`);
+          console.warn('[ProductDetail] scheme image content-type invalid:', ct);
+          return;
+        }
+        setImgStatus('ok');
+      } catch (err) {
+        setImgStatus('error');
+        setImgError(err.message || 'Fetch error');
+        console.warn('[ProductDetail] scheme image fetch error:', err);
       }
-    }
+    })();
+  }, [meta]);
 
-    if (!selectedProduct) {
-      pushMessage({ role: 'assistant', content: 'Please select a product/document first (or type a reaction name to list products).' });
-      return;
-    }
+  if (!meta) {
+    return (
+      <div className="p-6 text-gray-500 bg-white rounded-2xl shadow-sm">
+        <div className="text-lg font-medium">Select a product to view details</div>
+        <div className="text-sm mt-2">Product metadata and structured tables will appear here.</div>
+      </div>
+    );
+  }
 
-    try {
-      setLoadingDetails(true);
-      const res = await fetchProductDetails(selectedProduct.id, text);
-      const d = res.data || res;
-      let assistantText = '';
-      if (d.api_name) assistantText += `API: ${d.api_name}\n\n`;
-      if (d.reaction_chemistry) assistantText += `Reaction: ${d.reaction_chemistry}\n\n`;
-      if (d.yield) assistantText += `Yield: ${d.yield}\n\n`;
-      if (d.procedure) assistantText += `Procedure (excerpt):\n${(d.procedure||'').slice(0,600)}\n\n`;
-      if (!assistantText) assistantText = 'No structured answer found.';
-      pushMessage({ role: 'assistant', content: assistantText });
-      setProductDetails(d);
-      setDetailModalOpen(true);
-      setHistory(h => [{ title: selectedProduct.name, content: text, productId: selectedProduct.id }, ...h]);
-    } catch (err) {
-      console.error(err);
-      pushMessage({ role: 'assistant', content: 'Error querying backend.'});
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
-  const handleSelectProduct = async (productId) => {
-    const meta = await fetchProductMeta(productId);
-    setSelectedProduct(meta);
-    setProductDetails(null);
-    setSelectedSchemeUrl(null);
-    setLoadingDetails(true);
-    // show fancy loader by opening the modal early
-    setDetailModalOpen(true);
-    try {
-      // preload scheme url (for chat preview)
-      const scheme = await fetchSchemeImageUrl(productId);
-      setSelectedSchemeUrl(scheme);
-    } catch(e){
-      // ignore
-    }
-    try {
-      const res = await fetchProductDetails(productId);
-      const d = res.data || res;
-      setProductDetails(d);
-      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
-    } catch (e) {
-      console.error(e);
-      pushMessage({ role: 'assistant', content: 'Failed to load product details.'});
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
+  const pdfUrl = downloadPdfUrl(meta.id);
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
-      <div className="mx-auto my-8 w-full max-w-6xl px-4">
-        <div className="text-center mb-6">
-          <h1 className="text-3xl font-extrabold text-primary">Reaction Database AI</h1>
+    <div className="p-6 bg-white rounded-2xl shadow-lg">
+      <div className="flex justify-between items-start">
+        <div>
+          <h2 className="text-2xl font-bold text-primary">{meta.name}</h2>
+          <div className="text-sm text-purple-700">{meta.reaction_type}</div>
         </div>
-
-        <div className="relative">
-          <ChatWindow
-            messages={messages}
-            onSend={handleUserSend}
-            centeredWidth="max-w-4xl"
-            selectedSchemeUrl={selectedSchemeUrl}
-            selectedProduct={selectedProduct}
-          />
-
-          {productListVisible && products && products.length > 0 && (
-            <div className="mt-6">
-              <ProductTabs products={products} onSelect={handleSelectProduct} />
-            </div>
-          )}
-        </div>
-      </div>
-
-      <SidebarHistory history={history} onSelect={(h) => {
-        if (h && h.productId) handleSelectProduct(h.productId);
-      }} />
-
-      <ProductDetailModal
-        open={detailModalOpen}
-        onClose={() => setDetailModalOpen(false)}
-        meta={selectedProduct}
-        details={productDetails}
-        loading={loadingDetails}
-      />
-    </div>
-  );
-}
-#######################3
-src/components/ProductTabs.jsx
-import React from 'react';
-import { motion } from 'framer-motion';
-
-/**
- * Grid layout that wraps to show all products.
- */
-export default function ProductTabs({ products = [], onSelect }){
-  return (
-    <div className="bg-transparent">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
-        <div className="text-sm text-gray-500">Click a tile to view details</div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-        {products.map(p => (
-          <motion.button
-            key={p.id}
-            whileHover={{ y: -6 }}
-            onClick={() => onSelect(p.id)}
-            title={p.name}
-            className="bg-white border rounded-2xl p-4 shadow hover:shadow-xl transition flex flex-col justify-between text-left"
+        <div className="flex gap-2 items-center">
+          <a
+            href={schemeUrl || '#'}
+            target="_blank"
+            rel="noreferrer"
+            className="px-3 py-1 rounded-md bg-secondary/20 text-secondary text-sm"
+            title="Open synthetic scheme image"
           >
-            <div className="flex items-start gap-3">
-              <div className="flex-1">
-                <div className="text-sm font-semibold text-primary truncate" style={{ maxWidth: '100%' }}>{p.name}</div>
-                <div className="text-xs text-gray-400 mt-1">{p.reaction_type.replace(/_/g,' ')}</div>
-              </div>
-            </div>
-            <div className="mt-3 text-xs text-gray-500 truncate">{p.pdf_path ? p.pdf_path.split(/[\\/]/).pop() : ''}</div>
-          </motion.button>
-        ))}
+            View Scheme
+          </a>
+
+          <a
+            href={pdfUrl}
+            className="px-3 py-1 rounded-md bg-accent/10 text-accent text-sm"
+            target="_blank"
+            rel="noreferrer"
+            download={`${meta.name}.pdf`}
+            title="Download full PDF"
+          >
+            Download PDF
+          </a>
+        </div>
       </div>
-    </div>
-  );
-}
-#############################3
-src/components/ProductDetailModal.jsx
-import React from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { downloadPdfUrl } from '../api';
-import FancyLoader from './FancyLoader';
 
-export default function ProductDetailModal({ open, onClose, meta, details, loading }){
-  const pdfUrl = meta ? downloadPdfUrl(meta.id) : '#';
+      <div className="mt-6 space-y-4">
+        <div>
+          <h4 className="text-sm text-gray-500">API Name</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.api_name || '—'}</div>
+        </div>
 
-  return (
-    <AnimatePresence>
-      {open && meta && (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4">
-          <motion.div initial={{ y: -30, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ duration: 0.5 }} exit={{ y: -20, opacity: 0 }} className="w-full max-w-5xl bg-white rounded-3xl shadow-3xl overflow-hidden">
-            <div className="flex items-start justify-between p-5 border-b">
-              <div>
-                <h3 className="text-2xl font-bold text-primary leading-tight">{meta.name}</h3>
-                <div className="text-sm text-gray-500 mt-1">{meta.reaction_type.replace(/_/g,' ')}</div>
-              </div>
-              <div className="flex items-center gap-3">
-                <a href={pdfUrl} className="px-3 py-1 rounded-md bg-accent/10 text-accent" target="_blank" rel="noreferrer" download={`${meta.name}.pdf`}>Download PDF</a>
-                <button onClick={onClose} className="px-3 py-1 rounded-md bg-gray-100">Close</button>
-              </div>
-            </div>
+        <div>
+          <h4 className="text-sm text-gray-500">Reaction Chemistry</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.reaction_chemistry || '—'}</div>
+        </div>
 
-            <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6 max-h-[75vh] overflow-auto">
-              <div className="lg:col-span-2 space-y-4">
-                {loading ? (
-                  <div className="py-6 px-4 bg-gray-50 rounded-lg">
-                    <FancyLoader />
+        <div>
+          <h4 className="text-sm text-gray-500">Yield</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.yield || '—'}</div>
+        </div>
+
+        <div>
+          <h4 className="text-sm text-gray-500">Procedure</h4>
+          <div className="mt-1 p-3 bg-white rounded border whitespace-pre-wrap">{details?.procedure || '—'}</div>
+        </div>
+
+        <div>
+          <h4 className="text-sm text-gray-500">Tables</h4>
+          {details?.tables && details.tables.length > 0 ? (
+            details.tables.map((t, idx) => (
+              <div className="mt-3" key={idx}>
+                {t.headers && t.headers.length > 0 ? (
+                  <div className="overflow-auto rounded-lg border">
+                    <table className="min-w-full divide-y">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          {t.headers.map((h, i) => <th key={i} className="px-4 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y">
+                        {t.rows.map((r, ri) => (
+                          <tr key={ri}>
+                            {r.map((c, ci) => <td key={ci} className="px-4 py-2 text-sm">{c}</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                ) : details ? (
-                  <>
-                    <section>
-                      <h4 className="text-sm text-gray-500">API Name</h4>
-                      <div className="mt-2 p-3 bg-gray-50 rounded text-base leading-relaxed font-medium">{details.api_name || '—'}</div>
-                    </section>
-
-                    <section>
-                      <h4 className="text-sm text-gray-500">Reaction Chemistry</h4>
-                      <div className="mt-2 p-3 bg-gray-50 rounded text-sm leading-relaxed">{details.reaction_chemistry || '—'}</div>
-                    </section>
-
-                    <section>
-                      <h4 className="text-sm text-gray-500">Yield</h4>
-                      <div className="mt-2 p-3 bg-gray-50 rounded text-sm">{details.yield || '—'}</div>
-                    </section>
-
-                    <section>
-                      <h4 className="text-sm text-gray-500">Procedure</h4>
-                      <div className="mt-2 p-4 bg-white rounded border whitespace-pre-wrap text-sm leading-snug">{details.procedure || '—'}</div>
-                    </section>
-
-                    <section>
-                      <h4 className="text-sm text-gray-500">Tables</h4>
-                      <div className="mt-2 space-y-3">
-                        {details.tables && details.tables.length > 0 ? details.tables.map((t,i)=>(
-                          <div key={i} className="rounded-lg border overflow-auto">
-                            {t.headers && t.headers.length>0 ? (
-                              <table className="min-w-full">
-                                <thead className="bg-gray-50"><tr>{t.headers.map((h,idx)=> <th key={idx} className="px-3 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}</tr></thead>
-                                <tbody>
-                                  {t.rows.map((r,ri)=> <tr key={ri} className="odd:bg-white even:bg-gray-50">{r.map((c,ci)=> <td key={ci} className="px-3 py-2 text-sm">{c}</td>)}</tr>)}
-                                </tbody>
-                              </table>
-                            ) : <pre className="p-3 text-sm bg-gray-50">{t.raw_md}</pre>}
-                          </div>
-                        )) : <div className="text-sm text-gray-500">No tables detected</div>}
-                      </div>
-                    </section>
-                  </>
                 ) : (
-                  <div className="text-sm text-gray-500">No details loaded</div>
+                  <pre className="bg-gray-50 p-3 rounded whitespace-pre-wrap">{t.raw_md}</pre>
                 )}
               </div>
-
-              <div className="space-y-4">
-                <div className="bg-gray-50 rounded-lg p-3 flex items-center justify-center" style={{minHeight: 220}}>
-                  {loading ? <FancyLoader small /> : (
-                    details && details.raw ? (
-                      <img src={meta.scheme_image ? meta.scheme_image : ''} alt="scheme" className="max-w-full max-h-[360px] object-contain rounded" onError={(e)=>{ e.currentTarget.style.display='none'; }} />
-                    ) : (
-                      <div className="text-sm text-gray-500">Scheme preview will appear here</div>
-                    )
-                  )}
-                </div>
-
-                <div className="bg-white border rounded-lg p-3">
-                  <div className="text-xs text-gray-500">Quick Actions</div>
-                  <div className="mt-3 flex flex-col gap-2">
-                    <a href={pdfUrl} className="px-3 py-2 rounded-md bg-primary text-white text-center" target="_blank" rel="noreferrer" download={`${meta.name}.pdf`}>Download PDF</a>
-                    <button className="px-3 py-2 rounded-md border text-sm">Copy Procedure</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-          </motion.div>
-        </motion.div>
-      )}
-    </AnimatePresence>
-  );
-}
-##############################
-src/components/ChatWindow.jsx
-import React, { useRef, useEffect, useState } from 'react';
-import { motion } from 'framer-motion';
-import { FiSend } from 'react-icons/fi';
-import MicrophoneButton from './MicrophoneButton';
-
-export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3xl", selectedSchemeUrl = null, selectedProduct = null }){
-  const [text, setText] = useState('');
-  const textareaRef = useRef();
-
-  useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = (textareaRef.current.scrollHeight) + 'px';
-    }
-  }, [text, messages]);
-
-  const submit = () => {
-    const t = text.trim();
-    if (!t) return;
-    onSend(t);
-    setText('');
-  };
-
-  return (
-    <div className={`mx-auto ${centeredWidth}`}>
-      <div className="bg-white rounded-3xl shadow-2xl p-6">
-        {/* scheme preview area (only when product selected) */}
-        {selectedProduct && selectedSchemeUrl && (
-          <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.45 }} className="mb-4 flex items-center gap-4">
-            <img src={selectedSchemeUrl} alt="scheme" className="w-28 h-20 object-contain rounded-lg border p-1 bg-white" onError={(e)=> e.currentTarget.style.display='none'} />
-            <div>
-              <div className="text-sm font-semibold text-primary">{selectedProduct.name}</div>
-              <div className="text-xs text-gray-500">{selectedProduct.reaction_type?.replace(/_/g,' ')}</div>
-            </div>
-          </motion.div>
-        )}
-
-        <div className="min-h-[180px] max-h-[50vh] overflow-auto pr-2">
-          {messages.length === 0 && (
-            <div className="text-center text-gray-400 py-8">Type a reaction name or ask a question to begin.</div>
-          )}
-
-          {messages.map((m, idx) => (
-            <motion.div key={idx} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.28, delay: idx * 0.02 }} className={`mb-3 ${m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}`}>
-              <div className={`${m.role === 'user' ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-gray-50 text-gray-800'} px-4 py-3 rounded-2xl max-w-[80%] whitespace-pre-wrap break-words`} style={{fontFamily: 'Inter, system-ui, -apple-system'}}>
-                {m.content}
-              </div>
-            </motion.div>
-          ))}
+            ))
+          ) : <div className="text-sm text-gray-500">No tabular data detected.</div>}
         </div>
 
-        <div className="mt-4 flex items-end gap-3">
-          <MicrophoneButton onText={(t)=> setText(t)} />
-          <textarea ref={textareaRef} value={text} onChange={(e)=> setText(e.target.value)} rows={1} placeholder="Ask about reaction chemistry or type a reaction name..." className="flex-1 resize-none px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary text-sm" onKeyDown={(e)=>{ if (e.key==='Enter' && !e.shiftKey){ e.preventDefault(); submit(); } }} />
-          <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
-            <FiSend />
-          </button>
+        {/* Scheme image preview shown below tables for better layout */}
+        <div className="mt-4">
+          <h4 className="text-sm text-gray-500 mb-2">Synthetic Scheme Preview</h4>
+          <div className="w-full bg-gray-50 rounded p-3 flex items-center justify-center" style={{ minHeight: 120 }}>
+            {imgStatus === 'checking' && <div className="text-sm text-gray-500">Checking image…</div>}
+            {imgStatus === 'ok' && schemeUrl && (
+              <img
+                src={schemeUrl}
+                alt={`${meta.name} scheme`}
+                style={{ maxWidth: '100%', maxHeight: '360px', objectFit: 'contain', borderRadius: '8px' }}
+                onError={(e) => {
+                  e.currentTarget.style.display = 'none';
+                  const parent = e.currentTarget.parentNode;
+                  if (parent) {
+                    const node = document.createElement('div');
+                    node.textContent = 'Scheme image not available.';
+                    node.className = 'text-sm text-gray-500';
+                    parent.appendChild(node);
+                  }
+                }}
+              />
+            )}
+            {imgStatus === 'error' && (
+              <div className="text-sm text-red-500">
+                Could not load scheme image. {imgError ? `(${imgError})` : ''}
+              </div>
+            )}
+            {imgStatus === 'idle' && <div className="text-sm text-gray-500">No scheme image available.</div>}
+          </div>
         </div>
       </div>
     </div>
   );
 }
-########################################
-src/components/FancyLoader.jsx
-import React from 'react';
-import { motion } from 'framer-motion';
-
-export default function FancyLoader({ small = false }){
-  return (
-    <div className={`flex items-center justify-center ${small ? 'py-6' : 'py-12'}`}>
-      <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 2, ease: "linear" }} className="w-16 h-16 rounded-full bg-gradient-to-br from-secondary to-primary shadow-lg flex items-center justify-center">
-        <motion.div initial={{ scale: 0.6 }} animate={{ scale: [0.6, 1, 0.6] }} transition={{ repeat: Infinity, duration: 1.2 }} className="w-8 h-8 rounded-full bg-white/90" />
-      </motion.div>
-      <div className="ml-4 text-sm text-gray-500">
-        <div className="font-medium">Loading product details</div>
-        <div className="text-xs mt-1">Fetching extracted information — this may take a few seconds</div>
-      </div>
-    </div>
-  );
-}
-###############################
-src/styles.css
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
-
-body { font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
-
-.truncate {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.no-scrollbar::-webkit-scrollbar { display: none; }
-.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-
-.line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-
