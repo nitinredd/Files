@@ -1,181 +1,302 @@
-// src/components/ProductDetail.jsx
-import React, { useEffect, useState } from 'react';
+// ProductDetailModal.jsx
+import React, { useEffect, useState, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import FancyLoader from './FancyLoader';
 import { downloadPdfUrl, fetchSchemeImageUrl } from '../api';
 
-export default function ProductDetail({ meta, details }) {
+/**
+ * ProductDetailModal
+ *
+ * Props:
+ *  - open (bool) : whether modal is shown
+ *  - onClose (fn) : close handler
+ *  - meta (object) : product meta { id, name, reaction_type, scheme_image? }
+ *  - details (object|null) : structured details from backend (api_name, reaction_chemistry, yield, procedure, tables[])
+ *  - loading (bool) : whether details are currently being fetched
+ *
+ * This component is robust and defensive: it preloads scheme image and handles errors/CORS gracefully.
+ */
+export default function ProductDetailModal({ open, onClose, meta, details, loading }) {
   const [schemeUrl, setSchemeUrl] = useState(null);
-  const [imgStatus, setImgStatus] = useState('idle'); // 'idle' | 'checking' | 'ok' | 'error' 
+  const [imgStatus, setImgStatus] = useState('idle'); // idle | loading | ok | error
   const [imgError, setImgError] = useState('');
+  const closeBtnRef = useRef(null);
 
   useEffect(() => {
+    if (!open) {
+      setSchemeUrl(null);
+      setImgStatus('idle');
+      setImgError('');
+      return;
+    }
+    // Focus close button for keyboard users
+    if (closeBtnRef.current) closeBtnRef.current.focus();
+  }, [open]);
+
+  // choose and preload the scheme image intelligently
+  useEffect(() => {
+    let mounted = true;
     setSchemeUrl(null);
     setImgStatus('idle');
     setImgError('');
 
-    if (!meta) return;
+    if (!meta || !open) return;
 
-    // Choose URL:
-    // - if backend meta includes an http(s) url already, use it
-    // - else build from fetchSchemeImageUrl(meta.id)
-    const candidate = meta.scheme_image && typeof meta.scheme_image === 'string' && meta.scheme_image.match(/^https?:\/\//i)
-      ? meta.scheme_image
-      : fetchSchemeImageUrl(meta.id);
+    // Candidate priority:
+    // 1) meta.scheme_image if it's already an http(s) URL
+    // 2) fetchSchemeImageUrl(meta.id) — which returns a backend endpoint
+    const candidateUrl =
+      meta.scheme_image && typeof meta.scheme_image === 'string' && /^https?:\/\//i.test(meta.scheme_image)
+        ? meta.scheme_image
+        : fetchSchemeImageUrl(meta.id);
 
-    console.log('[ProductDetail] scheme candidate url:', candidate);
-    setSchemeUrl(candidate);
+    // Defensive: if candidateUrl is falsy, skip
+    if (!candidateUrl) {
+      setImgStatus('error');
+      setImgError('No scheme image configured for this product.');
+      return;
+    }
 
-    // Quick HEAD/GET check to surface status early
-    (async () => {
+    setSchemeUrl(candidateUrl);
+    setImgStatus('loading');
+
+    // Preload with native Image to detect load / error early
+    const img = new Image();
+    img.crossOrigin = 'anonymous'; // attempt CORS-friendly load; if server doesn't allow, onerror will fire
+    img.onload = () => {
+      if (!mounted) return;
+      setImgStatus('ok');
+    };
+    img.onerror = (err) => {
+      if (!mounted) return;
+      setImgStatus('error');
+      // try to provide a helpful error string
       try {
-        setImgStatus('checking');
-        // Use GET because some servers don't allow HEAD; we won't read full body if not needed
-        const res = await fetch(candidate, { method: 'GET' });
-        if (!res.ok) {
-          setImgStatus('error');
-          setImgError(`HTTP ${res.status} ${res.statusText}`);
-          console.warn('[ProductDetail] scheme image fetch failed:', res.status, res.statusText);
-          return;
-        }
-        const ct = res.headers.get('content-type') || '';
-        if (!ct.startsWith('image/')) {
-          setImgStatus('error');
-          setImgError(`Not an image (content-type: ${ct})`);
-          console.warn('[ProductDetail] scheme image content-type invalid:', ct);
-          return;
-        }
-        setImgStatus('ok');
-      } catch (err) {
-        setImgStatus('error');
-        setImgError(err.message || 'Fetch error');
-        console.warn('[ProductDetail] scheme image fetch error:', err);
+        if (err && err.message) setImgError(err.message);
+        else setImgError('Failed to load image (CORS or missing file).');
+      } catch {
+        setImgError('Failed to load image.');
       }
-    })();
-  }, [meta]);
+    };
+    // start loading
+    try {
+      img.src = candidateUrl;
+      // If the URL fails synchronously (rare), handle via error fallback
+    } catch (e) {
+      setImgStatus('error');
+      setImgError(e.message || 'Failed to start loading image.');
+    }
 
-  if (!meta) {
-    return (
-      <div className="p-6 text-gray-500 bg-white rounded-2xl shadow-sm">
-        <div className="text-lg font-medium">Select a product to view details</div>
-        <div className="text-sm mt-2">Product metadata and structured tables will appear here.</div>
-      </div>
-    );
-  }
+    return () => {
+      mounted = false;
+    };
+  }, [meta, open]);
 
+  // Close on ESC
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.key === 'Escape') {
+        onClose && onClose();
+      }
+    };
+    if (open) window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [open, onClose]);
+
+  if (!open || !meta) return null;
+
+  // helpers
   const pdfUrl = downloadPdfUrl(meta.id);
+  const copyProcedure = async () => {
+    try {
+      if (!details || !details.procedure) return;
+      await navigator.clipboard.writeText(details.procedure);
+      // small inline feedback - could be replaced with toast
+      alert('Procedure copied to clipboard');
+    } catch (e) {
+      alert('Failed to copy (clipboard permission denied).');
+    }
+  };
+
+  const openFullImage = () => {
+    if (!schemeUrl) return;
+    window.open(schemeUrl, '_blank', 'noopener,noreferrer');
+  };
 
   return (
-    <div className="p-6 bg-white rounded-2xl shadow-lg">
-      <div className="flex justify-between items-start">
-        <div>
-          <h2 className="text-2xl font-bold text-primary">{meta.name}</h2>
-          <div className="text-sm text-purple-700">{meta.reaction_type}</div>
-        </div>
-        <div className="flex gap-2 items-center">
-          <a
-            href={schemeUrl || '#'}
-            target="_blank"
-            rel="noreferrer"
-            className="px-3 py-1 rounded-md bg-secondary/20 text-secondary text-sm"
-            title="Open synthetic scheme image"
-          >
-            View Scheme
-          </a>
+    <AnimatePresence>
+      <motion.div
+        key="modal-root"
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        className="fixed inset-0 z-50 flex items-center justify-center"
+        aria-modal="true"
+        role="dialog"
+      >
+        {/* overlay */}
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="absolute inset-0 bg-black/35"
+          onClick={onClose}
+          aria-hidden="true"
+        />
 
-          <a
-            href={pdfUrl}
-            className="px-3 py-1 rounded-md bg-accent/10 text-accent text-sm"
-            target="_blank"
-            rel="noreferrer"
-            download={`${meta.name}.pdf`}
-            title="Download full PDF"
-          >
-            Download PDF
-          </a>
-        </div>
-      </div>
+        {/* modal container */}
+        <motion.div
+          initial={{ y: -30, opacity: 0, scale: 0.98 }}
+          animate={{ y: 0, opacity: 1, scale: 1 }}
+          exit={{ y: -20, opacity: 0, scale: 0.98 }}
+          transition={{ duration: 0.45, ease: [0.2, 0.9, 0.2, 1] }}
+          className="relative z-60 w-full max-w-6xl mx-4 rounded-2xl bg-white shadow-2xl overflow-hidden"
+          role="document"
+        >
+          {/* header */}
+          <div className="flex items-start justify-between px-6 py-4 border-b">
+            <div className="pr-4">
+              <h2 className="text-xl md:text-2xl font-semibold text-primary leading-tight">{meta.name}</h2>
+              <div className="text-sm text-gray-500 mt-1">{meta.reaction_type?.replace(/_/g, ' ')}</div>
+            </div>
 
-      <div className="mt-6 space-y-4">
-        <div>
-          <h4 className="text-sm text-gray-500">API Name</h4>
-          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.api_name || '—'}</div>
-        </div>
+            <div className="flex items-center gap-2">
+              <a href={pdfUrl} target="_blank" rel="noreferrer" className="inline-flex items-center px-3 py-2 rounded-md bg-primary text-white text-sm shadow-sm" download={`${meta.name}.pdf`}>
+                Download PDF
+              </a>
 
-        <div>
-          <h4 className="text-sm text-gray-500">Reaction Chemistry</h4>
-          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.reaction_chemistry || '—'}</div>
-        </div>
+              <button
+                ref={closeBtnRef}
+                onClick={onClose}
+                className="inline-flex items-center px-3 py-2 rounded-md bg-gray-100 text-sm hover:bg-gray-200"
+                aria-label="Close product details"
+              >
+                Close
+              </button>
+            </div>
+          </div>
 
-        <div>
-          <h4 className="text-sm text-gray-500">Yield</h4>
-          <div className="mt-1 p-3 bg-gray-50 rounded">{details?.yield || '—'}</div>
-        </div>
+          {/* body */}
+          <div className="p-6 grid grid-cols-1 lg:grid-cols-3 gap-6 max-h-[78vh] overflow-auto">
+            {/* left / main column — details */}
+            <div className="lg:col-span-2 space-y-5">
+              {/* top summary cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="bg-gray-50 p-3 rounded-lg">
+                  <div className="text-xs text-gray-500">API Name</div>
+                  <div className="text-sm font-medium mt-1 text-gray-800">{details?.api_name || '—'}</div>
+                </div>
+                <div className="bg-gray-50 p-3 rounded-lg">
+                  <div className="text-xs text-gray-500">Reaction Chemistry</div>
+                  <div className="text-sm font-medium mt-1 text-gray-800">{details?.reaction_chemistry || '—'}</div>
+                </div>
+                <div className="bg-gray-50 p-3 rounded-lg">
+                  <div className="text-xs text-gray-500">Yield</div>
+                  <div className="text-sm font-medium mt-1 text-gray-800">{details?.yield || '—'}</div>
+                </div>
+              </div>
 
-        <div>
-          <h4 className="text-sm text-gray-500">Procedure</h4>
-          <div className="mt-1 p-3 bg-white rounded border whitespace-pre-wrap">{details?.procedure || '—'}</div>
-        </div>
+              {/* Procedure */}
+              <div>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm text-gray-500">Procedure</h3>
+                  <div className="flex gap-2">
+                    <button onClick={copyProcedure} className="text-xs px-2 py-1 bg-gray-100 rounded">Copy Procedure</button>
+                    <a href={pdfUrl} target="_blank" rel="noreferrer" className="text-xs px-2 py-1 bg-white border rounded">Open Source PDF</a>
+                  </div>
+                </div>
+                <div className="mt-2 p-4 bg-white border rounded text-sm leading-relaxed whitespace-pre-wrap" style={{ fontFamily: 'ui-serif, Georgia, "Times New Roman", serif' }}>
+                  {details?.procedure || <span className="text-gray-400">Procedure not available.</span>}
+                </div>
+              </div>
 
-        <div>
-          <h4 className="text-sm text-gray-500">Tables</h4>
-          {details?.tables && details.tables.length > 0 ? (
-            details.tables.map((t, idx) => (
-              <div className="mt-3" key={idx}>
-                {t.headers && t.headers.length > 0 ? (
-                  <div className="overflow-auto rounded-lg border">
-                    <table className="min-w-full divide-y">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          {t.headers.map((h, i) => <th key={i} className="px-4 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}
-                        </tr>
-                      </thead>
-                      <tbody className="bg-white divide-y">
-                        {t.rows.map((r, ri) => (
-                          <tr key={ri}>
-                            {r.map((c, ci) => <td key={ci} className="px-4 py-2 text-sm">{c}</td>)}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+              {/* Tables */}
+              <div>
+                <h3 className="text-sm text-gray-500 mb-2">Tabular Data</h3>
+                {details?.tables && details.tables.length > 0 ? (
+                  <div className="space-y-4">
+                    {details.tables.map((t, ti) => (
+                      <div key={ti} className="rounded-lg border overflow-auto">
+                        {t.headers && t.headers.length > 0 ? (
+                          <table className="min-w-full text-sm">
+                            <thead className="bg-gray-50">
+                              <tr>
+                                {t.headers.map((h, hi) => (
+                                  <th key={hi} className="px-3 py-2 text-left font-medium text-gray-600">{h}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {t.rows.map((r, ri) => (
+                                <tr key={ri} className="odd:bg-white even:bg-gray-50">
+                                  {r.map((c, ci) => <td key={ci} className="px-3 py-2 align-top">{c}</td>)}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        ) : (
+                          <pre className="p-3 text-sm bg-gray-50">{t.raw_md}</pre>
+                        )}
+                      </div>
+                    ))}
                   </div>
                 ) : (
-                  <pre className="bg-gray-50 p-3 rounded whitespace-pre-wrap">{t.raw_md}</pre>
+                  <div className="text-sm text-gray-500">No tabular data detected in this document.</div>
                 )}
               </div>
-            ))
-          ) : <div className="text-sm text-gray-500">No tabular data detected.</div>}
-        </div>
+            </div>
 
-        {/* Scheme image preview shown below tables for better layout */}
-        <div className="mt-4">
-          <h4 className="text-sm text-gray-500 mb-2">Synthetic Scheme Preview</h4>
-          <div className="w-full bg-gray-50 rounded p-3 flex items-center justify-center" style={{ minHeight: 120 }}>
-            {imgStatus === 'checking' && <div className="text-sm text-gray-500">Checking image…</div>}
-            {imgStatus === 'ok' && schemeUrl && (
-              <img
-                src={schemeUrl}
-                alt={`${meta.name} scheme`}
-                style={{ maxWidth: '100%', maxHeight: '360px', objectFit: 'contain', borderRadius: '8px' }}
-                onError={(e) => {
-                  e.currentTarget.style.display = 'none';
-                  const parent = e.currentTarget.parentNode;
-                  if (parent) {
-                    const node = document.createElement('div');
-                    node.textContent = 'Scheme image not available.';
-                    node.className = 'text-sm text-gray-500';
-                    parent.appendChild(node);
-                  }
-                }}
-              />
-            )}
-            {imgStatus === 'error' && (
-              <div className="text-sm text-red-500">
-                Could not load scheme image. {imgError ? `(${imgError})` : ''}
+            {/* right column — scheme preview + actions */}
+            <div className="space-y-4">
+              <div className="bg-gray-50 rounded-lg p-3 flex flex-col items-stretch justify-center" style={{ minHeight: 220 }}>
+                {/* show loader while either details loading or image loading */}
+                { (loading || imgStatus === 'loading') && (
+                  <div className="flex items-center justify-center p-6">
+                    <FancyLoader message={loading ? 'Loading details' : 'Loading scheme preview'} sub={loading ? 'Extracting structured content' : 'Fetching image preview'} />
+                  </div>
+                )}
+
+                {imgStatus === 'ok' && schemeUrl && (
+                  <div className="flex flex-col items-center gap-3">
+                    <img
+                      src={schemeUrl}
+                      alt={`${meta.name} scheme`}
+                      className="max-w-full max-h-[360px] object-contain rounded-md border"
+                      onClick={openFullImage}
+                      style={{ cursor: 'zoom-in' }}
+                    />
+                    <div className="text-xs text-gray-500">Click image to open full size</div>
+                  </div>
+                )}
+
+                {imgStatus === 'error' && (
+                  <div className="text-sm text-red-500 text-center">
+                    <div>Scheme preview not available.</div>
+                    <div className="text-xs text-gray-500 mt-1">{imgError}</div>
+                  </div>
+                )}
+
+                {imgStatus === 'idle' && !loading && (
+                  <div className="text-sm text-gray-500 text-center">No scheme image provided for this product.</div>
+                )}
               </div>
-            )}
-            {imgStatus === 'idle' && <div className="text-sm text-gray-500">No scheme image available.</div>}
+
+              <div className="bg-white border rounded-lg p-3">
+                <div className="text-xs text-gray-500">Quick Actions</div>
+                <div className="mt-3 grid grid-cols-1 gap-2">
+                  <a href={pdfUrl} target="_blank" rel="noreferrer" className="inline-flex justify-center px-3 py-2 rounded-md bg-primary text-white text-sm">Download PDF</a>
+                  <button onClick={() => copyProcedure()} className="px-3 py-2 rounded-md border text-sm">Copy Procedure</button>
+                </div>
+              </div>
+
+              {/* meta + source path (helpful debug info) */}
+              <div className="text-xs text-gray-400">
+                <div>Product ID: <span className="text-gray-600">{meta.id}</span></div>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
-    </div>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
   );
 }
