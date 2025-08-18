@@ -1,389 +1,528 @@
-# main.py
-"""
-FastAPI backend for Reaction Database AI
-Single-file deployment as requested.
+package.json
+{
+  "name": "reaction-db-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "axios": "^1.4.0",
+    "framer-motion": "^10.12.16"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "tailwindcss": "^3.4.8",
+    "postcss": "^8.4.21",
+    "autoprefixer": "^10.4.14"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}
+############################3
+tailwind.config.js
+export default {
+    content: ['./index.html', './src/**/*.{js,jsx,ts,tsx}'],
+    theme: {
+      extend: {
+        colors: {
+          primary: '#6B21A8', // deep violet
+          secondary: '#C084FC', // lighter violet
+          accent: '#7C3AED', // purple
+          bg: '#FAF8FF',
+        }
+      }
+    },
+    plugins: [],
+  }
+###########################
+postcss.config.js
+export default {
+    plugins: {
+      tailwindcss: {},
+      autoprefixer: {},
+    },
+  };
+#####################
+public/index.html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Reaction Database AI — Demo</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.jsx"></script>
+  </body>
+</html>
+###########################
+src/styles.css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-Install requirements:
-pip install fastapi uvicorn python-multipart pydantic "python-multipart" PyMuPDF pandas langchain faiss-cpu pillow pydantic[dotenv] google-cloud-speech
+/* small customizations */
+body {
+  background: linear-gradient(180deg, #FBFAFF 0%, #F6F0FF 100%);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+###########################
+src/index.jsx
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+import './styles.css'
 
-(You may not need google-cloud-speech if you only use browser speech.)
-"""
+createRoot(document.getElementById('root')).render(<App />)
+#########################
+src/api.js
+import axios from 'axios';
+export const BASE_URL = 'http://localhost:8000';
 
-import os
-import re
-import glob
-import base64
-import io
-import json
-import threading
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import fitz  # PyMuPDF
-import pandas as pd
-from PIL import Image
+export const api = axios.create({
+  baseURL: BASE_URL,
+  timeout: 60000,
+});
 
-# LangChain & Azure imports (kept as your original block, unchanged)
-from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+// API helpers
+export const fetchReactions = () => api.get('/reactions').then(r => r.data);
+export const fetchProducts = (reaction) => api.get('/products', { params: reaction ? { reaction_type: reaction } : {} }).then(r => r.data);
+export const fetchProductMeta = (productId) => api.get(`/product/${productId}/meta`).then(r => r.data);
+export const downloadPdfUrl = (productId) => `${BASE_URL}/product/${productId}/pdf`;
+export const fetchProductDetails = (productId) => api.post('/product/details', { product_id: productId });
+export const fetchSchemeImageUrl = (productId) => `${BASE_URL}/product/${productId}/scheme-image`;
+export const transcribeAudio = (file, use_google=false) => {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('use_google', use_google ? 'true' : 'false');
+  return api.post('/transcribe', fd, { headers: {'Content-Type': 'multipart/form-data'} }).then(r => r.data);
+}
+#######################
+src/components/MicrophoneButton.jsx
+import React, { useState, useRef } from 'react';
+import { FiMic, FiMicOff } from 'react-icons/fi';
+import { motion } from 'framer-motion';
+import { transcribeAudio } from '../api';
 
-# ---------------------------
-# Configuration (as provided by you — DO NOT CHANGE unless you need to)
-# ---------------------------
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+export default function MicrophoneButton({ onText }) {
+  const [listening, setListening] = useState(false);
+  const [permissionDenied, setPermissionDenied] = useState(false);
+  const recognitionRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const recordedChunksRef = useRef([]);
 
-# Azure Configuration (kept exactly as requested)
-base_url="" 
-api_version="2025-01-01-preview"
-api_key=""
-deployment_name="api-ai4o"
-model_name="gpt-4o"
+  const startBrowserRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setPermissionDenied(true);
+      return;
+    }
+    const r = new SpeechRecognition();
+    r.lang = 'en-US';
+    r.interimResults = true;
+    r.continuous = true;
+    r.onresult = (ev) => {
+      let transcript = '';
+      for (let i = 0; i < ev.results.length; i++) {
+        transcript += ev.results[i][0].transcript;
+      }
+      onText(transcript);
+    };
+    r.onerror = (e) => {
+      console.error('SpeechRecognition error', e);
+    };
+    recognitionRef.current = r;
+    r.start();
+    setListening(true);
+  };
 
-# Initialize Azure services (kept as-is; fill azure_endpoint/api_key etc. with real values)
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-3-large",
-    api_version="2025-01-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment="api-ai-3l"
-)
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
-# ---------------------------
+  const stopBrowserRecognition = () => {
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop(); } catch(e){/*ignore*/ }
+      recognitionRef.current = null;
+    }
+    setListening(false);
+  };
 
-# Reaction types and filesystem layout (kept from your code)
-REACTION_TYPES = [
-    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
-    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
-    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
-]
+  const startRecordingAndUpload = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      alert('Media devices not supported in this browser.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mr = new MediaRecorder(stream);
+      recordedChunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data.size > 0) recordedChunksRef.current.push(e.data);
+      };
+      mr.onstop = async () => {
+        const blob = new Blob(recordedChunksRef.current, { type: 'audio/webm' });
+        // Send to backend for Google STT optionally (demo expects browser STT first)
+        try {
+          const res = await transcribeAudio(new File([blob], 'audio.webm'), false);
+          if (res.transcript) onText(res.transcript);
+        } catch (err) {
+          console.error('Transcription failed', err);
+        }
+      };
+      mediaRecorderRef.current = mr;
+      mr.start();
+      setListening(true);
+    } catch (e) {
+      console.error(e);
+      setPermissionDenied(true);
+    }
+  };
 
-BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
-PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
-SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    setListening(false);
+  };
 
-# Ensure dirs exist (idempotent)
-os.makedirs(PRODUCTS_DIR, exist_ok=True)
-os.makedirs(SCHEMES_DIR, exist_ok=True)
+  const toggle = () => {
+    if (listening) {
+      stopBrowserRecognition();
+      stopRecording();
+    } else {
+      // Prefer browser live recognition for instant UX:
+      startBrowserRecognition();
+      // fallback: startRecordingAndUpload();
+    }
+  };
 
-# Prompt template (kept largely the same)
-PROMPT_TEMPLATE = """
-You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format:
-1. **API Name**: The active pharmaceutical ingredient
-2. **Reaction Chemistry**: Type and description
-3. **Yield**: Exact yield percentage or value
-4. **Procedure**: Complete procedure EXACTLY as written in the source. Preserve all formatting, punctuation, and structure. Do NOT modify or summarize.
-5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
+  return (
+    <motion.button
+      whileTap={{ scale: 0.95 }}
+      onClick={toggle}
+      className={`p-3 rounded-full shadow-lg ${listening ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-white text-primary'}`}
+      title="Start/stop microphone"
+    >
+      {listening ? <FiMicOff size={20} /> : <FiMic size={20} />}
+    </motion.button>
+  );
+}
+#################################
+src/components/SidebarHistory.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
 
-Structure your response as follows (literal headers must appear in the LLM output exactly like below):
+export default function SidebarHistory({ history, onSelect }) {
+  return (
+    <div className="w-80 bg-white/60 backdrop-blur rounded-l-2xl p-4 h-full border-l">
+      <h3 className="text-xl font-semibold text-primary mb-3">Chat History</h3>
+      <div className="space-y-3 overflow-auto h-[70vh]">
+        {history.length === 0 && <div className="text-sm text-gray-500">No chats yet.</div>}
+        {history.map((h, i) => (
+          <motion.div
+            key={i}
+            layout
+            onClick={() => onSelect(i)}
+            className="p-3 rounded-lg border cursor-pointer hover:shadow-md transition"
+            whileHover={{ scale: 1.01 }}
+          >
+            <div className="text-sm font-medium text-primary">{h.title || h.preview || 'User query'}</div>
+            <div className="text-xs text-gray-600 mt-1 line-clamp-2">{h.content}</div>
+          </motion.div>
+        ))}
+      </div>
+    </div>
+  );
+}
+##############################
+src/components/ReactionList.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
 
-### API Name
-[API name here]
-### Reaction Chemistry
-[Reaction chemistry description here]
-### Yield
-[Yield value here]
-### Procedure
-[Complete procedure here]
-### Tabular Data
-[Markdown table here]
+export default function ReactionList({ reactions, onSelect, selected }) {
+  return (
+    <div className="w-full">
+      <h4 className="text-lg font-semibold text-primary mb-2">Reaction Types</h4>
+      <div className="grid grid-cols-2 gap-2">
+        {reactions.map((r) => (
+          <motion.button
+            key={r}
+            layout
+            onClick={() => onSelect(r)}
+            className={`p-3 rounded-lg ${selected === r ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-white border'} shadow-sm`}
+          >
+            {r.replace(/_/g, ' ')}
+          </motion.button>
+        ))}
+      </div>
+    </div>
+  );
+}
+################################
+src/components/ProductGrid.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
 
-Document Content:
-{context}
-Question: {question}
-Answer:
-"""
-PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
+export default function ProductGrid({ products, onView }) {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {products.map(p => (
+        <motion.div key={p.id} whileHover={{ y: -6 }} className="bg-white rounded-2xl p-4 shadow-md border">
+          <div className="flex justify-between items-start">
+            <div>
+              <h3 className="text-lg font-semibold text-primary">{p.name}</h3>
+              <div className="text-xs text-purple-700 mt-1">{p.reaction_type}</div>
+            </div>
+            <div className="flex flex-col gap-2">
+              <button className="px-3 py-1 rounded-full bg-indigo-50 text-indigo-600 text-sm" onClick={() => onView(p.id)}>View</button>
+            </div>
+          </div>
+        </motion.div>
+      ))}
+    </div>
+  );
+}
+###############################
+src/components/ProductDetail.jsx
+import React from 'react';
 
-# ------------------------------
-# Helper functions
-# ------------------------------
-def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
-    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
-        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
-        if os.path.exists(scheme_path):
-            return scheme_path
-    return None
+export default function ProductDetail({ meta, details }) {
+  if (!meta) return <div className="p-6 text-gray-500">Select a product to see details</div>;
 
-def list_products() -> List[Dict[str, Any]]:
-    products = []
-    for reaction_type in REACTION_TYPES:
-        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
-        if not os.path.exists(reaction_dir):
-            continue
-        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
-        for pdf_path in pdf_files:
-            filename = os.path.basename(pdf_path)
-            product_name = os.path.splitext(filename)[0]
-            scheme_image = find_scheme_image(reaction_type, product_name)
-            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
-            product_id = f"{reaction_type}_{product_name}"
-            products.append({
-                "id": product_id,
-                "name": product_name,
-                "reaction_type": reaction_type,
-                "pdf_path": pdf_path,
-                "scheme_image": scheme_image if scheme_image else None,
-                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
-            })
-    return products
+  return (
+    <div className="p-6 bg-white rounded-2xl shadow-lg">
+      <div className="flex justify-between items-start">
+        <div>
+          <h2 className="text-2xl font-bold text-primary">{meta.name}</h2>
+          <div className="text-sm text-purple-700">{meta.reaction_type}</div>
+        </div>
+        <div className="flex gap-2">
+          {meta.scheme_image && <a href={meta.scheme_image} target="_blank" rel="noreferrer" className="px-3 py-1 rounded-md bg-secondary/20 text-secondary">Scheme</a>}
+          <a href={meta.pdf_path} className="px-3 py-1 rounded-md bg-accent/10 text-accent" target="_blank" rel="noreferrer">Open PDF</a>
+        </div>
+      </div>
 
-def extract_pdf_text(pdf_path: str) -> str:
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text() + "\n"
-        return text
-    except Exception as e:
-        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
+      <div className="mt-6 space-y-4">
+        <div>
+          <h4 className="text-sm text-gray-500">API Name</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details.api_name || '—'}</div>
+        </div>
 
-# Cache for vectorstores and product details
-_vectorstore_cache: Dict[str, FAISS] = {}
-_product_details_cache: Dict[str, Dict[str, Any]] = {}
-_vectorstore_lock = threading.Lock()
+        <div>
+          <h4 className="text-sm text-gray-500">Reaction Chemistry</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details.reaction_chemistry || '—'}</div>
+        </div>
 
-def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
-    pid = product["id"]
-    with _vectorstore_lock:
-        if pid in _vectorstore_cache:
-            return _vectorstore_cache[pid]
-        text = extract_pdf_text(product["pdf_path"])
-        if not text or len(text.strip()) < 50:
-            return None
-        doc = Document(page_content=text, metadata={
-            "product_id": pid,
-            "product_name": product["name"],
-            "reaction_type": product["reaction_type"],
-            "source": product["pdf_path"]
+        <div>
+          <h4 className="text-sm text-gray-500">Yield</h4>
+          <div className="mt-1 p-3 bg-gray-50 rounded">{details.yield || '—'}</div>
+        </div>
+
+        <div>
+          <h4 className="text-sm text-gray-500">Procedure</h4>
+          <div className="mt-1 p-3 bg-white rounded border whitespace-pre-wrap">{details.procedure || '—'}</div>
+        </div>
+
+        <div>
+          <h4 className="text-sm text-gray-500">Tables</h4>
+          {details.tables && details.tables.length > 0 ? (
+            details.tables.map((t, idx) => (
+              <div className="mt-3" key={idx}>
+                {t.headers && t.headers.length > 0 ? (
+                  <div className="overflow-auto rounded-lg border">
+                    <table className="min-w-full divide-y">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          {t.headers.map((h, i) => <th key={i} className="px-4 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y">
+                        {t.rows.map((r, ri) => (
+                          <tr key={ri}>
+                            {r.map((c, ci) => <td key={ci} className="px-4 py-2 text-sm">{c}</td>)}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <pre className="bg-gray-50 p-3 rounded">{t.raw_md}</pre>
+                )}
+              </div>
+            ))
+          ) : <div className="text-sm text-gray-500">No tabular data detected.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+###########################
+src/components/ChatWindow.jsx
+import React, { useState, useEffect, useRef } from 'react';
+import MicrophoneButton from './MicrophoneButton';
+import { motion } from 'framer-motion';
+
+export default function ChatWindow({ onSend, messages, onSelectHistory }) {
+  const [text, setText] = useState('');
+  const inputRef = useRef();
+
+  useEffect(() => {
+    // Keep input visible/focused on mount
+    if (inputRef.current) inputRef.current.focus();
+  }, []);
+
+  useEffect(() => {
+    // If last assistant message contains something we want to preview in sidebar:
+    if (messages.length > 0) {
+      const last = messages[messages.length - 1];
+      // Optionally notify parent for history saving
+    }
+  }, [messages]);
+
+  const handleSend = () => {
+    if (!text.trim()) return;
+    onSend(text.trim());
+    setText('');
+  };
+
+  return (
+    <div className="flex-1 flex flex-col h-full">
+      <div className="flex-1 overflow-auto p-4 space-y-3">
+        {messages.map((m, idx) => (
+          <motion.div key={idx} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }}>
+            {m.role === 'user' ? (
+              <div className="text-right">
+                <div className="inline-block bg-gradient-to-br from-secondary to-primary text-white px-4 py-2 rounded-2xl">{m.content}</div>
+              </div>
+            ) : (
+              <div>
+                <div className="inline-block bg-white border px-4 py-2 rounded-2xl">{m.content}</div>
+              </div>
+            )}
+          </motion.div>
+        ))}
+      </div>
+
+      <div className="p-4 bg-white/60 backdrop-blur rounded-t-2xl border-t flex items-center gap-3">
+        <MicrophoneButton onText={(t) => setText(t)} />
+        <input
+          ref={inputRef}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') handleSend(); }}
+          className="flex-1 px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary"
+          placeholder="Ask about reaction chemistry..."
+        />
+        <button onClick={handleSend} className="px-5 py-2 rounded-full bg-primary text-white font-semibold">Send</button>
+      </div>
+    </div>
+  );
+}
+##############################
+src/App.jsx
+import React, { useEffect, useState } from 'react';
+import { fetchReactions, fetchProducts, fetchProductMeta, fetchProductDetails } from './api';
+import ReactionList from './components/ReactionList';
+import ProductGrid from './components/ProductGrid';
+import ProductDetail from './components/ProductDetail';
+import ChatWindow from './components/ChatWindow';
+import SidebarHistory from './components/SidebarHistory';
+import { motion } from 'framer-motion';
+
+export default function App() {
+  const [reactions, setReactions] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
+  const [products, setProducts] = useState([]);
+  const [selectedProductMeta, setSelectedProductMeta] = useState(null);
+  const [productDetails, setProductDetails] = useState(null);
+  const [messages, setMessages] = useState([
+    { role: 'assistant', content: "Hello! I'm your expert assistant. Ask me anything about the selected document or reaction." }
+  ]);
+  const [history, setHistory] = useState([]);
+
+  useEffect(() => {
+    fetchReactions().then(setReactions).catch(err => console.error(err));
+  }, []);
+
+  useEffect(() => {
+    fetchProducts(selectedReaction).then(setProducts).catch(err => console.error(err));
+  }, [selectedReaction]);
+
+  const handleSelectProduct = async (productId) => {
+    // fetch meta & details
+    try {
+      const meta = await fetchProductMeta(productId);
+      setSelectedProductMeta(meta);
+      // call details endpoint
+      const res = await fetchProductDetails(productId);
+      const details = res.data || res;
+      setProductDetails(details);
+      // keep chat box visible (it is)
+      setMessages(prev => [...prev, { role: 'assistant', content: `Loaded ${meta.name}. You can now ask questions about this document.` }]);
+      // Save to history
+      setHistory(h => [{ title: meta.name, content: details.procedure ? details.procedure.slice(0, 120) : '', productId: meta.id }, ...h]);
+    } catch (e) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Failed to load product details.' }]);
+    }
+  };
+
+  const handleSendMessage = (text) => {
+    setMessages(prev => [...prev, { role: 'user', content: text }]);
+    // For demo: if user asks about product details, we just ask backend again using same QA endpoint with a custom question.
+    if (selectedProductMeta) {
+      fetchProductDetails(selectedProductMeta.id, text) // note: fetchProductDetails currently only accepts product_id; in real extension, add question support
+        .then(res => {
+          const d = res.data || res;
+          setMessages(prev => [...prev, { role: 'assistant', content: (d.api_name ? `API: ${d.api_name}\n\nProcedure excerpt:\n${(d.procedure||'').slice(0,400)}` : 'No structured answer found.') }]);
         })
-        vs = FAISS.from_documents([doc], cached_embeddings)
-        _vectorstore_cache[pid] = vs
-        return vs
+        .catch(err => setMessages(prev => [...prev, { role: 'assistant', content: 'Error getting answer from backend.' }]));
+    } else {
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Please select a product/document first.' }]);
+    }
+  };
 
-def parse_structured_response(text: str) -> Dict[str, Any]:
-    """
-    Parse the LLM output (which we instructed to use literal '### API Name', etc.)
-    Return JSON with keys: api_name, reaction_chemistry, yield, procedure, tables (list)
-    Each table is {headers: [], rows: [[], [], ...]}
-    """
-    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
-    def grab(section):
-        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else None
+  return (
+    <div className="min-h-screen flex">
+      {/* Left column - controls */}
+      <div className="w-96 p-6">
+        <div className="mb-6">
+          <h1 className="text-3xl font-bold text-primary">Reaction Database AI</h1>
+          <p className="text-sm text-gray-600 mt-1">Where chemistry meets intelligence — demo frontend</p>
+        </div>
 
-    result["api_name"] = grab("API Name")
-    result["reaction_chemistry"] = grab("Reaction Chemistry")
-    result["yield"] = grab("Yield")
-    result["procedure"] = grab("Procedure")
-    tab_raw = grab("Tabular Data")
-    if tab_raw:
-        # find markdown tables starting with |...|
-        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
-        if table_patterns:
-            for tbl_md in table_patterns:
-                # normalize lines
-                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
-                if len(lines) >= 2:
-                    # header line and separator
-                    header = [h.strip() for h in lines[0].split("|")]
-                    rows = []
-                    for rowline in lines[2:]:
-                        cols = [c.strip() for c in rowline.split("|")]
-                        rows.append(cols)
-                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
-        else:
-            # fallback: provide the raw block
-            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
-    return result
+        <div className="space-y-6">
+          <ReactionList reactions={reactions} selected={selectedReaction} onSelect={setSelectedReaction} />
+          <div>
+            <h4 className="text-lg font-semibold text-primary mb-2">Products</h4>
+            <div className="space-y-3">
+              <ProductGrid products={products} onView={handleSelectProduct} />
+            </div>
+          </div>
+        </div>
+      </div>
 
-# ------------------------------
-# FastAPI app
-# ------------------------------
-app = FastAPI(title="Reaction Database AI (FastAPI)")
+      {/* Center - chat + product details */}
+      <div className="flex-1 flex flex-col p-6 gap-6">
+        <div className="flex-1 flex gap-6">
+          <div className="flex-1 bg-transparent rounded-2xl p-4">
+            <ChatWindow messages={messages} onSend={handleSendMessage} />
+          </div>
+          <div className="w-1/2">
+            <ProductDetail meta={selectedProductMeta} details={productDetails || {}} />
+          </div>
+        </div>
+      </div>
 
-# Allow the React dev server origin (adjust if you host differently)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],  # add your host/origin if different
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ------------------------------
-# Pydantic models
-# ------------------------------
-class ProductOut(BaseModel):
-    id: str
-    name: str
-    reaction_type: str
-    has_scheme_image: bool
-    has_scheme_cdx: bool
-
-class QARequest(BaseModel):
-    product_id: str
-    question: Optional[str] = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-
-# ------------------------------
-# Endpoints
-# ------------------------------
-@app.get("/reactions", response_model=List[str])
-def get_reactions():
-    return REACTION_TYPES
-
-@app.get("/products", response_model=List[ProductOut])
-def get_products(reaction_type: Optional[str] = None):
-    allp = list_products()
-    if reaction_type:
-        allp = [p for p in allp if p["reaction_type"] == reaction_type]
-    out = []
-    for p in allp:
-        out.append(ProductOut(
-            id=p["id"],
-            name=p["name"],
-            reaction_type=p["reaction_type"],
-            has_scheme_image=bool(p["scheme_image"]),
-            has_scheme_cdx=bool(p["scheme_cdx"])
-        ))
-    return out
-
-@app.get("/product/{product_id}/meta")
-def product_meta(product_id: str):
-    products = list_products()
-    for p in products:
-        if p["id"] == product_id:
-            return {
-                "id": p["id"],
-                "name": p["name"],
-                "reaction_type": p["reaction_type"],
-                "pdf_path": p["pdf_path"],
-                "scheme_image": p["scheme_image"],
-                "scheme_cdx": p["scheme_cdx"]
-            }
-    raise HTTPException(status_code=404, detail="Product not found")
-
-@app.get("/product/{product_id}/pdf")
-def product_pdf(product_id: str):
-    meta = product_meta(product_id)
-    pdf_path = meta["pdf_path"]
-    if os.path.exists(pdf_path):
-        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
-    raise HTTPException(status_code=404, detail="PDF not found")
-
-@app.get("/product/{product_id}/scheme-image")
-def product_scheme_image(product_id: str):
-    meta = product_meta(product_id)
-    path = meta.get("scheme_image")
-    if path and os.path.exists(path):
-        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
-    raise HTTPException(status_code=404, detail="Scheme image not found")
-
-@app.post("/product/details")
-def product_details(req: QARequest):
-    # Lookup product meta
-    products = list_products()
-    product = next((p for p in products if p["id"] == req.product_id), None)
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-
-    # If already cached, return
-    if req.product_id in _product_details_cache:
-        return _product_details_cache[req.product_id]
-
-    # Build vectorstore (may take time)
-    vs = build_product_vector_store(product)
-    if not vs:
-        raise HTTPException(status_code=500, detail="Failed to build vector store (empty/invalid PDF)")
-
-    retriever = vs.as_retriever(search_kwargs={"k": 1})
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=chat_model,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=False
-    )
-
-    # Run QA
-    try:
-        raw_response = qa_chain.run(req.question)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
-
-    parsed = parse_structured_response(raw_response)
-    # Cache
-    _product_details_cache[req.product_id] = parsed
-    return parsed
-
-# ------------------------------
-# Transcription endpoint (optional Google Cloud)
-# ------------------------------
-# If you want server-side Google STT you can paste your credentials JSON string into
-# GOOGLE_CREDENTIALS_JSON below (NOT recommended for public repos). For demos, prefer browser Web Speech API.
-GOOGLE_CREDENTIALS_JSON = ""  # <<< If you want to enable server-side Google STT, paste credentials JSON string here.
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
-    """
-    Accept an audio file (wav/webm/mp3) and return a transcript.
-    By default this endpoint will only provide a simple error unless GOOGLE_CREDENTIALS_JSON is provided.
-    The recommended demo approach is to use the browser Web Speech API for instant transcripts.
-    """
-    content = await file.read()
-    if not use_google:
-        # We recommend using browser speech API — but if user uploaded audio anyway, we can attempt a naive fallback:
-        # Try to return an error telling front-end to use browser API.
-        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
-
-    # If user wants Google transcription server-side:
-    if not GOOGLE_CREDENTIALS_JSON:
-        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
-
-    # Server-side Google Cloud Speech-to-Text usage (if enabled)
-    try:
-        from google.cloud import speech_v1p1beta1 as speech
-        from google.oauth2 import service_account
-    except Exception as e:
-        return {"error": f"google-cloud-speech library not installed: {e}"}
-
-    # Create credentials from JSON string (in-memory)
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    credentials = service_account.Credentials.from_service_account_info(creds_info)
-    client = speech.SpeechClient(credentials=credentials)
-
-    audio = speech.RecognitionAudio(content=content)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",
-        enable_automatic_punctuation=True,
-    )
-
-    response = client.recognize(config=config, audio=audio)
-    transcripts = [r.alternatives[0].transcript for r in response.results]
-    return {"transcript": " ".join(transcripts)}
-
-# ------------------------------
-# Health
-# ------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-# Run uvicorn via CLI: uvicorn main:app --host 0.0.0.0 --port 8000
+      {/* Right - history */}
+      <div className="w-80 p-6">
+        <SidebarHistory history={history} onSelect={(i) => {
+          const h = history[i];
+          // reopen product
+          if (h && h.productId) handleSelectProduct(h.productId);
+        }} />
+      </div>
+    </div>
+  );
+}
