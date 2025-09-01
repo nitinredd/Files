@@ -1,162 +1,98 @@
-def create_jmp_style_qq_plot(data, title, method_name, file_name):
-    """Create a JMP-style QQ plot with hyperbolic (arc-like) confidence bands."""
-    if len(data) == 0:
-        return None
-
-    # Calculate theoretical quantiles and sample quantiles
-    (osm, osr), (slope, intercept, r) = probplot(data, dist="norm", plot=None)
-
-    # Dense grid for smooth band drawing
-    x_grid = np.linspace(osm.min(), osm.max(), 400)
-    line_y = slope * x_grid + intercept
-
-    # Use residuals around the fitted reference line to estimate local spread
-    fitted_on_osm = slope * osm + intercept
-    resid = osr - fitted_on_osm
-    sigma_line = np.std(resid, ddof=1) if len(resid) > 1 else np.std(data, ddof=1)
-
-    # 95% z-value (you can tune this constant if you prefer JMP's slightly different factor)
-    z = norm.ppf(0.975)
-
-    # number of observations (for scaling)
+import pandas as pd
+import numpy as np
+import scipy.stats as stats
+import plotly.graph_objs as go
+from plotly.subplots import make_subplots
+from scipy.stats import norm
+ 
+ 
+# Generate sample data
+data = pd.Series([0.23, 0.29, 0.02, 0.42, 0.38, 0.37, 0.33, 0.23, 0.28, 0.5, 0.4, 0.28, 0.27])
+n = len(data)
+ 
+# Estimate mean and std
+mean = np.mean(data)
+std = np.std(data, ddof=1)
+ 
+# Calculate empirical cumulative probabilities
+sorted_data = data.sort_values()
+ecdf = (np.arange(1, n + 1)) / (n + 1)
+print(ecdf)
+ 
+# Simulate Lilliefors critical value
+def simulate_lilliefors_critical_value(n, alpha=0.05, num_simulations=100):
+    D_values = []
+    for _ in range(num_simulations):
+        sample = np.random.normal(loc=0, scale=1, size=n)
+        sample_mean = np.mean(sample)
+        sample_std = np.std(sample, ddof=1)
+        z_scores = (sample - sample_mean) / sample_std
+        z_scores.sort()
+        ecdf_sim = np.arange(1, n + 1) / (n+1)
+        cdf = stats.norm.cdf(z_scores)
+        D = np.max(np.abs(ecdf_sim - cdf))
+        D_values.append(D)
+    return np.percentile(D_values, 100 * (1 - alpha))
+ 
+# Q-Q plot with empirical CDF and Lilliefors confidence bands
+def qq_plot_interactive(data, alpha=0.05):
     n = len(data)
-
-    # Hyperbolic factor: grows roughly like sqrt(1 + x^2) -> wider in tails
-    hyperbolic_factor = z * sigma_line * np.sqrt(1.0 + x_grid**2) / np.sqrt(n)
-
-    upper_band = line_y + hyperbolic_factor
-    lower_band = line_y - hyperbolic_factor
-
-    # Build figure
+    ord_data = data.sort_values()
+    plotting_positions = stats.norm.ppf((np.arange(1, n + 1)) / (n+2))
+   
+    # Fit line for normal distribution
+    slope, intercept, _, _, _ = stats.linregress(plotting_positions, ord_data)
+    fit_line = intercept + slope * plotting_positions
+    print(fit_line)
+   
+    # Simulate Lilliefors critical value
+    D_critical = simulate_lilliefors_critical_value(n=n, alpha=alpha)
+   
+    # Calculate ECDF for lower and upper bands
+    lower_quantile = stats.norm.ppf(np.clip(ecdf - D_critical, 1e-10, 1 - 1e-10))
+    upper_quantile = stats.norm.ppf(np.clip(ecdf + D_critical, 1e-10, 1 - 1e-10))
+   
+    # Transform quantile bands to data space using the fitted line
+    lower_band = intercept + slope * lower_quantile
+    upper_band = intercept + slope * upper_quantile
+   
+    # Create interactive plot using Plotly
     fig = go.Figure()
-
-    # Add filled band (so it appears behind points)
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([x_grid, x_grid[::-1]]),
-        y=np.concatenate([upper_band, lower_band[::-1]]),
-        fill='toself',
-        fillcolor='rgba(220, 50, 50, 0.12)',  # subtle red fill
-        line=dict(color='rgba(255,255,255,0)'),  # invisible line for the fill polygon
-        hoverinfo='skip',
-        showlegend=False,
-    ))
-
-    # Add dashed upper and lower arc lines
-    fig.add_trace(go.Scatter(
-        x=x_grid,
-        y=upper_band,
-        mode='lines',
-        line=dict(color='red', width=1, dash='dot'),
-        name='Upper Confidence Band',
-        hoverinfo='skip',
-        showlegend=False
-    ))
-    fig.add_trace(go.Scatter(
-        x=x_grid,
-        y=lower_band,
-        mode='lines',
-        line=dict(color='red', width=1, dash='dot'),
-        name='Lower Confidence Band',
-        hoverinfo='skip',
-        showlegend=False
-    ))
-
-    # Add the main reference line (solid red)
-    fig.add_trace(go.Scatter(
-        x=x_grid,
-        y=line_y,
-        mode='lines',
-        name='Normal Reference Line',
-        line=dict(color='red', width=2, dash='solid'),
-        showlegend=False,
-        hovertemplate='Normal Reference Line<extra></extra>'
-    ))
-
-    # Add the data points (black circles)
-    fig.add_trace(go.Scatter(
-        x=osm,
-        y=osr,
-        mode='markers',
-        name='Data Points',
-        marker=dict(color='black', size=6, symbol='circle', line=dict(width=0)),
-        showlegend=False,
-        hovertemplate='<b>Normal Quantile:</b> %{x:.3f}<br><b>Sample Quantile:</b> %{y:.3f}<br><extra></extra>'
-    ))
-
-    # axis ranges & ticks
-    x_range = max(osm) - min(osm)
-    y_range = max(osr) - min(osr)
-    x_margin = x_range * 0.10
-    y_margin = y_range * 0.10
-
-    x_ticks = [-2.5, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
-    x_ticks = [tick for tick in x_ticks if min(osm)-x_margin <= tick <= max(osm)+x_margin]
-
-    mean_val = np.mean(data)
-    std_val = np.std(data, ddof=1)
-    skewness_val = skew(data)
-    kurtosis_val = kurtosis(data)
-
+ 
+    # Add data points to the primary y-axis
+    fig.add_trace(go.Scatter(x=plotting_positions, y=ord_data, mode='markers', name='Data',
+                             marker=dict(color='blue', size=10, line=dict(width=1, color='darkblue'))))
+ 
+    # # Add fitted normal line to the primary y-axis
+    fig.add_trace(go.Scatter(x=plotting_positions, y=fit_line, mode='lines', name='Normal Fit',
+                             line=dict(color='black', width=2)))
+ 
+    # Add upper confidence band to the secondary y-axis
+    fig.add_trace(go.Scatter(x=plotting_positions, y=upper_band, mode='lines', name='Upper Confidence Band',
+                             line=dict(color='red', dash='dash', width=2)))
+ 
+    # Add lower confidence band to the secondary y-axis
+    fig.add_trace(go.Scatter(x=plotting_positions, y=lower_band, mode='lines', name='Lower Confidence Band',
+                             line=dict(color='green', dash='dash', width=2)))
+ 
+    # Update layout for the plot
     fig.update_layout(
-        title=dict(
-            text=f'<b>Normal Quantile Plot</b><br><span style="font-size:12px;">{method_name} - {file_name.replace(".xlsx", "")}</span>',
-            x=0.5, y=0.95, font=dict(size=14, color='black', family='Arial')
-        ),
-        xaxis=dict(
-            title=dict(text='<b>Normal Quantile</b>', font=dict(size=12, color='black', family='Arial')),
-            range=[min(osm)-x_margin, max(osm)+x_margin],
-            tickvals=x_ticks,
-            tickmode='array',
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        yaxis=dict(
-            title=dict(text='<b>Sample Quantile</b>', font=dict(size=12, color='black', family='Arial')),
-            range=[min(osr)-y_margin, max(osr)+y_margin],
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(family="Arial, sans-serif"),
-        hovermode='closest',
-        width=600,
-        height=500,
-        margin=dict(l=80, r=100, t=80, b=60),
-        showlegend=False
+        title="Normal Quantile Plot with Lilliefors Confidence Bands",
+        xaxis_title="Theoretical Quantiles (Van der Waerden)",  # Primary x-axis
+        yaxis_title="Sample Quantiles",
+        width=900,
+        height=700,
+        margin=dict(l=40, r=40, t=40, b=40),
+        plot_bgcolor='rgba(240,240,240,1)',
+        paper_bgcolor='rgba(255,255,255,1)'
     )
-
-    stats_text = (
-        f'<b>Statistics:</b><br>'
-        f'Mean: {mean_val:.4f}<br>'
-        f'Std Dev: {std_val:.4f}<br>'
-        f'Skewness: {skewness_val:.4f}<br>'
-        f'Kurtosis: {kurtosis_val:.4f}<br>'
-        f'R²: {r**2:.4f}<br>'
-        f'N: {n:,}'
-    )
-
-    fig.add_annotation(
-        x=0.98, y=0.98, xref="paper", yref="paper",
-        text=stats_text, showarrow=False, align="left",
-        bgcolor="white", bordercolor="black", borderwidth=1, borderpad=6,
-        font=dict(size=9, color='black', family='Arial')
-    )
-
+ 
+    # Add gridlines
+    fig.update_xaxes(showgrid=True, gridcolor='lightgray', gridwidth=1)
+    fig.update_yaxes(showgrid=True, gridcolor='lightgray', gridwidth=1)
+   
     return fig
+ 
+# Create and show the interactive Q-Q plot
+fig = qq_plot_interactive(data)
+fig.show()
