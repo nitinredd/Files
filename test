@@ -1,368 +1,99 @@
-import os
+# debug_qq.py
 import streamlit as st
-import pandas as pd
 import numpy as np
-from zipfile import ZipFile
-from scipy.stats import skew, kurtosis, norm, probplot
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+from scipy.stats import norm, probplot
+import plotly.graph_objs as go
+import matplotlib.pyplot as plt
 
-# ----------------------------------------
-# Required Helper Functions
-# ----------------------------------------
+st.set_page_config(page_title="Debug: QQ Plot Rendering", layout="wide")
 
-def prepare_data(reference_df, test_df):
-    """Remove time zero if present and reset index"""
-    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
-        reference_df = reference_df.iloc[1:].reset_index(drop=True)
-    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
-        test_df = test_df.iloc[1:].reset_index(drop=True)
-    return reference_df, test_df
+st.title("Debug: Q–Q / Plotly Rendering Check")
 
-def conventional_f2(ref_means, test_means):
-    """Calculate conventional f2"""
-    diff = test_means - ref_means
-    sum_sq_diff = (diff ** 2).sum()
-    p = len(ref_means)
-    return 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
+# Use the values you reported
+count = 10000
+mean = 81.940
+sd = 6.355
+_min = 59.172
+_max = 99.437
 
-def expected_f2(ref_df, test_df):
-    """Calculate expected f2"""
-    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
-    test_means = test_df.iloc[:, 1:].mean(axis=1)
-    
-    # Conventional f2 component
-    diff = test_means - ref_means
-    sum_sq_diff = (diff ** 2).sum()
-    
-    # Variance components
-    ref_var = row_variance(ref_df)
-    test_var = row_variance(test_df)
-    sum_var = (ref_var + test_var).sum()
-    
-    n = ref_df.shape[1] - 1  # Number of units per time point
-    p = len(ref_means)
-    
-    adjustment = (1/n) * sum_var
-    return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
+st.markdown("### Raw stats (from your bootstrap run)")
+st.write(f"Count: {count} • Mean: {mean} • SD: {sd} • Min: {_min} • Max: {_max}")
 
-def bias_corrected_f2(ref_df, test_df):
-    """Calculate bias-corrected f2"""
-    try:
-        ref_means = ref_df.iloc[:, 1:].mean(axis=1)
-        test_means = test_df.iloc[:, 1:].mean(axis=1)
+# Recreate a sample using those stats (normal approximation) so we have reproducible data
+rng = np.random.default_rng(12345)
+vals = rng.normal(loc=mean, scale=sd, size=count)
+vals = np.clip(vals, _min, _max)  # clip to match the reported range loosely
 
-        diff = test_means - ref_means
-        sum_sq_diff = (diff ** 2).sum()
+st.markdown("### Quick sanity checks")
+st.write(f"actual count: {len(vals)}; mean: {vals.mean():.3f}; sd: {vals.std(ddof=1):.3f}; min: {vals.min():.3f}; max: {vals.max():.3f}")
 
-        ref_var = row_variance(ref_df)
-        test_var = row_variance(test_df)
-        sum_var = (ref_var + test_var).sum()
-
-        n = ref_df.shape[1] - 1
-        p = len(ref_means)
-
-        adjustment = (1 / n) * sum_var
-        right_side = sum_sq_diff + p
-
-        if adjustment < right_side:
-            adjusted_diff = sum_sq_diff - adjustment
-            if adjusted_diff > 0:
-                return 100 - 25 * np.log10(1 + (1 / p) * adjusted_diff)
-            else:
-                return None
-        else:
-            return None
-
-    except Exception:
+# ---- Plotly: JMP-style Q-Q (theoretical quantiles mapped to f2 units) ----
+def make_plotly_qq(vals, envelope_sims=500):
+    arr = np.asarray(vals, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 3:
         return None
 
-def row_variance(df):
-    """Calculate row-wise variance"""
-    return df.iloc[:, 1:].var(axis=1, ddof=1)
+    vals_sorted = np.sort(arr)
+    n = len(vals_sorted)
+    probs = (np.arange(1, n+1) - 0.5) / n
+    z_theor = norm.ppf(probs)
 
-def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
-    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
-    n_ref_units = ref_df.shape[1] - 1
-    n_test_units = test_df.shape[1] - 1
+    sample_mean = float(vals_sorted.mean())
+    sample_sd = float(vals_sorted.std(ddof=1)) if n > 1 else 0.0
+    # map theoretical to sample units
+    theor = sample_mean + sample_sd * z_theor
 
-    original_f2 = calc_func(ref_df, test_df)
-    f2_values = []
-    
-    for _ in range(n_iterations):
-        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
-        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
+    # envelope (simulate)
+    lower_env = upper_env = None
+    if sample_sd > 0 and envelope_sims > 0:
+        sims = rng.normal(loc=sample_mean, scale=sample_sd, size=(envelope_sims, n))
+        sims.sort(axis=1)
+        lower_env = np.percentile(sims, 2.5, axis=0)
+        upper_env = np.percentile(sims, 97.5, axis=0)
 
-        ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
-        test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
+    fig = go.Figure()
+    if lower_env is not None and upper_env is not None:
+        fig.add_trace(go.Scatter(x=theor, y=upper_env, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+        fig.add_trace(go.Scatter(x=theor, y=lower_env, mode='lines', fill='tonexty', fillcolor='rgba(200,200,200,0.3)', line=dict(width=0), showlegend=True, name='95% envelope'))
 
-        f2_val = calc_func(ref_sample, test_sample)
+    fig.add_trace(go.Scatter(x=theor, y=vals_sorted, mode='markers', marker=dict(size=6, color='black'), name='Sample quantiles'))
+    min_axis = min(theor.min(), vals_sorted.min())
+    max_axis = max(theor.max(), vals_sorted.max())
+    pad = 0.05 * (max_axis - min_axis) if (max_axis - min_axis) > 0 else 0.1
+    x_line = [min_axis - pad, max_axis + pad]
+    y_line = x_line
+    fig.add_trace(go.Scatter(x=x_line, y=y_line, mode='lines', line=dict(color='red', width=2), name='y=x'))
 
-        if f2_val is not None and isinstance(f2_val, (int, float)):
-            f2_values.append(f2_val)
-    
-    if not f2_values:
-        return original_f2, None, None, None, None, None, None, []
-    
-    f2_values = np.array(f2_values)
-    mean_f2 = np.mean(f2_values)
-    median_f2 = np.median(f2_values)
-    skewness_f2 = skew(f2_values)
-    kurtosis_f2 = kurtosis(f2_values)
-    lower_bound = np.percentile(f2_values, 5)
-    upper_bound = np.percentile(f2_values, 95)
-
-    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
-
-def create_jmp_style_qqplot(data, method_name, file_name):
-    """Create JMP-style QQ plot with confidence bands"""
-    if len(data) == 0:
-        return None
-        
-    # Calculate theoretical quantiles and ordered values
-    theoretical_quantiles = np.sort(norm.ppf(np.linspace(0.001, 0.999, len(data))))
-    ordered_data = np.sort(data)
-    
-    # Fit line
-    slope, intercept, r_value = np.polyfit(theoretical_quantiles, ordered_data, 1)
-    line_fit = slope * theoretical_quantiles + intercept
-    
-    # Calculate confidence bands (95%)
-    n = len(data)
-    std_err = np.sqrt(np.cumsum(1/theoretical_quantiles**2)) / n
-    upper_band = line_fit + 1.96 * std_err * np.std(data)
-    lower_band = line_fit - 1.96 * std_err * np.std(data)
-    
-    # Create figure
-    fig = make_subplots()
-    
-    # Add confidence bands
-    fig.add_trace(go.Scatter(
-        x=theoretical_quantiles, 
-        y=upper_band,
-        line=dict(color='lightgray', width=1),
-        name='95% Confidence Band',
-        fill=None,
-        mode='lines'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=theoretical_quantiles, 
-        y=lower_band,
-        line=dict(color='lightgray', width=1),
-        name='95% Confidence Band',
-        fill='tonexty',
-        mode='lines'
-    ))
-    
-    # Add reference line
-    fig.add_trace(go.Scatter(
-        x=theoretical_quantiles,
-        y=line_fit,
-        line=dict(color='red', width=2, dash='dash'),
-        name='Reference Line'
-    ))
-    
-    # Add data points
-    fig.add_trace(go.Scatter(
-        x=theoretical_quantiles,
-        y=ordered_data,
-        mode='markers',
-        marker=dict(color='blue', size=5),
-        name='Bootstrap Samples'
-    ))
-    
-    # Update layout for JMP style
-    fig.update_layout(
-        title=f"QQ Plot - {method_name} - {file_name}",
-        xaxis_title="Theoretical Quantiles",
-        yaxis_title="Sample Quantiles",
-        showlegend=True,
-        plot_bgcolor='white',
-        width=800,
-        height=600
-    )
-    
-    fig.update_xaxes(
-        showgrid=True, 
-        gridwidth=1, 
-        gridcolor='lightgray',
-        zeroline=True, 
-        zerolinewidth=2, 
-        zerolinecolor='black'
-    )
-    
-    fig.update_yaxes(
-        showgrid=True, 
-        gridwidth=1, 
-        gridcolor='lightgray',
-        zeroline=True, 
-        zerolinewidth=2, 
-        zerolinecolor='black'
-    )
-    
+    fig.update_layout(title="Plotly JMP-style Q–Q (theor->f2 units)", xaxis_title="Theoretical quantiles (mapped to f2)", yaxis_title="Sample quantiles (f2)", plot_bgcolor='white', height=500)
+    # Force axis ranges explicitly (helps if auto-scaling hides points)
+    fig.update_xaxes(range=[min_axis - pad, max_axis + pad])
+    fig.update_yaxes(range=[min_axis - pad, max_axis + pad])
     return fig
 
-# ----------------------------------------
-# Batch Processing Functions
-# ----------------------------------------
+fig = make_plotly_qq(vals)
+st.markdown("### Plotly Q–Q (expected to show points + red diagonal + grey envelope)")
+if fig is None:
+    st.warning("Not enough data for Q–Q")
+else:
+    st.plotly_chart(fig, use_container_width=True)
 
-def load_batch_data(folder_path):
-    """Load test and reference data from multiple Excel files in a folder."""
-    workbook_data = {}
-    
-    for file_name in os.listdir(folder_path):
-        if file_name.endswith(".xlsx"):
-            file_path = os.path.join(folder_path, file_name)
-            try:
-                reference_df = pd.read_excel(file_path, sheet_name=0)
-                test_df = pd.read_excel(file_path, sheet_name=1)
-                workbook_data[file_name] = (reference_df, test_df)
-            except Exception as e:
-                st.warning(f"Skipping file `{file_name}` due to error: {e}")
-    
-    return workbook_data
+# ---- Plotly scatter & histogram fallback ----
+st.markdown("### Plotly scatter of sorted values (x=index, y=f2)")
+scatter = go.Figure()
+scatter.add_trace(go.Scatter(x=np.arange(len(vals)), y=np.sort(vals), mode='markers'))
+scatter.update_layout(height=300)
+st.plotly_chart(scatter, use_container_width=True)
 
-def process_batch(workbook_data, methods, n_iterations=10000):
-    """Process multiple workbooks and calculate f2 metrics."""
-    all_results = []
-    qq_plots_data = {}  # Store data for QQ plots
-    
-    for file_name, (reference_df, test_df) in workbook_data.items():
-        try:
-            ref_clean, test_clean = prepare_data(reference_df, test_df)
-            
-            results = {"File Name": file_name}
-            qq_plots_data[file_name] = {}
-            
-            # Bootstrap calculation methods
-            if "Conventional Bootstrap" in methods:
-                def conv_func(r, t): 
-                    return conventional_f2(r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1))
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, conv_func, n_iterations)
-                results["Conventional Bootstrap f2"] = orig
-                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Conventional Bootstrap Mean"] = mean
-                results["Conventional Bootstrap Median"] = median
-                results["Conventional Bootstrap Skewness"] = skewness
-                results["Conventional Bootstrap Kurtosis"] = kurt
-                qq_plots_data[file_name]["Conventional Bootstrap"] = vals
+st.markdown("### Plotly histogram")
+hist = go.Figure()
+hist.add_trace(go.Histogram(x=vals, nbinsx=40))
+hist.update_layout(height=300)
+st.plotly_chart(hist, use_container_width=True)
 
-            if "Expected Bootstrap" in methods:
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, expected_f2, n_iterations)
-                results["Expected Bootstrap f2"] = orig
-                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Expected Bootstrap Mean"] = mean
-                results["Expected Bootstrap Median"] = median
-                results["Expected Bootstrap Skewness"] = skewness
-                results["Expected Bootstrap Kurtosis"] = kurt
-                qq_plots_data[file_name]["Expected Bootstrap"] = vals
-
-            if "Bias Corrected Bootstrap" in methods:
-                def bc_func(r, t): 
-                    bc = bias_corrected_f2(r, t)
-                    return bc if isinstance(bc, float) else None
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, bc_func, n_iterations)
-                results["Bias Corrected Bootstrap f2"] = orig
-                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Bias Corrected Bootstrap Mean"] = mean
-                results["Bias Corrected Bootstrap Median"] = median
-                results["Bias Corrected Bootstrap Skewness"] = skewness
-                results["Bias Corrected Bootstrap Kurtosis"] = kurt
-                qq_plots_data[file_name]["Bias Corrected Bootstrap"] = vals
-            
-            all_results.append(results)
-        
-        except Exception as e:
-            st.warning(f"Error processing file `{file_name}`: {e}")
-    
-    return pd.DataFrame(all_results), qq_plots_data
-
-def create_zip_report(report_df):
-    """Create a ZIP file containing the report CSV."""
-    report_file = "f2_similarities_report.csv"
-    zip_file = "f2_similarities_report.zip"
-    
-    report_df.to_csv(report_file, index=False)
-    
-    with ZipFile(zip_file, "w") as zipf:
-        zipf.write(report_file)
-    
-    return zip_file
-
-
-# ----------------------------------------
-# Streamlit App Code
-# ----------------------------------------
-
-def main():
-    st.set_page_config(page_title="Batch Similarity Analyzer", layout="wide")
-    st.title("Batch Similarity Analyzer")
-    st.markdown("""
-    This tool calculates f2 similarity for multiple Excel workbooks at once.
-    Upload a folder containing Excel files to generate a consolidated report.
-    """)
-    
-    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
-    
-    options = ["Conventional", "Expected", "Bias Corrected",
-               "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
-    selected_methods = st.multiselect("Select calculation methods:", options)
-    
-    if st.button("Calculate and Generate Report"):
-        if os.path.isdir(folder_path):
-            with st.spinner("Processing files..."):
-                workbook_data = load_batch_data(folder_path)
-                if workbook_data:
-                    report_df, qq_plots_data = process_batch(workbook_data, selected_methods)
-                    st.subheader("📊 Results Preview")
-                    st.dataframe(report_df.head())
-                    
-                    # Display QQ plots for bootstrap methods
-                    st.subheader("📈 QQ Plots for Bootstrap Methods")
-                    
-                    # Create selectors for file and method
-                    files = list(qq_plots_data.keys())
-                    if files:
-                        selected_file = st.selectbox("Select a file:", files)
-                        
-                        methods_in_file = list(qq_plots_data[selected_file].keys())
-                        if methods_in_file:
-                            selected_method = st.selectbox("Select a method:", methods_in_file)
-                            
-                            # Display the QQ plot
-                            data = qq_plots_data[selected_file][selected_method]
-                            if len(data) > 0:
-                                fig = create_jmp_style_qqplot(data, selected_method, selected_file)
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True)
-                                    
-                                    # Add interpretation
-                                    st.info("""
-                                    **QQ Plot Interpretation:**
-                                    - Points following the red line suggest normal distribution
-                                    - Points outside the confidence band indicate deviations from normality
-                                    - Curved patterns suggest skewness in the data
-                                    """)
-                            else:
-                                st.warning("No bootstrap data available for this method and file.")
-                    
-                    zip_file_path = create_zip_report(report_df)
-                    
-                    with open(zip_file_path, "rb") as f:
-                        st.download_button(
-                            label="Download Report (ZIP)",
-                            data=f,
-                            file_name="f2_similarities_report.zip",
-                            mime="application/zip"
-                        )
-                else:
-                    st.warning("No valid Excel files found in selected folder.")
-        else:
-            st.error("Invalid folder path. Please check the path and try again.")
-
-if __name__ == "__main__":
-    main()
+# ---- Matplotlib QQ (fallback) ----
+st.markdown("### Matplotlib QQ plot (scipy.stats.probplot) — fallback")
+fig2 = plt.figure(figsize=(6,4))
+probplot(vals, dist="norm", sparams=(vals.mean(), vals.std(ddof=1)), plot=plt)
+plt.title("Matplotlib QQ (probplot)")
+st.pyplot(fig2)
