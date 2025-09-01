@@ -442,8 +442,8 @@ def process_batch(workbook_data, methods, n_iterations=10000):
     
     return pd.DataFrame(all_results), bootstrap_data
 
-def create_zip_report(report_df):
-    """Create a ZIP file containing the report CSV."""
+def create_zip_report(report_df, qq_plots_data=None):
+    """Create a ZIP file containing the report CSV and QQ plots."""
     report_file = "f2_similarities_report.csv"
     zip_file = "f2_similarities_report.zip"
     
@@ -451,8 +451,54 @@ def create_zip_report(report_df):
     
     with ZipFile(zip_file, "w") as zipf:
         zipf.write(report_file)
+        
+        # Add QQ plots if available
+        if qq_plots_data:
+            for file_name, plots in qq_plots_data.items():
+                # Create individual plots
+                for method, fig in plots['individual'].items():
+                    if fig:
+                        plot_filename = f"QQ_Plot_{file_name.replace('.xlsx', '')}_{method.replace(' ', '_')}.html"
+                        fig.write_html(plot_filename)
+                        zipf.write(plot_filename)
+                        os.remove(plot_filename)  # Clean up temp file
+                
+                # Add combined plot
+                if plots['combined']:
+                    combined_filename = f"QQ_Plot_Combined_{file_name.replace('.xlsx', '')}.html"
+                    plots['combined'].write_html(combined_filename)
+                    zipf.write(combined_filename)
+                    os.remove(combined_filename)  # Clean up temp file
+    
+    # Clean up temp CSV file
+    if os.path.exists(report_file):
+        os.remove(report_file)
     
     return zip_file
+
+def generate_qq_plots(bootstrap_data):
+    """Generate all QQ plots and return them as a dictionary."""
+    qq_plots_data = {}
+    
+    for file_name, file_bootstrap_data in bootstrap_data.items():
+        plots = {
+            'individual': {},
+            'combined': None
+        }
+        
+        # Generate individual plots
+        for method, data in file_bootstrap_data.items():
+            if len(data) > 0:
+                fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
+                plots['individual'][method] = fig
+        
+        # Generate combined plot
+        combined_fig = create_combined_qq_plots(file_bootstrap_data, file_name)
+        plots['combined'] = combined_fig
+        
+        qq_plots_data[file_name] = plots
+    
+    return qq_plots_data
 
 # ----------------------------------------
 # Streamlit App Code
@@ -490,64 +536,53 @@ def main():
                     st.dataframe(report_df.head())
                     
                     # Generate QQ Plots for bootstrap methods
+                    qq_plots_data = None
                     if bootstrap_methods and bootstrap_data:
-                        st.subheader("📈 QQ Plot Analysis")
-                        st.markdown("*Assess the normality of bootstrap f2 distributions*")
-                        
-                        # Create tabs for different files
-                        file_names = list(bootstrap_data.keys())
-                        if len(file_names) == 1:
-                            # Single file - show plots directly
-                            file_name = file_names[0]
-                            file_data = bootstrap_data[file_name]
+                        with st.spinner("Generating QQ plots for download..."):
+                            qq_plots_data = generate_qq_plots(bootstrap_data)
                             
-                            # Show combined plot first
-                            combined_fig = create_combined_qq_plots(file_data, file_name)
-                            if combined_fig:
-                                st.plotly_chart(combined_fig, use_container_width=True)
+                            # Show summary of generated plots
+                            st.subheader("📈 QQ Plot Generation Summary")
+                            st.success("✅ QQ plots have been generated successfully!")
                             
-                            # Individual plots
-                            cols = st.columns(len(file_data))
-                            for idx, (method, data) in enumerate(file_data.items()):
-                                if len(data) > 0:
-                                    with cols[idx % len(cols)]:
-                                        fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
-                                        if fig:
-                                            st.plotly_chart(fig, use_container_width=True)
-                        
-                        else:
-                            # Multiple files - use tabs
-                            tabs = st.tabs(file_names[:5])  # Limit to 5 tabs for UI
-                            for tab_idx, (tab, file_name) in enumerate(zip(tabs, file_names[:5])):
-                                with tab:
-                                    file_data = bootstrap_data[file_name]
-                                    
-                                    # Show combined plot
-                                    combined_fig = create_combined_qq_plots(file_data, file_name)
-                                    if combined_fig:
-                                        st.plotly_chart(combined_fig, use_container_width=True)
-                                    
-                                    # Individual plots in expandable sections
-                                    for method, data in file_data.items():
-                                        if len(data) > 0:
-                                            with st.expander(f"Detailed {method} QQ Plot"):
-                                                fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
-                                                if fig:
-                                                    st.plotly_chart(fig, use_container_width=True)
+                            total_plots = 0
+                            for file_name, plots in qq_plots_data.items():
+                                individual_count = len([fig for fig in plots['individual'].values() if fig is not None])
+                                combined_count = 1 if plots['combined'] is not None else 0
+                                file_total = individual_count + combined_count
+                                total_plots += file_total
+                                
+                                st.write(f"**{file_name}:** {individual_count} individual plots + {combined_count} combined plot = {file_total} plots")
                             
-                            if len(file_names) > 5:
-                                st.info(f"Showing QQ plots for first 5 files. Total files processed: {len(file_names)}")
+                            st.info(f"📊 **Total QQ plots generated:** {total_plots}")
+                            st.markdown("""
+                            **QQ Plot Files Included in Download:**
+                            - Individual method plots: `QQ_Plot_[FileName]_[Method].html`
+                            - Combined comparison plots: `QQ_Plot_Combined_[FileName].html`
+                            - All plots are fully interactive and can be opened in any web browser
+                            """)
                     
-                    # Download report
-                    zip_file_path = create_zip_report(report_df)
+                    # Download report with QQ plots
+                    with st.spinner("Creating downloadable ZIP file..."):
+                        zip_file_path = create_zip_report(report_df, qq_plots_data)
                     
                     with open(zip_file_path, "rb") as f:
-                        st.download_button(
-                            label="📥 Download Report (ZIP)",
-                            data=f,read(
-                            file_name="f2_similarities_report.zip",
-                            mime="application/zip"
-                        )
+                        file_content = f.read()
+                    
+                    # Clean up the zip file
+                    if os.path.exists(zip_file_path):
+                        os.remove(zip_file_path)
+                    
+                    st.download_button(
+                        label="📥 Download Complete Report with QQ Plots (ZIP)",
+                        data=file_content,
+                        file_name="f2_similarities_report_with_plots.zip",
+                        mime="application/zip",
+                        help="Download includes CSV report and all QQ plot HTML files"
+                    )
+                    
+                    st.success("🎉 Report and QQ plots are ready for download!")
+                    
                 else:
                     st.warning("No valid Excel files found in selected folder.")
         else:
