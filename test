@@ -1,79 +1,575 @@
-# debug_force_plotly.py
+import os
 import streamlit as st
+import pandas as pd
 import numpy as np
-from scipy.stats import norm
-import plotly.graph_objs as go
+from zipfile import ZipFile
+from scipy.stats import skew, kurtosis, norm, probplot
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Force-Plotly Debug", layout="wide")
-st.title("Force Plotly Visibility Debug")
+# ----------------------------------------
+# Required Helper Functions
+# ----------------------------------------
 
-# Recreate sample from your reported stats
-count = 10000
-mean = 81.940
-sd = 6.355
-_min = 59.172
-_max = 99.437
+def prepare_data(reference_df, test_df):
+    """Remove time zero if present and reset index"""
+    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
+        reference_df = reference_df.iloc[1:].reset_index(drop=True)
+    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
+        test_df = test_df.iloc[1:].reset_index(drop=True)
+    return reference_df, test_df
 
-rng = np.random.default_rng(12345)
-vals = rng.normal(loc=mean, scale=sd, size=count)
-vals = np.clip(vals, _min, _max)
-vals_sorted = np.sort(vals)
-n = len(vals_sorted)
+def conventional_f2(ref_means, test_means):
+    """Calculate conventional f2"""
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    p = len(ref_means)
+    return 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
 
-st.write(f"count={n}, mean={vals_sorted.mean():.3f}, sd={vals_sorted.std(ddof=1):.3f}, min={vals_sorted.min():.3f}, max={vals_sorted.max():.3f}")
+def expected_f2(ref_df, test_df):
+    """Calculate expected f2"""
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
+    
+    # Conventional f2 component
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    
+    # Variance components
+    ref_var = row_variance(ref_df)
+    test_var = row_variance(test_df)
+    sum_var = (ref_var + test_var).sum()
+    
+    n = ref_df.shape[1] - 1  # Number of units per time point
+    p = len(ref_means)
+    
+    adjustment = (1/n) * sum_var
+    return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
 
-# Theoretical values mapped to f2 units (same as before)
-probs = (np.arange(1, n+1) - 0.5) / n
-z_theor = norm.ppf(probs)
-theor = vals_sorted.mean() + vals_sorted.std(ddof=1) * z_theor
+def bias_corrected_f2(ref_df, test_df):
+    """Calculate bias-corrected f2"""
+    try:
+        ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+        test_means = test_df.iloc[:, 1:].mean(axis=1)
 
-# Force-test 1: Plot ONLY points with VERY LARGE, HIGH-CONTRAST styling (no diagonal, no envelope)
-fig1 = go.Figure()
-fig1.add_trace(go.Scatter(
-    x=theor,
-    y=vals_sorted,
-    mode='markers',
-    marker=dict(
-        size=14,                  # large
-        color='blue',             # strong color
-        symbol='diamond-open',    # open diamond so fill/edge obvious
-        line=dict(width=3, color='yellow'),  # thick border in contrasting color
-        opacity=1.0
-    ),
-    name='BIG points'
-))
-fig1.update_layout(title="FORCE TEST: Only large points (no diagonal/envelope)", xaxis_title="theor (f2 units)", yaxis_title="sample f2", height=480, plot_bgcolor='white')
-# Force ranges so nothing is clipped
-pad = 0.05 * (max(theor.max(), vals_sorted.max()) - min(theor.min(), vals_sorted.min()))
-fig1.update_xaxes(range=[theor.min()-pad, theor.max()+pad])
-fig1.update_yaxes(range=[vals_sorted.min()-pad, vals_sorted.max()+pad])
+        diff = test_means - ref_means
+        sum_sq_diff = (diff ** 2).sum()
 
-st.plotly_chart(fig1, use_container_width=True)
+        ref_var = row_variance(ref_df)
+        test_var = row_variance(test_df)
+        sum_var = (ref_var + test_var).sum()
 
-# Force-test 2: show points with labels for first 20 points
-sample_idx = np.linspace(0, n-1, 20, dtype=int)
-fig2 = go.Figure()
-fig2.add_trace(go.Scatter(
-    x=theor[sample_idx],
-    y=vals_sorted[sample_idx],
-    mode='markers+text',
-    marker=dict(size=12, color='black', symbol='x', line=dict(width=2, color='white')),
-    text=[f"{i}" for i in sample_idx],
-    textposition='top center'
-))
-fig2.update_layout(title="Labelled subset of points (first 20 indices)", height=360, plot_bgcolor='white')
-st.plotly_chart(fig2, use_container_width=True)
+        n = ref_df.shape[1] - 1
+        p = len(ref_means)
 
-# Print first 10 (x,y) pairs to page so you can visually inspect numbers
-st.markdown("First 10 theoretical -> sample pairs (theor -> sample):")
-pairs = list(zip(np.round(theor[:10],3), np.round(vals_sorted[:10],3)))
-st.write(pairs)
+        adjustment = (1 / n) * sum_var
+        right_side = sum_sq_diff + p
 
-# Attempt server-side static export (Kaleido) to double-check rendering independent of browser
-st.markdown("Attempt server-side static PNG export via Plotly (requires `kaleido`).")
-try:
-    img_bytes = fig1.to_image(format="png", width=900, height=480)
-    st.image(img_bytes, caption="Server-rendered PNG (kaleido)", use_column_width=True)
-except Exception as e:
-    st.error(f"PNG export failed (kaleido missing or error). Exception: {e}")
-    st.info("If you want this export to work, run: pip install -U kaleido and restart the app.")
+        if adjustment < right_side:
+            adjusted_diff = sum_sq_diff - adjustment
+            if adjusted_diff > 0:
+                return 100 - 25 * np.log10(1 + (1 / p) * adjusted_diff)
+            else:
+                return None
+        else:
+            return None
+
+    except Exception:
+        return None
+
+def row_variance(df):
+    """Calculate row-wise variance"""
+    return df.iloc[:, 1:].var(axis=1, ddof=1)
+
+def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
+    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
+    n_ref_units = ref_df.shape[1] - 1
+    n_test_units = test_df.shape[1] - 1
+
+    original_f2 = calc_func(ref_df, test_df)
+    f2_values = []
+    
+    for _ in range(n_iterations):
+        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
+        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
+
+        ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
+        test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
+
+        f2_val = calc_func(ref_sample, test_sample)
+
+        if f2_val is not None and isinstance(f2_val, (int, float)):
+            f2_values.append(f2_val)
+    
+    if not f2_values:
+        return original_f2, None, None, None, None, None, None, []
+    
+    f2_values = np.array(f2_values)
+    mean_f2 = np.mean(f2_values)
+    median_f2 = np.median(f2_values)
+    skewness_f2 = skew(f2_values)
+    kurtosis_f2 = kurtosis(f2_values)
+    lower_bound = np.percentile(f2_values, 5)
+    upper_bound = np.percentile(f2_values, 95)
+
+    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
+
+def create_jmp_style_qq_plot(data, title, method_name, file_name):
+    """Create a JMP-style QQ plot with beautiful formatting"""
+    if len(data) == 0:
+        return None
+    
+    # Calculate theoretical quantiles and sample quantiles
+    (osm, osr), (slope, intercept, r) = probplot(data, dist="norm", plot=None)
+    
+    # Create theoretical normal line
+    line_x = np.linspace(osm.min(), osm.max(), 100)
+    line_y = slope * line_x + intercept
+    
+    # Create the plot
+    fig = go.Figure()
+    
+    # Add the reference line (theoretical normal)
+    fig.add_trace(go.Scatter(
+        x=line_x,
+        y=line_y,
+        mode='lines',
+        name='Normal Reference Line',
+        line=dict(color='#E74C3C', width=2, dash='solid'),
+        hovertemplate='Theoretical Normal Line<extra></extra>'
+    ))
+    
+    # Add the data points
+    fig.add_trace(go.Scatter(
+        x=osm,
+        y=osr,
+        mode='markers',
+        name='Sample Quantiles',
+        marker=dict(
+            color='#3498DB',
+            size=8,
+            opacity=0.7,
+            symbol='circle',
+            line=dict(width=1, color='#2980B9')
+        ),
+        hovertemplate=
+        '<b>Theoretical Quantile:</b> %{x:.3f}<br>' +
+        '<b>Sample Quantile:</b> %{y:.3f}<br>' +
+        '<extra></extra>'
+    ))
+    
+    # Add confidence bands (approximate)
+    n = len(data)
+    se = np.sqrt(np.pi / (2 * n))  # Approximate standard error
+    upper_band = line_y + 1.96 * se * np.sqrt(1 + line_x**2)
+    lower_band = line_y - 1.96 * se * np.sqrt(1 + line_x**2)
+    
+    fig.add_trace(go.Scatter(
+        x=line_x,
+        y=upper_band,
+        mode='lines',
+        name='95% Confidence Band',
+        line=dict(color='#BDC3C7', width=1, dash='dot'),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=line_x,
+        y=lower_band,
+        mode='lines',
+        fill='tonexty',
+        name='95% Confidence Band',
+        line=dict(color='#BDC3C7', width=1, dash='dot'),
+        fillcolor='rgba(189, 195, 199, 0.1)',
+        hoverinfo='skip'
+    ))
+    
+    # Calculate statistics for annotation
+    mean_val = np.mean(data)
+    std_val = np.std(data)
+    skewness_val = skew(data)
+    kurtosis_val = kurtosis(data)
+    
+    # Update layout with JMP-style formatting
+    fig.update_layout(
+        title=dict(
+            text=f'<b>Normal Quantile Plot</b><br><sub>{method_name} - {file_name}</sub>',
+            x=0.5,
+            font=dict(size=16, color='#2C3E50')
+        ),
+        xaxis=dict(
+            title=dict(
+                text='<b>Normal Quantile</b>',
+                font=dict(size=12, color='#2C3E50')
+            ),
+            gridcolor='#ECF0F1',
+            gridwidth=1,
+            showgrid=True,
+            zeroline=False,
+            tickfont=dict(size=10, color='#7F8C8D'),
+            linecolor='#BDC3C7',
+            linewidth=1
+        ),
+        yaxis=dict(
+            title=dict(
+                text=f'<b>{method_name} f2 Value</b>',
+                font=dict(size=12, color='#2C3E50')
+            ),
+            gridcolor='#ECF0F1',
+            gridwidth=1,
+            showgrid=True,
+            zeroline=False,
+            tickfont=dict(size=10, color='#7F8C8D'),
+            linecolor='#BDC3C7',
+            linewidth=1
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family="Arial, sans-serif"),
+        hovermode='closest',
+        legend=dict(
+            x=0.02,
+            y=0.98,
+            bgcolor='rgba(255, 255, 255, 0.8)',
+            bordercolor='#BDC3C7',
+            borderwidth=1,
+            font=dict(size=10)
+        ),
+        width=600,
+        height=500,
+        margin=dict(l=80, r=120, t=80, b=60)
+    )
+    
+    # Add statistics annotation box
+    stats_text = (
+        f'<b>Distribution Statistics:</b><br>'
+        f'Mean: {mean_val:.3f}<br>'
+        f'Std Dev: {std_val:.3f}<br>'
+        f'Skewness: {skewness_val:.3f}<br>'
+        f'Kurtosis: {kurtosis_val:.3f}<br>'
+        f'R²: {r**2:.3f}<br>'
+        f'N: {n:,}'
+    )
+    
+    fig.add_annotation(
+        x=0.98,
+        y=0.02,
+        xref="paper",
+        yref="paper",
+        text=stats_text,
+        showarrow=False,
+        align="left",
+        bgcolor="rgba(255, 255, 255, 0.9)",
+        bordercolor="#BDC3C7",
+        borderwidth=1,
+        borderpad=8,
+        font=dict(size=9, color='#2C3E50')
+    )
+    
+    return fig
+
+def create_combined_qq_plots(bootstrap_results, file_name):
+    """Create a combined view of all QQ plots for a file"""
+    methods_with_data = [(method, data) for method, data in bootstrap_results.items() if len(data) > 0]
+    
+    if not methods_with_data:
+        return None
+    
+    n_methods = len(methods_with_data)
+    cols = min(3, n_methods)
+    rows = (n_methods + cols - 1) // cols
+    
+    subplot_titles = [method for method, _ in methods_with_data]
+    
+    fig = make_subplots(
+        rows=rows,
+        cols=cols,
+        subplot_titles=subplot_titles,
+        vertical_spacing=0.12,
+        horizontal_spacing=0.1
+    )
+    
+    colors = ['#3498DB', '#E74C3C', '#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C']
+    
+    for idx, (method, data) in enumerate(methods_with_data):
+        row = idx // cols + 1
+        col = idx % cols + 1
+        color = colors[idx % len(colors)]
+        
+        # Calculate QQ plot data
+        (osm, osr), (slope, intercept, r) = probplot(data, dist="norm", plot=None)
+        line_x = np.linspace(osm.min(), osm.max(), 100)
+        line_y = slope * line_x + intercept
+        
+        # Add reference line
+        fig.add_trace(
+            go.Scatter(
+                x=line_x,
+                y=line_y,
+                mode='lines',
+                line=dict(color='#E74C3C', width=2),
+                showlegend=False,
+                hoverinfo='skip'
+            ),
+            row=row, col=col
+        )
+        
+        # Add data points
+        fig.add_trace(
+            go.Scatter(
+                x=osm,
+                y=osr,
+                mode='markers',
+                marker=dict(
+                    color=color,
+                    size=6,
+                    opacity=0.7,
+                    line=dict(width=1, color=color)
+                ),
+                showlegend=False,
+                hovertemplate=f'<b>{method}</b><br>Theoretical: %{{x:.3f}}<br>Sample: %{{y:.3f}}<extra></extra>'
+            ),
+            row=row, col=col
+        )
+    
+    fig.update_layout(
+        title=dict(
+            text=f'<b>Normal Quantile Plots Comparison</b><br><sub>{file_name}</sub>',
+            x=0.5,
+            font=dict(size=16, color='#2C3E50')
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        font=dict(family="Arial, sans-serif"),
+        height=300 * rows,
+        margin=dict(l=60, r=40, t=80, b=40)
+    )
+    
+    fig.update_xaxes(
+        title_text="Normal Quantile",
+        gridcolor='#ECF0F1',
+        showgrid=True,
+        tickfont=dict(size=9)
+    )
+    
+    fig.update_yaxes(
+        title_text="f2 Value",
+        gridcolor='#ECF0F1',
+        showgrid=True,
+        tickfont=dict(size=9)
+    )
+    
+    return fig
+
+# ----------------------------------------
+# Batch Processing Functions
+# ----------------------------------------
+
+def load_batch_data(folder_path):
+    """Load test and reference data from multiple Excel files in a folder."""
+    workbook_data = {}
+    
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith(".xlsx"):
+            file_path = os.path.join(folder_path, file_name)
+            try:
+                reference_df = pd.read_excel(file_path, sheet_name=0)
+                test_df = pd.read_excel(file_path, sheet_name=1)
+                workbook_data[file_name] = (reference_df, test_df)
+            except Exception as e:
+                st.warning(f"Skipping file `{file_name}` due to error: {e}")
+    
+    return workbook_data
+
+def process_batch(workbook_data, methods, n_iterations=10000):
+    """Process multiple workbooks and calculate f2 metrics."""
+    all_results = []
+    bootstrap_data = {}  # Store bootstrap data for QQ plots
+    
+    for file_name, (reference_df, test_df) in workbook_data.items():
+        try:
+            ref_clean, test_clean = prepare_data(reference_df, test_df)
+            
+            results = {"File Name": file_name}
+            file_bootstrap_data = {}
+            
+            # Bootstrap calculation methods
+            if "Conventional Bootstrap" in methods:
+                def conv_func(r, t): 
+                    return conventional_f2(r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1))
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, conv_func, n_iterations)
+                results["Conventional Bootstrap f2"] = orig
+                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Conventional Bootstrap Mean"] = mean
+                results["Conventional Bootstrap Median"] = median
+                results["Conventional Bootstrap Skewness"] = skewness
+                results["Conventional Bootstrap Kurtosis"] = kurt
+                file_bootstrap_data["Conventional Bootstrap"] = vals
+
+            if "Expected Bootstrap" in methods:
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, expected_f2, n_iterations)
+                results["Expected Bootstrap f2"] = orig
+                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Expected Bootstrap Mean"] = mean
+                results["Expected Bootstrap Median"] = median
+                results["Expected Bootstrap Skewness"] = skewness
+                results["Expected Bootstrap Kurtosis"] = kurt
+                file_bootstrap_data["Expected Bootstrap"] = vals
+
+            if "Bias Corrected Bootstrap" in methods:
+                def bc_func(r, t): 
+                    bc = bias_corrected_f2(r, t)
+                    return bc if isinstance(bc, float) else None
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, bc_func, n_iterations)
+                results["Bias Corrected Bootstrap f2"] = orig
+                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Bias Corrected Bootstrap Mean"] = mean
+                results["Bias Corrected Bootstrap Median"] = median
+                results["Bias Corrected Bootstrap Skewness"] = skewness
+                results["Bias Corrected Bootstrap Kurtosis"] = kurt
+                file_bootstrap_data["Bias Corrected Bootstrap"] = vals
+            
+            all_results.append(results)
+            bootstrap_data[file_name] = file_bootstrap_data
+        
+        except Exception as e:
+            st.warning(f"Error processing file `{file_name}`: {e}")
+    
+    return pd.DataFrame(all_results), bootstrap_data
+
+def create_zip_report(report_df):
+    """Create a ZIP file containing the report CSV."""
+    report_file = "f2_similarities_report.csv"
+    zip_file = "f2_similarities_report.zip"
+    
+    report_df.to_csv(report_file, index=False)
+    
+    with ZipFile(zip_file, "w") as zipf:
+        zipf.write(report_file)
+    
+    return zip_file
+
+# ----------------------------------------
+# Streamlit App Code
+# ----------------------------------------
+
+def main():
+    st.set_page_config(page_title="Batch Similarity Analyzer with QQ Plots", layout="wide")
+    st.title("Batch Similarity Analyzer with QQ Plots")
+    st.markdown("""
+    This tool calculates f2 similarity for multiple Excel workbooks at once and provides 
+    beautiful JMP-style QQ plots to assess the normality of bootstrap distributions.
+    Upload a folder containing Excel files to generate a consolidated report with visualizations.
+    """)
+    
+    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
+    
+    options = ["Conventional", "Expected", "Bias Corrected",
+               "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
+    selected_methods = st.multiselect("Select calculation methods:", options, 
+                                    default=["Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"])
+    
+    n_iterations = st.slider("Number of bootstrap iterations:", 1000, 50000, 10000, 1000)
+    
+    if st.button("Calculate and Generate Report"):
+        if os.path.isdir(folder_path):
+            with st.spinner("Processing files and generating QQ plots..."):
+                workbook_data = load_batch_data(folder_path)
+                if workbook_data:
+                    # Check if any bootstrap methods are selected for QQ plots
+                    bootstrap_methods = [m for m in selected_methods if "Bootstrap" in m]
+                    
+                    report_df, bootstrap_data = process_batch(workbook_data, selected_methods, n_iterations)
+                    
+                    st.subheader("📊 Results Preview")
+                    st.dataframe(report_df.head())
+                    
+                    # Generate QQ Plots for bootstrap methods
+                    if bootstrap_methods and bootstrap_data:
+                        st.subheader("📈 QQ Plot Analysis")
+                        st.markdown("*Assess the normality of bootstrap f2 distributions*")
+                        
+                        # Create tabs for different files
+                        file_names = list(bootstrap_data.keys())
+                        if len(file_names) == 1:
+                            # Single file - show plots directly
+                            file_name = file_names[0]
+                            file_data = bootstrap_data[file_name]
+                            
+                            # Show combined plot first
+                            combined_fig = create_combined_qq_plots(file_data, file_name)
+                            if combined_fig:
+                                st.plotly_chart(combined_fig, use_container_width=True)
+                            
+                            # Individual plots
+                            cols = st.columns(len(file_data))
+                            for idx, (method, data) in enumerate(file_data.items()):
+                                if len(data) > 0:
+                                    with cols[idx % len(cols)]:
+                                        fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
+                                        if fig:
+                                            st.plotly_chart(fig, use_container_width=True)
+                        
+                        else:
+                            # Multiple files - use tabs
+                            tabs = st.tabs(file_names[:5])  # Limit to 5 tabs for UI
+                            for tab_idx, (tab, file_name) in enumerate(zip(tabs, file_names[:5])):
+                                with tab:
+                                    file_data = bootstrap_data[file_name]
+                                    
+                                    # Show combined plot
+                                    combined_fig = create_combined_qq_plots(file_data, file_name)
+                                    if combined_fig:
+                                        st.plotly_chart(combined_fig, use_container_width=True)
+                                    
+                                    # Individual plots in expandable sections
+                                    for method, data in file_data.items():
+                                        if len(data) > 0:
+                                            with st.expander(f"Detailed {method} QQ Plot"):
+                                                fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
+                                                if fig:
+                                                    st.plotly_chart(fig, use_container_width=True)
+                            
+                            if len(file_names) > 5:
+                                st.info(f"Showing QQ plots for first 5 files. Total files processed: {len(file_names)}")
+                    
+                    # Download report
+                    zip_file_path = create_zip_report(report_df)
+                    
+                    with open(zip_file_path, "rb") as f:
+                        st.download_button(
+                            label="📥 Download Report (ZIP)",
+                            data=f,read(
+                            file_name="f2_similarities_report.zip",
+                            mime="application/zip"
+                        )
+                else:
+                    st.warning("No valid Excel files found in selected folder.")
+        else:
+            st.error("Invalid folder path. Please check the path and try again.")
+    
+    # Add information section
+    with st.expander("ℹ️ About QQ Plots"):
+        st.markdown("""
+        **Normal Quantile (QQ) Plots** help assess whether your bootstrap f2 distributions follow a normal distribution:
+        
+        - **Points on the red line**: Indicate normal distribution
+        - **S-curve pattern**: Suggests heavy tails (high kurtosis)  
+        - **Inverted S-curve**: Suggests light tails (low kurtosis)
+        - **Points above line on right**: Right skewness (positive skew)
+        - **Points below line on right**: Left skewness (negative skew)
+        - **Gray shaded area**: 95% confidence band for normal distribution
+        
+        **Statistics shown:**
+        - **R²**: How well data fits normal distribution (closer to 1.0 is better)
+        - **Skewness**: Measure of asymmetry (0 = symmetric)
+        - **Kurtosis**: Measure of tail heaviness (0 = normal)
+        """)
+
+if __name__ == "__main__":
+    main()
