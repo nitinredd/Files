@@ -30,11 +30,9 @@ def expected_f2(ref_df, test_df):
     ref_means = ref_df.iloc[:, 1:].mean(axis=1)
     test_means = test_df.iloc[:, 1:].mean(axis=1)
     
-    # Conventional f2 component
     diff = test_means - ref_means
     sum_sq_diff = (diff ** 2).sum()
     
-    # Variance components
     ref_var = row_variance(ref_df)
     test_var = row_variance(test_df)
     sum_var = (ref_var + test_var).sum()
@@ -81,7 +79,6 @@ def bias_corrected_f2(ref_df, test_df):
 
 def row_variance(df):
     """Calculate row-wise variance"""
-    # ddof=1 matches sample variance
     if df.shape[1] <= 1:
         return pd.Series(np.zeros(df.shape[0]))
     return df.iloc[:, 1:].var(axis=1, ddof=1)
@@ -117,7 +114,6 @@ def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
         f2_val = calc_func(ref_sample, test_sample)
 
         if f2_val is not None and isinstance(f2_val, (int, float, np.floating)):
-            # convert numpy floats to python float
             f2_values.append(float(f2_val))
     
     if not f2_values:
@@ -172,7 +168,6 @@ def process_batch(workbook_data, methods, n_iterations=10000):
             # Conventional Bootstrap (note: conventional_f2 expects means)
             if "Conventional Bootstrap" in methods:
                 def conv_func(r, t):
-                    # compute row means and feed to conventional_f2
                     ref_means = r.iloc[:, 1:].mean(axis=1)
                     test_means = t.iloc[:, 1:].mean(axis=1)
                     return conventional_f2(ref_means, test_means)
@@ -234,50 +229,51 @@ def create_zip_report(report_df):
     return zip_file
 
 # ----------------------------------------
-# Visualization: JMP-style Q-Q Plot (Plotly)
+# Visualization: Robust JMP-style Q-Q Plot (Plotly)
 # ----------------------------------------
 
 def make_jmp_style_qq_plot(f2_values, title="Q-Q Plot (JMP-style)", envelope_sims=1000):
     """
-    Create a JMP-styled Q-Q plot (Plotly) comparing bootstrap f2 values to Normal.
-    - f2_values: 1D array-like sample
-    - envelope_sims: number of simulated samples to build 95% envelope (1000 recommended)
-    Returns a Plotly Figure.
+    Robust JMP-styled Q-Q plot:
+    - convert theoretical quantiles into f2 units (so both axes are f2)
+    - handle NaN/inf, require at least 3 samples
+    - draw 95% simulated envelope
     """
-    if f2_values is None or len(f2_values) == 0:
+    if f2_values is None:
         return None
 
-    vals = np.sort(np.array(f2_values))
+    arr = np.asarray(f2_values, dtype=float)
+    # drop NaN / inf
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 3:
+        return None
+
+    vals = np.sort(arr)
     n = len(vals)
-    # theoretical quantiles from standard normal (probabilities using (i - 0.5)/n)
     probs = (np.arange(1, n+1) - 0.5) / n
     z_theor = norm.ppf(probs)
 
-    sample_mean = vals.mean()
-    sample_sd = vals.std(ddof=1) if n > 1 else 0.0
+    sample_mean = float(vals.mean())
+    sample_sd = float(vals.std(ddof=1)) if n > 1 else 0.0
 
-    # Expected sample quantiles under Normal(mean, sd)
-    expected_sample_quantiles = sample_mean + sample_sd * z_theor
+    # Theoretical quantiles mapped to f2 units (so x axis is in f2)
+    theor = sample_mean + sample_sd * z_theor
 
-    # Build simulated envelope by drawing many normal samples with same mean & sd
-    # and computing sorted quantiles for each simulation
-    if sample_sd <= 0 or n <= 1 or envelope_sims <= 0:
-        lower_env = None
-        upper_env = None
-    else:
+    # Envelope: simulate normal samples with sample_mean & sample_sd, compute sorted quantiles
+    lower_env = upper_env = None
+    if sample_sd > 0 and envelope_sims > 0:
         sims = np.random.normal(loc=sample_mean, scale=sample_sd, size=(envelope_sims, n))
         sims.sort(axis=1)
         lower_env = np.percentile(sims, 2.5, axis=0)
         upper_env = np.percentile(sims, 97.5, axis=0)
 
-    # Build Plotly traces in JMP style
+    # Build plotly figure
     fig = go.Figure()
 
-    # Envelope shaded area (if available)
+    # Envelope (fill between upper and lower) — use x = theor (f2 units)
     if lower_env is not None and upper_env is not None:
-        # Plot lower bound
         fig.add_trace(go.Scatter(
-            x=z_theor,
+            x=theor,
             y=upper_env,
             mode='lines',
             line=dict(width=0),
@@ -285,48 +281,46 @@ def make_jmp_style_qq_plot(f2_values, title="Q-Q Plot (JMP-style)", envelope_sim
             hoverinfo='skip',
             name='95% upper'
         ))
-        # Plot lower bound and fill to previous trace
         fig.add_trace(go.Scatter(
-            x=z_theor,
+            x=theor,
             y=lower_env,
             mode='lines',
             fill='tonexty',
-            fillcolor='rgba(200,200,200,0.25)',  # light grey semi-transparent
+            fillcolor='rgba(200,200,200,0.3)',
             line=dict(width=0),
             showlegend=True,
             hoverinfo='skip',
             name='95% envelope'
         ))
 
-    # The sample points
+    # Sample points (x = theor, y = sample quantiles)
     fig.add_trace(go.Scatter(
-        x=z_theor,
+        x=theor,
         y=vals,
         mode='markers',
-        marker=dict(size=6, symbol='circle', line=dict(width=0.5, color='rgba(0,0,0,0.2)')),
+        marker=dict(size=7, symbol='circle', color='black', opacity=0.85, line=dict(width=0.5, color='rgba(0,0,0,0.2)')),
         name='Sample quantiles',
-        hovertemplate='Theoretical (z): %{x:.3f}<br>Sample f2: %{y:.3f}<extra></extra>'
+        hovertemplate='Theor (f2): %{x:.3f}<br>Sample f2: %{y:.3f}<extra></extra>'
     ))
 
-    # Diagonal reference line (y = mean + sd * x)
-    # create endpoints for line (extend slightly beyond z range for neatness)
-    z_min, z_max = z_theor.min(), z_theor.max()
-    pad = 0.1 * max(abs(z_min), abs(z_max))
-    x_line = np.array([z_min - pad, z_max + pad])
-    y_line = sample_mean + sample_sd * x_line
+    # 45-degree reference line in f2 units
+    min_axis = min(theor.min(), vals.min())
+    max_axis = max(theor.max(), vals.max())
+    pad = 0.05 * (max_axis - min_axis) if (max_axis - min_axis) > 0 else 0.1
+    x_line = np.linspace(min_axis - pad, max_axis + pad, 2)
+    y_line = x_line
     fig.add_trace(go.Scatter(
         x=x_line,
         y=y_line,
         mode='lines',
         line=dict(color='red', width=2),
-        name='Reference line'
+        name='Reference line (y=x)'
     ))
 
-    # Layout to mimic JMP style (clean, white, crisp)
     fig.update_layout(
         title=dict(text=title, x=0.01, xanchor='left', font=dict(size=16, family='Arial')),
         xaxis=dict(
-            title='Theoretical Quantiles<br>(Standard Normal)',
+            title='Theoretical Quantiles (mapped to f2 units)',
             showgrid=True,
             gridcolor='rgba(200,200,200,0.25)',
             zeroline=False,
@@ -349,11 +343,10 @@ def make_jmp_style_qq_plot(f2_values, title="Q-Q Plot (JMP-style)", envelope_sim
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         margin=dict(l=60, r=20, t=80, b=60),
         hovermode='closest',
-        width=None,
         height=520,
     )
 
-    return fig
+    return fig, {"count": n, "mean": sample_mean, "sd": sample_sd, "min": float(vals.min()), "max": float(vals.max())}
 
 # ----------------------------------------
 # Streamlit App Code
@@ -393,21 +386,10 @@ def main():
                 st.warning("No valid Excel files found in selected folder.")
                 return
 
-            # Only keep bootstrap-style methods active for heavy bootstrap calculations
             methods_to_run = []
-            # Map friendly names to our internal long names to match keys in bootstrap_samples
-            method_map = {
-                "Conventional Bootstrap": "Conventional Bootstrap",
-                "Expected Bootstrap": "Expected Bootstrap",
-                "Bias Corrected Bootstrap": "Bias Corrected Bootstrap",
-            }
-            # If user selected "Conventional" or similar non-bootstrap ones, we still include them as placeholders
             for m in selected_methods:
                 if "Bootstrap" in m:
                     methods_to_run.append(m)
-            # If user selected non-bootstrap (Conventional, Expected, Bias Corrected), we still compute single-run metrics:
-            # We'll still call process_batch with only bootstrap methods (these include original values). For plain methods we could compute separately,
-            # but the user requested QQ of bootstrap so priority is bootstrap methods.
 
             summary_df, bootstrap_samples = process_batch(workbook_data, methods_to_run, n_iterations=n_iterations)
 
@@ -444,25 +426,29 @@ def main():
                 st.warning("No bootstrap f2 values for this selection (maybe bias-corrected failed for this dataset).")
             else:
                 qq_title = f"Q–Q Plot (JMP-style) — {file_choice} — {method_choice}"
-                fig = make_jmp_style_qq_plot(f2_vals, title=qq_title, envelope_sims=envelope_sims)
-                if fig is None:
-                    st.warning("Unable to generate Q–Q plot (not enough data).")
+                res = make_jmp_style_qq_plot(f2_vals, title=qq_title, envelope_sims=envelope_sims)
+                if res is None:
+                    st.warning("Unable to generate Q–Q plot (not enough finite bootstrap values).")
                 else:
+                    fig, stats = res
+                    # Debug small card
+                    st.markdown("**Bootstrap sample stats**")
+                    st.write(f"Count: {stats['count']}  •  Mean: {stats['mean']:.3f}  •  SD: {stats['sd']:.3f}  •  Min: {stats['min']:.3f}  •  Max: {stats['max']:.3f}")
                     st.plotly_chart(fig, use_container_width=True)
 
-                # Optional histogram below the QQ
-                st.markdown("**Bootstrap f2 distribution**")
-                hist = go.Figure()
-                hist.add_trace(go.Histogram(x=np.array(f2_vals), nbinsx=40, marker=dict(line=dict(width=0.1))))
-                hist.update_layout(
-                    title="Bootstrap f2 distribution",
-                    xaxis_title="f2 value",
-                    yaxis_title="Count",
-                    plot_bgcolor='white',
-                    margin=dict(l=40, r=20, t=40, b=40),
-                    height=300
-                )
-                st.plotly_chart(hist, use_container_width=True)
+                    # Optional histogram below the QQ
+                    st.markdown("**Bootstrap f2 distribution**")
+                    hist = go.Figure()
+                    hist.add_trace(go.Histogram(x=np.array(f2_vals), nbinsx=40, marker=dict(line=dict(width=0.1))))
+                    hist.update_layout(
+                        title="Bootstrap f2 distribution",
+                        xaxis_title="f2 value",
+                        yaxis_title="Count",
+                        plot_bgcolor='white',
+                        margin=dict(l=40, r=20, t=40, b=40),
+                        height=300
+                    )
+                    st.plotly_chart(hist, use_container_width=True)
 
     else:
         st.info("Set the folder path and options in the left sidebar then click **Calculate and Generate Report**.")
