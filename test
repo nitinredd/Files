@@ -3,8 +3,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from zipfile import ZipFile
-from scipy.stats import skew, kurtosis, norm
-import plotly.graph_objs as go
+from scipy.stats import skew, kurtosis, norm, probplot
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # ----------------------------------------
 # Required Helper Functions
@@ -12,14 +13,14 @@ import plotly.graph_objs as go
 
 def prepare_data(reference_df, test_df):
     """Remove time zero if present and reset index"""
-    if reference_df.shape[0] > 0 and (reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0'):
+    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
         reference_df = reference_df.iloc[1:].reset_index(drop=True)
-    if test_df.shape[0] > 0 and (test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0'):
+    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
         test_df = test_df.iloc[1:].reset_index(drop=True)
     return reference_df, test_df
 
 def conventional_f2(ref_means, test_means):
-    """Calculate conventional f2 when passed mean series"""
+    """Calculate conventional f2"""
     diff = test_means - ref_means
     sum_sq_diff = (diff ** 2).sum()
     p = len(ref_means)
@@ -30,9 +31,11 @@ def expected_f2(ref_df, test_df):
     ref_means = ref_df.iloc[:, 1:].mean(axis=1)
     test_means = test_df.iloc[:, 1:].mean(axis=1)
     
+    # Conventional f2 component
     diff = test_means - ref_means
     sum_sq_diff = (diff ** 2).sum()
     
+    # Variance components
     ref_var = row_variance(ref_df)
     test_var = row_variance(test_df)
     sum_var = (ref_var + test_var).sum()
@@ -40,7 +43,7 @@ def expected_f2(ref_df, test_df):
     n = ref_df.shape[1] - 1  # Number of units per time point
     p = len(ref_means)
     
-    adjustment = (1/n) * sum_var if n > 0 else 0
+    adjustment = (1/n) * sum_var
     return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
 
 def bias_corrected_f2(ref_df, test_df):
@@ -59,9 +62,6 @@ def bias_corrected_f2(ref_df, test_df):
         n = ref_df.shape[1] - 1
         p = len(ref_means)
 
-        if n <= 0 or p == 0:
-            return None
-
         adjustment = (1 / n) * sum_var
         right_side = sum_sq_diff + p
 
@@ -79,58 +79,132 @@ def bias_corrected_f2(ref_df, test_df):
 
 def row_variance(df):
     """Calculate row-wise variance"""
-    if df.shape[1] <= 1:
-        return pd.Series(np.zeros(df.shape[0]))
     return df.iloc[:, 1:].var(axis=1, ddof=1)
 
 def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
-    """
-    Bootstrap f2 calculation (returns:
-      original_f2, lower_bound, upper_bound, mean, median, skewness,
-      kurtosis, f2_values (list)
-    ).
-    calc_func must accept (ref_df, test_df) and return numeric or None.
-    """
-    n_ref_units = max(ref_df.shape[1] - 1, 1)
-    n_test_units = max(test_df.shape[1] - 1, 1)
+    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
+    n_ref_units = ref_df.shape[1] - 1
+    n_test_units = test_df.shape[1] - 1
 
     original_f2 = calc_func(ref_df, test_df)
     f2_values = []
     
     for _ in range(n_iterations):
-        # sample columns (units) with replacement, keep time column (col 0)
-        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True) if ref_df.shape[1] > 1 else []
-        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True) if test_df.shape[1] > 1 else []
+        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
+        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
 
-        if len(ref_sample_idx) > 0:
-            ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
-        else:
-            ref_sample = ref_df.copy()
-        if len(test_sample_idx) > 0:
-            test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
-        else:
-            test_sample = test_df.copy()
+        ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
+        test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
 
         f2_val = calc_func(ref_sample, test_sample)
 
-        if f2_val is not None and isinstance(f2_val, (int, float, np.floating)):
-            f2_values.append(float(f2_val))
+        if f2_val is not None and isinstance(f2_val, (int, float)):
+            f2_values.append(f2_val)
     
     if not f2_values:
         return original_f2, None, None, None, None, None, None, []
     
     f2_values = np.array(f2_values)
-    mean_f2 = float(np.mean(f2_values))
-    median_f2 = float(np.median(f2_values))
-    skewness_f2 = float(skew(f2_values))
-    kurtosis_f2 = float(kurtosis(f2_values))
-    lower_bound = float(np.percentile(f2_values, 5))
-    upper_bound = float(np.percentile(f2_values, 95))
+    mean_f2 = np.mean(f2_values)
+    median_f2 = np.median(f2_values)
+    skewness_f2 = skew(f2_values)
+    kurtosis_f2 = kurtosis(f2_values)
+    lower_bound = np.percentile(f2_values, 5)
+    upper_bound = np.percentile(f2_values, 95)
 
-    return float(original_f2) if original_f2 is not None else None, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values.tolist()
+    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
+
+def create_jmp_style_qqplot(data, method_name, file_name):
+    """Create JMP-style QQ plot with confidence bands"""
+    if len(data) == 0:
+        return None
+        
+    # Calculate theoretical quantiles and ordered values
+    theoretical_quantiles = np.sort(norm.ppf(np.linspace(0.001, 0.999, len(data))))
+    ordered_data = np.sort(data)
+    
+    # Fit line
+    slope, intercept, r_value = np.polyfit(theoretical_quantiles, ordered_data, 1)
+    line_fit = slope * theoretical_quantiles + intercept
+    
+    # Calculate confidence bands (95%)
+    n = len(data)
+    std_err = np.sqrt(np.cumsum(1/theoretical_quantiles**2)) / n
+    upper_band = line_fit + 1.96 * std_err * np.std(data)
+    lower_band = line_fit - 1.96 * std_err * np.std(data)
+    
+    # Create figure
+    fig = make_subplots()
+    
+    # Add confidence bands
+    fig.add_trace(go.Scatter(
+        x=theoretical_quantiles, 
+        y=upper_band,
+        line=dict(color='lightgray', width=1),
+        name='95% Confidence Band',
+        fill=None,
+        mode='lines'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=theoretical_quantiles, 
+        y=lower_band,
+        line=dict(color='lightgray', width=1),
+        name='95% Confidence Band',
+        fill='tonexty',
+        mode='lines'
+    ))
+    
+    # Add reference line
+    fig.add_trace(go.Scatter(
+        x=theoretical_quantiles,
+        y=line_fit,
+        line=dict(color='red', width=2, dash='dash'),
+        name='Reference Line'
+    ))
+    
+    # Add data points
+    fig.add_trace(go.Scatter(
+        x=theoretical_quantiles,
+        y=ordered_data,
+        mode='markers',
+        marker=dict(color='blue', size=5),
+        name='Bootstrap Samples'
+    ))
+    
+    # Update layout for JMP style
+    fig.update_layout(
+        title=f"QQ Plot - {method_name} - {file_name}",
+        xaxis_title="Theoretical Quantiles",
+        yaxis_title="Sample Quantiles",
+        showlegend=True,
+        plot_bgcolor='white',
+        width=800,
+        height=600
+    )
+    
+    fig.update_xaxes(
+        showgrid=True, 
+        gridwidth=1, 
+        gridcolor='lightgray',
+        zeroline=True, 
+        zerolinewidth=2, 
+        zerolinecolor='black'
+    )
+    
+    fig.update_yaxes(
+        showgrid=True, 
+        gridwidth=1, 
+        gridcolor='lightgray',
+        zeroline=True, 
+        zerolinewidth=2, 
+        zerolinecolor='black'
+    )
+    
+    return fig
 
 # ----------------------------------------
-# Batch Processing Functions (modified to keep bootstrap samples)
+# Batch Processing Functions
 # ----------------------------------------
 
 def load_batch_data(folder_path):
@@ -138,7 +212,7 @@ def load_batch_data(folder_path):
     workbook_data = {}
     
     for file_name in os.listdir(folder_path):
-        if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
+        if file_name.endswith(".xlsx"):
             file_path = os.path.join(folder_path, file_name)
             try:
                 reference_df = pd.read_excel(file_path, sheet_name=0)
@@ -150,71 +224,62 @@ def load_batch_data(folder_path):
     return workbook_data
 
 def process_batch(workbook_data, methods, n_iterations=10000):
-    """
-    Process multiple workbooks and calculate f2 metrics.
-    Returns (summary_df, bootstrap_samples_map)
-      - summary_df: DataFrame with summary values
-      - bootstrap_samples_map: dict keyed by (file_name, method) -> list of bootstrap f2 values
-    """
+    """Process multiple workbooks and calculate f2 metrics."""
     all_results = []
-    bootstrap_samples = {}  # (file_name, method) -> list
+    qq_plots_data = {}  # Store data for QQ plots
     
     for file_name, (reference_df, test_df) in workbook_data.items():
         try:
-            ref_clean, test_clean = prepare_data(reference_df.copy(), test_df.copy())
+            ref_clean, test_clean = prepare_data(reference_df, test_df)
             
             results = {"File Name": file_name}
+            qq_plots_data[file_name] = {}
             
-            # Conventional Bootstrap (note: conventional_f2 expects means)
+            # Bootstrap calculation methods
             if "Conventional Bootstrap" in methods:
-                def conv_func(r, t):
-                    ref_means = r.iloc[:, 1:].mean(axis=1)
-                    test_means = t.iloc[:, 1:].mean(axis=1)
-                    return conventional_f2(ref_means, test_means)
+                def conv_func(r, t): 
+                    return conventional_f2(r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1))
                 orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
                     ref_clean, test_clean, conv_func, n_iterations)
                 results["Conventional Bootstrap f2"] = orig
-                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
+                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
                 results["Conventional Bootstrap Mean"] = mean
                 results["Conventional Bootstrap Median"] = median
                 results["Conventional Bootstrap Skewness"] = skewness
                 results["Conventional Bootstrap Kurtosis"] = kurt
-                bootstrap_samples[(file_name, "Conventional Bootstrap")] = vals
+                qq_plots_data[file_name]["Conventional Bootstrap"] = vals
 
-            # Expected Bootstrap
             if "Expected Bootstrap" in methods:
                 orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
                     ref_clean, test_clean, expected_f2, n_iterations)
                 results["Expected Bootstrap f2"] = orig
-                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
+                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
                 results["Expected Bootstrap Mean"] = mean
                 results["Expected Bootstrap Median"] = median
                 results["Expected Bootstrap Skewness"] = skewness
                 results["Expected Bootstrap Kurtosis"] = kurt
-                bootstrap_samples[(file_name, "Expected Bootstrap")] = vals
+                qq_plots_data[file_name]["Expected Bootstrap"] = vals
 
-            # Bias Corrected Bootstrap
             if "Bias Corrected Bootstrap" in methods:
-                def bc_func(r, t):
+                def bc_func(r, t): 
                     bc = bias_corrected_f2(r, t)
-                    return float(bc) if isinstance(bc, (float, np.floating)) else None
+                    return bc if isinstance(bc, float) else None
                 orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
                     ref_clean, test_clean, bc_func, n_iterations)
                 results["Bias Corrected Bootstrap f2"] = orig
-                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
+                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
                 results["Bias Corrected Bootstrap Mean"] = mean
                 results["Bias Corrected Bootstrap Median"] = median
                 results["Bias Corrected Bootstrap Skewness"] = skewness
                 results["Bias Corrected Bootstrap Kurtosis"] = kurt
-                bootstrap_samples[(file_name, "Bias Corrected Bootstrap")] = vals
+                qq_plots_data[file_name]["Bias Corrected Bootstrap"] = vals
             
             all_results.append(results)
         
         except Exception as e:
             st.warning(f"Error processing file `{file_name}`: {e}")
     
-    summary_df = pd.DataFrame(all_results)
-    return summary_df, bootstrap_samples
+    return pd.DataFrame(all_results), qq_plots_data
 
 def create_zip_report(report_df):
     """Create a ZIP file containing the report CSV."""
@@ -228,230 +293,76 @@ def create_zip_report(report_df):
     
     return zip_file
 
-# ----------------------------------------
-# Visualization: Robust JMP-style Q-Q Plot (Plotly)
-# ----------------------------------------
-
-def make_jmp_style_qq_plot(f2_values, title="Q-Q Plot (JMP-style)", envelope_sims=1000):
-    """
-    Robust JMP-styled Q-Q plot:
-    - convert theoretical quantiles into f2 units (so both axes are f2)
-    - handle NaN/inf, require at least 3 samples
-    - draw 95% simulated envelope
-    """
-    if f2_values is None:
-        return None
-
-    arr = np.asarray(f2_values, dtype=float)
-    # drop NaN / inf
-    arr = arr[np.isfinite(arr)]
-    if arr.size < 3:
-        return None
-
-    vals = np.sort(arr)
-    n = len(vals)
-    probs = (np.arange(1, n+1) - 0.5) / n
-    z_theor = norm.ppf(probs)
-
-    sample_mean = float(vals.mean())
-    sample_sd = float(vals.std(ddof=1)) if n > 1 else 0.0
-
-    # Theoretical quantiles mapped to f2 units (so x axis is in f2)
-    theor = sample_mean + sample_sd * z_theor
-
-    # Envelope: simulate normal samples with sample_mean & sample_sd, compute sorted quantiles
-    lower_env = upper_env = None
-    if sample_sd > 0 and envelope_sims > 0:
-        sims = np.random.normal(loc=sample_mean, scale=sample_sd, size=(envelope_sims, n))
-        sims.sort(axis=1)
-        lower_env = np.percentile(sims, 2.5, axis=0)
-        upper_env = np.percentile(sims, 97.5, axis=0)
-
-    # Build plotly figure
-    fig = go.Figure()
-
-    # Envelope (fill between upper and lower) — use x = theor (f2 units)
-    if lower_env is not None and upper_env is not None:
-        fig.add_trace(go.Scatter(
-            x=theor,
-            y=upper_env,
-            mode='lines',
-            line=dict(width=0),
-            showlegend=False,
-            hoverinfo='skip',
-            name='95% upper'
-        ))
-        fig.add_trace(go.Scatter(
-            x=theor,
-            y=lower_env,
-            mode='lines',
-            fill='tonexty',
-            fillcolor='rgba(200,200,200,0.3)',
-            line=dict(width=0),
-            showlegend=True,
-            hoverinfo='skip',
-            name='95% envelope'
-        ))
-
-    # Sample points (x = theor, y = sample quantiles)
-    fig.add_trace(go.Scatter(
-        x=theor,
-        y=vals,
-        mode='markers',
-        marker=dict(size=7, symbol='circle', color='black', opacity=0.85, line=dict(width=0.5, color='rgba(0,0,0,0.2)')),
-        name='Sample quantiles',
-        hovertemplate='Theor (f2): %{x:.3f}<br>Sample f2: %{y:.3f}<extra></extra>'
-    ))
-
-    # 45-degree reference line in f2 units
-    min_axis = min(theor.min(), vals.min())
-    max_axis = max(theor.max(), vals.max())
-    pad = 0.05 * (max_axis - min_axis) if (max_axis - min_axis) > 0 else 0.1
-    x_line = np.linspace(min_axis - pad, max_axis + pad, 2)
-    y_line = x_line
-    fig.add_trace(go.Scatter(
-        x=x_line,
-        y=y_line,
-        mode='lines',
-        line=dict(color='red', width=2),
-        name='Reference line (y=x)'
-    ))
-
-    fig.update_layout(
-        title=dict(text=title, x=0.01, xanchor='left', font=dict(size=16, family='Arial')),
-        xaxis=dict(
-            title='Theoretical Quantiles (mapped to f2 units)',
-            showgrid=True,
-            gridcolor='rgba(200,200,200,0.25)',
-            zeroline=False,
-            mirror=True,
-            showline=True,
-            linecolor='black',
-            ticks='outside'
-        ),
-        yaxis=dict(
-            title='Sample Quantiles (f2)',
-            showgrid=True,
-            gridcolor='rgba(200,200,200,0.25)',
-            zeroline=False,
-            mirror=True,
-            showline=True,
-            linecolor='black',
-            ticks='outside'
-        ),
-        plot_bgcolor='white',
-        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
-        margin=dict(l=60, r=20, t=80, b=60),
-        hovermode='closest',
-        height=520,
-    )
-
-    return fig, {"count": n, "mean": sample_mean, "sd": sample_sd, "min": float(vals.min()), "max": float(vals.max())}
 
 # ----------------------------------------
 # Streamlit App Code
 # ----------------------------------------
 
 def main():
-    st.set_page_config(page_title="Batch Similarity Analyzer with JMP-style QQ", layout="wide")
-    st.title("Batch Similarity Analyzer — JMP-style Interactive Bootstrap Q–Q")
+    st.set_page_config(page_title="Batch Similarity Analyzer", layout="wide")
+    st.title("Batch Similarity Analyzer")
     st.markdown("""
-    Upload a folder with Excel workbooks (sheet 0 = reference, sheet 1 = test).  
-    Select bootstrap methods to compute and then inspect JMP-style Q–Q plots of the bootstrap f2 values.
+    This tool calculates f2 similarity for multiple Excel workbooks at once.
+    Upload a folder containing Excel files to generate a consolidated report.
     """)
-
-    # Left column: inputs
-    with st.sidebar:
-        st.header("Inputs / Settings")
-        folder_path = st.text_input("Enter path to folder containing Excel files:", "")
-        options = ["Conventional", "Expected", "Bias Corrected",
-                   "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
-        selected_methods = st.multiselect("Select calculation methods:", options, default=["Conventional Bootstrap", "Expected Bootstrap"])
-        n_iterations = st.slider("Bootstrap iterations (per file & per method):", 100, 20000, 2000, step=100)
-        envelope_sims = st.slider("Envelope simulation count (for QQ envelope):", 100, 2000, 1000, step=100)
-        run_button = st.button("Calculate and Generate Report")
-
-    # Placeholder for results and interactive area
-    results_area = st.container()
-    plot_area = st.container()
-
-    if run_button:
-        if not os.path.isdir(folder_path):
-            st.error("Invalid folder path. Please check the path and try again.")
-            return
-
-        with st.spinner("Processing files... this may take a while depending on bootstrap iterations..."):
-            workbook_data = load_batch_data(folder_path)
-            if not workbook_data:
-                st.warning("No valid Excel files found in selected folder.")
-                return
-
-            methods_to_run = []
-            for m in selected_methods:
-                if "Bootstrap" in m:
-                    methods_to_run.append(m)
-
-            summary_df, bootstrap_samples = process_batch(workbook_data, methods_to_run, n_iterations=n_iterations)
-
-        with results_area:
-            st.subheader("📊 Results Summary")
-            if not summary_df.empty:
-                st.dataframe(summary_df)
-                zip_file_path = create_zip_report(summary_df)
-                with open(zip_file_path, "rb") as f:
-                    st.download_button(
-                        label="Download Summary Report (ZIP)",
-                        data=f,
-                        file_name="f2_similarities_report.zip",
-                        mime="application/zip"
-                    )
-            else:
-                st.info("No summary data produced. Make sure you selected at least one Bootstrap method.")
-
-        # Interactive plotting area
-        with plot_area:
-            st.subheader("📈 Interactive JMP-style Q–Q Plot for Bootstrap Samples")
-            files_available = sorted({k[0] for k in bootstrap_samples.keys()})
-            if not files_available:
-                st.info("No bootstrap samples available to plot. Make sure you selected bootstrap methods and data files contain both sheets.")
-                return
-
-            file_choice = st.selectbox("Select file to inspect:", files_available)
-            methods_available = [k[1] for k in bootstrap_samples.keys() if k[0] == file_choice]
-            method_choice = st.selectbox("Select bootstrap method:", sorted(set(methods_available)))
-
-            # Retrieve f2 samples for selection
-            f2_vals = bootstrap_samples.get((file_choice, method_choice), [])
-            if not f2_vals:
-                st.warning("No bootstrap f2 values for this selection (maybe bias-corrected failed for this dataset).")
-            else:
-                qq_title = f"Q–Q Plot (JMP-style) — {file_choice} — {method_choice}"
-                res = make_jmp_style_qq_plot(f2_vals, title=qq_title, envelope_sims=envelope_sims)
-                if res is None:
-                    st.warning("Unable to generate Q–Q plot (not enough finite bootstrap values).")
+    
+    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
+    
+    options = ["Conventional", "Expected", "Bias Corrected",
+               "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
+    selected_methods = st.multiselect("Select calculation methods:", options)
+    
+    if st.button("Calculate and Generate Report"):
+        if os.path.isdir(folder_path):
+            with st.spinner("Processing files..."):
+                workbook_data = load_batch_data(folder_path)
+                if workbook_data:
+                    report_df, qq_plots_data = process_batch(workbook_data, selected_methods)
+                    st.subheader("📊 Results Preview")
+                    st.dataframe(report_df.head())
+                    
+                    # Display QQ plots for bootstrap methods
+                    st.subheader("📈 QQ Plots for Bootstrap Methods")
+                    
+                    # Create selectors for file and method
+                    files = list(qq_plots_data.keys())
+                    if files:
+                        selected_file = st.selectbox("Select a file:", files)
+                        
+                        methods_in_file = list(qq_plots_data[selected_file].keys())
+                        if methods_in_file:
+                            selected_method = st.selectbox("Select a method:", methods_in_file)
+                            
+                            # Display the QQ plot
+                            data = qq_plots_data[selected_file][selected_method]
+                            if len(data) > 0:
+                                fig = create_jmp_style_qqplot(data, selected_method, selected_file)
+                                if fig:
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                    # Add interpretation
+                                    st.info("""
+                                    **QQ Plot Interpretation:**
+                                    - Points following the red line suggest normal distribution
+                                    - Points outside the confidence band indicate deviations from normality
+                                    - Curved patterns suggest skewness in the data
+                                    """)
+                            else:
+                                st.warning("No bootstrap data available for this method and file.")
+                    
+                    zip_file_path = create_zip_report(report_df)
+                    
+                    with open(zip_file_path, "rb") as f:
+                        st.download_button(
+                            label="Download Report (ZIP)",
+                            data=f,
+                            file_name="f2_similarities_report.zip",
+                            mime="application/zip"
+                        )
                 else:
-                    fig, stats = res
-                    # Debug small card
-                    st.markdown("**Bootstrap sample stats**")
-                    st.write(f"Count: {stats['count']}  •  Mean: {stats['mean']:.3f}  •  SD: {stats['sd']:.3f}  •  Min: {stats['min']:.3f}  •  Max: {stats['max']:.3f}")
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    # Optional histogram below the QQ
-                    st.markdown("**Bootstrap f2 distribution**")
-                    hist = go.Figure()
-                    hist.add_trace(go.Histogram(x=np.array(f2_vals), nbinsx=40, marker=dict(line=dict(width=0.1))))
-                    hist.update_layout(
-                        title="Bootstrap f2 distribution",
-                        xaxis_title="f2 value",
-                        yaxis_title="Count",
-                        plot_bgcolor='white',
-                        margin=dict(l=40, r=20, t=40, b=40),
-                        height=300
-                    )
-                    st.plotly_chart(hist, use_container_width=True)
-
-    else:
-        st.info("Set the folder path and options in the left sidebar then click **Calculate and Generate Report**.")
+                    st.warning("No valid Excel files found in selected folder.")
+        else:
+            st.error("Invalid folder path. Please check the path and try again.")
 
 if __name__ == "__main__":
     main()
