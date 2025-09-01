@@ -1,482 +1,243 @@
-src/components/OpenWebUILoader.jsx
-// src/components/OpenWebUILoader.jsx
-import React from 'react'
-import { motion } from 'framer-motion'
+import os
+import streamlit as st
+import pandas as pd
+import numpy as np
+from zipfile import ZipFile
+from scipy.stats import skew, kurtosis
 
-/**
- * OpenWebUILoader
- * - lines: number of skeleton rows
- * - compact: smaller rows if true
- * - variant: 'dark' | 'muted'
- * - layoutId?: string  -> used for shared layout animation (morph)
- */
-export default function OpenWebUILoader({ lines = 4, compact = false, variant = 'dark', layoutId = undefined }) {
-  const rowHeight = compact ? 10 : 14
-  const gap = compact ? 8 : 12
-  const widths = [0.94, 0.78, 0.86, 0.62, 0.74, 0.9]
+# ----------------------------------------
+# Required Helper Functions
+# ----------------------------------------
 
-  const baseClass = variant === 'dark' ? 'owu-skel-dark' : 'owu-skel-muted'
+def prepare_data(reference_df, test_df):
+    """Remove time zero if present and reset index"""
+    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
+        reference_df = reference_df.iloc[1:].reset_index(drop=True)
+    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
+        test_df = test_df.iloc[1:].reset_index(drop=True)
+    return reference_df, test_df
 
-  // subtle stagger animation per row (keeps motion light)
-  const rowAnim = {
-    animate: i => ({
-      opacity: [0.2, 0.48, 0.28],
-      y: [4, 0, 2],
-      transition: { duration: 1.0, ease: 'easeInOut', repeat: Infinity, repeatDelay: 0.32, delay: i * 0.06 }
-    }),
-    initial: { opacity: 0.18, y: 4 }
-  }
+def conventional_f2(ref_means, test_means):
+    """Calculate conventional f2"""
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    p = len(ref_means)
+    return 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
 
-  return (
-    <motion.div
-      layoutId={layoutId}
-      initial={{ opacity: 1 }}
-      animate={{ opacity: 1 }}
-      className="w-full flex flex-col"
-      style={{ gap }}
-    >
-      <div className={`p-3 rounded-lg ${baseClass}`} style={{ overflow: 'hidden' }}>
-        {/* the row block approximates the final message bubble area so morph looks natural */}
-        {Array.from({ length: lines }).map((_, i) => (
-          <motion.div
-            key={i}
-            custom={i}
-            initial="initial"
-            animate="animate"
-            variants={rowAnim}
-            className="owu-skel-row rounded-md"
-            style={{
-              height: rowHeight,
-              width: `${Math.round(widths[i % widths.length] * 100)}%`,
-              marginBottom: i === lines - 1 ? 0 : 8
-            }}
-          />
-        ))}
-      </div>
-    </motion.div>
-  )
-}
-###################################
-src/components/Message.jsx
-// src/components/Message.jsx
-import React from 'react'
-import { motion } from 'framer-motion'
-import { FiVolume2 } from 'react-icons/fi'
-import { parseResponseToTable } from '../utils/parseResponseToTable'
+def expected_f2(ref_df, test_df):
+    """Calculate expected f2"""
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
+    
+    # Conventional f2 component
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    
+    # Variance components
+    ref_var = row_variance(ref_df)
+    test_var = row_variance(test_df)
+    sum_var = (ref_var + test_var).sum()
+    
+    n = ref_df.shape[1] - 1  # Number of units per time point
+    p = len(ref_means)
+    
+    adjustment = (1/n) * sum_var
+    return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
 
-/**
- * Message component
- * - Accepts layoutId (string). When present, the outer wrapper uses that layoutId so it can
- *   morph from a loader element that used the same layoutId.
- */
-export default function Message({ from, text, onReadAloud, layoutId }) {
-  const table = parseResponseToTable(text)
-  const isUser = from === 'user'
+def bias_corrected_f2(ref_df, test_df):
+    """Calculate bias-corrected f2"""
+    try:
+        ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+        test_means = test_df.iloc[:, 1:].mean(axis=1)
 
-  // message bubble variants
-  const variants = {
-    initial: { opacity: 0, scale: 0.98, y: 6 },
-    enter: { opacity: 1, scale: 1, y: 0, transition: { duration: 0.28, ease: 'easeOut' } },
-    exit: { opacity: 0, scale: 0.98, y: 6, transition: { duration: 0.18 } }
-  }
+        diff = test_means - ref_means
+        sum_sq_diff = (diff ** 2).sum()
 
-  // wrapper classes for user vs agent
-  const bubbleClass = isUser ? 'msg-user p-4 rounded-2xl text-white' : 'msg-agent p-4 rounded-2xl bg-white glass text-gray-900'
+        ref_var = row_variance(ref_df)
+        test_var = row_variance(test_df)
+        sum_var = (ref_var + test_var).sum()
 
-  return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <motion.div
-        layoutId={layoutId}
-        initial="initial"
-        animate="enter"
-        exit="exit"
-        variants={variants}
-        className={`max-w-[78%] shadow-soft ${bubbleClass}`}
-        style={{ overflow: 'hidden' }}
-      >
-        <div className="prose-sm whitespace-pre-wrap break-words">
-          {!table && <div>{text}</div>}
+        n = ref_df.shape[1] - 1
+        p = len(ref_means)
 
-          {table?.type === 'json' && (
-            <div className="overflow-auto">
-              <table className="min-w-full text-sm table-auto">
-                <thead>
-                  <tr className="text-left">
-                    {Object.keys(table.data[0]).map(h => <th key={h} className="px-3 py-2 border-b">{h}</th>)}
-                  </tr>
-                </thead>
-                <tbody>
-                  {table.data.map((row, idx) => (
-                    <tr key={idx}>
-                      {Object.keys(table.data[0]).map(k => <td key={k} className="px-3 py-2 border-b align-top">{String(row[k] ?? '')}</td>)}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+        adjustment = (1 / n) * sum_var
+        right_side = sum_sq_diff + p
 
-          {table?.type === 'matrix' && (
-            <div className="overflow-auto">
-              <table className="min-w-full text-sm table-auto">
-                <thead>
-                  <tr>{table.headers.map(h => <th key={h} className="px-3 py-2 border-b">{h}</th>)}</tr>
-                </thead>
-                <tbody>
-                  {table.rows.map((r, i) => <tr key={i}>{r.map((c,j) => <td key={j} className="px-3 py-2 border-b">{c}</td>)}</tr>)}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+        if adjustment < right_side:
+            adjusted_diff = sum_sq_diff - adjustment
+            if adjusted_diff > 0:
+                return 100 - 25 * np.log10(1 + (1 / p) * adjusted_diff)
+            else:
+                return None
+        else:
+            return None
 
-        {!isUser && (
-          <div className="mt-2 flex items-center justify-end gap-2">
-            <button onClick={() => onReadAloud?.(text)} className="px-3 py-1 text-xs rounded read-btn flex items-center gap-2">
-              <FiVolume2 /> Read
-            </button>
-          </div>
-        )}
-      </motion.div>
-    </div>
-  )
-}
-#########################################
-src/components/ChatWidget.jsx
-// src/components/ChatWidget.jsx
-import React, { useEffect, useRef, useState } from 'react'
-import { motion } from 'framer-motion'
-import {
-  FiMessageCircle,
-  FiX,
-  FiMic,
-  FiSend,
-  FiChevronDown
-} from 'react-icons/fi'
-import Message from './Message'
-import PromptModal from './PromptModal'
-import FileUploader from './FileUploader'
-import OpenWebUILoader from './OpenWebUILoader'
-import { chatRequest, speechToTextUpload, textToSpeechUrl } from '../api'
+    except Exception:
+        return None
 
-const TILE_QUESTIONS = {
-  "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
-  "Line B": ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
-  "Formulation Z": ["List excipients used", "Describe dissolution method"],
-  "Process Y": ["Steps in granulation?", "Drying temperature?"],
-  "Machine Q": ["Model number details?", "Maintenance interval?"]
-}
+def row_variance(df):
+    """Calculate row-wise variance"""
+    return df.iloc[:, 1:].var(axis=1, ddof=1)
 
-export default function ChatWidget() {
-  const [open, setOpen] = useState(false)
-  const [promptOpen, setPromptOpen] = useState(false)
-  const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [recording, setRecording] = useState(false)
-  const [suggests, setSuggests] = useState([])
+def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
+    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
+    n_ref_units = ref_df.shape[1] - 1
+    n_test_units = test_df.shape[1] - 1
 
-  const recorderRef = useRef(null)
-  const audioChunksRef = useRef([])
-  const scrollRef = useRef(null)
-  const loaderRef = useRef(null)
-  const pendingLayoutIdRef = useRef(null) // keep pending layout id between renders
-  const typingTimeout = useRef(null)
+    original_f2 = calc_func(ref_df, test_df)
+    f2_values = []
+    
+    for _ in range(n_iterations):
+        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
+        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
 
-  useEffect(() => {
-    // scroll when messages or loading change
-    if (loading && loaderRef.current) {
-      setTimeout(() => { try { loaderRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' }) } catch (e) {} }, 80)
-    } else {
-      setTimeout(() => { try { scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }) } catch (e) {} }, 120)
-    }
-  }, [messages, loading])
+        ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
+        test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
 
-  function appendMsg(from, text, extra = {}) {
-    setMessages(prev => [...prev, { id: crypto?.randomUUID?.() ?? Date.now(), from, text, ...extra }])
-  }
+        f2_val = calc_func(ref_sample, test_sample)
 
-  // send flow with shared layout animation: create a unique layoutId for this pending response
-  async function send(promptToSend = null) {
-    const q = (promptToSend !== null) ? String(promptToSend).trim() : input.trim()
-    if (!q) return
+        if f2_val is not None and isinstance(f2_val, (int, float)):
+            f2_values.append(f2_val)
+    
+    if not f2_values:
+        return original_f2, None, None, None, None, None, None, []
+    
+    f2_values = np.array(f2_values)
+    mean_f2 = np.mean(f2_values)
+    median_f2 = np.median(f2_values)
+    skewness_f2 = skew(f2_values)
+    kurtosis_f2 = kurtosis(f2_values)
+    lower_bound = np.percentile(f2_values, 5)
+    upper_bound = np.percentile(f2_values, 95)
 
-    // Append user's message
-    appendMsg('user', q)
-    setInput('')
+    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
 
-    // prepare pending layout id for skeleton -> message morph
-    const layoutId = `pending-${Date.now()}`
-    pendingLayoutIdRef.current = layoutId
 
-    // set loading true so skeleton with layoutId mounts (positioned after the last user message)
-    setLoading(true)
+# ----------------------------------------
+# Batch Processing Functions
+# ----------------------------------------
 
-    try {
-      const resp = await chatRequest(q)
-      const ans = resp?.response ?? 'Oops! No relevant information found.'
+def load_batch_data(folder_path):
+    """Load test and reference data from multiple Excel files in a folder."""
+    workbook_data = {}
+    
+    for file_name in os.listdir(folder_path):
+        if file_name.endswith(".xlsx"):
+            file_path = os.path.join(folder_path, file_name)
+            try:
+                reference_df = pd.read_excel(file_path, sheet_name=0)
+                test_df = pd.read_excel(file_path, sheet_name=1)
+                workbook_data[file_name] = (reference_df, test_df)
+            except Exception as e:
+                st.warning(f"Skipping file `{file_name}` due to error: {e}")
+    
+    return workbook_data
 
-      // Append agent message with same layoutId so Framer Motion morphs skeleton -> message
-      appendMsg('agent', ans, { layoutId })
-    } catch (e) {
-      appendMsg('agent', 'Error calling backend — ' + String(e.message ?? e), { layoutId })
-    } finally {
-      // remove loader (setLoading false) AFTER small delay to ensure shared layout picks up
-      setTimeout(() => {
-        setLoading(false)
-        // clear pending layout id — the agent message already has the same layoutId
-        pendingLayoutIdRef.current = null
-      }, 40)
-    }
-  }
+def process_batch(workbook_data, methods, n_iterations=10000):
+    """Process multiple workbooks and calculate f2 metrics."""
+    all_results = []
+    
+    for file_name, (reference_df, test_df) in workbook_data.items():
+        try:
+            ref_clean, test_clean = prepare_data(reference_df, test_df)
+            
+            results = {"File Name": file_name}
+            
+            # Bootstrap calculation methods
+            if "Conventional Bootstrap" in methods:
+                def conv_func(r, t): 
+                    return conventional_f2(r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1))
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, conv_func, n_iterations)
+                results["Conventional Bootstrap f2"] = orig
+                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Conventional Bootstrap Mean"] = mean
+                results["Conventional Bootstrap Median"] = median
+                results["Conventional Bootstrap Skewness"] = skewness
+                results["Conventional Bootstrap Kurtosis"] = kurt
 
-  function onPromptPick(p) {
-    setInput(p)
-    setTimeout(() => send(p), 260)
-  }
+            if "Expected Bootstrap" in methods:
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, expected_f2, n_iterations)
+                results["Expected Bootstrap f2"] = orig
+                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Expected Bootstrap Mean"] = mean
+                results["Expected Bootstrap Median"] = median
+                results["Expected Bootstrap Skewness"] = skewness
+                results["Expected Bootstrap Kurtosis"] = kurt
 
-  useEffect(() => {
-    clearTimeout(typingTimeout.current)
-    const val = (input || '').toLowerCase()
-    typingTimeout.current = setTimeout(() => {
-      const list = []
-      if (val.includes('capacity')) {
-        list.push({ title: 'Capacities table', prompt: 'Provide a table: Line | Max Capacity (kg/h) | Typical Batch Size (kg). Return only markdown table.' })
-      }
-      if (val.includes('dissolution')) {
-        list.push({ title: 'Dissolution table', prompt: 'Provide a table: Method | Medium | RPM | Temperature. Return only markdown table.' })
-      }
-      setSuggests(list)
-    }, 220)
-    return () => clearTimeout(typingTimeout.current)
-  }, [input])
+            if "Bias Corrected Bootstrap" in methods:
+                def bc_func(r, t): 
+                    bc = bias_corrected_f2(r, t)
+                    return bc if isinstance(bc, float) else None
+                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    ref_clean, test_clean, bc_func, n_iterations)
+                results["Bias Corrected Bootstrap f2"] = orig
+                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
+                results["Bias Corrected Bootstrap Mean"] = mean
+                results["Bias Corrected Bootstrap Median"] = median
+                results["Bias Corrected Bootstrap Skewness"] = skewness
+                results["Bias Corrected Bootstrap Kurtosis"] = kurt
+            
+            all_results.append(results)
+        
+        except Exception as e:
+            st.warning(f"Error processing file `{file_name}`: {e}")
+    
+    return pd.DataFrame(all_results)
 
-  function onSuggestionClick(item) {
-    setInput(item.prompt)
-    setTimeout(() => send(item.prompt), 200)
-  }
+def create_zip_report(report_df):
+    """Create a ZIP file containing the report CSV."""
+    report_file = "f2_similarities_report.csv"
+    zip_file = "f2_similarities_report.zip"
+    
+    report_df.to_csv(report_file, index=False)
+    
+    with ZipFile(zip_file, "w") as zipf:
+        zipf.write(report_file)
+    
+    return zip_file
 
-  // STT: record and convert to WAV
-  async function startRecording() {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mr = new MediaRecorder(stream)
-      recorderRef.current = mr
-      audioChunksRef.current = []
-      mr.ondataavailable = (e) => audioChunksRef.current.push(e.data)
-      mr.onstop = async () => {
-        try {
-          const blob = new Blob(audioChunksRef.current, { type: audioChunksRef.current[0]?.type || 'audio/webm' })
-          const wavBlob = await convertBlobToWav(blob)
-          const r = await speechToTextUpload(wavBlob)
-          const text = r?.text ?? ''
-          if (text) setInput(text)
-        } catch (err) {
-          appendMsg('agent', 'STT Error: ' + String(err.message ?? err))
-        }
-      }
-      mr.start()
-      setRecording(true)
-    } catch (e) {
-      appendMsg('agent', 'Mic access denied: ' + (e.message || e))
-    }
-  }
 
-  function stopRecording() {
-    const mr = recorderRef.current
-    if (mr && mr.state !== 'inactive') mr.stop()
-    setRecording(false)
-  }
+# ----------------------------------------
+# Streamlit App Code
+# ----------------------------------------
 
-  async function convertBlobToWav(blob) {
-    const arrayBuffer = await blob.arrayBuffer()
-    const audioCtx = new (window.AudioContext || window.webkitAudioContext)()
-    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer)
-    const numChannels = audioBuffer.numberOfChannels
-    const sampleRate = audioBuffer.sampleRate
+def main():
+    st.set_page_config(page_title="Batch Similarity Analyzer", layout="wide")
+    st.title("Batch Similarity Analyzer")
+    st.markdown("""
+    This tool calculates f2 similarity for multiple Excel workbooks at once.
+    Upload a folder containing Excel files to generate a consolidated report.
+    """)
+    
+    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
+    
+    options = ["Conventional", "Expected", "Bias Corrected",
+               "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
+    selected_methods = st.multiselect("Select calculation methods:", options)
+    
+    if st.button("Calculate and Generate Report"):
+        if os.path.isdir(folder_path):
+            with st.spinner("Processing files..."):
+                workbook_data = load_batch_data(folder_path)
+                if workbook_data:
+                    report_df = process_batch(workbook_data, selected_methods)
+                    st.subheader("📊 Results Preview")
+                    st.dataframe(report_df.head())
+                    zip_file_path = create_zip_report(report_df)
+                    
+                    with open(zip_file_path, "rb") as f:
+                        st.download_button(
+                            label="Download Report (ZIP)",
+                            data=f,
+                            file_name="f2_similarities_report.zip",
+                            mime="application/zip"
+                        )
+                else:
+                    st.warning("No valid Excel files found in selected folder.")
+        else:
+            st.error("Invalid folder path. Please check the path and try again.")
 
-    let interleaved
-    if (numChannels === 1) {
-      interleaved = audioBuffer.getChannelData(0)
-    } else {
-      const ch = []
-      for (let i = 0; i < numChannels; i++) ch.push(audioBuffer.getChannelData(i))
-      const len = ch[0].length
-      interleaved = new Float32Array(len * numChannels)
-      let idx = 0
-      for (let i = 0; i < len; i++) {
-        for (let c = 0; c < numChannels; c++) {
-          interleaved[idx++] = ch[c][i]
-        }
-      }
-    }
-
-    const wavView = encodeWAV(interleaved, numChannels, sampleRate)
-    return new Blob([wavView], { type: 'audio/wav' })
-  }
-
-  function encodeWAV(samples, numChannels, sampleRate) {
-    const bytesPerSample = 2
-    const blockAlign = numChannels * bytesPerSample
-    const buffer = new ArrayBuffer(44 + samples.length * bytesPerSample)
-    const view = new DataView(buffer)
-
-    function writeString(v, o, s) { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)) }
-    function floatTo16BitPCM(output, offset, input) {
-      for (let i = 0; i < input.length; i++, offset += 2) {
-        let s = Math.max(-1, Math.min(1, input[i]))
-        s = s < 0 ? s * 0x8000 : s * 0x7FFF
-        output.setInt16(offset, s, true)
-      }
-    }
-
-    writeString(view, 0, 'RIFF')
-    view.setUint32(4, 36 + samples.length * bytesPerSample, true)
-    writeString(view, 8, 'WAVE')
-    writeString(view, 12, 'fmt ')
-    view.setUint32(16, 16, true)
-    view.setUint16(20, 1, true)
-    view.setUint16(22, numChannels, true)
-    view.setUint32(24, sampleRate, true)
-    view.setUint32(28, sampleRate * blockAlign, true)
-    view.setUint16(32, blockAlign, true)
-    view.setUint16(34, 16, true)
-    writeString(view, 36, 'data')
-    view.setUint32(40, samples.length * bytesPerSample, true)
-    floatTo16BitPCM(view, 44, samples)
-    return view
-  }
-
-  function readAloud(text) {
-    const url = textToSpeechUrl(text)
-    const audio = new Audio(url)
-    audio.play()
-  }
-
-  function onFileUploaded(data) {
-    if (data?.filename) appendMsg('agent', `Uploaded: ${data.filename} — indexed and available for querying.`)
-    else appendMsg('agent', `Upload result: ${JSON.stringify(data)}`)
-  }
-
-  // find last user index
-  const lastUserIndex = (() => {
-    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].from === 'user') return i
-    return -1
-  })()
-
-  // render messages with loader injected after last user message while loading
-  const renderedMessages = []
-  messages.forEach((m, idx) => {
-    renderedMessages.push(
-      <Message key={m.id} from={m.from} text={m.text} onReadAloud={readAloud} layoutId={m.layoutId} />
-    )
-
-    if (loading && idx === lastUserIndex) {
-      // skeleton uses the pending layoutId so final agent message morphs into place
-      const layoutId = pendingLayoutIdRef.current
-      renderedMessages.push(
-        <div key="__loader__" ref={loaderRef} className="pt-2 pb-4">
-          <OpenWebUILoader lines={4} compact={false} variant="dark" layoutId={layoutId} />
-          <div className="text-xs text-gray-400 text-center mt-2">Generating response...</div>
-        </div>
-      )
-    }
-  })
-
-  // if no messages and loading, show loader at top
-  if (loading && messages.length === 0) {
-    const layoutId = pendingLayoutIdRef.current
-    renderedMessages.unshift(
-      <div key="__loader-first__" ref={loaderRef} className="pt-2 pb-4">
-        <OpenWebUILoader lines={4} compact={false} variant="dark" layoutId={layoutId} />
-        <div className="text-xs text-gray-400 text-center mt-2">Generating response...</div>
-      </div>
-    )
-  }
-
-  return (
-    <>
-      <div className="fixed bottom-6 right-6 z-50">
-        <motion.button whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.96 }} onClick={() => setOpen(true)}
-          className="w-16 h-16 rounded-full shadow-glow bg-gradient-to-br from-primary to-indigo-500 flex items-center justify-center text-white text-2xl">
-          <FiMessageCircle />
-        </motion.button>
-      </div>
-
-      {open && (
-        <div className="fixed inset-0 z-60 flex items-center justify-center p-4">
-          <div onClick={() => setOpen(false)} className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
-
-          <motion.div initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }}
-            className="relative chat-modal bg-white rounded-2xl shadow-2xl overflow-hidden" style={{ height: 'min(760px,86vh)', width: 'min(1100px,94vw)' }} role="dialog" aria-modal="true">
-
-            <div className="flex items-center justify-between px-6 py-4 border-b">
-              <div className="flex items-center gap-3">
-                <div className="w-11 h-11 rounded-lg bg-gradient-to-br from-primary to-indigo-400 flex items-center justify-center text-white font-bold">SP</div>
-                <div>
-                  <div className="font-semibold text-lg">Scaleup Predictor</div>
-                  <div className="text-xs text-gray-500">Ask your documents & dataset</div>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <button onClick={() => setPromptOpen(true)} className="px-3 py-2 rounded bg-white border flex items-center gap-2">
-                  <FiChevronDown /> Prompts
-                </button>
-
-                <FileUploader onUploaded={onFileUploaded} />
-
-                <button onClick={() => setOpen(false)} className="p-2 rounded hover:bg-gray-100" aria-label="Close chat">
-                  <FiX />
-                </button>
-              </div>
-            </div>
-
-            <div className="flex flex-col h-full">
-              <div className="flex-1 p-6 pb-6 overflow-auto scrollbar-thin relative">
-                <div className="flex flex-col gap-4">
-                  {renderedMessages.length === 0 && !loading && (
-                    <div className="text-center text-gray-400">Welcome — ask anything related to your dataset or uploaded documents.</div>
-                  )}
-
-                  {renderedMessages}
-
-                  <div ref={scrollRef} />
-                </div>
-              </div>
-
-              <div className="px-6 py-4 border-t bg-white relative -translate-y-0">
-                <div className="flex items-start gap-3">
-                  <textarea value={input} onChange={(e) => setInput(e.target.value)} placeholder="Type your question (Enter to send; Shift+Enter newline)" className="flex-1 resize-none p-3 rounded-xl border focus:outline-none" rows={2}
-                    onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() } }} aria-label="Message input" />
-
-                  <div className="flex flex-col gap-2">
-                    <button title={recording ? 'Stop recording' : 'Record (speech-to-text)'} onClick={() => { recording ? stopRecording() : startRecording() }} className={`p-3 rounded-lg border ${recording ? 'bg-red-50' : 'bg-white'}`} aria-pressed={recording}><FiMic /></button>
-
-                    <button onClick={() => send()} className="px-4 py-2 rounded-lg bg-primary text-white flex items-center gap-2" aria-label="Send message"><FiSend /> Send</button>
-                  </div>
-                </div>
-
-                <div className="mt-3">
-                  {suggests.length > 0 && (
-                    <div className="flex gap-3">
-                      {suggests.map((s, i) => (
-                        <motion.div key={i} whileHover={{ y: -6 }} className="p-3 rounded-lg bg-gray-50 border">
-                          <div className="text-xs font-medium">{s.title}</div>
-                          <div className="text-xs text-gray-500 mt-1 max-w-xs">{s.prompt}</div>
-                          <div className="mt-2"><button onClick={() => onSuggestionClick(s)} className="px-2 py-1 text-xs rounded bg-primary text-white">Use</button></div>
-                        </motion.div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </motion.div>
-        </div>
-      )}
-
-      <PromptModal open={promptOpen} onClose={() => setPromptOpen(false)} tiles={TILE_QUESTIONS} onPick={onPromptPick} />
-    </>
-  )
-}
+if __name__ == "__main__":
+    main()
