@@ -1,333 +1,137 @@
-#Backend
-import os
-import re
-import glob
-import base64
-import io
-import json
-from typing import Union
-from jose import jwt
-import threading
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic
-from datetime import datetime, timedelta
 from pydantic import BaseModel
-import fitz  # PyMuPDF
-import pandas as pd
-from PIL import Image
-from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
-import config
-import mimetypes
-from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from typing import List
 
-# ---------------------------
-# Configuration (as provided by you — DO NOT CHANGE unless you need to)
-# ---------------------------
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+class QueryRequest(BaseModel):
+    product_ids: List[str]
+    question: str
 
-# Azure Configuration (kept exactly as requested)
-base_url=""
-api_version="2025-01-01-preview"
+@app.post("/query")
+def query_documents(req: QueryRequest):
+    """
+    Query multiple product documents (product_ids) and return an answer + sources.
+    """
+    if not req.product_ids:
+        raise HTTPException(status_code=400, detail="product_ids must be a non-empty list")
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="question required")
 
-api_key=""
-deployment_name="api-ai4o"
-model_name="gpt-4o"
-
-# Initialize Azure services
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-3-large",
-    api_version="2025-01-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment="api-ai-3l"
-)
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
-# ---------------------------
-
-# 🔐 JWT Config
-SECRET_KEY = "myFAVsecretKEY"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-# Reaction types and filesystem layout (kept from your code)
-REACTION_TYPES = [
-    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
-    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
-    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
-]
-
-BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
-PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
-SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
-
-# Ensure dirs exist (idempotent)
-os.makedirs(PRODUCTS_DIR, exist_ok=True)
-os.makedirs(SCHEMES_DIR, exist_ok=True)
-
-# Prompt template (kept largely the same)
-PROMPT_TEMPLATE = """
-You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
-1. **API Name**: The active pharmaceutical ingredient
-2. **Reaction Chemistry**: Type and description
-3. **Yield**: Exact yield percentages or values mentioned in the source
-4. **Procedure**: Summarize the complete procedure into clear, concise Number bullet points, preserving the key steps and important details. Do NOT omit any steps or essential content.
-5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
-
-Structure your response as follows (literal headers must appear in the LLM output exactly like below):
-
-### API Name
-[API name here]
-### Reaction Chemistry
-[Reaction chemistry description here]
-### Yield
-[Yield value here]
-### Procedure
-[Complete procedure here]
-### Tabular Data
-[Markdown table here]
-
-Document Content:
-{context}
-Question: {question}
-Answer:
-"""
-PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
-
-# ------------------------------
-# Helper functions
-# ------------------------------
-def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
-    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
-        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
-        if os.path.exists(scheme_path):
-            return scheme_path
-    return None
-
-def list_products() -> List[Dict[str, Any]]:
-    products = []
-    for reaction_type in REACTION_TYPES:
-        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
-        if not os.path.exists(reaction_dir):
+    # Collect documents
+    docs = []
+    for pid in req.product_ids:
+        try:
+            meta = product_meta(pid)
+        except HTTPException:
             continue
-        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
-        for pdf_path in pdf_files:
-            filename = os.path.basename(pdf_path)
-            product_name = os.path.splitext(filename)[0]
-            scheme_image = find_scheme_image(reaction_type, product_name)
-            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
-            product_id = f"{reaction_type}_{product_name}"
-            products.append({
-                "id": product_id,
-                "name": product_name,
-                "reaction_type": reaction_type,
-                "pdf_path": pdf_path,
-                "scheme_image": scheme_image if scheme_image else None,
-                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
-            })
-    return products
-
-def extract_pdf_text(pdf_path: str) -> str:
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text() + "\n"
-        return text
-    except Exception as e:
-        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
-
-# Cache for vectorstores and product details
-_vectorstore_cache: Dict[str, FAISS] = {}
-_product_details_cache: Dict[str, Dict[str, Any]] = {}
-_vectorstore_lock = threading.Lock()
-
-def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
-    pid = product["id"]
-    with _vectorstore_lock:
-        if pid in _vectorstore_cache:
-            return _vectorstore_cache[pid]
-        text = extract_pdf_text(product["pdf_path"])
+        pdf_path = meta.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            continue
+        text = extract_pdf_text(pdf_path)
         if not text or len(text.strip()) < 50:
-            return None
-        doc = Document(page_content=text, metadata={
-            "product_id": pid,
-            "product_name": product["name"],
-            "reaction_type": product["reaction_type"],
-            "source": product["pdf_path"]
-        })
-        vs = FAISS.from_documents([doc], cached_embeddings)
-        _vectorstore_cache[pid] = vs
-        return vs
-
-def parse_structured_response(text: str) -> Dict[str, Any]:
-    """
-    Parse the LLM output (which we instructed to use literal '### API Name', etc.)
-    Return JSON with keys: api_name, reaction_chemistry, yield, procedure, tables (list)
-    Each table is {headers: [], rows: [[], [], ...]}
-    """
-    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
-    def grab(section):
-        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else None
-
-    result["api_name"] = grab("API Name")
-    result["reaction_chemistry"] = grab("Reaction Chemistry")
-    result["yield"] = grab("Yield")
-    result["procedure"] = grab("Procedure")
-    tab_raw = grab("Tabular Data")
-    if tab_raw:
-        # find markdown tables starting with |...|
-        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
-        if table_patterns:
-            for tbl_md in table_patterns:
-                # normalize lines
-                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
-                if len(lines) >= 2:
-                    # header line and separator
-                    header = [h.strip() for h in lines[0].split("|")]
-                    rows = []
-                    for rowline in lines[2:]:
-                        cols = [c.strip() for c in rowline.split("|")]
-                        rows.append(cols)
-                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
-        else:
-            # fallback: provide the raw block
-            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
-    return result
-
-# ------------------------------
-# FastAPI app
-# ------------------------------
-app = FastAPI(title="Reaction Database AI (FastAPI)")
-
-# Allow the React dev server origin (adjust if you host differently)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # add your host/origin if different
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ------------------------------
-# Pydantic models
-# ------------------------------
-class ProductOut(BaseModel):
-    id: str
-    name: str
-    reaction_type: str
-    has_scheme_image: bool
-    has_scheme_cdx: bool
-
-class QARequest(BaseModel):
-    product_id: Optional[str] = None  # Make product_id optional
-    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-
-# ------------------------------
-# Endpoints
-# ------------------------------
-@app.get("/reactions", response_model=List[str])
-def get_reactions():
-    return REACTION_TYPES
-
-@app.get("/products", response_model=List[ProductOut])
-def get_products(reaction_type: Optional[str] = None):
-    allp = list_products()
-    if reaction_type:
-        allp = [p for p in allp if p["reaction_type"] == reaction_type]
-    out = []
-    for p in allp:
-        out.append(ProductOut(
-            id=p["id"],
-            name=p["name"],
-            reaction_type=p["reaction_type"],
-            has_scheme_image=bool(p["scheme_image"]),
-            has_scheme_cdx=bool(p["scheme_cdx"])
-        ))
-    return out
-
-@app.get("/product/{product_id}/meta")
-def product_meta(product_id: str):
-    products = list_products()
-    for p in products:
-        if p["id"] == product_id:
-            return {
-                "id": p["id"],
-                "name": p["name"],
-                "reaction_type": p["reaction_type"],
-                "pdf_path": p["pdf_path"],
-                "scheme_image": p["scheme_image"],
-                "scheme_cdx": p["scheme_cdx"]
+            continue
+        doc = Document(
+            page_content=text,
+            metadata={
+                "product_id": pid,
+                "product_name": meta.get("name", ""),
+                "reaction_type": meta.get("reaction_type", "")
             }
-    raise HTTPException(status_code=404, detail="Product not found")
+        )
+        docs.append(doc)
 
-@app.get("/product/{product_id}/pdf")
-def product_pdf(product_id: str):
-    meta = product_meta(product_id)
-    pdf_path = meta["pdf_path"]
-    if os.path.exists(pdf_path):
-        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
-    raise HTTPException(status_code=404, detail="PDF not found")
+    if len(docs) == 0:
+        raise HTTPException(status_code=404, detail="No documents available for the provided product_ids")
 
-@app.get("/product/{product_id}/scheme-image")
-def product_scheme_image(product_id: str):
-    meta = product_meta(product_id)
-    path = meta.get("scheme_image")
-    if path and os.path.exists(path):
-        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
-    raise HTTPException(status_code=404, detail="Scheme image not found")
+    # Build FAISS on-the-fly (safe for moderate numbers of docs)
+    try:
+        vector_store = FAISS.from_documents(docs, cached_embeddings)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
+
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=True
+    )
+
+    try:
+        out = qa_chain({"query": req.question})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
+
+    answer_text = out.get("result") or out.get("output_text") or str(out)
+    source_docs = out.get("source_documents", [])
+
+    # Build sources: unique product ids preserving order
+    seen = set()
+    sources = []
+    for sd in source_docs:
+        pid = sd.metadata.get("product_id")
+        pname = sd.metadata.get("product_name")
+        if pid and pid not in seen:
+            seen.add(pid)
+            sources.append({"product_id": pid, "product_name": pname})
+
+    return {"answer": answer_text, "sources": sources}
+#####################################################
+class QARequest(BaseModel):
+    product_id: Optional[str] = None
+    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
 
 @app.post("/product/details")
 def product_details(req: QARequest):
-    # If no `product_id` is provided, handle the question directly using the model
-    if not req.product_id:
-        try:
-            # Handle the random question by hitting the model directly
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=None,  # No retriever, as there's no associated document
-                chain_type_kwargs={"prompt": PROMPT_TEMPLATE},  # Update the prompt as necessary
-                return_source_documents=False,
-            )
-            raw_response = qa_chain.run(req.question)
-            return {"response": raw_response}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error responding to random question: {e}")
+    """
+    If product_id provided -> run on that product.
+    If no product_id provided -> try to detect product name mention in the question and run on that product (intelligent chunking).
+    Otherwise (no product and no name mention) fallback to a model-only response (best-effort).
+    """
+    q_text = (req.question or "").strip()
+    if not q_text:
+        raise HTTPException(status_code=400, detail="question required")
 
-    # Lookup product meta if `product_id` is provided
-    products = list_products()
-    product = next((p for p in products if p["id"] == req.product_id), None)
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    # If product_id explicitly provided -> use it
+    if req.product_id:
+        pid = req.product_id
+    else:
+        # Try to detect product name mention in the query
+        # Build normalized map: normalized_name -> product_id
+        products = list_products()
+        norm_map = {}
+        for p in products:
+            # normalize product name: remove non-alnum, lowercase
+            name_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
+            norm_map[name_norm] = p["id"]
 
-    # Process based on the type of question provided
-    random_question_flag = req.question.lower() not in [
-        "extract api name, reaction chemistry, yield, procedure, and tabular data",
-        "reaction chemistry",
-    ]
+        # Normalize question and search for any product name token matches
+        q_norm = re.sub(r'[^a-z0-9\s]', ' ', q_text.lower())  # keep spaces
+        # Try to find longest matching product name substring
+        matched_pid = None
+        matched_name = None
+        # iterate products by length descending to prefer longer matches
+        for p in sorted(products, key=lambda x: len(x["name"]), reverse=True):
+            candidate_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
+            if candidate_norm and candidate_norm in q_norm.replace(' ', ''):
+                matched_pid = p["id"]
+                matched_name = p["name"]
+                break
 
-    if random_question_flag:
-        # Handle random question for the provided product/document
+        if matched_pid:
+            pid = matched_pid
+        else:
+            pid = None
+
+    # If we have a pid now, run QA against that single product
+    if pid:
+        # find product metadata
+        products = list_products()
+        product = next((x for x in products if x["id"] == pid), None)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # For a user query, run retriever on that product
         try:
             text = extract_pdf_text(product["pdf_path"])
             doc = Document(page_content=text, metadata={
@@ -337,316 +141,105 @@ def product_details(req: QARequest):
                 "source": product["pdf_path"],
             })
             vs = FAISS.from_documents([doc], cached_embeddings)
-
-            retriever = vs.as_retriever(search_kwargs={"k": 1})
+            retriever = vs.as_retriever(search_kwargs={"k": 3})
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
                 chain_type="stuff",
                 retriever=retriever,
                 chain_type_kwargs={"prompt": PROMPT},
-                return_source_documents=False,
+                return_source_documents=True
             )
-
-            raw_response = qa_chain.run(req.question)
-            return {"response": raw_response}
+            out = qa_chain({"query": q_text})
+            answer_text = out.get("result") or out.get("output_text") or ""
+            # sources
+            sdocs = out.get("source_documents", [])
+            seen = set()
+            sources = []
+            for sd in sdocs:
+                pid_src = sd.metadata.get("product_id")
+                pname_src = sd.metadata.get("product_name")
+                if pid_src and pid_src not in seen:
+                    seen.add(pid_src)
+                    sources.append({"product_id": pid_src, "product_name": pname_src})
+            return {"answer": answer_text, "sources": sources}
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing the random question: {e}")
+            raise HTTPException(status_code=500, detail=f"Error processing product-specific QA: {e}")
 
-    # Process regular reaction chemistry queries as before
-    if req.product_id in _product_details_cache:
-        return _product_details_cache[req.product_id]
-
-    vs = build_product_vector_store(product)
-    if not vs:
-        raise HTTPException(status_code=500, detail="Failed to build vector store (empty/invalid PDF)")
-
-    retriever = vs.as_retriever(search_kwargs={"k": 1})
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=chat_model,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=False,
-    )
-
+    # If no product context: fallback to generative model response (no retriever)
     try:
-        raw_response = qa_chain.run(req.question)
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=None,
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=False
+        )
+        raw_response = qa_chain.run(q_text)
+        return {"response": raw_response}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error generating response: {e}")
+############################################
+// append to src/api.js
+export const queryWithCitations = (productIds = [], question = "") => {
+  return api.post('/query', { product_ids: productIds, question });
+};
+#########################
+import React from 'react';
+import { motion } from 'framer-motion';
 
-    parsed = parse_structured_response(raw_response)
-    _product_details_cache[req.product_id] = parsed
-    return parsed
-
-# ------------------------------
-# Transcription endpoint (optional Google Cloud)
-# ------------------------------
-# If you want server-side Google STT you can paste your credentials JSON string into
-# GOOGLE_CREDENTIALS_JSON below (NOT recommended for public repos). For demos, prefer browser Web Speech API.
-GOOGLE_CREDENTIALS_JSON = ""  # <<< If you want to enable server-side Google STT, paste credentials JSON string here.
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
-    """
-    Accept an audio file (wav/webm/mp3) and return a transcript.
-    By default this endpoint will only provide a simple error unless GOOGLE_CREDENTIALS_JSON is provided.
-    The recommended demo approach is to use the browser Web Speech API for instant transcripts.
-    """
-    content = await file.read()
-    if not use_google:
-        # We recommend using browser speech API — but if user uploaded audio anyway, we can attempt a naive fallback:
-        # Try to return an error telling front-end to use browser API.
-        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
-
-    # If user wants Google transcription server-side:
-    if not GOOGLE_CREDENTIALS_JSON:
-        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
-
-    # Server-side Google Cloud Speech-to-Text usage (if enabled)
-    try:
-        from google.cloud import speech_v1p1beta1 as speech
-        from google.oauth2 import service_account
-    except Exception as e:
-        return {"error": f"google-cloud-speech library not installed: {e}"}
-
-    # Create credentials from JSON string (in-memory)
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    credentials = service_account.Credentials.from_service_account_info(creds_info)
-    client = speech.SpeechClient(credentials=credentials)
-
-    audio = speech.RecognitionAudio(content=content)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",
-        enable_automatic_punctuation=True,
-    )
-
-    response = client.recognize(config=config, audio=audio)
-    transcripts = [r.alternatives[0].transcript for r in response.results]
-    return {"transcript": " ".join(transcripts)}
-
-# ------------------------------
-# Health
-# ------------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# 🔐 JWT Token Creation Function
-def create_access_token(data: dict, expires_delta: Union[timedelta , None] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-# 🔓 Login Endpoint
-@app.post("/login")
-async def login(user_info: dict = Depends(config.check_ldap_auth)):
-    if not user_info:
-        raise HTTPException(status_code=400, detail="Invalid Credentials")
-
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user_info["first_name"]},
-        expires_delta=access_token_expires
-    )
-
-    return {
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "firstname": user_info["first_name"],
-        "lastname": user_info["last_name"],
-    }
-################################################
-import React, { useEffect, useState } from 'react';
-import ChatWindow from "./ChatWindow";
-import ProductTabs from "./ProductTabs";
-import ProductDetailModal from "./ProductDetailModal";
-import SidebarHistory from "./SidebarHistory";
-import { fetchReactions, fetchProducts, fetchProductMeta, fetchProductDetails, fetchSchemeImageUrl } from './api';
-import Navbar from "../Navbar/Navbar";
-import Footer from "../Footer/Footer";
-
-import chem_logo from "../../assets/Chemhub_Logo_Colored.png";
-
-
-export default function App(){
-  const [reactions, setReactions] = useState([]);
-  const [products, setProducts] = useState([]);
-  const [selectedReaction, setSelectedReaction] = useState(null);
-  const [selectedProduct, setSelectedProduct] = useState(null); // meta
-  const [productDetails, setProductDetails] = useState(null);
-  const [productListVisible, setProductListVisible] = useState(false);
-  const [detailModalOpen, setDetailModalOpen] = useState(false);
-  const [messages, setMessages] = useState([]); // start empty; chat bar only
-  const [history, setHistory] = useState([]);
-  const [loadingDetails, setLoadingDetails] = useState(false);
-  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
-
-  useEffect(() => {
-    fetchReactions().then(setReactions).catch(e=>console.error(e));
-  }, []);
-
-  const pushMessage = (m) => setMessages(prev => [...prev, m]);
-
-  const normalize = s => (s||'').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
-
-  const handleUserSend = async (text) => {
-    pushMessage({ role: 'user', content: text });
-
-    const norm = normalize(text);
-    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g,'_')));
-    if (match) {
-      setSelectedReaction(match);
-      try {
-        const prods = await fetchProducts(match);
-        setProducts(prods || []);
-        setProductListVisible(true);
-        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
-      } catch (e) {
-        console.error(e);
-        pushMessage({ role:'assistant', content: 'Error loading products for that reaction.' });
-      }
-      return;
-    }
-
-    const prefix = text.match(/(?:show|list|find).{0,20}for\s+(.+)/i);
-    if (prefix && prefix[1]) {
-      const candidate = prefix[1].trim();
-      const found = reactions.find(r => normalize(r).includes(normalize(candidate)) || normalize(candidate).includes(normalize(r)));
-      if (found) {
-        setSelectedReaction(found);
-        try {
-          const prods = await fetchProducts(found);
-          setProducts(prods || []);
-          setProductListVisible(true);
-          pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')}. Select below.`});
-        } catch (e) {
-          console.error(e);
-          pushMessage({ role:'assistant', content: 'Error fetching products.'});
-        }
-        return;
-      }
-    }
-
-    if (!selectedProduct) {
-      pushMessage({ role: 'assistant', content: 'Please select a product/document first (or type a reaction name to list products).' });
-      return;
-    }
-
-    try {
-      setLoadingDetails(true);
-      const res = await fetchProductDetails(selectedProduct.id, text);
-      const d = res.data || res;
-      let assistantText = '';
-      if (d.api_name) assistantText += `API: ${d.api_name}\n\n`;
-      if (d.reaction_chemistry) assistantText += `Reaction: ${d.reaction_chemistry}\n\n`;
-      if (d.yield) assistantText += `Yield: ${d.yield}\n\n`;
-      if (d.procedure) assistantText += `Procedure (excerpt):\n${(d.procedure||'').slice(0,600)}\n\n`;
-      if (!assistantText) assistantText = 'No structured answer found.';
-      pushMessage({ role: 'assistant', content: assistantText });
-      setProductDetails(d);
-      setDetailModalOpen(true);
-      setHistory(h => [{ title: selectedProduct.name, content: text, productId: selectedProduct.id }, ...h]);
-    } catch (err) {
-      console.error(err);
-      pushMessage({ role: 'assistant', content: 'Error querying backend.'});
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
-  const handleSelectProduct = async (productId) => {
-    const meta = await fetchProductMeta(productId);
-    setSelectedProduct(meta);
-    setProductDetails(null);
-    setSelectedSchemeUrl(null);
-    setLoadingDetails(true);
-    // show fancy loader by opening the modal early
-    setDetailModalOpen(true);
-    try {
-      // preload scheme url (for chat preview)
-      const scheme = await fetchSchemeImageUrl(productId);
-      setSelectedSchemeUrl(scheme);
-    } catch(e){
-      // ignore
-    }
-    try {
-      const res = await fetchProductDetails(productId);
-      const d = res.data || res;
-      setProductDetails(d);
-      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
-    } catch (e) {
-      console.error(e);
-      pushMessage({ role: 'assistant', content: 'Failed to load product details.'});
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
+/**
+ * ProductTabs with right-click citation support
+ * props:
+ *  - products
+ *  - onSelect(productId)
+ *  - onContext(product) // right-click to toggle citation
+ *  - citedIds: Set of product ids currently cited
+ */
+export default function ProductTabs({ products = [], onSelect, onContext, citedIds = new Set() }) {
   return (
-    <>
-    <Navbar/>
-    <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
-      {/* center column */}
-      <div className="mx-auto my-8 w-full max-w-6xl px-4">
-        {/* Header */}
-        <div className="flex flex-col items-center justify-center mb-6">
-          {/* Logo */}
-          <img
-            className="h-50 w-30"
-            src={chem_logo}
-            alt="chemhub-logo"
-          />
-          
-          {/* Tagline
-          <h2 className="text-[30px] font-extrabold text-gray-900 mt-4 text-center font-poppins">
-            Ask, Browse & Explore
-          </h2> */}
-        </div>
-
-        <div className="relative">
-          <ChatWindow
-            messages={messages}
-            onSend={handleUserSend}
-            centeredWidth="max-w-4xl"
-            selectedSchemeUrl={selectedSchemeUrl}
-            selectedProduct={selectedProduct}
-          />
-
-          {productListVisible && products && products.length > 0 && (
-            <div className="mt-6">
-              <ProductTabs products={products} onSelect={handleSelectProduct} />
-            </div>
-          )}
-        </div>
+    <div className="bg-transparent">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
+        <div className="text-sm text-gray-500">Left-click to view • Right-click to cite</div>
       </div>
 
-      <SidebarHistory history={history} onSelect={(h) => {
-        if (h && h.productId) handleSelectProduct(h.productId);
-      }} />
-
-      <ProductDetailModal
-        open={detailModalOpen}
-        onClose={() => setDetailModalOpen(false)}
-        meta={selectedProduct}
-        details={productDetails}
-        loading={loadingDetails}
-      />
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        {products.map(p => {
+          const selected = citedIds.has(p.id);
+          return (
+            <motion.button
+              key={p.id}
+              whileHover={{ y: -4 }}
+              onClick={() => onSelect && onSelect(p.id)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                onContext && onContext(p);
+              }}
+              title={p.name}
+              className={`relative bg-white border rounded-2xl p-4 shadow hover:shadow-xl transition flex flex-col justify-between text-left text-sm ${selected ? 'ring-2 ring-accent' : ''}`}
+            >
+              <div className="flex items-start gap-3">
+                <div className="flex-1">
+                  <div className="font-semibold text-primary truncate">{p.name}</div>
+                  <div className="text-xs text-gray-400 mt-1">{p.reaction_type?.replace(/_/g,' ')}</div>
+                </div>
+                {selected && <div className="text-xs text-white bg-accent px-2 py-1 rounded-full">CITED</div>}
+              </div>
+              <div className="mt-3 text-xs text-gray-500 truncate">{p.pdf_path ? p.pdf_path.split(/[\\/]/).pop() : ''}</div>
+            </motion.button>
+          );
+        })}
+      </div>
     </div>
-    <Footer/>
-    </>
   );
 }
-##########################################################
+#########################################
 import React, { useRef, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { FiSend } from 'react-icons/fi';
-import MicrophoneButton from './MicrophoneButton'; // keep your mic component
+import MicrophoneButton from './MicrophoneButton';
 
-export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3xl" }){
+export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3xl", selectedCitedDocs = [], removeCitation = () => {} }){
   const [text, setText] = useState('');
   const textareaRef = useRef();
 
@@ -667,6 +260,18 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
   return (
     <div className={`mx-auto ${centeredWidth}`}>
       <div className="bg-white rounded-3xl shadow-2xl p-6">
+        {/* Citation chips */}
+        {selectedCitedDocs && selectedCitedDocs.length > 0 && (
+          <div className="mb-4 flex flex-wrap gap-2">
+            {selectedCitedDocs.map(d => (
+              <div key={d.id} className="flex items-center gap-2 bg-purple-50 text-purple-800 px-3 py-1 rounded-full text-xs">
+                <span className="max-w-[220px] truncate">{d.name}</span>
+                <button onClick={() => removeCitation(d.id)} className="ml-1 px-1 rounded-full bg-white shadow text-xs" title="Remove citation">✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="min-h-[220px] max-h-[54vh] overflow-auto pr-2">
           {messages.map((m, idx) => (
             <motion.div
@@ -692,7 +297,7 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
             onChange={(e)=> setText(e.target.value)}
             rows={1}
             placeholder="Ask about reaction chemistry or type a reaction name..."
-            className="flex-1 resize-none px-4 py-3 text-white rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
+            className="flex-1 resize-none px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
             onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
           />
           <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
@@ -703,37 +308,364 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
     </div>
   );
 }
-###########################################
-import React, { useRef } from "react";
+########################
+// src/App.jsx
+import React, { useEffect, useState } from 'react';
+import ChatWindow from "./ChatWindow";
+import ProductTabs from "./ProductTabs";
+import ProductDetailModal from "./ProductDetailModal";
+import SidebarHistory from "./SidebarHistory";
+import {
+  fetchReactions,
+  fetchProducts,
+  fetchProductMeta,
+  fetchProductDetails,
+  fetchSchemeImageUrl,
+  queryWithCitations
+} from './api';
+import Navbar from "../Navbar/Navbar";
+import Footer from "../Footer/Footer";
+
+import chem_logo from "../../assets/Chemhub_Logo_Colored.png";
+
+export default function App() {
+  // Core state
+  const [reactions, setReactions] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
+  const [selectedProduct, setSelectedProduct] = useState(null); // meta
+  const [productDetails, setProductDetails] = useState(null);
+  const [productListVisible, setProductListVisible] = useState(false);
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [messages, setMessages] = useState([]); // chat messages
+  const [history, setHistory] = useState([]);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
+
+  // Citation-specific state (multi-select)
+  // Each item: { id, name, reaction_type }
+  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
+
+  // Load reactions on mount
+  useEffect(() => {
+    fetchReactions().then(setReactions).catch(e => console.error("fetchReactions:", e));
+  }, []);
+
+  // Helpers
+  const pushMessage = (m) => setMessages(prev => [...prev, m]);
+  const normalize = s => (s || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  // Set of cited ids for ProductTabs styling
+  const citedIdsSet = new Set(selectedCitedDocs.map(d => d.id));
+
+  // Toggle citation on right-click
+  const handleToggleCite = (product) => {
+    // determine if currently cited
+    const exists = selectedCitedDocs.find(p => p.id === product.id);
+    if (exists) {
+      // remove
+      setSelectedCitedDocs(prev => prev.filter(p => p.id !== product.id));
+      pushMessage({ role: 'assistant', content: `Removed citation: ${product.name}` });
+    } else {
+      // add (prepend)
+      setSelectedCitedDocs(prev => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
+      pushMessage({ role: 'assistant', content: `Added citation: ${product.name}` });
+    }
+  };
+
+  // Remove citation from chip
+  const removeCitation = (id) => {
+    const found = selectedCitedDocs.find(d => d.id === id);
+    setSelectedCitedDocs(prev => prev.filter(d => d.id !== id));
+    if (found) pushMessage({ role: 'assistant', content: `Removed citation: ${found.name}` });
+  };
+
+  // Handle user sending a message
+  const handleUserSend = async (text) => {
+    // 1. Append user's message to chat
+    pushMessage({ role: 'user', content: text });
+
+    // 2. Quick reaction-type detection (unchanged)
+    const norm = normalize(text);
+    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, '_')));
+    if (match) {
+      setSelectedReaction(match);
+      try {
+        const prods = await fetchProducts(match);
+        setProducts(prods || []);
+        setProductListVisible(true);
+        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.` });
+      } catch (e) {
+        console.error("fetchProducts by reaction:", e);
+        pushMessage({ role: 'assistant', content: 'Error loading products for that reaction.' });
+      }
+      return;
+    }
+
+    // 3. "show/list/find ... for X" style detection (unchanged)
+    const prefix = text.match(/(?:show|list|find).{0,20}for\s+(.+)/i);
+    if (prefix && prefix[1]) {
+      const candidate = prefix[1].trim();
+      const found = reactions.find(r => normalize(r).includes(normalize(candidate)) || normalize(candidate).includes(normalize(r)));
+      if (found) {
+        setSelectedReaction(found);
+        try {
+          const prods = await fetchProducts(found);
+          setProducts(prods || []);
+          setProductListVisible(true);
+          pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')}. Select below.` });
+        } catch (e) {
+          console.error("fetchProducts by candidate:", e);
+          pushMessage({ role: 'assistant', content: 'Error fetching products.' });
+        }
+        return;
+      }
+    }
+
+    // 4. If there are cited documents -> use the /query endpoint to search ONLY those docs
+    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
+      try {
+        pushMessage({ role: 'assistant', content: 'Searching selected documents...' });
+        const productIds = selectedCitedDocs.map(d => d.id);
+        const res = await queryWithCitations(productIds, text);
+        const payload = (res && res.data) ? res.data : res;
+
+        // Primary answer
+        const answer = payload?.answer || payload?.response || "No relevant answer found.";
+        pushMessage({ role: 'assistant', content: answer });
+
+        // Citations block (if provided)
+        if (payload?.sources && Array.isArray(payload.sources) && payload.sources.length > 0) {
+          const citationsText = payload.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
+          pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
+        } else {
+          pushMessage({ role: 'assistant', content: 'No citation sources returned.' });
+        }
+      } catch (err) {
+        console.error("queryWithCitations error:", err);
+        pushMessage({ role: 'assistant', content: 'Error querying selected documents.' });
+      }
+      return;
+    }
+
+    // 5. If no product selected, try to let backend detect product mention (your backend handles name-detection)
+    //    We call fetchProductDetails without a productId (backend will detect if a product name is mentioned)
+    if (!selectedProduct) {
+      try {
+        pushMessage({ role: 'assistant', content: 'Searching documents for mentioned product (if any)...' });
+        const res = await fetchProductDetails(undefined, text); // backend expects product_id optional
+        const payload = (res && res.data) ? res.data : res;
+
+        // Handle response shapes: {answer, sources} or {response} or parsed structured object
+        if (payload?.answer || payload?.sources) {
+          const answer = payload.answer || payload.response || "No relevant answer.";
+          pushMessage({ role: 'assistant', content: answer });
+
+          if (payload?.sources && Array.isArray(payload.sources) && payload.sources.length > 0) {
+            const citationsText = payload.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
+            pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
+          }
+        } else if (payload?.response) {
+          pushMessage({ role: 'assistant', content: payload.response });
+        } else {
+          // fallback: no structured answer -> ask user to select product
+          pushMessage({ role: 'assistant', content: 'Please select a product/document first (or right-click to cite documents).' });
+        }
+      } catch (err) {
+        console.error("fetchProductDetails (no product) error:", err);
+        pushMessage({ role: 'assistant', content: 'Error querying documents.' });
+      }
+      return;
+    }
+
+    // 6. If a single product is selected -> perform per-product QA (existing flow)
+    try {
+      setLoadingDetails(true);
+      const res = await fetchProductDetails(selectedProduct.id, text);
+      const d = (res && res.data) ? res.data : res;
+
+      // The backend may return {answer, sources} for queries or parsed structured object for extraction.
+      if (d?.answer || d?.sources) {
+        const answer = d.answer || d.response || "No answer.";
+        pushMessage({ role: 'assistant', content: answer });
+        if (d.sources && d.sources.length > 0) {
+          const citationsText = d.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
+          pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
+        }
+      } else {
+        // If backend returned structured parsed info (api_name, procedure, tables...), display a summary and open detail modal
+        let assistantText = '';
+        if (d?.api_name) assistantText += `API: ${d.api_name}\n\n`;
+        if (d?.reaction_chemistry) assistantText += `Reaction: ${d.reaction_chemistry}\n\n`;
+        if (d?.yield) assistantText += `Yield: ${d.yield}\n\n`;
+        if (d?.procedure) assistantText += `Procedure (excerpt):\n${(d.procedure || '').slice(0, 600)}\n\n`;
+        if (!assistantText) assistantText = 'No structured answer found.';
+        pushMessage({ role: 'assistant', content: assistantText });
+
+        // set details & modal for user to inspect
+        setProductDetails(d);
+        setDetailModalOpen(true);
+        setHistory(h => [{ title: selectedProduct.name, content: text, productId: selectedProduct.id }, ...h]);
+      }
+    } catch (err) {
+      console.error("fetchProductDetails (selectedProduct) error:", err);
+      pushMessage({ role: 'assistant', content: 'Error querying backend.' });
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  // When user clicks a product tile to open detail modal
+  const handleSelectProduct = async (productId) => {
+    try {
+      const meta = await fetchProductMeta(productId);
+      setSelectedProduct(meta);
+      setProductDetails(null);
+      setSelectedSchemeUrl(null);
+      setLoadingDetails(true);
+
+      // open modal early with loader
+      setDetailModalOpen(true);
+
+      // preload scheme url for chat preview (optional)
+      try {
+        const scheme = await fetchSchemeImageUrl(productId);
+        setSelectedSchemeUrl(scheme);
+      } catch (e) {
+        // ignore scheme preload errors
+      }
+
+      const res = await fetchProductDetails(productId); // default behavior will return parsed structured info
+      const d = (res && res.data) ? res.data : res;
+      setProductDetails(d);
+      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0, 120) : '', productId: meta.id }, ...h]);
+    } catch (e) {
+      console.error("handleSelectProduct error:", e);
+      pushMessage({ role: 'assistant', content: 'Failed to load product details.' });
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  return (
+    <>
+      <Navbar />
+      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
+        {/* center column */}
+        <div className="mx-auto my-8 w-full max-w-6xl px-4">
+          {/* Header / Logo */}
+          <div className="flex flex-col items-center justify-center mb-6">
+            <img className="h-50 w-30" src={chem_logo} alt="chemhub-logo" />
+          </div>
+
+          {/* Main area (chat + product tabs) */}
+          <div className="relative">
+            <ChatWindow
+              messages={messages}
+              onSend={handleUserSend}
+              centeredWidth="max-w-4xl"
+              selectedSchemeUrl={selectedSchemeUrl}
+              selectedProduct={selectedProduct}
+              selectedCitedDocs={selectedCitedDocs}
+              removeCitation={removeCitation}
+            />
+
+            {productListVisible && products && products.length > 0 && (
+              <div className="mt-6">
+                <ProductTabs
+                  products={products}
+                  onSelect={handleSelectProduct}
+                  onContext={handleToggleCite} // right-click toggles citation
+                  citedIds={citedIdsSet}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Right-side collapsible history */}
+        <SidebarHistory
+          history={history}
+          onSelect={(h) => {
+            if (h && h.productId) handleSelectProduct(h.productId);
+          }}
+        />
+
+        {/* Product detail modal */}
+        <ProductDetailModal
+          open={detailModalOpen}
+          onClose={() => setDetailModalOpen(false)}
+          meta={selectedProduct}
+          details={productDetails}
+          loading={loadingDetails}
+        />
+      </div>
+      <Footer />
+    </>
+  );
+}
+##########################
+// src/components/ProductTabs.jsx
+import React, { useRef, useEffect } from "react";
 import { motion } from "framer-motion";
 
-// Props: products: [{id, name, reaction_type, has_scheme_image, has_scheme_cdx}]
-// onSelect(productId)
-
-export default function ProductTabs({ products = [], onSelect }) {
+/**
+ * ProductTabs
+ *
+ * Props:
+ *  - products: Array<{id, name, reaction_type, pdf_path, has_scheme_image, has_scheme_cdx}>
+ *  - onSelect(productId)        // left-click / keyboard Enter to open product
+ *  - onContext(product)         // right-click to toggle citation selection
+ *  - citedIds: Set<string>      // set of product ids currently cited (for visual state)
+ *
+ * Features:
+ *  - horizontal scroll area with left/right nav buttons
+ *  - long-press / hold to continuously scroll (mouse + touch)
+ *  - right-click toggles citation (prevents default context menu)
+ *  - accessible: supports Enter key to select tile
+ *  - graceful truncation + full name via title attribute
+ */
+export default function ProductTabs({
+  products = [],
+  onSelect,
+  onContext,
+  citedIds = new Set(),
+}) {
   const scrollContainerRef = useRef(null);
-  let scrollInterval = null;
+  const scrollIntervalRef = useRef(null);
 
-  // Scroll a small amount repeatedly for fast scrolling
+  useEffect(() => {
+    // Cleanup on unmount
+    return () => {
+      if (scrollIntervalRef.current) {
+        clearInterval(scrollIntervalRef.current);
+        scrollIntervalRef.current = null;
+      }
+    };
+  }, []);
+
   const startScrolling = (direction) => {
-    if (scrollInterval) return; // Prevent multiple intervals
-    scrollInterval = setInterval(() => {
+    if (!scrollContainerRef.current) return;
+    if (scrollIntervalRef.current) return; // already scrolling
+
+    scrollIntervalRef.current = setInterval(() => {
       scrollContainerRef.current.scrollBy({
         left: direction === "left" ? -60 : 60,
         behavior: "smooth",
       });
-    }, 100); // Adjust speed by modifying interval timing (100ms here).
+    }, 100);
   };
 
-  // Stop continuous scrolling
   const stopScrolling = () => {
-    clearInterval(scrollInterval);
-    scrollInterval = null;
+    if (scrollIntervalRef.current) {
+      clearInterval(scrollIntervalRef.current);
+      scrollIntervalRef.current = null;
+    }
   };
 
-  // Immediate single scroll (used for a normal click)
   const scrollOnce = (direction) => {
-    stopScrolling(); // Clear any existing interval
+    if (!scrollContainerRef.current) return;
+    stopScrolling();
     scrollContainerRef.current.scrollBy({
       left: direction === "left" ? -240 : 240,
       behavior: "smooth",
@@ -742,65 +674,93 @@ export default function ProductTabs({ products = [], onSelect }) {
 
   return (
     <div className="bg-transparent">
-      {/* Header Section */}
+      {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
-        <div className="text-sm text-gray-500">Click a tile to view details</div>
+        <div className="text-sm text-gray-500">Left-click to open • Right-click to cite</div>
       </div>
 
-      {/* Tabs Container with Navigation */}
-      <div className="flex items-center">
-        {/* Left Navigation Button */}
+      {/* Navigation + Scroll area */}
+      <div className="flex items-center gap-3">
+        {/* Left nav */}
         <button
-          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          aria-label="Scroll left"
           title="Scroll Left"
-          onClick={() => scrollOnce("left")} // Normal click behavior
-          onMouseDown={() => startScrolling("left")} // Start long press scrolling
-          onMouseUp={stopScrolling} // Stop scrolling when mouse is released
-          onTouchStart={() => startScrolling("left")} // Start scrolling on touch
-          onTouchEnd={stopScrolling} // Stop scrolling when touch ends
+          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          onClick={() => scrollOnce("left")}
+          onMouseDown={() => startScrolling("left")}
+          onMouseUp={stopScrolling}
+          onMouseLeave={stopScrolling}
+          onTouchStart={() => startScrolling("left")}
+          onTouchEnd={stopScrolling}
         >
           ←
         </button>
 
-        {/* Scrollable Tabs */}
+        {/* Scrollable container */}
         <div
           ref={scrollContainerRef}
           className="overflow-x-auto py-2 w-full no-scrollbar flex gap-3"
+          role="list"
         >
-          {products.map((product) => (
-            <motion.button
-              key={product.id}
-              whileHover={{ y: -6 }}
-              onClick={() => onSelect(product.id)}
-              title={product.name}
-              className="min-w-[220px] max-w-[240px] flex-shrink-0 bg-white border rounded-2xl p-3 shadow hover:shadow-lg transition flex flex-col"
-            >
-              {/* Product Tabs Content */}
-              <div className="flex items-center justify-between gap-3">
-                <div className="text-sm font-semibold truncate">
-                  {product.name}
+          {products.map((product) => {
+            const isCited = citedIds && citedIds.has && citedIds.has(product.id);
+            return (
+              <motion.button
+                key={product.id}
+                role="listitem"
+                whileHover={{ y: -6 }}
+                whileTap={{ scale: 0.98 }}
+                onClick={() => onSelect && onSelect(product.id)}
+                onContextMenu={(e) => {
+                  if (onContext) {
+                    e.preventDefault();
+                    onContext(product);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onSelect && onSelect(product.id);
+                  }
+                }}
+                title={product.name}
+                className={`min-w-[220px] max-w-[240px] flex-shrink-0 bg-white border rounded-2xl p-3 shadow hover:shadow-lg transition flex flex-col justify-between text-left
+                  ${isCited ? "ring-2 ring-accent" : ""}`}
+                aria-pressed={isCited ? "true" : "false"}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1">
+                    <div className="text-sm font-semibold text-primary truncate" style={{ maxWidth: "100%" }}>
+                      {product.name}
+                    </div>
+                    <div className="text-xs text-gray-400 mt-1">{(product.reaction_type || "").replace(/_/g, " ")}</div>
+                  </div>
+
+                  {isCited && (
+                    <div className="text-xs text-white bg-accent px-2 py-1 rounded-full">CITED</div>
+                  )}
                 </div>
-                <div className="text-xs text-gray-400">
-                  {product.reaction_type.replace(/_/g, " ")}
+
+                <div className="text-xs mt-2 text-gray-500 truncate">
+                  {product.pdf_path ? product.pdf_path.split(/[\\/]/).pop() : ""}
                 </div>
-              </div>
-              <div className="text-xs mt-2 text-gray-500 truncate">
-                {product.pdf_path ? product.pdf_path.split(/[\\/]/).pop() : ""}
-              </div>
-            </motion.button>
-          ))}
+              </motion.button>
+            );
+          })}
         </div>
 
-        {/* Right Navigation Button */}
+        {/* Right nav */}
         <button
-          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          aria-label="Scroll right"
           title="Scroll Right"
-          onClick={() => scrollOnce("right")} // Normal click behavior
-          onMouseDown={() => startScrolling("right")} // Start long press scrolling
-          onMouseUp={stopScrolling} // Stop scrolling when mouse is released
-          onTouchStart={() => startScrolling("right")} // Start scrolling on touch
-          onTouchEnd={stopScrolling} // Stop scrolling when touch ends
+          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          onClick={() => scrollOnce("right")}
+          onMouseDown={() => startScrolling("right")}
+          onMouseUp={stopScrolling}
+          onMouseLeave={stopScrolling}
+          onTouchStart={() => startScrolling("right")}
+          onTouchEnd={stopScrolling}
         >
           →
         </button>
@@ -808,3 +768,5 @@ export default function ProductTabs({ products = [], onSelect }) {
     </div>
   );
 }
+
+#############################
