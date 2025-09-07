@@ -1,5 +1,248 @@
-// fetchProductDetails(productId?: string, question?: string)
-export const fetchProductDetails = (productId = undefined, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data") => {
-  // axios instance 'api' assumed
+# --- Prompt templates: extraction vs QA ---
+EXTRACTION_PROMPT_TEMPLATE = """
+You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
+1. **API Name**: The active pharmaceutical ingredient
+2. **Reaction Chemistry**: Type and description
+3. **Yield**: Exact yield percentages or values mentioned in the source
+4. **Procedure**: Summarize the complete procedure into clear, concise numbered bullet points, preserving the key steps and important details. Do NOT omit any steps or essential content.
+5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
+
+Structure your response as follows (literal headers must appear exactly like below):
+
+### API Name
+[API name here]
+### Reaction Chemistry
+[Reaction chemistry description here]
+### Yield
+[Yield value here]
+### Procedure
+[Complete procedure here]
+### Tabular Data
+[Markdown table here]
+
+Document Content:
+{context}
+Question: {question}
+Answer:
+"""
+EXTRACTION_PROMPT = PromptTemplate(template=EXTRACTION_PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+
+QA_PROMPT_TEMPLATE = """
+You are a concise pharmaceutical chemistry expert. Use the provided document context to answer the user's question directly and concisely.
+
+Rules (follow exactly):
+- Use only the information present in the context. Do NOT hallucinate.
+- Answer in one short paragraph (2-6 sentences) unless the user explicitly asks for step-by-step procedure.
+- At the end, append a short "Citations" section that lists the document(s) used, in the format: [1] <product_name> (id: <product_id>), [2] ...
+- Do NOT reproduce the full document content. Do NOT provide unrequested long verbatim passages.
+- If multiple documents were used, identify only those documents that were actually the sources of the answer.
+- If the answer is not present in the context, say "I could not find an answer in the provided documents." (do not guess).
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+"""
+QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
+##############
+@app.post("/product/details")
+def product_details(req: QARequest):
+    """
+    Robust product/details endpoint.
+
+    Behavior summary:
+    - If req.product_id is provided:
+        * If question == canonical extraction prompt -> run structured extraction (cached) and return parsed structure.
+        * Otherwise -> run retrieval QA on that single product and return {"answer": ..., "sources": [...]}
+    - If req.product_id is NOT provided:
+        * Attempt to detect a product name mentioned in the question by matching normalized filenames.
+          - If a product is detected -> run retrieval QA on that product and return {"answer": ..., "sources": [...]}
+          - If no product detected -> fallback to a generative model response {"response": "..."} (no retriever).
+    Errors return JSON with helpful messages; server traceback is printed and included (last lines) in the JSON for local debugging.
+    """
+    import traceback
+
+    try:
+        q_text = (req.question or "").strip()
+        if not q_text:
+            return JSONResponse(status_code=400, content={"error": "question is required"})
+
+        # canonical extraction text (case-insensitive)
+        CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
+
+        # normalization helper: lowercase + remove non-alphanumeric
+        def _normalize_alnum(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+        # Detect a product by normalized substring matching of product filenames (prefer longest name)
+        def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
+            products = list_products()
+            if not products:
+                return None
+            q_norm = _normalize_alnum(question)
+            # prefer longer product names to avoid accidental short substring matches
+            for p in sorted(products, key=lambda x: len(x["name"]), reverse=True):
+                name_norm = _normalize_alnum(p["name"])
+                if name_norm and name_norm in q_norm:
+                    return p
+            return None
+
+        # Run retrieval QA on a single product and return {"answer":..., "sources":[...]}
+        def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
+            pdf_path = product.get("pdf_path")
+            if not pdf_path or not os.path.exists(pdf_path):
+                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}")
+
+            # extract text (may raise)
+            text = extract_pdf_text(pdf_path)
+            if not text or len(text.strip()) < 20:
+                raise HTTPException(status_code=500, detail="Document content empty or unreadable")
+
+            doc = Document(
+                page_content=text,
+                metadata={
+                    "product_id": product["id"],
+                    "product_name": product["name"],
+                    "reaction_type": product["reaction_type"],
+                    "source": pdf_path,
+                }
+            )
+
+            # Build a temporary FAISS index for this single document (acceptable for single-product QA)
+            try:
+                vs = FAISS.from_documents([doc], cached_embeddings)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed building FAISS index: {e}")
+
+            retriever = vs.as_retriever(search_kwargs={"k": k})
+
+            # Choose QA prompt (prefer QA_PROMPT, fall back to PROMPT if QA_PROMPT not defined)
+            prompt_to_use = None
+            try:
+                prompt_to_use = QA_PROMPT
+            except NameError:
+                # last-resort fallback to PROMPT (existing prompt template)
+                prompt_to_use = PROMPT if "PROMPT" in globals() else EXTRACTION_PROMPT
+
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt_to_use},
+                return_source_documents=True,
+            )
+
+            out = qa_chain({"query": question})
+            answer_text = out.get("result") or out.get("output_text") or ""
+            source_docs = out.get("source_documents", []) or []
+
+            # Build unique ordered sources list for citations
+            seen = set()
+            sources = []
+            for sd in source_docs:
+                pid = sd.metadata.get("product_id")
+                pname = sd.metadata.get("product_name")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    sources.append({"product_id": pid, "product_name": pname})
+            return {"answer": answer_text, "sources": sources}
+
+        # If an explicit product_id was provided, follow that flow
+        if req.product_id:
+            products = list_products()
+            product = next((p for p in products if p["id"] == req.product_id), None)
+            if not product:
+                return JSONResponse(status_code=404, content={"error": "Product not found"})
+
+            # Determine if this is canonical extraction vs. a user question
+            is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
+
+            if not is_extraction:
+                # User question about this specific product -> run retrieval QA and return answer + sources
+                return _run_retrieval_for_product(product, q_text, k=3)
+
+            # Structured extraction requested -> reuse cached parsed result if present
+            if req.product_id in _product_details_cache:
+                return _product_details_cache[req.product_id]
+
+            # Build or reuse vector store and run extraction prompt (k=1)
+            vs = build_product_vector_store(product)
+            if not vs:
+                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
+
+            retriever = vs.as_retriever(search_kwargs={"k": 1})
+
+            # Use extraction prompt for structured output; fallback if unavailable
+            prompt_for_extraction = None
+            try:
+                prompt_for_extraction = EXTRACTION_PROMPT
+            except NameError:
+                prompt_for_extraction = PROMPT if "PROMPT" in globals() else None
+
+            if not prompt_for_extraction:
+                return JSONResponse(status_code=500, content={"error": "No extraction prompt configured on the server."})
+
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt_for_extraction},
+                return_source_documents=False,
+            )
+
+            try:
+                raw_response = qa_chain.run(q_text)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"LLM extraction error: {e}")
+
+            parsed = parse_structured_response(raw_response)
+            _product_details_cache[req.product_id] = parsed
+            return parsed
+
+        # No explicit product_id: detect mention in question
+        detected = _detect_product_by_name(q_text)
+        if detected:
+            return _run_retrieval_for_product(detected, q_text, k=3)
+
+        # Fallback: no detected product, perform a model-only generative response
+        # Use QA prompt (if present) for concise answers; else fallback to PROMPT
+        prompt_for_gen = None
+        try:
+            prompt_for_gen = QA_PROMPT
+        except NameError:
+            prompt_for_gen = PROMPT if "PROMPT" in globals() else EXTRACTION_PROMPT
+
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=None,
+            chain_type_kwargs={"prompt": prompt_for_gen},
+            return_source_documents=False,
+        )
+
+        raw_response = qa_chain.run(q_text)
+        return {"response": raw_response}
+
+    except HTTPException as he:
+        # Known HTTP exceptions: re-raise so FastAPI returns correct status code
+        raise he
+    except Exception as e:
+        # Unexpected error: log and return JSON with brief trace (useful for local debugging)
+        tb = traceback.format_exc()
+        print("=== /product/details ERROR ===")
+        print(tb)
+        # include last 20 lines of trace in response for debugging (remove in production)
+        trace_lines = tb.splitlines()[-20:]
+        return JSONResponse(status_code=500, content={
+            "error": "Internal server error in /product/details",
+            "message": str(e),
+            "trace": trace_lines
+        })
+##############
+// default to structured extraction when asking for details
+export const fetchProductDetails = (productId, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data") => {
   return api.post('/product/details', { product_id: productId, question });
 };
