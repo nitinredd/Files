@@ -1,248 +1,273 @@
-from pydantic import BaseModel
-from typing import List
-
-class QueryRequest(BaseModel):
-    product_ids: List[str]
-    question: str
-
-@app.post("/query")
-def query_documents(req: QueryRequest):
-    """
-    Query multiple product documents (product_ids) and return an answer + sources.
-    """
-    if not req.product_ids:
-        raise HTTPException(status_code=400, detail="product_ids must be a non-empty list")
-    if not req.question or not req.question.strip():
-        raise HTTPException(status_code=400, detail="question required")
-
-    # Collect documents
-    docs = []
-    for pid in req.product_ids:
-        try:
-            meta = product_meta(pid)
-        except HTTPException:
-            continue
-        pdf_path = meta.get("pdf_path")
-        if not pdf_path or not os.path.exists(pdf_path):
-            continue
-        text = extract_pdf_text(pdf_path)
-        if not text or len(text.strip()) < 50:
-            continue
-        doc = Document(
-            page_content=text,
-            metadata={
-                "product_id": pid,
-                "product_name": meta.get("name", ""),
-                "reaction_type": meta.get("reaction_type", "")
-            }
-        )
-        docs.append(doc)
-
-    if len(docs) == 0:
-        raise HTTPException(status_code=404, detail="No documents available for the provided product_ids")
-
-    # Build FAISS on-the-fly (safe for moderate numbers of docs)
-    try:
-        vector_store = FAISS.from_documents(docs, cached_embeddings)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
-
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=chat_model,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": PROMPT},
-        return_source_documents=True
-    )
-
-    try:
-        out = qa_chain({"query": req.question})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
-
-    answer_text = out.get("result") or out.get("output_text") or str(out)
-    source_docs = out.get("source_documents", [])
-
-    # Build sources: unique product ids preserving order
-    seen = set()
-    sources = []
-    for sd in source_docs:
-        pid = sd.metadata.get("product_id")
-        pname = sd.metadata.get("product_name")
-        if pid and pid not in seen:
-            seen.add(pid)
-            sources.append({"product_id": pid, "product_name": pname})
-
-    return {"answer": answer_text, "sources": sources}
-#####################################################
-class QARequest(BaseModel):
-    product_id: Optional[str] = None
-    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+from difflib import SequenceMatcher
+from typing import Tuple
 
 @app.post("/product/details")
 def product_details(req: QARequest):
     """
-    If product_id provided -> run on that product.
-    If no product_id provided -> try to detect product name mention in the question and run on that product (intelligent chunking).
-    Otherwise (no product and no name mention) fallback to a model-only response (best-effort).
+    Handles product-specific extraction and QA.
+
+    Behavior:
+      - If req.product_id is provided:
+          * If question is the structured extraction prompt -> return parsed structured data (cached).
+          * Else -> run retrieval QA on that product and return answer + sources.
+      - If req.product_id is NOT provided:
+          * Attempt to detect a product name mentioned in the question (exact normalized match, then fuzzy).
+            - If a product is detected -> run retrieval QA on that single product and return answer + sources.
+            - If no product detected -> fallback to model-only generative response.
     """
     q_text = (req.question or "").strip()
     if not q_text:
-        raise HTTPException(status_code=400, detail="question required")
+        raise HTTPException(status_code=400, detail="question is required")
 
-    # If product_id explicitly provided -> use it
-    if req.product_id:
-        pid = req.product_id
-    else:
-        # Try to detect product name mention in the query
-        # Build normalized map: normalized_name -> product_id
+    # Helper: normalize strings for robust matching (remove non-alphanum, lowercase)
+    def _normalize_for_match(s: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', (s or "").lower())
+
+    # Helper: attempt to detect a product mentioned in the free-text query
+    def _detect_product_in_text(question: str) -> Optional[Dict[str, Any]]:
+        """
+        Returns the product dict if a product name is detected in question, else None.
+        Strategy:
+          1) Exact normalized substring match (prefer longest product names).
+          2) Fuzzy matching using SequenceMatcher ratio; pick best above threshold.
+        """
         products = list_products()
-        norm_map = {}
+        if not products:
+            return None
+
+        q_norm_space = re.sub(r'[^a-z0-9\s]', ' ', question.lower())
+        q_norm_alnum = re.sub(r'[^a-z0-9]', '', question.lower())
+
+        # 1) Exact normalized substring match (prefer long names)
+        sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
+        for p in sorted_products:
+            name_norm = _normalize_for_match(p["name"])
+            if not name_norm:
+                continue
+            # If normalized name appears in normalized query (alnum) OR query with spaces removal
+            if name_norm in q_norm_alnum:
+                return p
+            # Also check loose token presence
+            if name_norm in q_norm_space.replace(' ', ''):
+                return p
+
+        # 2) Fuzzy match fallback (SequenceMatcher), choose best above threshold
+        best = None
+        best_ratio = 0.0
+        q_lower = question.lower()
         for p in products:
-            # normalize product name: remove non-alnum, lowercase
-            name_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
-            norm_map[name_norm] = p["id"]
+            pname = (p["name"] or "").lower()
+            # compute similarity between product name and question
+            ratio = SequenceMatcher(None, pname, q_lower).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best = p
+        # threshold: pick only if reasonably similar (tweakable)
+        if best and best_ratio >= 0.60:
+            return best
 
-        # Normalize question and search for any product name token matches
-        q_norm = re.sub(r'[^a-z0-9\s]', ' ', q_text.lower())  # keep spaces
-        # Try to find longest matching product name substring
-        matched_pid = None
-        matched_name = None
-        # iterate products by length descending to prefer longer matches
-        for p in sorted(products, key=lambda x: len(x["name"]), reverse=True):
-            candidate_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
-            if candidate_norm and candidate_norm in q_norm.replace(' ', ''):
-                matched_pid = p["id"]
-                matched_name = p["name"]
-                break
+        return None
 
-        if matched_pid:
-            pid = matched_pid
-        else:
-            pid = None
+    # Helper: run retrieval QA on a single product and return answer + sources
+    def _run_retrieval_on_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
+        pdf_path = product.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            raise HTTPException(status_code=404, detail="Product PDF not found")
 
-    # If we have a pid now, run QA against that single product
-    if pid:
-        # find product metadata
-        products = list_products()
-        product = next((x for x in products if x["id"] == pid), None)
-        if not product:
-            raise HTTPException(status_code=404, detail="Product not found")
-
-        # For a user query, run retriever on that product
+        # Extract text (could be heavy — consider caching)
         try:
-            text = extract_pdf_text(product["pdf_path"])
-            doc = Document(page_content=text, metadata={
-                "product_id": product["id"],
-                "product_name": product["name"],
-                "reaction_type": product["reaction_type"],
-                "source": product["pdf_path"],
-            })
-            vs = FAISS.from_documents([doc], cached_embeddings)
-            retriever = vs.as_retriever(search_kwargs={"k": 3})
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": PROMPT},
-                return_source_documents=True
-            )
-            out = qa_chain({"query": q_text})
-            answer_text = out.get("result") or out.get("output_text") or ""
-            # sources
-            sdocs = out.get("source_documents", [])
-            seen = set()
-            sources = []
-            for sd in sdocs:
-                pid_src = sd.metadata.get("product_id")
-                pname_src = sd.metadata.get("product_name")
-                if pid_src and pid_src not in seen:
-                    seen.add(pid_src)
-                    sources.append({"product_id": pid_src, "product_name": pname_src})
-            return {"answer": answer_text, "sources": sources}
+            text = extract_pdf_text(pdf_path)
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing product-specific QA: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to extract PDF text: {e}")
 
-    # If no product context: fallback to generative model response (no retriever)
-    try:
+        if not text or len(text.strip()) < 20:
+            raise HTTPException(status_code=500, detail="Document content is empty or unreadable")
+
+        # Build a Document and temporary FAISS index (safe for single doc)
+        doc = Document(page_content=text, metadata={
+            "product_id": product["id"],
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        })
+
+        try:
+            vs = FAISS.from_documents([doc], cached_embeddings)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
+
+        retriever = vs.as_retriever(search_kwargs={"k": k})
+
         qa_chain = RetrievalQA.from_chain_type(
             llm=chat_model,
             chain_type="stuff",
-            retriever=None,
+            retriever=retriever,
             chain_type_kwargs={"prompt": PROMPT},
-            return_source_documents=False
+            return_source_documents=True,  # we want sources for citation
+        )
+
+        try:
+            out = qa_chain({"query": question})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
+
+        # Out shape: contains 'result' and 'source_documents'
+        answer_text = out.get("result") or out.get("output_text") or ""
+        source_docs = out.get("source_documents", []) or []
+
+        # Build unique ordered sources list
+        seen = set()
+        sources = []
+        for sd in source_docs:
+            pid = sd.metadata.get("product_id")
+            pname = sd.metadata.get("product_name")
+            if pid and pid not in seen:
+                seen.add(pid)
+                sources.append({"product_id": pid, "product_name": pname})
+
+        return {"answer": answer_text, "sources": sources}
+
+    # If a product_id was explicitly provided -> follow existing product-specific flow
+    if req.product_id:
+        products = list_products()
+        product = next((p for p in products if p["id"] == req.product_id), None)
+        if not product:
+            raise HTTPException(status_code=404, detail="Product not found")
+
+        # Determine whether the question is the structured extraction default or a random user question
+        random_question_flag = q_text.lower() not in [
+            "extract api name, reaction chemistry, yield, procedure, and tabular data",
+            "reaction chemistry",
+        ]
+
+        # If it's a random user question -> run retrieval QA on the product and return answer + sources
+        if random_question_flag:
+            return _run_retrieval_on_product(product, q_text, k=3)
+
+        # Otherwise, it's the structured extraction request -> reuse cached parsing if present
+        if req.product_id in _product_details_cache:
+            return _product_details_cache[req.product_id]
+
+        # Build vectorstore (or reuse existing) and run the extraction prompt (we want parsed structured result)
+        vs = build_product_vector_store(product)
+        if not vs:
+            raise HTTPException(status_code=500, detail="Failed to build vector store (empty/invalid PDF)")
+
+        retriever = vs.as_retriever(search_kwargs={"k": 1})
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=retriever,
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=False,
+        )
+
+        try:
+            raw_response = qa_chain.run(q_text)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+        parsed = parse_structured_response(raw_response)
+        _product_details_cache[req.product_id] = parsed
+        return parsed
+
+    # No explicit product_id -> attempt to detect product mention in the question
+    detected_product = _detect_product_in_text(q_text)
+    if detected_product:
+        # If a product is detected, run retrieval QA on that single product and return answer + sources
+        return _run_retrieval_on_product(detected_product, q_text, k=3)
+
+    # Fallback: no product id and no detected product -> generative model response
+    try:
+        # Using the model with the generic prompt template
+        # We create a simple chain that uses the prompt template with context empty
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=None,  # no retriever — pure model generation
+            chain_type_kwargs={"prompt": PROMPT},
+            return_source_documents=False,
         )
         raw_response = qa_chain.run(q_text)
         return {"response": raw_response}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error generating response: {e}")
-############################################
-// append to src/api.js
-export const queryWithCitations = (productIds = [], question = "") => {
-  return api.post('/query', { product_ids: productIds, question });
+##########################
+@app.get("/products/search")
+def search_products(q: str = "", limit: int = 10):
+    """
+    Return up to `limit` products that match the query `q`.
+    Matching strategy:
+      1. prefix matches on normalized name (best)
+      2. substring matches on normalized name (fallback)
+    Normalization: lowercased, non-alphanumeric removed (so 'Prod-1' matches 'prod1', 'Prod 1', etc).
+    """
+    if q is None:
+        q = ""
+    q_norm = re.sub(r'[^a-z0-9]', '', q.lower())
+    if q_norm == "":
+        # return first N products as a fallback (stable order)
+        prods = list_products()[:limit]
+        return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in prods]
+
+    products = list_products()
+    # collect prefix matches first (longer names first)
+    prefix_matches = []
+    substring_matches = []
+    for p in products:
+        name_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
+        if name_norm.startswith(q_norm):
+            prefix_matches.append(p)
+        elif q_norm in name_norm:
+            substring_matches.append(p)
+
+    # sort prefix matches by name length (prefer longer exact names)
+    prefix_matches = sorted(prefix_matches, key=lambda x: -len(x["name"]))
+    substring_matches = sorted(substring_matches, key=lambda x: -len(x["name"]))
+
+    combined = prefix_matches + substring_matches
+    combined = combined[:limit]
+
+    return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
+
+##############################
+// src/api.js (append)
+export const searchProducts = (query, limit = 10) => {
+  return api.get('/products/search', { params: { q: query, limit } });
 };
-#########################
-import React from 'react';
-import { motion } from 'framer-motion';
-
-/**
- * ProductTabs with right-click citation support
- * props:
- *  - products
- *  - onSelect(productId)
- *  - onContext(product) // right-click to toggle citation
- *  - citedIds: Set of product ids currently cited
- */
-export default function ProductTabs({ products = [], onSelect, onContext, citedIds = new Set() }) {
-  return (
-    <div className="bg-transparent">
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
-        <div className="text-sm text-gray-500">Left-click to view • Right-click to cite</div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-        {products.map(p => {
-          const selected = citedIds.has(p.id);
-          return (
-            <motion.button
-              key={p.id}
-              whileHover={{ y: -4 }}
-              onClick={() => onSelect && onSelect(p.id)}
-              onContextMenu={(e) => {
-                e.preventDefault();
-                onContext && onContext(p);
-              }}
-              title={p.name}
-              className={`relative bg-white border rounded-2xl p-4 shadow hover:shadow-xl transition flex flex-col justify-between text-left text-sm ${selected ? 'ring-2 ring-accent' : ''}`}
-            >
-              <div className="flex items-start gap-3">
-                <div className="flex-1">
-                  <div className="font-semibold text-primary truncate">{p.name}</div>
-                  <div className="text-xs text-gray-400 mt-1">{p.reaction_type?.replace(/_/g,' ')}</div>
-                </div>
-                {selected && <div className="text-xs text-white bg-accent px-2 py-1 rounded-full">CITED</div>}
-              </div>
-              <div className="mt-3 text-xs text-gray-500 truncate">{p.pdf_path ? p.pdf_path.split(/[\\/]/).pop() : ''}</div>
-            </motion.button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-#########################################
+########################
+// src/components/ChatWindow.jsx
 import React, { useRef, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { FiSend } from 'react-icons/fi';
 import MicrophoneButton from './MicrophoneButton';
+import { searchProducts } from '../api'; // <- ensure this exists
 
-export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3xl", selectedCitedDocs = [], removeCitation = () => {} }){
+/**
+ * ChatWindow with product-name autocomplete dropdown.
+ *
+ * Props:
+ *  - messages: array of chat messages
+ *  - onSend(text): called when user submits
+ *  - centeredWidth: tailwind max-width class
+ *  - selectedCitedDocs, removeCitation (kept for compatibility)
+ */
+export default function ChatWindow({
+  messages,
+  onSend,
+  centeredWidth = "max-w-3xl",
+  selectedCitedDocs = [],
+  removeCitation = () => {}
+}) {
   const [text, setText] = useState('');
   const textareaRef = useRef();
+  const [suggestions, setSuggestions] = useState([]); // {id,name,reaction_type}
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1); // for keyboard nav
+  const debounceRef = useRef(null);
+  const containerRef = useRef(null);
 
+  // autosize textarea
   useEffect(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
@@ -250,17 +275,137 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
     }
   }, [text, messages]);
 
+  // hide suggestions on outside click
+  useEffect(() => {
+    const onDocClick = (e) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target)) {
+        setShowSuggestions(false);
+        setActiveIndex(-1);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
+
+  // Debounced search for product suggestions
+  useEffect(() => {
+    const q = (text || '').trim();
+    // If user typed less than 2 chars, don't show suggestions (tweakable)
+    if (q.length < 2) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      setActiveIndex(-1);
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+      return;
+    }
+
+    // debounce
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await searchProducts(q, 8); // top 8 matches
+        const payload = res && res.data ? res.data : res;
+        setSuggestions(payload || []);
+        setShowSuggestions(Array.isArray(payload) && payload.length > 0);
+        setActiveIndex(-1);
+      } catch (err) {
+        console.error("searchProducts error:", err);
+        setSuggestions([]);
+        setShowSuggestions(false);
+      }
+    }, 220); // 220ms debounce
+    return () => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+    };
+  }, [text]);
+
+  // keyboard handling for the textarea (arrow keys navigate suggestions)
+  const onKeyDown = (e) => {
+    if (showSuggestions && suggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveIndex((i) => Math.min(i + 1, suggestions.length - 1));
+        return;
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveIndex((i) => Math.max(i - 1, 0));
+        return;
+      } else if (e.key === 'Enter' && activeIndex >= 0) {
+        // choose active suggestion on Enter (if suggestion focused)
+        e.preventDefault();
+        chooseSuggestion(suggestions[activeIndex]);
+        return;
+      } else if (e.key === 'Escape') {
+        setShowSuggestions(false);
+        setActiveIndex(-1);
+        return;
+      }
+    }
+
+    // default Enter behavior (send) handled in submit below when not in suggestions
+    if (e.key === 'Enter' && !e.shiftKey && !showSuggestions) {
+      e.preventDefault();
+      submit();
+    }
+  };
+
+  // Insert product name into text (or you could set behavior to cite product)
+  const chooseSuggestion = (s) => {
+    if (!s) return;
+    // Option A: Insert product name into the text cursor position — simplest: append if empty or at end
+    // For more advanced insertion, you'd calculate selectionStart and splice text; here we append or replace last token
+    // We'll replace the current last "word-like" token the user is typing with the product name for a natural feel.
+
+    try {
+      const el = textareaRef.current;
+      if (el) {
+        const cursor = el.selectionStart || text.length;
+        // find token start before cursor (allow alnum and punctuation)
+        let left = text.slice(0, cursor);
+        let right = text.slice(cursor);
+        // find last whitespace in left
+        const lastWs = left.lastIndexOf(' ');
+        const prefix = lastWs === -1 ? '' : left.slice(0, lastWs + 1);
+        // Build new text: prefix + product name + (if right begins with whitespace keep it)
+        const newText = prefix + s.name + (right && !right.startsWith(' ') ? ' ' + right : right);
+        setText(newText);
+      } else {
+        // fallback
+        setText((t) => (t ? t + ' ' + s.name : s.name));
+      }
+    } catch (e) {
+      setText((t) => (t ? t + ' ' + s.name : s.name));
+    }
+
+    setShowSuggestions(false);
+    setActiveIndex(-1);
+    // focus back to textarea
+    setTimeout(() => {
+      try { textareaRef.current && textareaRef.current.focus(); } catch {}
+    }, 0);
+  };
+
   const submit = () => {
     const t = text.trim();
     if (!t) return;
     onSend(t);
     setText('');
+    setSuggestions([]);
+    setShowSuggestions(false);
+    setActiveIndex(-1);
   };
 
   return (
-    <div className={`mx-auto ${centeredWidth}`}>
+    <div className={`mx-auto ${centeredWidth}`} ref={containerRef}>
       <div className="bg-white rounded-3xl shadow-2xl p-6">
-        {/* Citation chips */}
+        {/* Citation chips (if any) */}
         {selectedCitedDocs && selectedCitedDocs.length > 0 && (
           <div className="mb-4 flex flex-wrap gap-2">
             {selectedCitedDocs.map(d => (
@@ -272,6 +417,7 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
           </div>
         )}
 
+        {/* Messages */}
         <div className="min-h-[220px] max-h-[54vh] overflow-auto pr-2">
           {messages.map((m, idx) => (
             <motion.div
@@ -288,485 +434,53 @@ export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3x
           ))}
         </div>
 
-        {/* Input area */}
-        <div className="mt-4 flex items-end gap-3">
-          <MicrophoneButton onText={(t) => setText(t)} />
-          <textarea
-            ref={textareaRef}
-            value={text}
-            onChange={(e)=> setText(e.target.value)}
-            rows={1}
-            placeholder="Ask about reaction chemistry or type a reaction name..."
-            className="flex-1 resize-none px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
-          />
-          <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
-            <FiSend />
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-########################
-// src/App.jsx
-import React, { useEffect, useState } from 'react';
-import ChatWindow from "./ChatWindow";
-import ProductTabs from "./ProductTabs";
-import ProductDetailModal from "./ProductDetailModal";
-import SidebarHistory from "./SidebarHistory";
-import {
-  fetchReactions,
-  fetchProducts,
-  fetchProductMeta,
-  fetchProductDetails,
-  fetchSchemeImageUrl,
-  queryWithCitations
-} from './api';
-import Navbar from "../Navbar/Navbar";
-import Footer from "../Footer/Footer";
-
-import chem_logo from "../../assets/Chemhub_Logo_Colored.png";
-
-export default function App() {
-  // Core state
-  const [reactions, setReactions] = useState([]);
-  const [products, setProducts] = useState([]);
-  const [selectedReaction, setSelectedReaction] = useState(null);
-  const [selectedProduct, setSelectedProduct] = useState(null); // meta
-  const [productDetails, setProductDetails] = useState(null);
-  const [productListVisible, setProductListVisible] = useState(false);
-  const [detailModalOpen, setDetailModalOpen] = useState(false);
-  const [messages, setMessages] = useState([]); // chat messages
-  const [history, setHistory] = useState([]);
-  const [loadingDetails, setLoadingDetails] = useState(false);
-  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
-
-  // Citation-specific state (multi-select)
-  // Each item: { id, name, reaction_type }
-  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
-
-  // Load reactions on mount
-  useEffect(() => {
-    fetchReactions().then(setReactions).catch(e => console.error("fetchReactions:", e));
-  }, []);
-
-  // Helpers
-  const pushMessage = (m) => setMessages(prev => [...prev, m]);
-  const normalize = s => (s || '').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
-
-  // Set of cited ids for ProductTabs styling
-  const citedIdsSet = new Set(selectedCitedDocs.map(d => d.id));
-
-  // Toggle citation on right-click
-  const handleToggleCite = (product) => {
-    // determine if currently cited
-    const exists = selectedCitedDocs.find(p => p.id === product.id);
-    if (exists) {
-      // remove
-      setSelectedCitedDocs(prev => prev.filter(p => p.id !== product.id));
-      pushMessage({ role: 'assistant', content: `Removed citation: ${product.name}` });
-    } else {
-      // add (prepend)
-      setSelectedCitedDocs(prev => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
-      pushMessage({ role: 'assistant', content: `Added citation: ${product.name}` });
-    }
-  };
-
-  // Remove citation from chip
-  const removeCitation = (id) => {
-    const found = selectedCitedDocs.find(d => d.id === id);
-    setSelectedCitedDocs(prev => prev.filter(d => d.id !== id));
-    if (found) pushMessage({ role: 'assistant', content: `Removed citation: ${found.name}` });
-  };
-
-  // Handle user sending a message
-  const handleUserSend = async (text) => {
-    // 1. Append user's message to chat
-    pushMessage({ role: 'user', content: text });
-
-    // 2. Quick reaction-type detection (unchanged)
-    const norm = normalize(text);
-    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, '_')));
-    if (match) {
-      setSelectedReaction(match);
-      try {
-        const prods = await fetchProducts(match);
-        setProducts(prods || []);
-        setProductListVisible(true);
-        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.` });
-      } catch (e) {
-        console.error("fetchProducts by reaction:", e);
-        pushMessage({ role: 'assistant', content: 'Error loading products for that reaction.' });
-      }
-      return;
-    }
-
-    // 3. "show/list/find ... for X" style detection (unchanged)
-    const prefix = text.match(/(?:show|list|find).{0,20}for\s+(.+)/i);
-    if (prefix && prefix[1]) {
-      const candidate = prefix[1].trim();
-      const found = reactions.find(r => normalize(r).includes(normalize(candidate)) || normalize(candidate).includes(normalize(r)));
-      if (found) {
-        setSelectedReaction(found);
-        try {
-          const prods = await fetchProducts(found);
-          setProducts(prods || []);
-          setProductListVisible(true);
-          pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')}. Select below.` });
-        } catch (e) {
-          console.error("fetchProducts by candidate:", e);
-          pushMessage({ role: 'assistant', content: 'Error fetching products.' });
-        }
-        return;
-      }
-    }
-
-    // 4. If there are cited documents -> use the /query endpoint to search ONLY those docs
-    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
-      try {
-        pushMessage({ role: 'assistant', content: 'Searching selected documents...' });
-        const productIds = selectedCitedDocs.map(d => d.id);
-        const res = await queryWithCitations(productIds, text);
-        const payload = (res && res.data) ? res.data : res;
-
-        // Primary answer
-        const answer = payload?.answer || payload?.response || "No relevant answer found.";
-        pushMessage({ role: 'assistant', content: answer });
-
-        // Citations block (if provided)
-        if (payload?.sources && Array.isArray(payload.sources) && payload.sources.length > 0) {
-          const citationsText = payload.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
-          pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
-        } else {
-          pushMessage({ role: 'assistant', content: 'No citation sources returned.' });
-        }
-      } catch (err) {
-        console.error("queryWithCitations error:", err);
-        pushMessage({ role: 'assistant', content: 'Error querying selected documents.' });
-      }
-      return;
-    }
-
-    // 5. If no product selected, try to let backend detect product mention (your backend handles name-detection)
-    //    We call fetchProductDetails without a productId (backend will detect if a product name is mentioned)
-    if (!selectedProduct) {
-      try {
-        pushMessage({ role: 'assistant', content: 'Searching documents for mentioned product (if any)...' });
-        const res = await fetchProductDetails(undefined, text); // backend expects product_id optional
-        const payload = (res && res.data) ? res.data : res;
-
-        // Handle response shapes: {answer, sources} or {response} or parsed structured object
-        if (payload?.answer || payload?.sources) {
-          const answer = payload.answer || payload.response || "No relevant answer.";
-          pushMessage({ role: 'assistant', content: answer });
-
-          if (payload?.sources && Array.isArray(payload.sources) && payload.sources.length > 0) {
-            const citationsText = payload.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
-            pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
-          }
-        } else if (payload?.response) {
-          pushMessage({ role: 'assistant', content: payload.response });
-        } else {
-          // fallback: no structured answer -> ask user to select product
-          pushMessage({ role: 'assistant', content: 'Please select a product/document first (or right-click to cite documents).' });
-        }
-      } catch (err) {
-        console.error("fetchProductDetails (no product) error:", err);
-        pushMessage({ role: 'assistant', content: 'Error querying documents.' });
-      }
-      return;
-    }
-
-    // 6. If a single product is selected -> perform per-product QA (existing flow)
-    try {
-      setLoadingDetails(true);
-      const res = await fetchProductDetails(selectedProduct.id, text);
-      const d = (res && res.data) ? res.data : res;
-
-      // The backend may return {answer, sources} for queries or parsed structured object for extraction.
-      if (d?.answer || d?.sources) {
-        const answer = d.answer || d.response || "No answer.";
-        pushMessage({ role: 'assistant', content: answer });
-        if (d.sources && d.sources.length > 0) {
-          const citationsText = d.sources.map((s, i) => `${i + 1}. ${s.product_name} (id: ${s.product_id})`).join('\n');
-          pushMessage({ role: 'assistant', content: `Citations:\n${citationsText}` });
-        }
-      } else {
-        // If backend returned structured parsed info (api_name, procedure, tables...), display a summary and open detail modal
-        let assistantText = '';
-        if (d?.api_name) assistantText += `API: ${d.api_name}\n\n`;
-        if (d?.reaction_chemistry) assistantText += `Reaction: ${d.reaction_chemistry}\n\n`;
-        if (d?.yield) assistantText += `Yield: ${d.yield}\n\n`;
-        if (d?.procedure) assistantText += `Procedure (excerpt):\n${(d.procedure || '').slice(0, 600)}\n\n`;
-        if (!assistantText) assistantText = 'No structured answer found.';
-        pushMessage({ role: 'assistant', content: assistantText });
-
-        // set details & modal for user to inspect
-        setProductDetails(d);
-        setDetailModalOpen(true);
-        setHistory(h => [{ title: selectedProduct.name, content: text, productId: selectedProduct.id }, ...h]);
-      }
-    } catch (err) {
-      console.error("fetchProductDetails (selectedProduct) error:", err);
-      pushMessage({ role: 'assistant', content: 'Error querying backend.' });
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
-  // When user clicks a product tile to open detail modal
-  const handleSelectProduct = async (productId) => {
-    try {
-      const meta = await fetchProductMeta(productId);
-      setSelectedProduct(meta);
-      setProductDetails(null);
-      setSelectedSchemeUrl(null);
-      setLoadingDetails(true);
-
-      // open modal early with loader
-      setDetailModalOpen(true);
-
-      // preload scheme url for chat preview (optional)
-      try {
-        const scheme = await fetchSchemeImageUrl(productId);
-        setSelectedSchemeUrl(scheme);
-      } catch (e) {
-        // ignore scheme preload errors
-      }
-
-      const res = await fetchProductDetails(productId); // default behavior will return parsed structured info
-      const d = (res && res.data) ? res.data : res;
-      setProductDetails(d);
-      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0, 120) : '', productId: meta.id }, ...h]);
-    } catch (e) {
-      console.error("handleSelectProduct error:", e);
-      pushMessage({ role: 'assistant', content: 'Failed to load product details.' });
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
-  return (
-    <>
-      <Navbar />
-      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
-        {/* center column */}
-        <div className="mx-auto my-8 w-full max-w-6xl px-4">
-          {/* Header / Logo */}
-          <div className="flex flex-col items-center justify-center mb-6">
-            <img className="h-50 w-30" src={chem_logo} alt="chemhub-logo" />
-          </div>
-
-          {/* Main area (chat + product tabs) */}
-          <div className="relative">
-            <ChatWindow
-              messages={messages}
-              onSend={handleUserSend}
-              centeredWidth="max-w-4xl"
-              selectedSchemeUrl={selectedSchemeUrl}
-              selectedProduct={selectedProduct}
-              selectedCitedDocs={selectedCitedDocs}
-              removeCitation={removeCitation}
+        {/* Input area + suggestions */}
+        <div className="mt-4 relative">
+          <div className="flex items-end gap-3">
+            <MicrophoneButton onText={(t) => setText(t)} />
+            <textarea
+              ref={textareaRef}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              rows={1}
+              placeholder="Ask about reaction chemistry or type a product name..."
+              className="flex-1 resize-none px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
+              onKeyDown={onKeyDown}
+              onFocus={() => { if (suggestions && suggestions.length > 0) setShowSuggestions(true); }}
             />
-
-            {productListVisible && products && products.length > 0 && (
-              <div className="mt-6">
-                <ProductTabs
-                  products={products}
-                  onSelect={handleSelectProduct}
-                  onContext={handleToggleCite} // right-click toggles citation
-                  citedIds={citedIdsSet}
-                />
-              </div>
-            )}
+            <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
+              <FiSend />
+            </button>
           </div>
+
+          {/* Suggestions dropdown */}
+          {showSuggestions && suggestions && suggestions.length > 0 && (
+            <div className="absolute left-16 right-0 z-40 mt-2 rounded-xl bg-white border shadow-lg overflow-hidden">
+              <ul className="max-h-56 overflow-auto">
+                {suggestions.map((s, i) => (
+                  <li key={s.id}>
+                    <button
+                      className={`w-full text-left px-4 py-3 hover:bg-gray-50 flex justify-between items-center ${i === activeIndex ? 'bg-gray-100' : ''}`}
+                      onMouseDown={(e) => {
+                        // use mouseDown to prevent textarea blur before click
+                        e.preventDefault();
+                        chooseSuggestion(s);
+                      }}
+                      onMouseEnter={() => setActiveIndex(i)}
+                    >
+                      <div className="truncate">
+                        <div className="font-medium text-sm text-primary">{s.name}</div>
+                        <div className="text-xs text-gray-400 mt-1">{(s.reaction_type || "").replace(/_/g, ' ')}</div>
+                      </div>
+                      <div className="text-xs text-gray-400 ml-4">Select</div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
-
-        {/* Right-side collapsible history */}
-        <SidebarHistory
-          history={history}
-          onSelect={(h) => {
-            if (h && h.productId) handleSelectProduct(h.productId);
-          }}
-        />
-
-        {/* Product detail modal */}
-        <ProductDetailModal
-          open={detailModalOpen}
-          onClose={() => setDetailModalOpen(false)}
-          meta={selectedProduct}
-          details={productDetails}
-          loading={loadingDetails}
-        />
-      </div>
-      <Footer />
-    </>
-  );
-}
-##########################
-// src/components/ProductTabs.jsx
-import React, { useRef, useEffect } from "react";
-import { motion } from "framer-motion";
-
-/**
- * ProductTabs
- *
- * Props:
- *  - products: Array<{id, name, reaction_type, pdf_path, has_scheme_image, has_scheme_cdx}>
- *  - onSelect(productId)        // left-click / keyboard Enter to open product
- *  - onContext(product)         // right-click to toggle citation selection
- *  - citedIds: Set<string>      // set of product ids currently cited (for visual state)
- *
- * Features:
- *  - horizontal scroll area with left/right nav buttons
- *  - long-press / hold to continuously scroll (mouse + touch)
- *  - right-click toggles citation (prevents default context menu)
- *  - accessible: supports Enter key to select tile
- *  - graceful truncation + full name via title attribute
- */
-export default function ProductTabs({
-  products = [],
-  onSelect,
-  onContext,
-  citedIds = new Set(),
-}) {
-  const scrollContainerRef = useRef(null);
-  const scrollIntervalRef = useRef(null);
-
-  useEffect(() => {
-    // Cleanup on unmount
-    return () => {
-      if (scrollIntervalRef.current) {
-        clearInterval(scrollIntervalRef.current);
-        scrollIntervalRef.current = null;
-      }
-    };
-  }, []);
-
-  const startScrolling = (direction) => {
-    if (!scrollContainerRef.current) return;
-    if (scrollIntervalRef.current) return; // already scrolling
-
-    scrollIntervalRef.current = setInterval(() => {
-      scrollContainerRef.current.scrollBy({
-        left: direction === "left" ? -60 : 60,
-        behavior: "smooth",
-      });
-    }, 100);
-  };
-
-  const stopScrolling = () => {
-    if (scrollIntervalRef.current) {
-      clearInterval(scrollIntervalRef.current);
-      scrollIntervalRef.current = null;
-    }
-  };
-
-  const scrollOnce = (direction) => {
-    if (!scrollContainerRef.current) return;
-    stopScrolling();
-    scrollContainerRef.current.scrollBy({
-      left: direction === "left" ? -240 : 240,
-      behavior: "smooth",
-    });
-  };
-
-  return (
-    <div className="bg-transparent">
-      {/* Header */}
-      <div className="flex items-center justify-between mb-2">
-        <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
-        <div className="text-sm text-gray-500">Left-click to open • Right-click to cite</div>
-      </div>
-
-      {/* Navigation + Scroll area */}
-      <div className="flex items-center gap-3">
-        {/* Left nav */}
-        <button
-          aria-label="Scroll left"
-          title="Scroll Left"
-          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
-          onClick={() => scrollOnce("left")}
-          onMouseDown={() => startScrolling("left")}
-          onMouseUp={stopScrolling}
-          onMouseLeave={stopScrolling}
-          onTouchStart={() => startScrolling("left")}
-          onTouchEnd={stopScrolling}
-        >
-          ←
-        </button>
-
-        {/* Scrollable container */}
-        <div
-          ref={scrollContainerRef}
-          className="overflow-x-auto py-2 w-full no-scrollbar flex gap-3"
-          role="list"
-        >
-          {products.map((product) => {
-            const isCited = citedIds && citedIds.has && citedIds.has(product.id);
-            return (
-              <motion.button
-                key={product.id}
-                role="listitem"
-                whileHover={{ y: -6 }}
-                whileTap={{ scale: 0.98 }}
-                onClick={() => onSelect && onSelect(product.id)}
-                onContextMenu={(e) => {
-                  if (onContext) {
-                    e.preventDefault();
-                    onContext(product);
-                  }
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    onSelect && onSelect(product.id);
-                  }
-                }}
-                title={product.name}
-                className={`min-w-[220px] max-w-[240px] flex-shrink-0 bg-white border rounded-2xl p-3 shadow hover:shadow-lg transition flex flex-col justify-between text-left
-                  ${isCited ? "ring-2 ring-accent" : ""}`}
-                aria-pressed={isCited ? "true" : "false"}
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex-1">
-                    <div className="text-sm font-semibold text-primary truncate" style={{ maxWidth: "100%" }}>
-                      {product.name}
-                    </div>
-                    <div className="text-xs text-gray-400 mt-1">{(product.reaction_type || "").replace(/_/g, " ")}</div>
-                  </div>
-
-                  {isCited && (
-                    <div className="text-xs text-white bg-accent px-2 py-1 rounded-full">CITED</div>
-                  )}
-                </div>
-
-                <div className="text-xs mt-2 text-gray-500 truncate">
-                  {product.pdf_path ? product.pdf_path.split(/[\\/]/).pop() : ""}
-                </div>
-              </motion.button>
-            );
-          })}
-        </div>
-
-        {/* Right nav */}
-        <button
-          aria-label="Scroll right"
-          title="Scroll Right"
-          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
-          onClick={() => scrollOnce("right")}
-          onMouseDown={() => startScrolling("right")}
-          onMouseUp={stopScrolling}
-          onMouseLeave={stopScrolling}
-          onTouchStart={() => startScrolling("right")}
-          onTouchEnd={stopScrolling}
-        >
-          →
-        </button>
       </div>
     </div>
   );
 }
-
-#############################
