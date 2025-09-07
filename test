@@ -1,19 +1,25 @@
+from difflib import SequenceMatcher
+import traceback
+from fastapi.responses import JSONResponse
+
 @app.post("/product/details")
 def product_details(req: QARequest):
     """
-    Robust product/details endpoint.
+    Robust product/details endpoint with strong product-name detection and detailed server-side debugging prints.
 
     Behavior:
-      - If req.product_id is provided:
-          * If question == canonical extraction prompt -> run structured extraction (cached) and return parsed structure.
-          * Otherwise -> run retrieval QA on that single product and return {"answer":..., "sources":[...]}
-      - If req.product_id is NOT provided:
-          * Attempt to detect a product name mentioned in the question (normalized filename substring).
-            - If a product is detected -> run retrieval QA on that product and return {"answer":..., "sources":[...]}
-            - If no product detected -> fallback to a generative model response {"response": "..."} (no retriever).
+      - If req.product_id provided:
+          * If question == canonical extraction -> run extraction prompt and return parsed structured data (cached).
+          * Else -> run retrieval QA on that product and return {"answer":..., "sources":[...]}.
+      - If req.product_id not provided:
+          * Attempt to detect product name inside question by:
+              1) normalized alnum substring match (prefer long names),
+              2) token overlap check,
+              3) similarity ratio fallback (SequenceMatcher).
+          * If a product is detected -> build retriever on that product PDF and run QA (returns answer + sources).
+          * Otherwise fallback to generative model response (no retriever).
+    NOTE: This function prints detailed information to the backend logs for debugging detection issues.
     """
-    import traceback
-
     try:
         q_text = (req.question or "").strip()
         if not q_text:
@@ -22,90 +28,129 @@ def product_details(req: QARequest):
         # canonical extraction text (case-insensitive)
         CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
 
-        # --- helpers inside function to keep scope local and clear ---
-
+        # helper: normalize to alphanumeric lowercase
         def _normalize_alnum(s: str) -> str:
-            """Lowercase and remove non-alphanumeric characters for robust matching."""
             return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
+        # helper: tokenized set (alnum tokens)
+        def _tokens(s: str):
+            return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
+
+        # BEGIN DEBUG LOG
+        print("=== /product/details called ===")
+        print("Question:", q_text)
+        # END DEBUG LOG
+
+        # helper to detect product by multiple strategies
         def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
-            """
-            Detect a product by checking normalized product filenames against normalized question.
-            Prefer longer product names first to avoid accidental short substr matches.
-            Returns product dict or None.
-            """
             products = list_products()
             if not products:
+                print("DEBUG: No products available to match.")
                 return None
-            q_norm = _normalize_alnum(question)
-            for p in sorted(products, key=lambda x: len(x["name"]), reverse=True):
+
+            q_norm_alnum = _normalize_alnum(question)
+            q_tokens = set(_tokens(question))
+
+            # 1) Exact normalized substring match (prefer longer product names)
+            sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
+            exact_matches = []
+            for p in sorted_products:
                 name_norm = _normalize_alnum(p["name"])
-                if name_norm and name_norm in q_norm:
-                    return p
+                if not name_norm:
+                    continue
+                if name_norm in q_norm_alnum:
+                    exact_matches.append((p, name_norm))
+            if exact_matches:
+                chosen = exact_matches[0][0]
+                print(f"DEBUG: Exact normalized substring match -> '{chosen['name']}' (id: {chosen['id']})")
+                return chosen
+
+            # 2) Token overlap heuristic: count how many name tokens appear in question tokens
+            token_matches = []
+            for p in sorted_products:
+                pname_tokens = set(_tokens(p["name"]))
+                if not pname_tokens:
+                    continue
+                overlap = pname_tokens.intersection(q_tokens)
+                if overlap:
+                    token_matches.append((p, len(overlap), len(pname_tokens), overlap))
+            if token_matches:
+                # prefer highest overlap ratio (over name token count), then more tokens matched
+                token_matches.sort(key=lambda x: (-(x[1] / x[2]), -x[1]))
+                best = token_matches[0]
+                p_best, match_count, token_count, overlap = best
+                ratio = match_count / token_count
+                print(f"DEBUG: Token-overlap candidate -> '{p_best['name']}' (id: {p_best['id']}) overlap {match_count}/{token_count} tokens {overlap} ratio={ratio:.2f}")
+                # require at least 50% token overlap to be confident
+                if ratio >= 0.5:
+                    return p_best
+
+            # 3) Similarity fallback: pick best SequenceMatcher ratio over product.name vs question
+            best = None
+            best_ratio = 0.0
+            for p in products:
+                pname = (p["name"] or "").lower()
+                if not pname.strip():
+                    continue
+                # Compute two similarity scores and average them:
+                # a) between full names (lower) and question
+                r1 = SequenceMatcher(None, pname, question.lower()).ratio()
+                # b) between normalized alnum strings (robust to spacing/punctuation)
+                r2 = SequenceMatcher(None, _normalize_alnum(pname), q_norm_alnum).ratio()
+                ratio = (r1 + r2) / 2.0
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best = (p, ratio, r1, r2)
+            # log top candidate
+            if best:
+                p_best, ratio, r1, r2 = best
+                print(f"DEBUG: Best similarity candidate -> '{p_best['name']}' (id: {p_best['id']}) ratio_avg={ratio:.3f} r1={r1:.3f} r2={r2:.3f}")
+                # Apply a conservative threshold to avoid false positives
+                if ratio >= 0.60:
+                    return p_best
+                else:
+                    print(f"DEBUG: Best similarity below threshold (0.60): {ratio:.3f} -> will NOT auto-select")
             return None
 
-        def _choose_prompt_for_extraction() -> Any:
-            """Return extraction prompt (EXTRACTION_PROMPT or fallback)."""
-            try:
-                return EXTRACTION_PROMPT
-            except NameError:
-                # fallback to PROMPT if present
-                if "PROMPT" in globals():
-                    return PROMPT
-                # If nothing is configured, raise
-                raise RuntimeError("No extraction prompt configured (EXTRACTION_PROMPT or PROMPT missing).")
-
-        def _choose_prompt_for_qa() -> Any:
-            """Return QA prompt (QA_PROMPT or fallback)."""
-            try:
-                return QA_PROMPT
-            except NameError:
-                # fallback to PROMPT if present (less ideal but safe)
-                if "PROMPT" in globals():
-                    return PROMPT
-                # As last resort, attempt to use EXTRACTION_PROMPT if available
-                try:
-                    return EXTRACTION_PROMPT
-                except NameError:
-                    raise RuntimeError("No QA prompt configured (QA_PROMPT, PROMPT, or EXTRACTION_PROMPT missing).")
-
+        # helper: run retrieval QA over a given product and return {answer, sources}
         def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
-            """
-            Build a temporary retriever over a single product PDF and run QA using QA_PROMPT.
-            Returns {"answer": "...", "sources":[{product_id, product_name}, ...]}
-            """
+            print(f"DEBUG: Running retrieval for product: {product['name']} (id: {product['id']})")
             pdf_path = product.get("pdf_path")
             if not pdf_path or not os.path.exists(pdf_path):
-                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}")
+                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}: {pdf_path}")
 
-            # Extract text (may raise)
-            text = extract_pdf_text(pdf_path)
+            # extract text and verify
+            try:
+                text = extract_pdf_text(pdf_path)
+            except Exception as e:
+                print(f"ERROR: extract_pdf_text failed for {pdf_path}: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to extract text: {e}")
+
             if not text or len(text.strip()) < 20:
                 raise HTTPException(status_code=500, detail="Document content empty or unreadable")
 
-            doc = Document(
-                page_content=text,
-                metadata={
-                    "product_id": product["id"],
-                    "product_name": product["name"],
-                    "reaction_type": product["reaction_type"],
-                    "source": pdf_path,
-                }
-            )
+            doc = Document(page_content=text, metadata={
+                "product_id": product["id"],
+                "product_name": product["name"],
+                "reaction_type": product["reaction_type"],
+                "source": pdf_path
+            })
 
-            # Build FAISS for this single doc (acceptable for single-product queries)
             try:
                 vs = FAISS.from_documents([doc], cached_embeddings)
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed building FAISS index for product: {e}")
+                print(f"ERROR: FAISS.from_documents failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed building FAISS index: {e}")
 
             retriever = vs.as_retriever(search_kwargs={"k": k})
 
-            # Choose QA prompt (with safe fallback)
+            # choose QA prompt (prefer QA_PROMPT)
             try:
-                prompt_to_use = _choose_prompt_for_qa()
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
+                prompt_to_use = QA_PROMPT
+            except NameError:
+                # fallback to PROMPT or EXTRACTION_PROMPT
+                prompt_to_use = globals().get("PROMPT") or globals().get("EXTRACTION_PROMPT")
+                print("DEBUG: QA_PROMPT not found, fallback to available prompt.")
 
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
@@ -119,7 +164,7 @@ def product_details(req: QARequest):
             answer_text = out.get("result") or out.get("output_text") or ""
             source_docs = out.get("source_documents", []) or []
 
-            # Build unique ordered sources
+            # build unique ordered sources
             seen = set()
             sources = []
             for sd in source_docs:
@@ -128,13 +173,14 @@ def product_details(req: QARequest):
                 if pid and pid not in seen:
                     seen.add(pid)
                     sources.append({"product_id": pid, "product_name": pname})
+            print(f"DEBUG: Retrieval produced answer length={len(answer_text)} and {len(sources)} source(s)")
             return {"answer": answer_text, "sources": sources}
 
         # -------------------------
-        # Main logic
+        # Main branching logic
         # -------------------------
 
-        # 1) If explicit product_id provided -> use it
+        # 1) explicit product_id path (keep prior behavior)
         if req.product_id:
             products = list_products()
             product = next((p for p in products if p["id"] == req.product_id), None)
@@ -144,24 +190,26 @@ def product_details(req: QARequest):
             is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
 
             if not is_extraction:
-                # User question about this product -> run retrieval QA and return answer + sources
+                # question about this product -> run retrieval QA
                 return _run_retrieval_for_product(product, q_text, k=3)
 
-            # Structured extraction requested -> reuse cached parsed result if available
+            # structured extraction -> cached or run
             if req.product_id in _product_details_cache:
+                print("DEBUG: returning cached parsed details")
                 return _product_details_cache[req.product_id]
 
-            # Build or reuse vectorstore and run extraction prompt (k=1)
             vs = build_product_vector_store(product)
             if not vs:
                 return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
 
             retriever = vs.as_retriever(search_kwargs={"k": 1})
-
+            # extraction prompt chooser
             try:
-                prompt_for_extraction = _choose_prompt_for_extraction()
-            except Exception as e:
-                return JSONResponse(status_code=500, content={"error": str(e)})
+                prompt_for_extraction = EXTRACTION_PROMPT
+            except NameError:
+                prompt_for_extraction = globals().get("PROMPT")
+            if not prompt_for_extraction:
+                return JSONResponse(status_code=500, content={"error": "No extraction prompt configured on the server."})
 
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
@@ -171,26 +219,25 @@ def product_details(req: QARequest):
                 return_source_documents=False,
             )
 
-            try:
-                raw_response = qa_chain.run(q_text)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"LLM extraction error: {e}")
-
+            raw_response = qa_chain.run(q_text)
             parsed = parse_structured_response(raw_response)
             _product_details_cache[req.product_id] = parsed
+            print("DEBUG: structured extraction completed and cached")
             return parsed
 
-        # 2) No explicit product_id -> try to detect a product name mention in the question
-        detected_product = _detect_product_by_name(q_text)
-        if detected_product:
-            # IMPORTANT: build retriever and run QA on the detected product (fixes earlier bug)
-            return _run_retrieval_for_product(detected_product, q_text, k=3)
+        # 2) no explicit product_id: attempt detection from free-text
+        detected = _detect_product_by_name(q_text)
+        if detected:
+            # IMPORTANT: run retrieval on detected product (this was the missing step previously)
+            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
+            return _run_retrieval_for_product(detected, q_text, k=3)
 
-        # 3) Fallback: no product detected -> do a generative response (concise QA prompt)
+        # 3) fallback: generative response (concise QA prompt)
+        print("DEBUG: No product detected in question -> falling back to generative QA (no retriever)")
         try:
-            prompt_for_gen = _choose_prompt_for_qa()
-        except Exception as e:
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            prompt_for_gen = QA_PROMPT
+        except NameError:
+            prompt_for_gen = globals().get("PROMPT") or globals().get("EXTRACTION_PROMPT")
 
         qa_chain = RetrievalQA.from_chain_type(
             llm=chat_model,
@@ -204,14 +251,13 @@ def product_details(req: QARequest):
         return {"response": raw_response}
 
     except HTTPException as he:
-        # Known HTTP exceptions - re-raise so FastAPI handles status codes correctly
+        # raise HTTP exceptions normally
         raise he
     except Exception as e:
-        # Unexpected error: log and return helpful JSON for local debugging
         tb = traceback.format_exc()
         print("=== /product/details ERROR ===")
         print(tb)
-        trace_lines = tb.splitlines()[-20:]
+        trace_lines = tb.splitlines()[-30:]
         return JSONResponse(status_code=500, content={
             "error": "Internal server error in /product/details",
             "message": str(e),
