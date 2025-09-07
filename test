@@ -1,652 +1,810 @@
+#Backend
 import os
-import streamlit as st
+import re
+import glob
+import base64
+import io
+import json
+from typing import Union
+from jose import jwt
+import threading
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+import fitz  # PyMuPDF
 import pandas as pd
-import numpy as np
-from zipfile import ZipFile
-from scipy.stats import skew, kurtosis, norm, probplot
-from scipy import stats
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+from PIL import Image
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+import config
+import mimetypes
+from fastapi import HTTPException
+from fastapi.responses import FileResponse
 
-# ----------------------------------------
-# Required Helper Functions
-# ----------------------------------------
+# ---------------------------
+# Configuration (as provided by you — DO NOT CHANGE unless you need to)
+# ---------------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-def prepare_data(reference_df, test_df):
-    """Remove time zero if present and reset index"""
-    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
-        reference_df = reference_df.iloc[1:].reset_index(drop=True)
-    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
-        test_df = test_df.iloc[1:].reset_index(drop=True)
-    return reference_df, test_df
+# Azure Configuration (kept exactly as requested)
+base_url=""
+api_version="2025-01-01-preview"
 
-def conventional_f2(ref_means, test_means):
-    """Calculate conventional f2"""
-    diff = test_means - ref_means
-    sum_sq_diff = (diff ** 2).sum()
-    p = len(ref_means)
-    return 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
+api_key=""
+deployment_name="api-ai4o"
+model_name="gpt-4o"
 
-def expected_f2(ref_df, test_df):
-    """Calculate expected f2"""
-    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
-    test_means = test_df.iloc[:, 1:].mean(axis=1)
-    
-    # Conventional f2 component
-    diff = test_means - ref_means
-    sum_sq_diff = (diff ** 2).sum()
-    
-    # Variance components
-    ref_var = row_variance(ref_df)
-    test_var = row_variance(test_df)
-    sum_var = (ref_var + test_var).sum()
-    
-    n = ref_df.shape[1] - 1  # Number of units per time point
-    p = len(ref_means)
-    
-    adjustment = (1/n) * sum_var
-    return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
+# Initialize Azure services
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_version="2025-01-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="api-ai-3l"
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+# ---------------------------
 
-def bias_corrected_f2(ref_df, test_df):
-    """Calculate bias-corrected f2"""
+# 🔐 JWT Config
+SECRET_KEY = "myFAVsecretKEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# Reaction types and filesystem layout (kept from your code)
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+
+# Ensure dirs exist (idempotent)
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+
+# Prompt template (kept largely the same)
+PROMPT_TEMPLATE = """
+You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
+1. **API Name**: The active pharmaceutical ingredient
+2. **Reaction Chemistry**: Type and description
+3. **Yield**: Exact yield percentages or values mentioned in the source
+4. **Procedure**: Summarize the complete procedure into clear, concise Number bullet points, preserving the key steps and important details. Do NOT omit any steps or essential content.
+5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
+
+Structure your response as follows (literal headers must appear in the LLM output exactly like below):
+
+### API Name
+[API name here]
+### Reaction Chemistry
+[Reaction chemistry description here]
+### Yield
+[Yield value here]
+### Procedure
+[Complete procedure here]
+### Tabular Data
+[Markdown table here]
+
+Document Content:
+{context}
+Question: {question}
+Answer:
+"""
+PROMPT = PromptTemplate(template=PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+# ------------------------------
+# Helper functions
+# ------------------------------
+def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
+    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
+    return None
+
+def list_products() -> List[Dict[str, Any]]:
+    products = []
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.pdf"))
+        for pdf_path in pdf_files:
+            filename = os.path.basename(pdf_path)
+            product_name = os.path.splitext(filename)[0]
+            scheme_image = find_scheme_image(reaction_type, product_name)
+            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+            product_id = f"{reaction_type}_{product_name}"
+            products.append({
+                "id": product_id,
+                "name": product_name,
+                "reaction_type": reaction_type,
+                "pdf_path": pdf_path,
+                "scheme_image": scheme_image if scheme_image else None,
+                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+            })
+    return products
+
+def extract_pdf_text(pdf_path: str) -> str:
     try:
-        ref_means = ref_df.iloc[:, 1:].mean(axis=1)
-        test_means = test_df.iloc[:, 1:].mean(axis=1)
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
 
-        diff = test_means - ref_means
-        sum_sq_diff = (diff ** 2).sum()
+# Cache for vectorstores and product details
+_vectorstore_cache: Dict[str, FAISS] = {}
+_product_details_cache: Dict[str, Dict[str, Any]] = {}
+_vectorstore_lock = threading.Lock()
 
-        ref_var = row_variance(ref_df)
-        test_var = row_variance(test_df)
-        sum_var = (ref_var + test_var).sum()
-
-        n = ref_df.shape[1] - 1
-        p = len(ref_means)
-
-        adjustment = (1 / n) * sum_var
-        right_side = sum_sq_diff + p
-
-        if adjustment < right_side:
-            adjusted_diff = sum_sq_diff - adjustment
-            if adjusted_diff > 0:
-                return 100 - 25 * np.log10(1 + (1 / p) * adjusted_diff)
-            else:
-                return None
-        else:
+def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
+    pid = product["id"]
+    with _vectorstore_lock:
+        if pid in _vectorstore_cache:
+            return _vectorstore_cache[pid]
+        text = extract_pdf_text(product["pdf_path"])
+        if not text or len(text.strip()) < 50:
             return None
+        doc = Document(page_content=text, metadata={
+            "product_id": pid,
+            "product_name": product["name"],
+            "reaction_type": product["reaction_type"],
+            "source": product["pdf_path"]
+        })
+        vs = FAISS.from_documents([doc], cached_embeddings)
+        _vectorstore_cache[pid] = vs
+        return vs
 
-    except Exception:
-        return None
+def parse_structured_response(text: str) -> Dict[str, Any]:
+    """
+    Parse the LLM output (which we instructed to use literal '### API Name', etc.)
+    Return JSON with keys: api_name, reaction_chemistry, yield, procedure, tables (list)
+    Each table is {headers: [], rows: [[], [], ...]}
+    """
+    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
+    def grab(section):
+        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else None
 
-def row_variance(df):
-    """Calculate row-wise variance"""
-    return df.iloc[:, 1:].var(axis=1, ddof=1)
-
-def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
-    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
-    n_ref_units = ref_df.shape[1] - 1
-    n_test_units = test_df.shape[1] - 1
-
-    original_f2 = calc_func(ref_df, test_df)
-    f2_values = []
-    
-    for _ in range(n_iterations):
-        ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
-        test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
-
-        ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
-        test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
-
-        f2_val = calc_func(ref_sample, test_sample)
-
-        if f2_val is not None and isinstance(f2_val, (int, float)):
-            f2_values.append(f2_val)
-    
-    if not f2_values:
-        return original_f2, None, None, None, None, None, None, []
-    
-    f2_values = np.array(f2_values)
-    mean_f2 = np.mean(f2_values)
-    median_f2 = np.median(f2_values)
-    skewness_f2 = skew(f2_values)
-    kurtosis_f2 = kurtosis(f2_values)
-    lower_bound = np.percentile(f2_values, 5)
-    upper_bound = np.percentile(f2_values, 95)
-
-    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
-
-def simulate_lilliefors_critical_value(n, alpha=0.05, num_simulations=1000):
-    """Simulate Lilliefors critical value for confidence bands"""
-    D_values = []
-    for _ in range(num_simulations):
-        sample = np.random.normal(loc=0, scale=1, size=n)
-        sample_mean = np.mean(sample)
-        sample_std = np.std(sample, ddof=1)
-        z_scores = (sample - sample_mean) / sample_std
-        z_scores.sort()
-        ecdf_sim = np.arange(1, n + 1) / (n + 1)
-        cdf = norm.cdf(z_scores)
-        D = np.max(np.abs(ecdf_sim - cdf))
-        D_values.append(D)
-    return np.percentile(D_values, 100 * (1 - alpha))
-
-def create_jmp_style_qq_plot(data, title, method_name, file_name):
-    """Create a JMP-style QQ plot with proper curved confidence bands"""
-    if len(data) == 0:
-        return None
-    
-    n = len(data)
-    
-    # Sort data and calculate plotting positions
-    sorted_data = np.sort(data)
-    plotting_positions = norm.ppf((np.arange(1, n + 1)) / (n + 2))
-    
-    # Fit line for normal distribution
-    slope, intercept, r, _, _ = stats.linregress(plotting_positions, sorted_data)
-    fit_line = intercept + slope * plotting_positions
-    
-    # Calculate empirical CDF
-    ecdf = (np.arange(1, n + 1)) / (n + 1)
-    
-    # Get Lilliefors critical value for confidence bands
-    D_critical = simulate_lilliefors_critical_value(n=n, alpha=0.05)
-    
-    # Calculate confidence bands using ECDF approach
-    lower_quantile = norm.ppf(np.clip(ecdf - D_critical, 1e-10, 1 - 1e-10))
-    upper_quantile = norm.ppf(np.clip(ecdf + D_critical, 1e-10, 1 - 1e-10))
-    
-    # Transform quantile bands to data space using the fitted line
-    lower_band = intercept + slope * lower_quantile
-    upper_band = intercept + slope * upper_quantile
-    
-    # Create the plot
-    fig = go.Figure()
-    
-    # Add curved confidence bands first (so they appear behind)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=upper_band,
-        mode='lines',
-        name='Upper Confidence Band',
-        line=dict(color='red', width=1, dash='dot'),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=lower_band,
-        mode='lines',
-        name='Lower Confidence Band', 
-        line=dict(color='red', width=1, dash='dot'),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-    
-    # Add the main reference line (solid red)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=fit_line,
-        mode='lines',
-        name='Normal Reference Line',
-        line=dict(color='red', width=2, dash='solid'),
-        showlegend=False,
-        hovertemplate='Normal Reference Line<extra></extra>'
-    ))
-    
-    # Add the data points (black circles)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=sorted_data,
-        mode='markers',
-        name='Data Points',
-        marker=dict(
-            color='black',
-            size=6,
-            symbol='circle',
-            line=dict(width=0)
-        ),
-        showlegend=False,
-        hovertemplate=
-        '<b>Normal Quantile:</b> %{x:.3f}<br>' +
-        '<b>Sample Quantile:</b> %{y:.3f}<br>' +
-        '<extra></extra>'
-    ))
-    
-    # Calculate nice axis ranges
-    x_range = max(plotting_positions) - min(plotting_positions)
-    y_range = max(sorted_data) - min(sorted_data)
-    x_margin = x_range * 0.1
-    y_margin = y_range * 0.1
-    
-    # Set up axis ticks similar to JMP
-    x_ticks = [-2.5, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
-    x_ticks = [tick for tick in x_ticks if min(plotting_positions)-x_margin <= tick <= max(plotting_positions)+x_margin]
-    
-    # Calculate statistics for annotation
-    mean_val = np.mean(data)
-    std_val = np.std(data)
-    skewness_val = skew(data)
-    kurtosis_val = kurtosis(data)
-    
-    # Update layout with exact JMP-style formatting
-    fig.update_layout(
-        title=dict(
-            text=f'<b>Normal Quantile Plot</b><br><span style="font-size: 12px;">{method_name} - {file_name.replace(".xlsx", "")}</span>',
-            x=0.5,
-            y=0.95,
-            font=dict(size=14, color='black', family='Arial')
-        ),
-        xaxis=dict(
-            title=dict(
-                text='<b>Normal Quantile</b>',
-                font=dict(size=12, color='black', family='Arial')
-            ),
-            range=[min(plotting_positions)-x_margin, max(plotting_positions)+x_margin],
-            tickvals=x_ticks,
-            tickmode='array',
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        yaxis=dict(
-            title=dict(
-                text='<b>Sample Quantile</b>',
-                font=dict(size=12, color='black', family='Arial')
-            ),
-            range=[min(sorted_data)-y_margin, max(sorted_data)+y_margin],
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(family="Arial, sans-serif"),
-        hovermode='closest',
-        width=600,
-        height=500,
-        margin=dict(l=80, r=100, t=80, b=60),
-        showlegend=False
-    )
-    
-    # Add statistics annotation box (top right, similar to JMP)
-    stats_text = (
-        f'<b>Statistics:</b><br>'
-        f'Mean: {mean_val:.4f}<br>'
-        f'Std Dev: {std_val:.4f}<br>'
-        f'Skewness: {skewness_val:.4f}<br>'
-        f'Kurtosis: {kurtosis_val:.4f}<br>'
-        f'R²: {r**2:.4f}<br>'
-        f'N: {n:,}'
-    )
-    
-    fig.add_annotation(
-        x=0.98,
-        y=0.98,
-        xref="paper",
-        yref="paper",
-        text=stats_text,
-        showarrow=False,
-        align="left",
-        bgcolor="white",
-        bordercolor="black",
-        borderwidth=1,
-        borderpad=6,
-        font=dict(size=9, color='black', family='Arial')
-    )
-    
-    return fig
-
-def create_combined_qq_plots(bootstrap_results, file_name):
-    """Create a combined view of all QQ plots for a file"""
-    methods_with_data = [(method, data) for method, data in bootstrap_results.items() if len(data) > 0]
-    
-    if not methods_with_data:
-        return None
-    
-    n_methods = len(methods_with_data)
-    cols = min(3, n_methods)
-    rows = (n_methods + cols - 1) // cols
-    
-    subplot_titles = [method for method, _ in methods_with_data]
-    
-    fig = make_subplots(
-        rows=rows,
-        cols=cols,
-        subplot_titles=subplot_titles,
-        vertical_spacing=0.12,
-        horizontal_spacing=0.1
-    )
-    
-    colors = ['#3498DB', '#E74C3C', '#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C']
-    
-    for idx, (method, data) in enumerate(methods_with_data):
-        row = idx // cols + 1
-        col = idx % cols + 1
-        color = colors[idx % len(colors)]
-        
-        # Calculate QQ plot data
-        (osm, osr), (slope, intercept, r) = probplot(data, dist="norm", plot=None)
-        line_x = np.linspace(osm.min(), osm.max(), 100)
-        line_y = slope * line_x + intercept
-        
-        # Add reference line
-        fig.add_trace(
-            go.Scatter(
-                x=line_x,
-                y=line_y,
-                mode='lines',
-                line=dict(color='#E74C3C', width=2),
-                showlegend=False,
-                hoverinfo='skip'
-            ),
-            row=row, col=col
-        )
-        
-        # Add data points
-        fig.add_trace(
-            go.Scatter(
-                x=osm,
-                y=osr,
-                mode='markers',
-                marker=dict(
-                    color=color,
-                    size=6,
-                    opacity=0.7,
-                    line=dict(width=1, color=color)
-                ),
-                showlegend=False,
-                hovertemplate=f'<b>{method}</b><br>Theoretical: %{{x:.3f}}<br>Sample: %{{y:.3f}}<extra></extra>'
-            ),
-            row=row, col=col
-        )
-    
-    fig.update_layout(
-        title=dict(
-            text=f'<b>Normal Quantile Plots Comparison</b><br><sub>{file_name}</sub>',
-            x=0.5,
-            font=dict(size=16, color='#2C3E50')
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(family="Arial, sans-serif"),
-        height=300 * rows,
-        margin=dict(l=60, r=40, t=80, b=40)
-    )
-    
-    fig.update_xaxes(
-        title_text="Normal Quantile",
-        gridcolor='#ECF0F1',
-        showgrid=True,
-        tickfont=dict(size=9)
-    )
-    
-    fig.update_yaxes(
-        title_text="f2 Value",
-        gridcolor='#ECF0F1',
-        showgrid=True,
-        tickfont=dict(size=9)
-    )
-    
-    return fig
-
-# ----------------------------------------
-# Batch Processing Functions
-# ----------------------------------------
-
-def load_batch_data(folder_path):
-    """Load test and reference data from multiple Excel files in a folder."""
-    workbook_data = {}
-    
-    for file_name in os.listdir(folder_path):
-        if file_name.endswith(".xlsx"):
-            file_path = os.path.join(folder_path, file_name)
-            try:
-                reference_df = pd.read_excel(file_path, sheet_name=0)
-                test_df = pd.read_excel(file_path, sheet_name=1)
-                workbook_data[file_name] = (reference_df, test_df)
-            except Exception as e:
-                st.warning(f"Skipping file `{file_name}` due to error: {e}")
-    
-    return workbook_data
-
-def process_batch(workbook_data, methods, n_iterations=10000):
-    """Process multiple workbooks and calculate f2 metrics."""
-    all_results = []
-    bootstrap_data = {}  # Store bootstrap data for QQ plots
-    
-    for file_name, (reference_df, test_df) in workbook_data.items():
-        try:
-            ref_clean, test_clean = prepare_data(reference_df, test_df)
-            
-            results = {"File Name": file_name}
-            file_bootstrap_data = {}
-            
-            # Bootstrap calculation methods
-            if "Conventional Bootstrap" in methods:
-                def conv_func(r, t): 
-                    return conventional_f2(r.iloc[:, 1:].mean(axis=1), t.iloc[:, 1:].mean(axis=1))
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, conv_func, n_iterations)
-                results["Conventional Bootstrap f2"] = orig
-                results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Conventional Bootstrap Mean"] = mean
-                results["Conventional Bootstrap Median"] = median
-                results["Conventional Bootstrap Skewness"] = skewness
-                results["Conventional Bootstrap Kurtosis"] = kurt
-                file_bootstrap_data["Conventional Bootstrap"] = vals
-
-            if "Expected Bootstrap" in methods:
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, expected_f2, n_iterations)
-                results["Expected Bootstrap f2"] = orig
-                results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Expected Bootstrap Mean"] = mean
-                results["Expected Bootstrap Median"] = median
-                results["Expected Bootstrap Skewness"] = skewness
-                results["Expected Bootstrap Kurtosis"] = kurt
-                file_bootstrap_data["Expected Bootstrap"] = vals
-
-            if "Bias Corrected Bootstrap" in methods:
-                def bc_func(r, t): 
-                    bc = bias_corrected_f2(r, t)
-                    return bc if isinstance(bc, float) else None
-                orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
-                    ref_clean, test_clean, bc_func, n_iterations)
-                results["Bias Corrected Bootstrap f2"] = orig
-                results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower and upper else None
-                results["Bias Corrected Bootstrap Mean"] = mean
-                results["Bias Corrected Bootstrap Median"] = median
-                results["Bias Corrected Bootstrap Skewness"] = skewness
-                results["Bias Corrected Bootstrap Kurtosis"] = kurt
-                file_bootstrap_data["Bias Corrected Bootstrap"] = vals
-            
-            all_results.append(results)
-            bootstrap_data[file_name] = file_bootstrap_data
-        
-        except Exception as e:
-            st.warning(f"Error processing file `{file_name}`: {e}")
-    
-    return pd.DataFrame(all_results), bootstrap_data
-
-def create_zip_report(report_df, qq_plots_data=None):
-    """Create a ZIP file containing the report CSV and QQ plots."""
-    report_file = "f2_similarities_report.csv"
-    zip_file = "f2_similarities_report.zip"
-    
-    report_df.to_csv(report_file, index=False)
-    
-    with ZipFile(zip_file, "w") as zipf:
-        zipf.write(report_file)
-        
-        # Add QQ plots if available
-        if qq_plots_data:
-            for file_name, plots in qq_plots_data.items():
-                # Create individual plots
-                for method, fig in plots['individual'].items():
-                    if fig:
-                        plot_filename = f"QQ_Plot_{file_name.replace('.xlsx', '')}_{method.replace(' ', '_')}.html"
-                        fig.write_html(plot_filename)
-                        zipf.write(plot_filename)
-                        os.remove(plot_filename)  # Clean up temp file
-                
-                # Add combined plot
-                if plots['combined']:
-                    combined_filename = f"QQ_Plot_Combined_{file_name.replace('.xlsx', '')}.html"
-                    plots['combined'].write_html(combined_filename)
-                    zipf.write(combined_filename)
-                    os.remove(combined_filename)  # Clean up temp file
-    
-    # Clean up temp CSV file
-    if os.path.exists(report_file):
-        os.remove(report_file)
-    
-    return zip_file
-
-def generate_qq_plots(bootstrap_data):
-    """Generate all QQ plots and return them as a dictionary."""
-    qq_plots_data = {}
-    
-    for file_name, file_bootstrap_data in bootstrap_data.items():
-        plots = {
-            'individual': {},
-            'combined': None
-        }
-        
-        # Generate individual plots
-        for method, data in file_bootstrap_data.items():
-            if len(data) > 0:
-                fig = create_jmp_style_qq_plot(data, f"QQ Plot", method, file_name)
-                plots['individual'][method] = fig
-        
-        # Generate combined plot
-        combined_fig = create_combined_qq_plots(file_bootstrap_data, file_name)
-        plots['combined'] = combined_fig
-        
-        qq_plots_data[file_name] = plots
-    
-    return qq_plots_data
-
-# ----------------------------------------
-# Streamlit App Code
-# ----------------------------------------
-
-def main():
-    st.set_page_config(page_title="Batch Similarity Analyzer with QQ Plots", layout="wide")
-    st.title("Batch Similarity Analyzer with QQ Plots")
-    st.markdown("""
-    This tool calculates f2 similarity for multiple Excel workbooks at once and provides 
-    beautiful JMP-style QQ plots to assess the normality of bootstrap distributions.
-    Upload a folder containing Excel files to generate a consolidated report with visualizations.
-    """)
-    
-    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
-    
-    options = ["Conventional", "Expected", "Bias Corrected",
-               "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
-    selected_methods = st.multiselect("Select calculation methods:", options, 
-                                    default=["Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"])
-    
-    n_iterations = st.slider("Number of bootstrap iterations:", 1000, 50000, 10000, 1000)
-    
-    if st.button("Calculate and Generate Report"):
-        if os.path.isdir(folder_path):
-            with st.spinner("Processing files and generating QQ plots..."):
-                workbook_data = load_batch_data(folder_path)
-                if workbook_data:
-                    # Check if any bootstrap methods are selected for QQ plots
-                    bootstrap_methods = [m for m in selected_methods if "Bootstrap" in m]
-                    
-                    report_df, bootstrap_data = process_batch(workbook_data, selected_methods, n_iterations)
-                    
-                    st.subheader("📊 Results Preview")
-                    st.dataframe(report_df.head())
-                    
-                    # Generate QQ Plots for bootstrap methods
-                    qq_plots_data = None
-                    if bootstrap_methods and bootstrap_data:
-                        with st.spinner("Generating QQ plots for download..."):
-                            qq_plots_data = generate_qq_plots(bootstrap_data)
-                            
-                            # Show summary of generated plots
-                            st.subheader("📈 QQ Plot Generation Summary")
-                            st.success("✅ QQ plots have been generated successfully!")
-                            
-                            total_plots = 0
-                            for file_name, plots in qq_plots_data.items():
-                                individual_count = len([fig for fig in plots['individual'].values() if fig is not None])
-                                combined_count = 1 if plots['combined'] is not None else 0
-                                file_total = individual_count + combined_count
-                                total_plots += file_total
-                                
-                                st.write(f"**{file_name}:** {individual_count} individual plots + {combined_count} combined plot = {file_total} plots")
-                            
-                            st.info(f"📊 **Total QQ plots generated:** {total_plots}")
-                            st.markdown("""
-                            **QQ Plot Files Included in Download:**
-                            - Individual method plots: `QQ_Plot_[FileName]_[Method].html`
-                            - Combined comparison plots: `QQ_Plot_Combined_[FileName].html`
-                            - All plots are fully interactive and can be opened in any web browser
-                            """)
-                    
-                    # Download report with QQ plots
-                    with st.spinner("Creating downloadable ZIP file..."):
-                        zip_file_path = create_zip_report(report_df, qq_plots_data)
-                    
-                    with open(zip_file_path, "rb") as f:
-                        file_content = f.read()
-                    
-                    # Clean up the zip file
-                    if os.path.exists(zip_file_path):
-                        os.remove(zip_file_path)
-                    
-                    st.download_button(
-                        label="📥 Download Complete Report with QQ Plots (ZIP)",
-                        data=file_content,
-                        file_name="f2_similarities_report_with_plots.zip",
-                        mime="application/zip",
-                        help="Download includes CSV report and all QQ plot HTML files"
-                    )
-                    
-                    st.success("🎉 Report and QQ plots are ready for download!")
-                    
-                else:
-                    st.warning("No valid Excel files found in selected folder.")
+    result["api_name"] = grab("API Name")
+    result["reaction_chemistry"] = grab("Reaction Chemistry")
+    result["yield"] = grab("Yield")
+    result["procedure"] = grab("Procedure")
+    tab_raw = grab("Tabular Data")
+    if tab_raw:
+        # find markdown tables starting with |...|
+        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
+        if table_patterns:
+            for tbl_md in table_patterns:
+                # normalize lines
+                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    # header line and separator
+                    header = [h.strip() for h in lines[0].split("|")]
+                    rows = []
+                    for rowline in lines[2:]:
+                        cols = [c.strip() for c in rowline.split("|")]
+                        rows.append(cols)
+                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
         else:
-            st.error("Invalid folder path. Please check the path and try again.")
-    
-    # Add information section
-    with st.expander("ℹ️ About QQ Plots"):
-        st.markdown("""
-        **Normal Quantile (QQ) Plots** help assess whether your bootstrap f2 distributions follow a normal distribution:
-        
-        - **Points on the red line**: Indicate normal distribution
-        - **S-curve pattern**: Suggests heavy tails (high kurtosis)  
-        - **Inverted S-curve**: Suggests light tails (low kurtosis)
-        - **Points above line on right**: Right skewness (positive skew)
-        - **Points below line on right**: Left skewness (negative skew)
-        - **Gray shaded area**: 95% confidence band for normal distribution
-        
-        **Statistics shown:**
-        - **R²**: How well data fits normal distribution (closer to 1.0 is better)
-        - **Skewness**: Measure of asymmetry (0 = symmetric)
-        - **Kurtosis**: Measure of tail heaviness (0 = normal)
-        """)
+            # fallback: provide the raw block
+            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
+    return result
 
-if __name__ == "__main__":
-    main()
+# ------------------------------
+# FastAPI app
+# ------------------------------
+app = FastAPI(title="Reaction Database AI (FastAPI)")
+
+# Allow the React dev server origin (adjust if you host differently)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # add your host/origin if different
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------
+# Pydantic models
+# ------------------------------
+class ProductOut(BaseModel):
+    id: str
+    name: str
+    reaction_type: str
+    has_scheme_image: bool
+    has_scheme_cdx: bool
+
+class QARequest(BaseModel):
+    product_id: Optional[str] = None  # Make product_id optional
+    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+
+# ------------------------------
+# Endpoints
+# ------------------------------
+@app.get("/reactions", response_model=List[str])
+def get_reactions():
+    return REACTION_TYPES
+
+@app.get("/products", response_model=List[ProductOut])
+def get_products(reaction_type: Optional[str] = None):
+    allp = list_products()
+    if reaction_type:
+        allp = [p for p in allp if p["reaction_type"] == reaction_type]
+    out = []
+    for p in allp:
+        out.append(ProductOut(
+            id=p["id"],
+            name=p["name"],
+            reaction_type=p["reaction_type"],
+            has_scheme_image=bool(p["scheme_image"]),
+            has_scheme_cdx=bool(p["scheme_cdx"])
+        ))
+    return out
+
+@app.get("/product/{product_id}/meta")
+def product_meta(product_id: str):
+    products = list_products()
+    for p in products:
+        if p["id"] == product_id:
+            return {
+                "id": p["id"],
+                "name": p["name"],
+                "reaction_type": p["reaction_type"],
+                "pdf_path": p["pdf_path"],
+                "scheme_image": p["scheme_image"],
+                "scheme_cdx": p["scheme_cdx"]
+            }
+    raise HTTPException(status_code=404, detail="Product not found")
+
+@app.get("/product/{product_id}/pdf")
+def product_pdf(product_id: str):
+    meta = product_meta(product_id)
+    pdf_path = meta["pdf_path"]
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
+    raise HTTPException(status_code=404, detail="PDF not found")
+
+@app.get("/product/{product_id}/scheme-image")
+def product_scheme_image(product_id: str):
+    meta = product_meta(product_id)
+    path = meta.get("scheme_image")
+    if path and os.path.exists(path):
+        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
+    raise HTTPException(status_code=404, detail="Scheme image not found")
+
+@app.post("/product/details")
+def product_details(req: QARequest):
+    # If no `product_id` is provided, handle the question directly using the model
+    if not req.product_id:
+        try:
+            # Handle the random question by hitting the model directly
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=None,  # No retriever, as there's no associated document
+                chain_type_kwargs={"prompt": PROMPT_TEMPLATE},  # Update the prompt as necessary
+                return_source_documents=False,
+            )
+            raw_response = qa_chain.run(req.question)
+            return {"response": raw_response}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error responding to random question: {e}")
+
+    # Lookup product meta if `product_id` is provided
+    products = list_products()
+    product = next((p for p in products if p["id"] == req.product_id), None)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    # Process based on the type of question provided
+    random_question_flag = req.question.lower() not in [
+        "extract api name, reaction chemistry, yield, procedure, and tabular data",
+        "reaction chemistry",
+    ]
+
+    if random_question_flag:
+        # Handle random question for the provided product/document
+        try:
+            text = extract_pdf_text(product["pdf_path"])
+            doc = Document(page_content=text, metadata={
+                "product_id": product["id"],
+                "product_name": product["name"],
+                "reaction_type": product["reaction_type"],
+                "source": product["pdf_path"],
+            })
+            vs = FAISS.from_documents([doc], cached_embeddings)
+
+            retriever = vs.as_retriever(search_kwargs={"k": 1})
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": PROMPT},
+                return_source_documents=False,
+            )
+
+            raw_response = qa_chain.run(req.question)
+            return {"response": raw_response}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing the random question: {e}")
+
+    # Process regular reaction chemistry queries as before
+    if req.product_id in _product_details_cache:
+        return _product_details_cache[req.product_id]
+
+    vs = build_product_vector_store(product)
+    if not vs:
+        raise HTTPException(status_code=500, detail="Failed to build vector store (empty/invalid PDF)")
+
+    retriever = vs.as_retriever(search_kwargs={"k": 1})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": PROMPT},
+        return_source_documents=False,
+    )
+
+    try:
+        raw_response = qa_chain.run(req.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+    parsed = parse_structured_response(raw_response)
+    _product_details_cache[req.product_id] = parsed
+    return parsed
+
+# ------------------------------
+# Transcription endpoint (optional Google Cloud)
+# ------------------------------
+# If you want server-side Google STT you can paste your credentials JSON string into
+# GOOGLE_CREDENTIALS_JSON below (NOT recommended for public repos). For demos, prefer browser Web Speech API.
+GOOGLE_CREDENTIALS_JSON = ""  # <<< If you want to enable server-side Google STT, paste credentials JSON string here.
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
+    """
+    Accept an audio file (wav/webm/mp3) and return a transcript.
+    By default this endpoint will only provide a simple error unless GOOGLE_CREDENTIALS_JSON is provided.
+    The recommended demo approach is to use the browser Web Speech API for instant transcripts.
+    """
+    content = await file.read()
+    if not use_google:
+        # We recommend using browser speech API — but if user uploaded audio anyway, we can attempt a naive fallback:
+        # Try to return an error telling front-end to use browser API.
+        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
+
+    # If user wants Google transcription server-side:
+    if not GOOGLE_CREDENTIALS_JSON:
+        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
+
+    # Server-side Google Cloud Speech-to-Text usage (if enabled)
+    try:
+        from google.cloud import speech_v1p1beta1 as speech
+        from google.oauth2 import service_account
+    except Exception as e:
+        return {"error": f"google-cloud-speech library not installed: {e}"}
+
+    # Create credentials from JSON string (in-memory)
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(creds_info)
+    client = speech.SpeechClient(credentials=credentials)
+
+    audio = speech.RecognitionAudio(content=content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+    )
+
+    response = client.recognize(config=config, audio=audio)
+    transcripts = [r.alternatives[0].transcript for r in response.results]
+    return {"transcript": " ".join(transcripts)}
+
+# ------------------------------
+# Health
+# ------------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# 🔐 JWT Token Creation Function
+def create_access_token(data: dict, expires_delta: Union[timedelta , None] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# 🔓 Login Endpoint
+@app.post("/login")
+async def login(user_info: dict = Depends(config.check_ldap_auth)):
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Invalid Credentials")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_info["first_name"]},
+        expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "firstname": user_info["first_name"],
+        "lastname": user_info["last_name"],
+    }
+################################################
+import React, { useEffect, useState } from 'react';
+import ChatWindow from "./ChatWindow";
+import ProductTabs from "./ProductTabs";
+import ProductDetailModal from "./ProductDetailModal";
+import SidebarHistory from "./SidebarHistory";
+import { fetchReactions, fetchProducts, fetchProductMeta, fetchProductDetails, fetchSchemeImageUrl } from './api';
+import Navbar from "../Navbar/Navbar";
+import Footer from "../Footer/Footer";
+
+import chem_logo from "../../assets/Chemhub_Logo_Colored.png";
+
+
+export default function App(){
+  const [reactions, setReactions] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
+  const [selectedProduct, setSelectedProduct] = useState(null); // meta
+  const [productDetails, setProductDetails] = useState(null);
+  const [productListVisible, setProductListVisible] = useState(false);
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [messages, setMessages] = useState([]); // start empty; chat bar only
+  const [history, setHistory] = useState([]);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
+
+  useEffect(() => {
+    fetchReactions().then(setReactions).catch(e=>console.error(e));
+  }, []);
+
+  const pushMessage = (m) => setMessages(prev => [...prev, m]);
+
+  const normalize = s => (s||'').toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  const handleUserSend = async (text) => {
+    pushMessage({ role: 'user', content: text });
+
+    const norm = normalize(text);
+    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g,'_')));
+    if (match) {
+      setSelectedReaction(match);
+      try {
+        const prods = await fetchProducts(match);
+        setProducts(prods || []);
+        setProductListVisible(true);
+        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
+      } catch (e) {
+        console.error(e);
+        pushMessage({ role:'assistant', content: 'Error loading products for that reaction.' });
+      }
+      return;
+    }
+
+    const prefix = text.match(/(?:show|list|find).{0,20}for\s+(.+)/i);
+    if (prefix && prefix[1]) {
+      const candidate = prefix[1].trim();
+      const found = reactions.find(r => normalize(r).includes(normalize(candidate)) || normalize(candidate).includes(normalize(r)));
+      if (found) {
+        setSelectedReaction(found);
+        try {
+          const prods = await fetchProducts(found);
+          setProducts(prods || []);
+          setProductListVisible(true);
+          pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')}. Select below.`});
+        } catch (e) {
+          console.error(e);
+          pushMessage({ role:'assistant', content: 'Error fetching products.'});
+        }
+        return;
+      }
+    }
+
+    if (!selectedProduct) {
+      pushMessage({ role: 'assistant', content: 'Please select a product/document first (or type a reaction name to list products).' });
+      return;
+    }
+
+    try {
+      setLoadingDetails(true);
+      const res = await fetchProductDetails(selectedProduct.id, text);
+      const d = res.data || res;
+      let assistantText = '';
+      if (d.api_name) assistantText += `API: ${d.api_name}\n\n`;
+      if (d.reaction_chemistry) assistantText += `Reaction: ${d.reaction_chemistry}\n\n`;
+      if (d.yield) assistantText += `Yield: ${d.yield}\n\n`;
+      if (d.procedure) assistantText += `Procedure (excerpt):\n${(d.procedure||'').slice(0,600)}\n\n`;
+      if (!assistantText) assistantText = 'No structured answer found.';
+      pushMessage({ role: 'assistant', content: assistantText });
+      setProductDetails(d);
+      setDetailModalOpen(true);
+      setHistory(h => [{ title: selectedProduct.name, content: text, productId: selectedProduct.id }, ...h]);
+    } catch (err) {
+      console.error(err);
+      pushMessage({ role: 'assistant', content: 'Error querying backend.'});
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  const handleSelectProduct = async (productId) => {
+    const meta = await fetchProductMeta(productId);
+    setSelectedProduct(meta);
+    setProductDetails(null);
+    setSelectedSchemeUrl(null);
+    setLoadingDetails(true);
+    // show fancy loader by opening the modal early
+    setDetailModalOpen(true);
+    try {
+      // preload scheme url (for chat preview)
+      const scheme = await fetchSchemeImageUrl(productId);
+      setSelectedSchemeUrl(scheme);
+    } catch(e){
+      // ignore
+    }
+    try {
+      const res = await fetchProductDetails(productId);
+      const d = res.data || res;
+      setProductDetails(d);
+      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
+    } catch (e) {
+      console.error(e);
+      pushMessage({ role: 'assistant', content: 'Failed to load product details.'});
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  return (
+    <>
+    <Navbar/>
+    <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
+      {/* center column */}
+      <div className="mx-auto my-8 w-full max-w-6xl px-4">
+        {/* Header */}
+        <div className="flex flex-col items-center justify-center mb-6">
+          {/* Logo */}
+          <img
+            className="h-50 w-30"
+            src={chem_logo}
+            alt="chemhub-logo"
+          />
+          
+          {/* Tagline
+          <h2 className="text-[30px] font-extrabold text-gray-900 mt-4 text-center font-poppins">
+            Ask, Browse & Explore
+          </h2> */}
+        </div>
+
+        <div className="relative">
+          <ChatWindow
+            messages={messages}
+            onSend={handleUserSend}
+            centeredWidth="max-w-4xl"
+            selectedSchemeUrl={selectedSchemeUrl}
+            selectedProduct={selectedProduct}
+          />
+
+          {productListVisible && products && products.length > 0 && (
+            <div className="mt-6">
+              <ProductTabs products={products} onSelect={handleSelectProduct} />
+            </div>
+          )}
+        </div>
+      </div>
+
+      <SidebarHistory history={history} onSelect={(h) => {
+        if (h && h.productId) handleSelectProduct(h.productId);
+      }} />
+
+      <ProductDetailModal
+        open={detailModalOpen}
+        onClose={() => setDetailModalOpen(false)}
+        meta={selectedProduct}
+        details={productDetails}
+        loading={loadingDetails}
+      />
+    </div>
+    <Footer/>
+    </>
+  );
+}
+##########################################################
+import React, { useRef, useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
+import { FiSend } from 'react-icons/fi';
+import MicrophoneButton from './MicrophoneButton'; // keep your mic component
+
+export default function ChatWindow({ messages, onSend, centeredWidth = "max-w-3xl" }){
+  const [text, setText] = useState('');
+  const textareaRef = useRef();
+
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+    }
+  }, [text, messages]);
+
+  const submit = () => {
+    const t = text.trim();
+    if (!t) return;
+    onSend(t);
+    setText('');
+  };
+
+  return (
+    <div className={`mx-auto ${centeredWidth}`}>
+      <div className="bg-white rounded-3xl shadow-2xl p-6">
+        <div className="min-h-[220px] max-h-[54vh] overflow-auto pr-2">
+          {messages.map((m, idx) => (
+            <motion.div
+              key={idx}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.28, delay: idx * 0.02 }}
+              className={`mb-3 ${m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}`}
+            >
+              <div className={`${m.role === 'user' ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-gray-50 text-gray-800'} px-4 py-3 rounded-2xl max-w-[80%] whitespace-pre-wrap break-words`}>
+                {m.content}
+              </div>
+            </motion.div>
+          ))}
+        </div>
+
+        {/* Input area */}
+        <div className="mt-4 flex items-end gap-3">
+          <MicrophoneButton onText={(t) => setText(t)} />
+          <textarea
+            ref={textareaRef}
+            value={text}
+            onChange={(e)=> setText(e.target.value)}
+            rows={1}
+            placeholder="Ask about reaction chemistry or type a reaction name..."
+            className="flex-1 resize-none px-4 py-3 text-white rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
+          />
+          <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
+            <FiSend />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+###########################################
+import React, { useRef } from "react";
+import { motion } from "framer-motion";
+
+// Props: products: [{id, name, reaction_type, has_scheme_image, has_scheme_cdx}]
+// onSelect(productId)
+
+export default function ProductTabs({ products = [], onSelect }) {
+  const scrollContainerRef = useRef(null);
+  let scrollInterval = null;
+
+  // Scroll a small amount repeatedly for fast scrolling
+  const startScrolling = (direction) => {
+    if (scrollInterval) return; // Prevent multiple intervals
+    scrollInterval = setInterval(() => {
+      scrollContainerRef.current.scrollBy({
+        left: direction === "left" ? -60 : 60,
+        behavior: "smooth",
+      });
+    }, 100); // Adjust speed by modifying interval timing (100ms here).
+  };
+
+  // Stop continuous scrolling
+  const stopScrolling = () => {
+    clearInterval(scrollInterval);
+    scrollInterval = null;
+  };
+
+  // Immediate single scroll (used for a normal click)
+  const scrollOnce = (direction) => {
+    stopScrolling(); // Clear any existing interval
+    scrollContainerRef.current.scrollBy({
+      left: direction === "left" ? -240 : 240,
+      behavior: "smooth",
+    });
+  };
+
+  return (
+    <div className="bg-transparent">
+      {/* Header Section */}
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-lg font-semibold text-primary">Matched Products</h3>
+        <div className="text-sm text-gray-500">Click a tile to view details</div>
+      </div>
+
+      {/* Tabs Container with Navigation */}
+      <div className="flex items-center">
+        {/* Left Navigation Button */}
+        <button
+          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          title="Scroll Left"
+          onClick={() => scrollOnce("left")} // Normal click behavior
+          onMouseDown={() => startScrolling("left")} // Start long press scrolling
+          onMouseUp={stopScrolling} // Stop scrolling when mouse is released
+          onTouchStart={() => startScrolling("left")} // Start scrolling on touch
+          onTouchEnd={stopScrolling} // Stop scrolling when touch ends
+        >
+          ←
+        </button>
+
+        {/* Scrollable Tabs */}
+        <div
+          ref={scrollContainerRef}
+          className="overflow-x-auto py-2 w-full no-scrollbar flex gap-3"
+        >
+          {products.map((product) => (
+            <motion.button
+              key={product.id}
+              whileHover={{ y: -6 }}
+              onClick={() => onSelect(product.id)}
+              title={product.name}
+              className="min-w-[220px] max-w-[240px] flex-shrink-0 bg-white border rounded-2xl p-3 shadow hover:shadow-lg transition flex flex-col"
+            >
+              {/* Product Tabs Content */}
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-sm font-semibold truncate">
+                  {product.name}
+                </div>
+                <div className="text-xs text-gray-400">
+                  {product.reaction_type.replace(/_/g, " ")}
+                </div>
+              </div>
+              <div className="text-xs mt-2 text-gray-500 truncate">
+                {product.pdf_path ? product.pdf_path.split(/[\\/]/).pop() : ""}
+              </div>
+            </motion.button>
+          ))}
+        </div>
+
+        {/* Right Navigation Button */}
+        <button
+          className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-full shadow-md transition"
+          title="Scroll Right"
+          onClick={() => scrollOnce("right")} // Normal click behavior
+          onMouseDown={() => startScrolling("right")} // Start long press scrolling
+          onMouseUp={stopScrolling} // Stop scrolling when mouse is released
+          onTouchStart={() => startScrolling("right")} // Start scrolling on touch
+          onTouchEnd={stopScrolling} // Stop scrolling when touch ends
+        >
+          →
+        </button>
+      </div>
+    </div>
+  );
+}
