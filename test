@@ -1,265 +1,563 @@
-from difflib import SequenceMatcher
-import traceback
-from fastapi.responses import JSONResponse
+// src/api.js (append or ensure these exist)
+import api from './axiosInstance'; // your axios instance (assumed)
 
-@app.post("/product/details")
-def product_details(req: QARequest):
-    """
-    Robust product/details endpoint with strong product-name detection and detailed server-side debugging prints.
+// Download URL for a product PDF (for anchors)
+export const downloadPdfUrl = (productId) => {
+  // If you host backend on same origin, just return direct endpoint
+  return `/product/${encodeURIComponent(productId)}/pdf`;
+};
 
-    Behavior:
-      - If req.product_id provided:
-          * If question == canonical extraction -> run extraction prompt and return parsed structured data (cached).
-          * Else -> run retrieval QA on that product and return {"answer":..., "sources":[...]}.
-      - If req.product_id not provided:
-          * Attempt to detect product name inside question by:
-              1) normalized alnum substring match (prefer long names),
-              2) token overlap check,
-              3) similarity ratio fallback (SequenceMatcher).
-          * If a product is detected -> build retriever on that product PDF and run QA (returns answer + sources).
-          * Otherwise fallback to generative model response (no retriever).
-    NOTE: This function prints detailed information to the backend logs for debugging detection issues.
-    """
-    try:
-        q_text = (req.question or "").strip()
-        if not q_text:
-            return JSONResponse(status_code=400, content={"error": "question is required"})
+// fetch product meta (if not already present)
+export const fetchProductMeta = async (productId) => {
+  const res = await api.get(`/product/${encodeURIComponent(productId)}/meta`);
+  return res.data;
+};
 
-        # canonical extraction text (case-insensitive)
-        CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
+// query with citations (existing)
+export const queryWithCitations = (productIds = [], question = "") => {
+  return api.post('/query', { product_ids: productIds, question });
+};
+###############################
+// src/components/CitationCard.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
+import { FaDownload, FaFilePdf } from 'react-icons/fa';
 
-        # helper: normalize to alphanumeric lowercase
-        def _normalize_alnum(s: str) -> str:
-            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+/**
+ * Props:
+ *  - source: { product_id, product_name }
+ *  - onOpen: optional callback (product_id) when clicked
+ *  - downloadHref: optional url string for direct download (fallbacks to /product/{id}/pdf)
+ */
+export default function CitationCard({ source, onOpen = () => {}, downloadHref = null }) {
+  const id = source.product_id;
+  const name = source.product_name;
 
-        # helper: tokenized set (alnum tokens)
-        def _tokens(s: str):
-            return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
+  const pdfUrl = downloadHref || `/product/${encodeURIComponent(id)}/pdf`;
 
-        # BEGIN DEBUG LOG
-        print("=== /product/details called ===")
-        print("Question:", q_text)
-        # END DEBUG LOG
+  return (
+    <motion.a
+      href={pdfUrl}
+      target="_blank"
+      rel="noreferrer"
+      whileHover={{ scale: 1.02, y: -4 }}
+      whileTap={{ scale: 0.98 }}
+      className="group block"
+      onClick={(e) => { /* anchor will handle download/open */ }}
+      title={`Open ${name}`}
+    >
+      <div className="relative flex items-center gap-3 bg-white rounded-xl shadow-md p-3 hover:shadow-xl transition">
+        <div className="w-12 h-12 rounded-lg bg-gradient-to-br from-purple-200 to-purple-400 flex items-center justify-center text-white">
+          <FaFilePdf />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-semibold text-primary truncate">{name}</div>
+          <div className="text-xs text-gray-400 mt-1 truncate">ID: {id}</div>
+        </div>
+        <div className="flex-shrink-0">
+          <a href={pdfUrl} target="_blank" rel="noreferrer" onClick={(e) => { /* anchor opens */ }} className="inline-flex items-center gap-2 px-3 py-1 rounded-md bg-purple-50 text-purple-700 text-xs font-medium shadow-sm hover:bg-purple-100">
+            <FaDownload /> Download
+          </a>
+        </div>
+      </div>
+    </motion.a>
+  );
+}
+#########################
+// src/components/ChatWindow.jsx
+import React, { useRef, useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
+import { FiSend } from 'react-icons/fi';
+import MicrophoneButton from './MicrophoneButton';
+import CitationCard from './CitationCard';
 
-        # helper to detect product by multiple strategies
-        def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
-            products = list_products()
-            if not products:
-                print("DEBUG: No products available to match.")
-                return None
+/**
+ * ChatWindow props:
+ *  - messages: [{role, content, tables?:[], sources?:[] }]
+ *  - onSend(text)
+ *  - centeredWidth
+ *  - loading: boolean -> show loader overlay
+ *  - selectedCitedDocs / removeCitation kept for compatibility
+ */
+export default function ChatWindow({
+  messages,
+  onSend,
+  centeredWidth = "max-w-3xl",
+  loading = false,
+  selectedCitedDocs = [],
+  removeCitation = () => {}
+}) {
+  const [text, setText] = useState('');
+  const textareaRef = useRef();
 
-            q_norm_alnum = _normalize_alnum(question)
-            q_tokens = set(_tokens(question))
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+    }
+  }, [text, messages]);
 
-            # 1) Exact normalized substring match (prefer longer product names)
-            sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
-            exact_matches = []
-            for p in sorted_products:
-                name_norm = _normalize_alnum(p["name"])
-                if not name_norm:
-                    continue
-                if name_norm in q_norm_alnum:
-                    exact_matches.append((p, name_norm))
-            if exact_matches:
-                chosen = exact_matches[0][0]
-                print(f"DEBUG: Exact normalized substring match -> '{chosen['name']}' (id: {chosen['id']})")
-                return chosen
+  const submit = (e) => {
+    e && e.preventDefault();
+    const t = text.trim();
+    if (!t) return;
+    onSend(t);
+    setText('');
+  };
 
-            # 2) Token overlap heuristic: count how many name tokens appear in question tokens
-            token_matches = []
-            for p in sorted_products:
-                pname_tokens = set(_tokens(p["name"]))
-                if not pname_tokens:
-                    continue
-                overlap = pname_tokens.intersection(q_tokens)
-                if overlap:
-                    token_matches.append((p, len(overlap), len(pname_tokens), overlap))
-            if token_matches:
-                # prefer highest overlap ratio (over name token count), then more tokens matched
-                token_matches.sort(key=lambda x: (-(x[1] / x[2]), -x[1]))
-                best = token_matches[0]
-                p_best, match_count, token_count, overlap = best
-                ratio = match_count / token_count
-                print(f"DEBUG: Token-overlap candidate -> '{p_best['name']}' (id: {p_best['id']}) overlap {match_count}/{token_count} tokens {overlap} ratio={ratio:.2f}")
-                # require at least 50% token overlap to be confident
-                if ratio >= 0.5:
-                    return p_best
+  // parse a markdown table into {headers, rows}
+  function parseMdTable(md) {
+    // md is a string for one table, lines separated by \n
+    const lines = md.trim().split('\n').map(l => l.trim()).filter(l => l);
+    if (lines.length < 2) return null;
+    // header line is first, separator is second
+    const headerLine = lines[0].replace(/^\||\|$/g, '');
+    const headers = headerLine.split('|').map(h => h.trim());
+    const rows = [];
+    for (let i = 2; i < lines.length; i++) {
+      const rowLine = lines[i].replace(/^\||\|$/g, '');
+      const cols = rowLine.split('|').map(c => c.trim());
+      rows.push(cols);
+    }
+    return { headers, rows };
+  }
 
-            # 3) Similarity fallback: pick best SequenceMatcher ratio over product.name vs question
-            best = None
-            best_ratio = 0.0
-            for p in products:
-                pname = (p["name"] or "").lower()
-                if not pname.strip():
-                    continue
-                # Compute two similarity scores and average them:
-                # a) between full names (lower) and question
-                r1 = SequenceMatcher(None, pname, question.lower()).ratio()
-                # b) between normalized alnum strings (robust to spacing/punctuation)
-                r2 = SequenceMatcher(None, _normalize_alnum(pname), q_norm_alnum).ratio()
-                ratio = (r1 + r2) / 2.0
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best = (p, ratio, r1, r2)
-            # log top candidate
-            if best:
-                p_best, ratio, r1, r2 = best
-                print(f"DEBUG: Best similarity candidate -> '{p_best['name']}' (id: {p_best['id']}) ratio_avg={ratio:.3f} r1={r1:.3f} r2={r2:.3f}")
-                # Apply a conservative threshold to avoid false positives
-                if ratio >= 0.60:
-                    return p_best
-                else:
-                    print(f"DEBUG: Best similarity below threshold (0.60): {ratio:.3f} -> will NOT auto-select")
-            return None
+  // Convert any markdown tables inside content into an array
+  function extractMarkdownTables(content) {
+    // find markdown tables pattern
+    const tablePatterns = content.match(/(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)/g);
+    if (!tablePatterns) return [];
+    return tablePatterns.map(tp => parseMdTable(tp)).filter(Boolean);
+  }
 
-        # helper: run retrieval QA over a given product and return {answer, sources}
-        def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
-            print(f"DEBUG: Running retrieval for product: {product['name']} (id: {product['id']})")
-            pdf_path = product.get("pdf_path")
-            if not pdf_path or not os.path.exists(pdf_path):
-                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}: {pdf_path}")
+  // Render message content: detect parsed tables and sources if message has them
+  function renderMessageContent(m) {
+    // If message contains structured tables in m.tables (from backend parsed output), render them
+    if (m.tables && Array.isArray(m.tables) && m.tables.length > 0) {
+      return m.tables.map((t, idx) => (
+        <div key={idx} className="mt-3">
+          {t.headers && t.headers.length > 0 ? (
+            <div className="overflow-auto rounded-lg border">
+              <table className="min-w-full divide-y">
+                <thead className="bg-gray-50">
+                  <tr>
+                    {t.headers.map((h, i) => <th key={i} className="px-4 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody className="bg-white divide-y">
+                  {t.rows.map((r, ri) => (
+                    <tr key={ri}>
+                      {r.map((c, ci) => <td key={ci} className="px-4 py-2 text-sm">{c}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <pre className="bg-gray-50 p-3 rounded whitespace-pre-wrap">{t.raw_md || ''}</pre>
+          )}
+        </div>
+      ));
+    }
 
-            # extract text and verify
-            try:
-                text = extract_pdf_text(pdf_path)
-            except Exception as e:
-                print(f"ERROR: extract_pdf_text failed for {pdf_path}: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to extract text: {e}")
+    // Next: check raw content for markdown table(s)
+    const mdTables = extractMarkdownTables(m.content || "");
+    if (mdTables && mdTables.length > 0) {
+      return mdTables.map((t, i) => (
+        <div key={i} className="mt-3">
+          <div className="overflow-auto rounded-lg border">
+            <table className="min-w-full divide-y">
+              <thead className="bg-gray-50">
+                <tr>
+                  {t.headers.map((h, hi) => <th key={hi} className="px-4 py-2 text-left text-xs font-medium text-gray-600">{h}</th>)}
+                </tr>
+              </thead>
+              <tbody className="bg-white divide-y">
+                {t.rows.map((r, ri) => (
+                  <tr key={ri}>
+                    {r.map((c, ci) => <td key={ci} className="px-4 py-2 text-sm">{c}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ));
+    }
 
-            if not text or len(text.strip()) < 20:
-                raise HTTPException(status_code=500, detail="Document content empty or unreadable")
+    // Else, just return the plain content (with newlines preserved)
+    return <div className="whitespace-pre-wrap">{m.content}</div>;
+  }
 
-            doc = Document(page_content=text, metadata={
-                "product_id": product["id"],
-                "product_name": product["name"],
-                "reaction_type": product["reaction_type"],
-                "source": pdf_path
-            })
+  return (
+    <div className={`mx-auto ${centeredWidth}`}>
+      <div className="relative bg-white rounded-3xl shadow-2xl p-6">
+        {/* loader overlay */}
+        {loading && (
+          <div className="absolute inset-0 z-50 flex items-center justify-center rounded-3xl bg-white/80 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-3">
+              <svg className="w-16 h-16 animate-spin" viewBox="0 0 50 50">
+                <circle cx="25" cy="25" r="20" strokeWidth="4" stroke="url(#g1)" fill="none" strokeLinecap="round"></circle>
+                <defs>
+                  <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" stopColor="#7c3aed" />
+                    <stop offset="100%" stopColor="#a78bfa" />
+                  </linearGradient>
+                </defs>
+              </svg>
+              <div className="text-sm text-gray-700">Looking up the document — fetching answer...</div>
+            </div>
+          </div>
+        )}
 
-            try:
-                vs = FAISS.from_documents([doc], cached_embeddings)
-            except Exception as e:
-                print(f"ERROR: FAISS.from_documents failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed building FAISS index: {e}")
+        {/* Messages */}
+        <div className="min-h-[220px] max-h-[54vh] overflow-auto pr-2">
+          {messages.map((m, idx) => (
+            <motion.div
+              key={idx}
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.28, delay: idx * 0.02 }}
+              className={`mb-3 ${m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}`}
+            >
+              <div className={`${m.role === 'user' ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-gray-50 text-gray-800'} px-4 py-3 rounded-2xl max-w-[80%] whitespace-pre-wrap break-words`}>
+                {renderMessageContent(m)}
 
-            retriever = vs.as_retriever(search_kwargs={"k": k})
+                {/* If the assistant message has sources, render them as citation cards */}
+                {m.sources && m.sources.length > 0 && (
+                  <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {m.sources.map((s, i) => (
+                      <CitationCard key={i} source={s} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          ))}
+        </div>
 
-            # choose QA prompt (prefer QA_PROMPT)
-            try:
-                prompt_to_use = QA_PROMPT
-            except NameError:
-                # fallback to PROMPT or EXTRACTION_PROMPT
-                prompt_to_use = globals().get("PROMPT") or globals().get("EXTRACTION_PROMPT")
-                print("DEBUG: QA_PROMPT not found, fallback to available prompt.")
+        {/* Input area */}
+        <div className="mt-4 flex items-end gap-3">
+          <MicrophoneButton onText={(t) => setText(t)} />
+          <textarea
+            ref={textareaRef}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={1}
+            placeholder="Ask about reaction chemistry or type a product name..."
+            className="flex-1 resize-none px-4 py-3 rounded-3xl border focus:outline-none focus:ring-2 focus:ring-secondary scrollbar-hide"
+            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
+          />
+          <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
+            <FiSend />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+#################################################
+// src/App.jsx
+import React, { useEffect, useState } from 'react';
+import ChatWindow from "./ChatWindow";
+import ProductTabs from "./ProductTabs";
+import ProductDetailModal from "./ProductDetailModal";
+import SidebarHistory from "./SidebarHistory";
+import {
+  fetchReactions,
+  fetchProducts,
+  fetchProductMeta,
+  fetchProductDetails,
+  fetchSchemeImageUrl,
+  queryWithCitations,
+  downloadPdfUrl,
+} from './api';
+import Navbar from "../Navbar/Navbar";
+import Footer from "../Footer/Footer";
+import chem_logo from "../../assets/Chemhub_Logo_Colored.png";
 
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": prompt_to_use},
-                return_source_documents=True,
-            )
+// Helper: detect markdown tables in a string and convert to structured arrays (headers/rows)
+function extractMarkdownTablesFromText(text) {
+  if (!text) return [];
+  const tablePatterns = text.match(/(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)/g);
+  if (!tablePatterns) return [];
+  return tablePatterns.map((tbl) => {
+    const lines = tbl.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) return null;
+    const headers = lines[0].replace(/^\||\|$/g, '').split('|').map(h => h.trim());
+    const rows = [];
+    for (let i = 2; i < lines.length; i++) {
+      const cols = lines[i].replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      rows.push(cols);
+    }
+    return { headers, rows, raw_md: tbl };
+  }).filter(Boolean);
+}
 
-            out = qa_chain({"query": question})
-            answer_text = out.get("result") or out.get("output_text") or ""
-            source_docs = out.get("source_documents", []) or []
+export default function App() {
+  const [reactions, setReactions] = useState([]);
+  const [products, setProducts] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
+  const [selectedProduct, setSelectedProduct] = useState(null);
+  const [productDetails, setProductDetails] = useState(null);
+  const [productListVisible, setProductListVisible] = useState(false);
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [history, setHistory] = useState([]);
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
+  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
+  // UI-level loading flag for query
+  const [queryLoading, setQueryLoading] = useState(false);
 
-            # build unique ordered sources
-            seen = set()
-            sources = []
-            for sd in source_docs:
-                pid = sd.metadata.get("product_id")
-                pname = sd.metadata.get("product_name")
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    sources.append({"product_id": pid, "product_name": pname})
-            print(f"DEBUG: Retrieval produced answer length={len(answer_text)} and {len(sources)} source(s)")
-            return {"answer": answer_text, "sources": sources}
+  useEffect(() => {
+    fetchReactions().then(setReactions).catch(e => console.error("fetchReactions:", e));
+    // initial greeting minimal
+    setMessages([{ role: 'assistant', content: "Type a reaction or product name to begin — I'll fetch relevant documents." }]);
+  }, []);
 
-        # -------------------------
-        # Main branching logic
-        # -------------------------
+  const pushMessage = (m) => setMessages(prev => [...prev, m]);
 
-        # 1) explicit product_id path (keep prior behavior)
-        if req.product_id:
-            products = list_products()
-            product = next((p for p in products if p["id"] == req.product_id), None)
-            if not product:
-                return JSONResponse(status_code=404, content={"error": "Product not found"})
+  // Toggle citation selection (right-click)
+  const handleToggleCite = (product) => {
+    const exists = selectedCitedDocs.find(p => p.id === product.id);
+    if (exists) {
+      setSelectedCitedDocs(prev => prev.filter(p => p.id !== product.id));
+      pushMessage({ role: 'assistant', content: `Removed citation: ${product.name}` });
+    } else {
+      setSelectedCitedDocs(prev => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
+      pushMessage({ role: 'assistant', content: `Added citation: ${product.name}` });
+    }
+  };
 
-            is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
+  const removeCitation = (id) => {
+    const found = selectedCitedDocs.find(d => d.id === id);
+    setSelectedCitedDocs(prev => prev.filter(d => d.id !== id));
+    if (found) pushMessage({ role: 'assistant', content: `Removed citation: ${found.name}` });
+  };
 
-            if not is_extraction:
-                # question about this product -> run retrieval QA
-                return _run_retrieval_for_product(product, q_text, k=3)
+  // Helper to convert backend "sources" (product ids) to the shape expected by ChatWindow
+  // We also may fetch meta if we want richer info; for now sources come as {product_id, product_name}
+  const normalizeSources = (sources) => {
+    if (!sources) return [];
+    return sources.map(s => ({ product_id: s.product_id, product_name: s.product_name }));
+  };
 
-            # structured extraction -> cached or run
-            if req.product_id in _product_details_cache:
-                print("DEBUG: returning cached parsed details")
-                return _product_details_cache[req.product_id]
+  // Handle user queries
+  const handleUserSend = async (text) => {
+    pushMessage({ role: 'user', content: text });
 
-            vs = build_product_vector_store(product)
-            if not vs:
-                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
+    // Reaction detection (unchanged)
+    const norm = text.toString().toLowerCase().replace(/[^a-z0-9]/g, '');
+    const match = reactions.find(r => r.toString().toLowerCase().replace(/[^a-z0-9]/g, '') === norm || r.toString().toLowerCase().replace(/[^a-z0-9]/g, '') === text.toString().toLowerCase().replace(/\s+/g,'_').replace(/[^a-z0-9]/g, '') );
+    if (match) {
+      setSelectedReaction(match);
+      try {
+        const prods = await fetchProducts(match);
+        setProducts(prods || []);
+        setProductListVisible(true);
+        pushMessage({ role: 'assistant', content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
+      } catch (e) {
+        console.error(e);
+        pushMessage({ role: 'assistant', content: 'Error loading products for that reaction.' });
+      }
+      return;
+    }
 
-            retriever = vs.as_retriever(search_kwargs={"k": 1})
-            # extraction prompt chooser
-            try:
-                prompt_for_extraction = EXTRACTION_PROMPT
-            except NameError:
-                prompt_for_extraction = globals().get("PROMPT")
-            if not prompt_for_extraction:
-                return JSONResponse(status_code=500, content={"error": "No extraction prompt configured on the server."})
+    // If there are cited docs selected, query across them using /query
+    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
+      setQueryLoading(true);
+      try {
+        const ids = selectedCitedDocs.map(d => d.id);
+        // show intermediate assistant loading message (displayed with loader in ChatWindow)
+        pushMessage({ role: 'assistant', content: 'Searching selected documents...', loading: true });
+        const res = await queryWithCitations(ids, text);
+        const payload = res && res.data ? res.data : res;
 
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": prompt_for_extraction},
-                return_source_documents=False,
-            )
+        // Remove the previous 'loading' assistant message (we appended it)
+        setMessages(prev => {
+          // remove last assistant message with loading true
+          const idx = prev.map(m => m.loading).lastIndexOf(true);
+          if (idx >= 0) {
+            const copy = prev.slice(0, idx).concat(prev.slice(idx+1));
+            return copy;
+          }
+          return prev;
+        });
 
-            raw_response = qa_chain.run(q_text)
-            parsed = parse_structured_response(raw_response)
-            _product_details_cache[req.product_id] = parsed
-            print("DEBUG: structured extraction completed and cached")
-            return parsed
+        const answer = payload?.answer || payload?.response || "No relevant answer found.";
+        // push the answer with sources (converted)
+        pushMessage({ role: 'assistant', content: answer, sources: normalizeSources(payload.sources) });
 
-        # 2) no explicit product_id: attempt detection from free-text
-        detected = _detect_product_by_name(q_text)
-        if detected:
-            # IMPORTANT: run retrieval on detected product (this was the missing step previously)
-            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
-            return _run_retrieval_for_product(detected, q_text, k=3)
+      } catch (err) {
+        console.error("queryWithCitations error:", err);
+        pushMessage({ role: 'assistant', content: 'Error querying selected documents.' });
+      } finally {
+        setQueryLoading(false);
+      }
+      return;
+    }
 
-        # 3) fallback: generative response (concise QA prompt)
-        print("DEBUG: No product detected in question -> falling back to generative QA (no retriever)")
-        try:
-            prompt_for_gen = QA_PROMPT
-        except NameError:
-            prompt_for_gen = globals().get("PROMPT") or globals().get("EXTRACTION_PROMPT")
+    // If no selected citations and no selected product, call fetchProductDetails without product_id (backend will detect product name)
+    if (!selectedProduct) {
+      setQueryLoading(true);
+      // show loading assistant message
+      pushMessage({ role: 'assistant', content: 'Searching documents...', loading: true });
+      try {
+        const res = await fetchProductDetails(undefined, text);
+        const payload = (res && res.data) ? res.data : res;
 
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=None,
-            chain_type_kwargs={"prompt": prompt_for_gen},
-            return_source_documents=False,
-        )
+        // Remove the previous 'loading' assistant message
+        setMessages(prev => {
+          const idx = prev.map(m => m.loading).lastIndexOf(true);
+          if (idx >= 0) {
+            const copy = prev.slice(0, idx).concat(prev.slice(idx+1));
+            return copy;
+          }
+          return prev;
+        });
 
-        raw_response = qa_chain.run(q_text)
-        return {"response": raw_response}
+        // If payload contains parsed structured data: (api_name/procedure/tables)
+        if (payload && payload.api_name) {
+          // build content summarizing parsed data
+          let summary = '';
+          if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
+          if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
+          if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
+          if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure||'').slice(0,400)}\n\n`;
+          // push assistant message containing structured tables (payload.tables)
+          pushMessage({ role: 'assistant', content: summary, tables: (payload.tables || []) });
+        } else if (payload && (payload.answer || payload.response)) {
+          // it's a QA-style response with answer + possibly sources
+          const answer = payload.answer || payload.response || "No answer.";
+          pushMessage({ role: 'assistant', content: answer, sources: normalizeSources(payload.sources) });
 
-    except HTTPException as he:
-        # raise HTTP exceptions normally
-        raise he
-    except Exception as e:
-        tb = traceback.format_exc()
-        print("=== /product/details ERROR ===")
-        print(tb)
-        trace_lines = tb.splitlines()[-30:]
-        return JSONResponse(status_code=500, content={
-            "error": "Internal server error in /product/details",
-            "message": str(e),
-            "trace": trace_lines
-        })
+        } else {
+          // fallback
+          pushMessage({ role: 'assistant', content: 'No structured data found. Try asking specifically for "Extract API Name..." or select a product.' });
+        }
+      } catch (err) {
+        console.error("fetchProductDetails (no product) error:", err);
+        pushMessage({ role: 'assistant', content: 'Error querying documents.' });
+      } finally {
+        setQueryLoading(false);
+      }
+      return;
+    }
+
+    // If a product is selected, call fetchProductDetails(productId, text)
+    setQueryLoading(true);
+    // show loading assistant message
+    pushMessage({ role: 'assistant', content: 'Fetching answer from selected document...', loading: true });
+    try {
+      const res = await fetchProductDetails(selectedProduct.id, text);
+      const payload = (res && res.data) ? res.data : res;
+
+      // Remove the previous 'loading' assistant message
+      setMessages(prev => {
+        const idx = prev.map(m => m.loading).lastIndexOf(true);
+        if (idx >= 0) {
+          const copy = prev.slice(0, idx).concat(prev.slice(idx+1));
+          return copy;
+        }
+        return prev;
+      });
+
+      if (payload && payload.api_name) {
+        // structured parsed response
+        let summary = '';
+        if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
+        if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
+        if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
+        if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure||'').slice(0,400)}\n\n`;
+        pushMessage({ role: 'assistant', content: summary, tables: (payload.tables || []) });
+        setProductDetails(payload);
+        setDetailModalOpen(true);
+        setHistory(h => [{ title: selectedProduct.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: selectedProduct.id }, ...h]);
+      } else if (payload && (payload.answer || payload.response)) {
+        const answer = payload.answer || payload.response || "No answer.";
+        pushMessage({ role: 'assistant', content: answer, sources: normalizeSources(payload.sources) });
+      } else {
+        pushMessage({ role: 'assistant', content: 'No answer found from document.' });
+      }
+    } catch (err) {
+      console.error("fetchProductDetails (selectedProduct) error:", err);
+      pushMessage({ role: 'assistant', content: 'Error querying backend.' });
+    } finally {
+      setQueryLoading(false);
+    }
+  };
+
+  // open product modal
+  const handleSelectProduct = async (productId) => {
+    const meta = await fetchProductMeta(productId);
+    setSelectedProduct(meta);
+    setProductDetails(null);
+    setSelectedSchemeUrl(null);
+    setLoadingDetails(true);
+    setDetailModalOpen(true);
+    try {
+      const scheme = await fetchSchemeImageUrl(productId);
+      setSelectedSchemeUrl(scheme);
+    } catch (e) {}
+    try {
+      const res = await fetchProductDetails(productId); // default extraction
+      const d = (res && res.data) ? res.data : res;
+      setProductDetails(d);
+      setHistory(h => [{ title: meta.name, content: d.procedure ? d.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
+    } catch (e) {
+      console.error(e);
+      pushMessage({ role: 'assistant', content: 'Failed to load product details.'});
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  return (
+    <>
+      <Navbar/>
+      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex">
+        <div className="mx-auto my-8 w-full max-w-6xl px-4">
+          <div className="flex flex-col items-center justify-center mb-6">
+            <img className="h-50 w-30" src={chem_logo} alt="chemhub-logo" />
+          </div>
+
+          <div className="relative">
+            <ChatWindow
+              messages={messages}
+              onSend={handleUserSend}
+              centeredWidth="max-w-4xl"
+              loading={queryLoading || loadingDetails}
+              selectedCitedDocs={selectedCitedDocs}
+              removeCitation={removeCitation}
+            />
+
+            {productListVisible && products && products.length > 0 && (
+              <div className="mt-6">
+                <ProductTabs
+                  products={products}
+                  onSelect={handleSelectProduct}
+                  onContext={handleToggleCite}
+                  citedIds={new Set(selectedCitedDocs.map(d => d.id))}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+
+        <SidebarHistory history={history} onSelect={(h) => {
+          if (h && h.productId) handleSelectProduct(h.productId);
+        }} />
+
+        <ProductDetailModal
+          open={detailModalOpen}
+          onClose={() => setDetailModalOpen(false)}
+          meta={selectedProduct}
+          details={productDetails}
+          loading={loadingDetails}
+        />
+      </div>
+      <Footer/>
+    </>
+  );
+}
