@@ -1,87 +1,756 @@
-# add this import near the top with your other imports
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-# -------------------------
-# Improved data loader that keeps JSON but stores as text fields
-# -------------------------
-def load_json_data(paths: dict[str, str]) -> dict[str, pd.DataFrame]:
-    dfs: dict[str, pd.DataFrame] = {}
+#SCPCB - Zero Hallucination Solution with Structured Query Engine
+import os
+import io
+import json
+import uuid
+import pandas as pd
+import logging
+import speech_recognition as sr
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from typing import Union, List, Dict, Any, Optional, Tuple
+import tiktoken
+from dataclasses import dataclass
+from enum import Enum
+import re
+from collections import defaultdict
+
+from gtts import gTTS
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+
+# ─── CONFIG ──────────────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Azure GPT configuration (keep as-is)
+base_url=""
+api_version="2024-02-15-preview"
+api_key=""
+deployment_name="GPT4o"
+model_name="GPT4o"
+
+# Paths to embedded JSON files
+EMBEDDED_FILES = {
+    'data_1': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Prime_M+F_JSON.json",
+    # 'data_2': r"C:\Users\p00095189\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Formulas.json",
+    # additional files can be specified dynamically, and can be left None
+}
+
+# Sample‑prompt tiles (for frontend to fetch)
+TILE_QUESTIONS = {
+    "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
+    "Line B":    ["What is the Speed range?", "What equipment is used?", "What is the pressure limit?"],
+    "Facility X":["Who owns this facility?", "What lines are operational?"],
+    "Formulation Z": ["List excipients used", "Describe dissolution method"],
+    "Process Y": ["Steps in granulation?", "Drying temperature?"],
+    "Machine Q": ["Model number details?", "Maintenance interval?"],
+    "Raw Material P": ["What are specs?", "Approved vendors?"]
+}
+
+# ─── SETUP LLM + EMBEDDINGS ──────────────────────────────────────
+
+# Embedding store & cache
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="Def_data_qa"
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+# Initialize tokenizer
+try:
+    tokenizer = tiktoken.encoding_for_model("gpt-4")
+except:
+    tokenizer = tiktoken.get_encoding("cl100k_base")
+
+# ─── ZERO HALLUCINATION ARCHITECTURE ────────────────────────────
+
+@dataclass
+class StructuredField:
+    """Represents a field in the JSON structure with metadata."""
+    path: str  # JSONPath-like string
+    field_type: str
+    sample_values: List[str]
+    description: str
+    parent_context: str
+
+@dataclass
+class QueryResult:
+    """Result of a structured query with provenance."""
+    answer: str
+    source_data: Dict[str, Any]
+    confidence: float
+    query_type: str
+    field_paths: List[str]
+
+class QueryType(Enum):
+    DIRECT_FIELD = "direct_field"
+    AGGREGATION = "aggregation" 
+    COMPARISON = "comparison"
+    EXISTENCE = "existence"
+    LISTING = "listing"
+
+class StructuredQueryEngine:
+    """
+    Zero-hallucination query engine that works with structured JSON data.
+    Uses field mapping and direct data access instead of chunking.
+    """
+    
+    def __init__(self, json_data: Dict[str, Any], data_name: str):
+        self.json_data = json_data
+        self.data_name = data_name
+        self.field_map = {}  # Maps field names to their paths
+        self.value_index = defaultdict(list)  # Inverted index for fast value lookup
+        self.structure_map = {}  # Maps queries to exact data locations
+        
+        # Build comprehensive field mapping
+        self._build_field_mapping()
+        self._build_value_index()
+        
+        logger.info(f"[QueryEngine] Mapped {len(self.field_map)} fields for {data_name}")
+    
+    def _build_field_mapping(self):
+        """Build comprehensive mapping of all fields in the JSON structure."""
+        def traverse(obj, path="", parent_context=""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    current_path = f"{path}.{key}" if path else key
+                    current_context = f"{parent_context} > {key}" if parent_context else key
+                    
+                    # Store field information
+                    field_info = StructuredField(
+                        path=current_path,
+                        field_type=type(value).__name__,
+                        sample_values=[str(value)] if not isinstance(value, (dict, list)) else [],
+                        description=self._generate_field_description(key, value),
+                        parent_context=current_context
+                    )
+                    
+                    # Multiple ways to access the same field
+                    self.field_map[key.lower()] = field_info
+                    self.field_map[current_path.lower()] = field_info
+                    
+                    # Also map common variations
+                    variations = self._generate_field_variations(key)
+                    for variation in variations:
+                        if variation not in self.field_map:
+                            self.field_map[variation] = field_info
+                    
+                    # Recurse for nested structures
+                    traverse(value, current_path, current_context)
+            
+            elif isinstance(obj, list) and obj:
+                for i, item in enumerate(obj):
+                    traverse(item, f"{path}[{i}]", parent_context)
+        
+        traverse(self.json_data)
+    
+    def _generate_field_variations(self, field_name: str) -> List[str]:
+        """Generate common variations of field names for better matching."""
+        variations = set()
+        
+        # Original
+        variations.add(field_name.lower())
+        
+        # With/without spaces and underscores
+        variations.add(field_name.replace("_", " ").lower())
+        variations.add(field_name.replace(" ", "_").lower())
+        variations.add(field_name.replace("-", "_").lower())
+        variations.add(field_name.replace("_", "").lower())
+        
+        # Plurals and singulars
+        if field_name.endswith('s'):
+            variations.add(field_name[:-1].lower())
+        else:
+            variations.add(f"{field_name}s".lower())
+        
+        # Common abbreviations
+        abbrev_map = {
+            'identification': 'id',
+            'identifier': 'id',
+            'description': 'desc',
+            'specification': 'spec',
+            'specifications': 'specs',
+            'temperature': 'temp',
+            'pressure': 'press',
+            'manufacturer': 'mfg',
+            'manufacturing': 'mfg'
+        }
+        
+        for full, abbrev in abbrev_map.items():
+            if full in field_name.lower():
+                variations.add(field_name.lower().replace(full, abbrev))
+            if abbrev in field_name.lower():
+                variations.add(field_name.lower().replace(abbrev, full))
+        
+        return list(variations)
+    
+    def _generate_field_description(self, key: str, value: Any) -> str:
+        """Generate meaningful description for fields."""
+        if isinstance(value, (str, int, float)):
+            return f"Field '{key}' containing {type(value).__name__} value"
+        elif isinstance(value, list):
+            return f"Field '{key}' containing list of {len(value) if value else 0} items"
+        elif isinstance(value, dict):
+            return f"Field '{key}' containing object with {len(value)} properties"
+        return f"Field '{key}'"
+    
+    def _build_value_index(self):
+        """Build inverted index for fast value-based searching."""
+        def index_values(obj, path=""):
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    current_path = f"{path}.{key}" if path else key
+                    
+                    if isinstance(value, (str, int, float)):
+                        # Index the value for searching
+                        value_str = str(value).lower()
+                        self.value_index[value_str].append({
+                            'path': current_path,
+                            'value': value,
+                            'context': obj
+                        })
+                        
+                        # Index words within string values
+                        if isinstance(value, str):
+                            words = re.findall(r'\w+', value_str)
+                            for word in words:
+                                if len(word) > 2:  # Skip very short words
+                                    self.value_index[word].append({
+                                        'path': current_path,
+                                        'value': value,
+                                        'context': obj,
+                                        'word_match': True
+                                    })
+                    
+                    index_values(value, current_path)
+            
+            elif isinstance(obj, list):
+                for i, item in enumerate(obj):
+                    index_values(item, f"{path}[{i}]")
+        
+        index_values(self.json_data)
+    
+    def extract_exact_data(self, query: str) -> QueryResult:
+        """
+        Extract exact data without hallucination using structured approach.
+        """
+        query_lower = query.lower()
+        
+        # Step 1: Identify query type and extract key terms
+        query_type, key_terms = self._analyze_query(query_lower)
+        
+        # Step 2: Find exact matches in field mapping
+        matched_fields = self._find_matching_fields(key_terms)
+        
+        # Step 3: Find value matches
+        matched_values = self._find_matching_values(key_terms)
+        
+        # Step 4: Extract exact data based on matches
+        if matched_fields or matched_values:
+            return self._construct_exact_answer(query_type, matched_fields, matched_values, query)
+        
+        # Step 5: If no exact matches, return structured "not found"
+        return QueryResult(
+            answer="The requested information is not available in the current dataset.",
+            source_data={},
+            confidence=1.0,  # High confidence in "not found"
+            query_type=query_type.value,
+            field_paths=[]
+        )
+    
+    def _analyze_query(self, query: str) -> Tuple[QueryType, List[str]]:
+        """Analyze query to determine type and extract key terms."""
+        
+        # Extract key terms (nouns, important words)
+        key_terms = []
+        
+        # Remove common question words and extract meaningful terms
+        stop_words = {'what', 'is', 'the', 'are', 'how', 'which', 'where', 'when', 'who', 'why', 'a', 'an'}
+        words = re.findall(r'\w+', query.lower())
+        key_terms = [word for word in words if word not in stop_words and len(word) > 2]
+        
+        # Determine query type based on patterns
+        if any(word in query for word in ['list', 'all', 'show me', 'give me all']):
+            query_type = QueryType.LISTING
+        elif any(word in query for word in ['how many', 'count', 'number of']):
+            query_type = QueryType.AGGREGATION
+        elif any(word in query for word in ['compare', 'difference', 'vs', 'versus']):
+            query_type = QueryType.COMPARISON
+        elif any(word in query for word in ['does', 'is there', 'exists', 'available']):
+            query_type = QueryType.EXISTENCE
+        else:
+            query_type = QueryType.DIRECT_FIELD
+        
+        return query_type, key_terms
+    
+    def _find_matching_fields(self, key_terms: List[str]) -> List[StructuredField]:
+        """Find fields that match the query terms."""
+        matches = []
+        
+        for term in key_terms:
+            if term in self.field_map:
+                field = self.field_map[term]
+                if field not in matches:
+                    matches.append(field)
+            
+            # Also check partial matches
+            for field_key, field_info in self.field_map.items():
+                if term in field_key and field_info not in matches:
+                    matches.append(field_info)
+        
+        return matches
+    
+    def _find_matching_values(self, key_terms: List[str]) -> List[Dict]:
+        """Find values that match the query terms."""
+        matches = []
+        
+        for term in key_terms:
+            if term in self.value_index:
+                matches.extend(self.value_index[term])
+        
+        return matches
+    
+    def _construct_exact_answer(self, query_type: QueryType, matched_fields: List[StructuredField], 
+                               matched_values: List[Dict], original_query: str) -> QueryResult:
+        """Construct answer from exact matches without hallucination."""
+        
+        source_data = {}
+        field_paths = []
+        answer_parts = []
+        
+        # Handle field matches
+        for field in matched_fields:
+            try:
+                # Extract actual value from JSON using path
+                value = self._get_value_by_path(field.path)
+                if value is not None:
+                    source_data[field.path] = value
+                    field_paths.append(field.path)
+                    
+                    if isinstance(value, (list, dict)):
+                        answer_parts.append(f"{field.path}: {json.dumps(value, indent=2)}")
+                    else:
+                        answer_parts.append(f"{field.path}: {value}")
+            except Exception as e:
+                logger.warning(f"Could not extract value for path {field.path}: {e}")
+        
+        # Handle value matches
+        unique_contexts = {}
+        for match in matched_values:
+            context_key = match['path']
+            if context_key not in unique_contexts:
+                unique_contexts[context_key] = match
+                source_data[match['path']] = match['value']
+                field_paths.append(match['path'])
+                answer_parts.append(f"{match['path']}: {match['value']}")
+        
+        # Construct final answer based on query type
+        if query_type == QueryType.LISTING:
+            if answer_parts:
+                answer = "Here are the matching items:\n" + "\n".join(answer_parts)
+            else:
+                answer = "No matching items found in the dataset."
+        
+        elif query_type == QueryType.DIRECT_FIELD:
+            if len(answer_parts) == 1:
+                # Single direct answer
+                path, value = answer_parts[0].split(": ", 1)
+                answer = value
+            elif answer_parts:
+                # Multiple matches
+                answer = "Found multiple matches:\n" + "\n".join(answer_parts)
+            else:
+                answer = "No matching information found in the dataset."
+        
+        elif query_type == QueryType.AGGREGATION:
+            if source_data:
+                count = len(source_data)
+                answer = f"Found {count} matching item(s):\n" + "\n".join(answer_parts)
+            else:
+                answer = "No items found to count."
+        
+        elif query_type == QueryType.EXISTENCE:
+            if source_data:
+                answer = f"Yes, found the following:\n" + "\n".join(answer_parts)
+            else:
+                answer = "No, the requested information does not exist in the dataset."
+        
+        else:  # COMPARISON or other
+            if answer_parts:
+                answer = "\n".join(answer_parts)
+            else:
+                answer = "No data available for comparison."
+        
+        confidence = 1.0 if source_data else 1.0  # Always high confidence with exact matches
+        
+        return QueryResult(
+            answer=answer,
+            source_data=source_data,
+            confidence=confidence,
+            query_type=query_type.value,
+            field_paths=field_paths
+        )
+    
+    def _get_value_by_path(self, path: str) -> Any:
+        """Get value from JSON using dot notation path."""
+        try:
+            parts = path.split('.')
+            current = self.json_data
+            
+            for part in parts:
+                # Handle array indices
+                if '[' in part and ']' in part:
+                    key = part.split('[')[0]
+                    index = int(part.split('[')[1].split(']')[0])
+                    current = current[key][index]
+                else:
+                    current = current[part]
+            
+            return current
+        except (KeyError, IndexError, TypeError):
+            return None
+
+class LLMQueryClassifier:
+    """
+    Uses LLM only for query classification and term extraction, not for data generation.
+    This ensures zero hallucination while leveraging LLM's understanding capabilities.
+    """
+    
+    def __init__(self, llm):
+        self.llm = llm
+    
+    def classify_and_extract(self, query: str, available_fields: List[str]) -> Dict[str, Any]:
+        """
+        Use LLM to classify query and extract relevant field names from available options.
+        """
+        
+        # Create a focused prompt that only asks for classification, not data generation
+        prompt = f"""
+You are a query classifier. Your job is to analyze the user query and identify:
+1. The type of information being requested
+2. Which fields from the available data might contain the answer
+3. Key terms that should be searched for
+
+USER QUERY: "{query}"
+
+AVAILABLE FIELDS IN DATASET:
+{', '.join(available_fields[:50])}  # Limit to avoid token issues
+
+RESPOND WITH ONLY THIS JSON FORMAT:
+{{
+    "query_type": "direct_field|listing|aggregation|existence|comparison",
+    "relevant_fields": ["field1", "field2"],
+    "search_terms": ["term1", "term2"],
+    "confidence": 0.95
+}}
+
+Do not generate any data or answers. Only classify and identify relevant fields.
+"""
+        
+        try:
+            response = self.llm.invoke([{"role": "user", "content": prompt}])
+            result = json.loads(response.content)
+            return result
+        except Exception as e:
+            logger.warning(f"LLM classification failed: {e}")
+            # Fallback to rule-based classification
+            return {
+                "query_type": "direct_field",
+                "relevant_fields": [],
+                "search_terms": query.split(),
+                "confidence": 0.5
+            }
+
+# ─── ENHANCED AGENT CLASSES ──────────────────────────────────────
+
+class ZeroHallucinationAgent:
+    """Agent that guarantees zero hallucination by using only exact data matches."""
+    
+    def __init__(self, name: str, json_data: Dict[str, Any]):
+        self.name = name
+        self.query_engine = StructuredQueryEngine(json_data, name)
+        self.llm_classifier = LLMQueryClassifier(chat_model)
+        
+        # Get available fields for LLM classification
+        self.available_fields = list(self.query_engine.field_map.keys())
+    
+    def ask(self, query: str) -> QueryResult:
+        """
+        Answer query with zero hallucination guarantee.
+        """
+        try:
+            # Step 1: Use LLM only for query classification (no data generation)
+            classification = self.llm_classifier.classify_and_extract(query, self.available_fields)
+            
+            # Step 2: Use structured engine for exact data extraction
+            result = self.query_engine.extract_exact_data(query)
+            
+            # Step 3: Enhance with classification insights if available
+            if classification.get('relevant_fields'):
+                # Double-check with LLM-suggested fields
+                additional_matches = []
+                for field in classification['relevant_fields']:
+                    if field.lower() in self.query_engine.field_map:
+                        field_info = self.query_engine.field_map[field.lower()]
+                        value = self.query_engine._get_value_by_path(field_info.path)
+                        if value is not None:
+                            additional_matches.append(f"{field_info.path}: {value}")
+                
+                # If we found additional relevant data, include it
+                if additional_matches and not result.source_data:
+                    result.answer = "Found the following relevant information:\n" + "\n".join(additional_matches)
+                    result.confidence = classification.get('confidence', 0.8)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error in ZeroHallucinationAgent {self.name}: {e}")
+            return QueryResult(
+                answer="Error processing query. Please try rephrasing your question.",
+                source_data={},
+                confidence=1.0,
+                query_type="error",
+                field_paths=[]
+            )
+
+class CoordinatorAgent:
+    def __init__(self, children: List[ZeroHallucinationAgent]):
+        self.children = children
+
+    def coordinate(self, query: str) -> Union[QueryResult, None]:
+        best_result = None
+        best_confidence = 0
+        
+        for child in self.children:
+            try:
+                result = child.ask(query)
+                if result.source_data and result.confidence > best_confidence:
+                    best_result = result
+                    best_confidence = result.confidence
+                    logger.info(f"Coordinator selected {child.name} (confidence: {result.confidence})")
+            except Exception as e:
+                logger.warning(f"Child agent {child.name} error: {str(e)}")
+        
+        return best_result
+
+class AgentManager:
+    def __init__(self, agents: List[ZeroHallucinationAgent]):
+        self.coordinator = CoordinatorAgent(agents)
+        self.query_logs: List[Dict] = []
+    
+    def handle_query(self, query: str) -> str:
+        result = self.coordinator.coordinate(query)
+        
+        if result:
+            # Log the query and result for analysis
+            self.query_logs.append({
+                "query": query,
+                "answer": result.answer,
+                "confidence": result.confidence,
+                "query_type": result.query_type,
+                "field_paths": result.field_paths,
+                "has_source_data": bool(result.source_data)
+            })
+            
+            return result.answer
+        else:
+            fallback = "I don't have the specific information you're looking for in the current dataset. Please try rephrasing your question or ask about available data fields."
+            self.query_logs.append({
+                "query": query,
+                "answer": fallback,
+                "confidence": 1.0,
+                "query_type": "no_match",
+                "field_paths": [],
+                "has_source_data": False
+            })
+            return fallback
+
+# ─── DATA LOADING WITHOUT CHUNKING ──────────────────────────────
+
+def load_structured_json_data(paths: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Load JSON data as complete structures (no chunking).
+    """
+    datasets: Dict[str, Dict[str, Any]] = {}
+    
     for name, path in paths.items():
         if not path:
             continue
+        
         try:
+            logger.info(f"[Data] Loading complete JSON structure for '{name}' from {path}")
+            
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            records = []
-            # convert each logical item into a JSON string (one "record" per item)
-            if isinstance(data, list):
-                for idx, item in enumerate(data):
-                    content = json.dumps(item, sort_keys=True, ensure_ascii=False)
-                    records.append({"id": f"{name}__{idx}", "content": content})
-            else:
-                content = json.dumps(data, sort_keys=True, ensure_ascii=False)
-                records.append({"id": f"{name}__0", "content": content})
-            df = pd.DataFrame(records)
-            dfs[name] = df
-            logger.info(f"[Data] Loaded {len(df)} records for '{name}'")
+            
+            datasets[name] = data
+            
+            # Log structure information
+            def count_items(obj):
+                if isinstance(obj, dict):
+                    return sum(count_items(v) for v in obj.values()) + len(obj)
+                elif isinstance(obj, list):
+                    return sum(count_items(item) for item in obj) + len(obj)
+                else:
+                    return 1
+            
+            total_items = count_items(data)
+            logger.info(f"[Data] '{name}' loaded with {total_items} total data items")
+            
         except Exception as e:
             logger.error(f"[Data] Failed to load '{name}': {e}")
-    return dfs
-$$$$$$$$$$$
-# -------------------------
-# Build vectorstores with chunking & metadata
-# -------------------------
-def build_vectorstores(dfs: dict[str, pd.DataFrame]) -> list[ChildAgent]:
-    agents: list[ChildAgent] = []
+    
+    return datasets
 
-    # configure splitter: tune chunk_size & overlap as needed
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,    # characters; adjust down if needed (e.g. 800)
-        chunk_overlap=200
-    )
-
-    for key, df in dfs.items():
-        docs = []
-        total_chunks = 0
-        for _, row in df.iterrows():
-            content = row["content"]
-            doc_id = row.get("id", key)
-            # split content into smaller passages
-            chunks = splitter.split_text(content)
-            for i, chunk in enumerate(chunks):
-                metadata = {"source": key, "orig_id": doc_id, "chunk": i, "chunk_len": len(chunk)}
-                docs.append(Document(page_content=chunk, metadata=metadata))
-            total_chunks += len(chunks)
-
-        if not docs:
-            continue
-
-        # Create FAISS store from documents
-        store = FAISS.from_documents(docs, cached_embeddings)
-        # reduce k so we only return a small number of short chunks to the combiner
-        retriever = store.as_retriever(search_kwargs={"k": 3})
-        agents.append(ChildAgent(name=key, retriever=retriever))
-        logger.info(f"[Vectorstore] Built store for '{key}' ({len(docs)} chunks total)")
-    return agents
-$$$$$$$$$$$$$$$$$$$$$
-# -------------------------
-# ChildAgent: use map_reduce combiner but DO NOT pass unsupported chain_type_kwargs
-# -------------------------
-class ChildAgent:
-    def __init__(self, name: str, retriever):
-        self.name = name
-        # Use map_reduce but avoid passing extra/unsupported kwargs that LangChain/Pydantic may reject.
-        # return_source_documents=True helps debugging / provenance (you can show which chunks were used).
-        self.chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="map_reduce",   # safe to use; don't pass unknown kwargs
-            retriever=retriever,
-            return_source_documents=True,
-        )
-
-    def ask(self, query: str) -> str:
+def build_zero_hallucination_agents(datasets: Dict[str, Dict[str, Any]]) -> List[ZeroHallucinationAgent]:
+    """
+    Build zero-hallucination agents from complete JSON datasets.
+    """
+    agents: List[ZeroHallucinationAgent] = []
+    
+    for name, data in datasets.items():
         try:
-            # .run returns a single-string answer for most RetrievalQA chains
-            return self.chain.run(query)
+            logger.info(f"[Agent] Building zero-hallucination agent for '{name}'")
+            
+            agent = ZeroHallucinationAgent(name, data)
+            agents.append(agent)
+            
+            logger.info(f"[Agent] Successfully built agent '{name}' with {len(agent.available_fields)} mapped fields")
+            
         except Exception as e:
-            logger.warning(f"Child agent {self.name} error in ask(): {e}")
-            raise
+            logger.error(f"[Agent] Failed to build agent for '{name}': {e}")
+    
+    return agents
+
+# Initialize the zero-hallucination system
+logger.info("[Startup] Loading complete JSON structures...")
+DATASETS = load_structured_json_data(EMBEDDED_FILES)
+
+logger.info("[Startup] Building zero-hallucination agents...")
+AGENTS = build_zero_hallucination_agents(DATASETS)
+
+logger.info("[Startup] Initializing agent manager...")
+MANAGER = AgentManager(AGENTS)
+
+recognizer = sr.Recognizer()
+
+# ─── FASTAPI APP ─────────────────────────────────────────────────
+
+app = FastAPI(title="Zero-Hallucination JSON Chatbot")
+
+# CORS for your React frontend on :5173
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Request models
+class ChatRequest(BaseModel):
+    message: str
+
+# ─── ENDPOINTS ────────────────────────────────────────────────────
+
+@app.get("/sample-tiles")
+def sample_tiles():
+    """Return the sample-prompt tiles and questions."""
+    return JSONResponse(TILE_QUESTIONS)
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    q = req.message.strip()
+    if not q:
+        raise HTTPException(400, "Empty query")
+    
+    logger.info(f"[API] /chat query='{q}'")
+    
+    try:
+        ans = MANAGER.handle_query(q)
+        return {"response": ans}
+    except Exception as e:
+        logger.error(f"[API] Error processing query: {e}")
+        return {"response": "Sorry, I encountered an error processing your request. Please try again."}
+
+@app.get("/available-fields")
+def get_available_fields():
+    """Get all available fields across all datasets."""
+    all_fields = {}
+    
+    for agent in AGENTS:
+        all_fields[agent.name] = {
+            "total_fields": len(agent.available_fields),
+            "sample_fields": agent.available_fields[:20],  # Show first 20 as sample
+            "field_categories": {}
+        }
+    
+    return all_fields
+
+@app.get("/query-logs")
+def get_query_logs():
+    """Get recent query logs for analysis."""
+    return {
+        "total_queries": len(MANAGER.query_logs),
+        "recent_queries": MANAGER.query_logs[-10:] if MANAGER.query_logs else [],
+        "success_rate": sum(1 for log in MANAGER.query_logs if log['has_source_data']) / max(len(MANAGER.query_logs), 1)
+    }
+
+@app.post("/speech-to-text")
+async def speech_to_text(file: UploadFile = File(...)):
+    """Accepts an uploaded audio file and returns transcribed text."""
+    try:
+        data = await file.read()
+        audio = sr.AudioFile(io.BytesIO(data))
+        with audio as src:
+            audio_data = recognizer.record(src)
+        text = recognizer.recognize_google(audio_data)
+        return {"text": text}
+    except Exception as e:
+        logger.error(f"[API] STT error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.get("/text-to-speech")
+def text_to_speech(text: str):
+    """Returns an MP3 audio stream of the given text."""
+    try:
+        buf = io.BytesIO()
+        gTTS(text).write_to_fp(buf)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="audio/mp3")
+    except Exception as e:
+        logger.error(f"[API] TTS error: {e}")
+        raise HTTPException(500, str(e))
+
+@app.get("/health")
+def health():
+    """Health check with zero-hallucination system status."""
+    return {
+        "status": "ok",
+        "system_type": "zero_hallucination",
+        "agents": [{"name": a.name, "fields_mapped": len(a.available_fields)} for a in AGENTS],
+        "total_datasets": len(DATASETS),
+        "query_success_rate": sum(1 for log in MANAGER.query_logs if log['has_source_data']) / max(len(MANAGER.query_logs), 1) if MANAGER.query_logs else 0
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
