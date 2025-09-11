@@ -1,84 +1,26 @@
-# new imports for compression and summarization
-from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+# add these near your other langchain imports
+from langchain.chains.llm import LLMChain
+from langchain.prompts import PromptTemplate
 from langchain.retrievers.document_compressors import LLMChainExtractor
-from langchain.schema import Document as LC_Document
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-# Token estimation heuristic and model context limits
-# Rough heuristic: 1 token ~ 4 characters (varies). Adjust safety_margin if needed.
-TOKEN_CHAR_RATIO = 4
-MODEL_CONTEXT_LIMIT = 128000  # tokens (match model limit from the error)
-SAFETY_MARGIN_TOKENS = 2000   # leave some headroom
-RETRIEVER_K = 2               # you already tried 1; keep default 2 here
-@@@@@@@@@@@@@@@@@@@@@@@@@@@
-class ChildAgent:
-    def __init__(self, name: str, retriever):
-        self.name = name
-        # Use map_reduce to avoid stuffing raw docs into a single prompt
-        # If you prefer refine, change chain_type="refine"
-        self.chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="map_reduce",
-            retriever=retriever,
-            return_source_documents=False
-        )
-
-    def _estimate_tokens(self, text: str) -> int:
-        # very rough: tokens ≈ characters / TOKEN_CHAR_RATIO
-        return max(1, int(len(text) / TOKEN_CHAR_RATIO))
-
-    def ask(self, query: str) -> str:
-        # run the chain.run() which returns a string result
-        try:
-            # try to run normally
-            return self.chain.run(query)
-        except Exception as e:
-            # If we hit a token/context error at runtime, try a fallback summarization
-            logger.warning(f"[{self.name}] Chain run error: {e} — attempting fallback summarization")
-            try:
-                # fallback: retrieve a few docs and summarize them before asking
-                docs = self.chain.retriever.get_relevant_documents(query)  # list[Document]
-                joined = "\n\n".join(d.page_content for d in docs)
-                est_tokens = self._estimate_tokens(joined)
-                if est_tokens > (MODEL_CONTEXT_LIMIT - SAFETY_MARGIN_TOKENS):
-                    # Summarize the joined content into a short synopsis using chat_model
-                    prompt = (
-                        "Summarize the following content into a concise 300-token (or less) summary "
-                        "that preserves facts. Make it suitable to answer a user question:\n\n"
-                        + joined
-                    )
-                    # call chat_model directly to get a short summary
-                    summary = chat_model.generate([{"role": "user", "content": prompt}])
-                    # chat_model.generate returns a LangChain LLMResult; try to extract text
-                    try:
-                        summary_text = summary.generations[0][0].text
-                    except Exception:
-                        # fallback to string conversion
-                        summary_text = str(summary)
-                    # Now ask the chain with the short summary as context using a temporary retriever
-                    tmp_doc = LC_Document(page_content=summary_text, metadata={"source": f"{self.name}-summary"})
-                    # create an in-memory retriever: we can build a simple one-off FAISS store or
-                    # simply call the chain directly with the summary prefixed to query
-                    prompt_for_chain = f"Context:\n{summary_text}\n\nQuestion: {query}"
-                    # attempt a direct chat_model call
-                    resp = chat_model.generate([{"role": "user", "content": prompt_for_chain}])
-                    try:
-                        return resp.generations[0][0].text
-                    except Exception:
-                        return str(resp)
-                else:
-                    # If not too many tokens, just join and call chain on a constructed input
-                    prompt_for_chain = f"Context:\n{joined}\n\nQuestion: {query}"
-                    resp = chat_model.generate([{"role": "user", "content": prompt_for_chain}])
-                    try:
-                        return resp.generations[0][0].text
-                    except Exception:
-                        return str(resp)
-            except Exception as ex:
-                logger.error(f"[{self.name}] Fallback failed: {ex}")
-                return ""
-@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+from langchain.retrievers.contextual_compression import ContextualCompressionRetriever
+#################
 def build_vectorstores(dfs: dict[str, pd.DataFrame]) -> list[ChildAgent]:
     agents: list[ChildAgent] = []
+    # create extractor_chain and LLMChainExtractor once (reuse for all vectorstores)
+    extract_prompt = PromptTemplate(
+        input_variables=["text", "query"],
+        template=(
+            "You are an information extractor.\n\n"
+            "User question:\n{query}\n\n"
+            "From the following DOCUMENT TEXT, extract only the minimal snippets that are directly "
+            "relevant to answering the question. Return only the snippets, separated by a blank line. "
+            "Do not add commentary.\n\nDOCUMENT:\n{text}\n\n"
+            "If nothing relevant is found, return an empty string."
+        )
+    )
+    extractor_chain = LLMChain(llm=chat_model, prompt=extract_prompt)
+    extractor = LLMChainExtractor(llm_chain=extractor_chain)
+
     for key, df in dfs.items():
         docs = [
             Document(page_content=row["content"], metadata={"source": key})
@@ -89,11 +31,10 @@ def build_vectorstores(dfs: dict[str, pd.DataFrame]) -> list[ChildAgent]:
 
         store = FAISS.from_documents(docs, cached_embeddings)
 
-        # Base retriever: keep k small
+        # Keep k small if you want fewer docs before compression; compression will further reduce tokens
         base_retriever = store.as_retriever(search_kwargs={"k": RETRIEVER_K})
 
-        # Wrap with contextual compression extractor: extracts only relevant parts for query
-        extractor = LLMChainExtractor(llm=chat_model)   # uses chat_model to extract relevant snippets
+        # Wrap the base retriever with contextual compression using the LLMChainExtractor
         compressed_retriever = ContextualCompressionRetriever(
             base_retriever=base_retriever,
             base_compressor=extractor
@@ -102,3 +43,5 @@ def build_vectorstores(dfs: dict[str, pd.DataFrame]) -> list[ChildAgent]:
         agents.append(ChildAgent(name=key, retriever=compressed_retriever))
         logger.info(f"[Vectorstore] Built store for '{key}' ({len(docs)} docs) with k={RETRIEVER_K}")
     return agents
+
+#########################
