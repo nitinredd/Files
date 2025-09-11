@@ -1,4 +1,4 @@
-#SCPCB - Zero Hallucination Solution with Structured Query Engine
+#SCPCB - Intelligent Autonomous Multi-Agent System with Dynamic Reasoning
 import os
 import io
 import json
@@ -12,10 +12,13 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Union, List, Dict, Any, Optional, Tuple
 import tiktoken
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
+import asyncio
+from datetime import datetime
+import hashlib
 
 from gtts import gTTS
 from langchain_openai import AzureChatOpenAI
@@ -24,6 +27,9 @@ from langchain.storage.file_system import LocalFileStore
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain.schema import HumanMessage, SystemMessage
 
 # ─── CONFIG ──────────────────────────────────────────────────────
 
@@ -47,7 +53,7 @@ EMBEDDED_FILES = {
 # Sample‑prompt tiles (for frontend to fetch)
 TILE_QUESTIONS = {
     "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
-    "Line B":    ["What is the Speed range?", "What equipment is used?", "What is the pressure limit?"],
+    "Line B":    ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
     "Facility X":["Who owns this facility?", "What lines are operational?"],
     "Formulation Z": ["List excipients used", "Describe dissolution method"],
     "Process Y": ["Steps in granulation?", "Drying temperature?"],
@@ -81,581 +87,1120 @@ try:
 except:
     tokenizer = tiktoken.get_encoding("cl100k_base")
 
-# ─── ZERO HALLUCINATION ARCHITECTURE ────────────────────────────
+# ─── INTELLIGENT AGENT FRAMEWORK ────────────────────────────────
 
 @dataclass
-class StructuredField:
-    """Represents a field in the JSON structure with metadata."""
-    path: str  # JSONPath-like string
-    field_type: str
-    sample_values: List[str]
-    description: str
-    parent_context: str
+class ReasoningContext:
+    """Context for multi-step reasoning"""
+    query: str
+    reasoning_chain: List[Dict[str, Any]] = field(default_factory=list)
+    discovered_facts: Dict[str, Any] = field(default_factory=dict)
+    confidence_scores: Dict[str, float] = field(default_factory=dict)
+    exploration_depth: int = 0
+    max_depth: int = 3
 
 @dataclass
-class QueryResult:
-    """Result of a structured query with provenance."""
-    answer: str
-    source_data: Dict[str, Any]
-    confidence: float
-    query_type: str
-    field_paths: List[str]
+class AgentCapability:
+    """Defines what an agent can do"""
+    specialization: str
+    data_domains: List[str]
+    reasoning_types: List[str]
+    confidence_threshold: float = 0.7
 
-class QueryType(Enum):
-    DIRECT_FIELD = "direct_field"
-    AGGREGATION = "aggregation" 
-    COMPARISON = "comparison"
-    EXISTENCE = "existence"
-    LISTING = "listing"
+@dataclass
+class AgentMemory:
+    """Long-term and short-term memory for agents"""
+    episodic_memory: deque = field(default_factory=lambda: deque(maxlen=100))
+    semantic_memory: Dict[str, Any] = field(default_factory=dict)
+    learned_patterns: Dict[str, List[str]] = field(default_factory=dict)
+    interaction_history: List[Dict] = field(default_factory=list)
 
-class StructuredQueryEngine:
+class ReasoningType(Enum):
+    ANALYTICAL = "analytical"      # Break down complex queries
+    SYNTHESIS = "synthesis"        # Combine information from multiple sources
+    INFERENCE = "inference"        # Make logical deductions
+    EXPLORATION = "exploration"    # Discover related information
+    VALIDATION = "validation"      # Cross-check information accuracy
+
+class IntelligentChildAgent:
     """
-    Zero-hallucination query engine that works with structured JSON data.
-    Uses field mapping and direct data access instead of chunking.
+    Autonomous agent with reasoning capabilities and dynamic learning
     """
     
-    def __init__(self, json_data: Dict[str, Any], data_name: str):
-        self.json_data = json_data
-        self.data_name = data_name
-        self.field_map = {}  # Maps field names to their paths
-        self.value_index = defaultdict(list)  # Inverted index for fast value lookup
-        self.structure_map = {}  # Maps queries to exact data locations
+    def __init__(self, name: str, data_chunks: List[Document], capabilities: AgentCapability):
+        self.name = name
+        self.capabilities = capabilities
+        self.memory = AgentMemory()
         
-        # Build comprehensive field mapping
-        self._build_field_mapping()
-        self._build_value_index()
+        # Build vectorstore for this agent's data domain
+        self.vectorstore = FAISS.from_documents(data_chunks, cached_embeddings)
+        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 5})
         
-        logger.info(f"[QueryEngine] Mapped {len(self.field_map)} fields for {data_name}")
+        # Create specialized chain with dynamic prompting
+        self.chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=self.retriever,
+            return_source_documents=True
+        )
+        
+        # Initialize reasoning patterns
+        self._initialize_reasoning_patterns()
+        
+        logger.info(f"Initialized agent {name} with specialization: {capabilities.specialization}")
     
-    def _build_field_mapping(self):
-        """Build comprehensive mapping of all fields in the JSON structure."""
-        def traverse(obj, path="", parent_context=""):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    current_path = f"{path}.{key}" if path else key
-                    current_context = f"{parent_context} > {key}" if parent_context else key
-                    
-                    # Store field information
-                    field_info = StructuredField(
-                        path=current_path,
-                        field_type=type(value).__name__,
-                        sample_values=[str(value)] if not isinstance(value, (dict, list)) else [],
-                        description=self._generate_field_description(key, value),
-                        parent_context=current_context
-                    )
-                    
-                    # Multiple ways to access the same field
-                    self.field_map[key.lower()] = field_info
-                    self.field_map[current_path.lower()] = field_info
-                    
-                    # Also map common variations
-                    variations = self._generate_field_variations(key)
-                    for variation in variations:
-                        if variation not in self.field_map:
-                            self.field_map[variation] = field_info
-                    
-                    # Recurse for nested structures
-                    traverse(value, current_path, current_context)
-            
-            elif isinstance(obj, list) and obj:
-                for i, item in enumerate(obj):
-                    traverse(item, f"{path}[{i}]", parent_context)
-        
-        traverse(self.json_data)
-    
-    def _generate_field_variations(self, field_name: str) -> List[str]:
-        """Generate common variations of field names for better matching."""
-        variations = set()
-        
-        # Original
-        variations.add(field_name.lower())
-        
-        # With/without spaces and underscores
-        variations.add(field_name.replace("_", " ").lower())
-        variations.add(field_name.replace(" ", "_").lower())
-        variations.add(field_name.replace("-", "_").lower())
-        variations.add(field_name.replace("_", "").lower())
-        
-        # Plurals and singulars
-        if field_name.endswith('s'):
-            variations.add(field_name[:-1].lower())
-        else:
-            variations.add(f"{field_name}s".lower())
-        
-        # Common abbreviations
-        abbrev_map = {
-            'identification': 'id',
-            'identifier': 'id',
-            'description': 'desc',
-            'specification': 'spec',
-            'specifications': 'specs',
-            'temperature': 'temp',
-            'pressure': 'press',
-            'manufacturer': 'mfg',
-            'manufacturing': 'mfg'
+    def _initialize_reasoning_patterns(self):
+        """Initialize domain-specific reasoning patterns"""
+        domain_patterns = {
+            'pharmaceutical': [
+                "When analyzing formulations, consider API-excipient interactions",
+                "Process parameters often have interdependencies",
+                "Regulatory requirements may influence technical decisions"
+            ],
+            'manufacturing': [
+                "Equipment specifications determine process capabilities",
+                "Scale-up considerations affect process parameters",
+                "Quality control measures are integrated with process steps"
+            ],
+            'analytical': [
+                "Method validation requires multiple parameters",
+                "Analytical results should be correlated with process data",
+                "Specifications often have acceptance criteria ranges"
+            ]
         }
         
-        for full, abbrev in abbrev_map.items():
-            if full in field_name.lower():
-                variations.add(field_name.lower().replace(full, abbrev))
-            if abbrev in field_name.lower():
-                variations.add(field_name.lower().replace(abbrev, full))
-        
-        return list(variations)
+        for domain in self.capabilities.data_domains:
+            if domain in domain_patterns:
+                self.memory.learned_patterns[domain] = domain_patterns[domain]
     
-    def _generate_field_description(self, key: str, value: Any) -> str:
-        """Generate meaningful description for fields."""
-        if isinstance(value, (str, int, float)):
-            return f"Field '{key}' containing {type(value).__name__} value"
-        elif isinstance(value, list):
-            return f"Field '{key}' containing list of {len(value) if value else 0} items"
-        elif isinstance(value, dict):
-            return f"Field '{key}' containing object with {len(value)} properties"
-        return f"Field '{key}'"
-    
-    def _build_value_index(self):
-        """Build inverted index for fast value-based searching."""
-        def index_values(obj, path=""):
-            if isinstance(obj, dict):
-                for key, value in obj.items():
-                    current_path = f"{path}.{key}" if path else key
-                    
-                    if isinstance(value, (str, int, float)):
-                        # Index the value for searching
-                        value_str = str(value).lower()
-                        self.value_index[value_str].append({
-                            'path': current_path,
-                            'value': value,
-                            'context': obj
-                        })
-                        
-                        # Index words within string values
-                        if isinstance(value, str):
-                            words = re.findall(r'\w+', value_str)
-                            for word in words:
-                                if len(word) > 2:  # Skip very short words
-                                    self.value_index[word].append({
-                                        'path': current_path,
-                                        'value': value,
-                                        'context': obj,
-                                        'word_match': True
-                                    })
-                    
-                    index_values(value, current_path)
-            
-            elif isinstance(obj, list):
-                for i, item in enumerate(obj):
-                    index_values(item, f"{path}[{i}]")
-        
-        index_values(self.json_data)
-    
-    def extract_exact_data(self, query: str) -> QueryResult:
+    async def reason_and_respond(self, context: ReasoningContext) -> Dict[str, Any]:
         """
-        Extract exact data without hallucination using structured approach.
+        Autonomous reasoning with multi-step analysis
         """
-        query_lower = query.lower()
-        
-        # Step 1: Identify query type and extract key terms
-        query_type, key_terms = self._analyze_query(query_lower)
-        
-        # Step 2: Find exact matches in field mapping
-        matched_fields = self._find_matching_fields(key_terms)
-        
-        # Step 3: Find value matches
-        matched_values = self._find_matching_values(key_terms)
-        
-        # Step 4: Extract exact data based on matches
-        if matched_fields or matched_values:
-            return self._construct_exact_answer(query_type, matched_fields, matched_values, query)
-        
-        # Step 5: If no exact matches, return structured "not found"
-        return QueryResult(
-            answer="The requested information is not available in the current dataset.",
-            source_data={},
-            confidence=1.0,  # High confidence in "not found"
-            query_type=query_type.value,
-            field_paths=[]
-        )
-    
-    def _analyze_query(self, query: str) -> Tuple[QueryType, List[str]]:
-        """Analyze query to determine type and extract key terms."""
-        
-        # Extract key terms (nouns, important words)
-        key_terms = []
-        
-        # Remove common question words and extract meaningful terms
-        stop_words = {'what', 'is', 'the', 'are', 'how', 'which', 'where', 'when', 'who', 'why', 'a', 'an'}
-        words = re.findall(r'\w+', query.lower())
-        key_terms = [word for word in words if word not in stop_words and len(word) > 2]
-        
-        # Determine query type based on patterns
-        if any(word in query for word in ['list', 'all', 'show me', 'give me all']):
-            query_type = QueryType.LISTING
-        elif any(word in query for word in ['how many', 'count', 'number of']):
-            query_type = QueryType.AGGREGATION
-        elif any(word in query for word in ['compare', 'difference', 'vs', 'versus']):
-            query_type = QueryType.COMPARISON
-        elif any(word in query for word in ['does', 'is there', 'exists', 'available']):
-            query_type = QueryType.EXISTENCE
-        else:
-            query_type = QueryType.DIRECT_FIELD
-        
-        return query_type, key_terms
-    
-    def _find_matching_fields(self, key_terms: List[str]) -> List[StructuredField]:
-        """Find fields that match the query terms."""
-        matches = []
-        
-        for term in key_terms:
-            if term in self.field_map:
-                field = self.field_map[term]
-                if field not in matches:
-                    matches.append(field)
-            
-            # Also check partial matches
-            for field_key, field_info in self.field_map.items():
-                if term in field_key and field_info not in matches:
-                    matches.append(field_info)
-        
-        return matches
-    
-    def _find_matching_values(self, key_terms: List[str]) -> List[Dict]:
-        """Find values that match the query terms."""
-        matches = []
-        
-        for term in key_terms:
-            if term in self.value_index:
-                matches.extend(self.value_index[term])
-        
-        return matches
-    
-    def _construct_exact_answer(self, query_type: QueryType, matched_fields: List[StructuredField], 
-                               matched_values: List[Dict], original_query: str) -> QueryResult:
-        """Construct answer from exact matches without hallucination."""
-        
-        source_data = {}
-        field_paths = []
-        answer_parts = []
-        
-        # Handle field matches
-        for field in matched_fields:
-            try:
-                # Extract actual value from JSON using path
-                value = self._get_value_by_path(field.path)
-                if value is not None:
-                    source_data[field.path] = value
-                    field_paths.append(field.path)
-                    
-                    if isinstance(value, (list, dict)):
-                        answer_parts.append(f"{field.path}: {json.dumps(value, indent=2)}")
-                    else:
-                        answer_parts.append(f"{field.path}: {value}")
-            except Exception as e:
-                logger.warning(f"Could not extract value for path {field.path}: {e}")
-        
-        # Handle value matches
-        unique_contexts = {}
-        for match in matched_values:
-            context_key = match['path']
-            if context_key not in unique_contexts:
-                unique_contexts[context_key] = match
-                source_data[match['path']] = match['value']
-                field_paths.append(match['path'])
-                answer_parts.append(f"{match['path']}: {match['value']}")
-        
-        # Construct final answer based on query type
-        if query_type == QueryType.LISTING:
-            if answer_parts:
-                answer = "Here are the matching items:\n" + "\n".join(answer_parts)
-            else:
-                answer = "No matching items found in the dataset."
-        
-        elif query_type == QueryType.DIRECT_FIELD:
-            if len(answer_parts) == 1:
-                # Single direct answer
-                path, value = answer_parts[0].split(": ", 1)
-                answer = value
-            elif answer_parts:
-                # Multiple matches
-                answer = "Found multiple matches:\n" + "\n".join(answer_parts)
-            else:
-                answer = "No matching information found in the dataset."
-        
-        elif query_type == QueryType.AGGREGATION:
-            if source_data:
-                count = len(source_data)
-                answer = f"Found {count} matching item(s):\n" + "\n".join(answer_parts)
-            else:
-                answer = "No items found to count."
-        
-        elif query_type == QueryType.EXISTENCE:
-            if source_data:
-                answer = f"Yes, found the following:\n" + "\n".join(answer_parts)
-            else:
-                answer = "No, the requested information does not exist in the dataset."
-        
-        else:  # COMPARISON or other
-            if answer_parts:
-                answer = "\n".join(answer_parts)
-            else:
-                answer = "No data available for comparison."
-        
-        confidence = 1.0 if source_data else 1.0  # Always high confidence with exact matches
-        
-        return QueryResult(
-            answer=answer,
-            source_data=source_data,
-            confidence=confidence,
-            query_type=query_type.value,
-            field_paths=field_paths
-        )
-    
-    def _get_value_by_path(self, path: str) -> Any:
-        """Get value from JSON using dot notation path."""
-        try:
-            parts = path.split('.')
-            current = self.json_data
-            
-            for part in parts:
-                # Handle array indices
-                if '[' in part and ']' in part:
-                    key = part.split('[')[0]
-                    index = int(part.split('[')[1].split(']')[0])
-                    current = current[key][index]
-                else:
-                    current = current[part]
-            
-            return current
-        except (KeyError, IndexError, TypeError):
-            return None
-
-class LLMQueryClassifier:
-    """
-    Uses LLM only for query classification and term extraction, not for data generation.
-    This ensures zero hallucination while leveraging LLM's understanding capabilities.
-    """
-    
-    def __init__(self, llm):
-        self.llm = llm
-    
-    def classify_and_extract(self, query: str, available_fields: List[str]) -> Dict[str, Any]:
-        """
-        Use LLM to classify query and extract relevant field names from available options.
-        """
-        
-        # Create a focused prompt that only asks for classification, not data generation
-        prompt = f"""
-You are a query classifier. Your job is to analyze the user query and identify:
-1. The type of information being requested
-2. Which fields from the available data might contain the answer
-3. Key terms that should be searched for
-
-USER QUERY: "{query}"
-
-AVAILABLE FIELDS IN DATASET:
-{', '.join(available_fields[:50])}  # Limit to avoid token issues
-
-RESPOND WITH ONLY THIS JSON FORMAT:
-{{
-    "query_type": "direct_field|listing|aggregation|existence|comparison",
-    "relevant_fields": ["field1", "field2"],
-    "search_terms": ["term1", "term2"],
-    "confidence": 0.95
-}}
-
-Do not generate any data or answers. Only classify and identify relevant fields.
-"""
+        reasoning_result = {
+            "agent": self.name,
+            "reasoning_type": None,
+            "confidence": 0.0,
+            "answer": "",
+            "reasoning_steps": [],
+            "discovered_context": {},
+            "suggested_followups": []
+        }
         
         try:
-            response = self.llm.invoke([{"role": "user", "content": prompt}])
-            result = json.loads(response.content)
-            return result
+            # Step 1: Analyze query complexity and determine reasoning approach
+            reasoning_approach = await self._analyze_query_complexity(context.query)
+            reasoning_result["reasoning_type"] = reasoning_approach.value
+            
+            # Step 2: Execute reasoning based on approach
+            if reasoning_approach == ReasoningType.ANALYTICAL:
+                result = await self._analytical_reasoning(context)
+            elif reasoning_approach == ReasoningType.SYNTHESIS:
+                result = await self._synthesis_reasoning(context)
+            elif reasoning_approach == ReasoningType.INFERENCE:
+                result = await self._inference_reasoning(context)
+            elif reasoning_approach == ReasoningType.EXPLORATION:
+                result = await self._exploration_reasoning(context)
+            else:  # VALIDATION
+                result = await self._validation_reasoning(context)
+            
+            reasoning_result.update(result)
+            
+            # Step 3: Learn from this interaction
+            await self._update_memory(context, reasoning_result)
+            
+            # Step 4: Suggest intelligent follow-ups
+            reasoning_result["suggested_followups"] = await self._generate_followups(context, reasoning_result)
+            
+            return reasoning_result
+            
         except Exception as e:
-            logger.warning(f"LLM classification failed: {e}")
-            # Fallback to rule-based classification
+            logger.error(f"Reasoning error in agent {self.name}: {e}")
             return {
-                "query_type": "direct_field",
-                "relevant_fields": [],
-                "search_terms": query.split(),
-                "confidence": 0.5
+                **reasoning_result,
+                "answer": f"I encountered an issue while reasoning about your query. Let me try a different approach.",
+                "confidence": 0.1
+            }
+    
+    async def _analyze_query_complexity(self, query: str) -> ReasoningType:
+        """Intelligently determine the best reasoning approach"""
+        
+        analysis_prompt = f"""
+        Analyze this query and determine the best reasoning approach:
+        
+        Query: "{query}"
+        
+        My specialization: {self.capabilities.specialization}
+        My data domains: {', '.join(self.capabilities.data_domains)}
+        
+        Reasoning approaches:
+        - ANALYTICAL: Break down complex multi-part questions
+        - SYNTHESIS: Combine information from multiple sources
+        - INFERENCE: Make logical deductions from available data
+        - EXPLORATION: Discover related information and connections
+        - VALIDATION: Cross-check and verify information accuracy
+        
+        Respond with just the reasoning type and brief justification:
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=analysis_prompt)]
+            )
+            
+            content = response.content.lower()
+            
+            if "analytical" in content:
+                return ReasoningType.ANALYTICAL
+            elif "synthesis" in content:
+                return ReasoningType.SYNTHESIS
+            elif "inference" in content:
+                return ReasoningType.INFERENCE
+            elif "exploration" in content:
+                return ReasoningType.EXPLORATION
+            else:
+                return ReasoningType.VALIDATION
+                
+        except Exception:
+            # Fallback to pattern-based analysis
+            query_lower = query.lower()
+            if any(word in query_lower for word in ['what', 'how', 'why', 'explain']):
+                return ReasoningType.ANALYTICAL
+            elif any(word in query_lower for word in ['compare', 'relate', 'combine']):
+                return ReasoningType.SYNTHESIS
+            elif any(word in query_lower for word in ['predict', 'expect', 'likely']):
+                return ReasoningType.INFERENCE
+            else:
+                return ReasoningType.EXPLORATION
+    
+    async def _analytical_reasoning(self, context: ReasoningContext) -> Dict[str, Any]:
+        """Break down complex queries into components"""
+        
+        # Retrieve relevant documents
+        docs = await asyncio.to_thread(self.retriever.get_relevant_documents, context.query)
+        
+        # Construct analytical prompt
+        analytical_prompt = f"""
+        As an expert in {self.capabilities.specialization}, analyze this query step by step:
+        
+        Query: "{context.query}"
+        
+        Available context from my domain:
+        {self._format_documents(docs)}
+        
+        Please provide:
+        1. Step-by-step analysis
+        2. Direct answer based on the context
+        3. Confidence level (0-1)
+        4. Any limitations or assumptions
+        
+        Remember: Base your analysis on the provided context, but use your expertise to provide insights.
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=analytical_prompt)]
+            )
+            
+            return {
+                "answer": response.content,
+                "confidence": self._extract_confidence(response.content),
+                "reasoning_steps": self._extract_reasoning_steps(response.content),
+                "source_documents": [doc.page_content[:200] + "..." for doc in docs[:3]]
+            }
+        except Exception as e:
+            return {
+                "answer": "I couldn't complete the analytical reasoning due to a technical issue.",
+                "confidence": 0.1,
+                "reasoning_steps": [f"Error: {str(e)}"],
+                "source_documents": []
+            }
+    
+    async def _synthesis_reasoning(self, context: ReasoningContext) -> Dict[str, Any]:
+        """Combine information from multiple sources"""
+        
+        # Get diverse documents
+        docs = await asyncio.to_thread(self.retriever.get_relevant_documents, context.query)
+        
+        # Look for complementary information
+        related_queries = self._generate_related_queries(context.query)
+        additional_context = []
+        
+        for related_query in related_queries[:2]:  # Limit to avoid token explosion
+            related_docs = await asyncio.to_thread(self.retriever.get_relevant_documents, related_query)
+            additional_context.extend(related_docs[:2])
+        
+        synthesis_prompt = f"""
+        Synthesize information to answer this query comprehensively:
+        
+        Primary Query: "{context.query}"
+        
+        Primary Context:
+        {self._format_documents(docs)}
+        
+        Additional Related Context:
+        {self._format_documents(additional_context)}
+        
+        Please:
+        1. Identify connections between different pieces of information
+        2. Provide a comprehensive synthesized answer
+        3. Note any conflicting information
+        4. Suggest areas for further investigation
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=synthesis_prompt)]
+            )
+            
+            return {
+                "answer": response.content,
+                "confidence": self._extract_confidence(response.content),
+                "reasoning_steps": ["Gathered primary context", "Explored related information", "Synthesized comprehensive response"],
+                "discovered_context": {"related_queries": related_queries},
+                "source_documents": [doc.page_content[:200] + "..." for doc in (docs + additional_context)[:5]]
+            }
+        except Exception as e:
+            return {
+                "answer": "I couldn't complete the synthesis due to a technical issue.",
+                "confidence": 0.1,
+                "reasoning_steps": [f"Error during synthesis: {str(e)}"],
+                "discovered_context": {},
+                "source_documents": []
+            }
+    
+    async def _inference_reasoning(self, context: ReasoningContext) -> Dict[str, Any]:
+        """Make logical deductions"""
+        
+        docs = await asyncio.to_thread(self.retriever.get_relevant_documents, context.query)
+        
+        # Check memory for relevant patterns
+        relevant_patterns = []
+        for domain, patterns in self.memory.learned_patterns.items():
+            if domain in self.capabilities.data_domains:
+                relevant_patterns.extend(patterns)
+        
+        inference_prompt = f"""
+        Make logical inferences to answer this query:
+        
+        Query: "{context.query}"
+        
+        Available Facts:
+        {self._format_documents(docs)}
+        
+        Relevant Domain Knowledge Patterns:
+        {chr(10).join('- ' + pattern for pattern in relevant_patterns)}
+        
+        Please:
+        1. State the known facts
+        2. Apply logical reasoning
+        3. Draw reasonable inferences
+        4. Clearly distinguish between facts and inferences
+        5. Provide confidence levels for inferences
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=inference_prompt)]
+            )
+            
+            return {
+                "answer": response.content,
+                "confidence": self._extract_confidence(response.content),
+                "reasoning_steps": ["Analyzed known facts", "Applied domain patterns", "Drew logical inferences"],
+                "discovered_context": {"applied_patterns": relevant_patterns[:3]},
+                "source_documents": [doc.page_content[:200] + "..." for doc in docs[:3]]
+            }
+        except Exception as e:
+            return {
+                "answer": "I couldn't complete the inference reasoning.",
+                "confidence": 0.1,
+                "reasoning_steps": [f"Error during inference: {str(e)}"],
+                "discovered_context": {},
+                "source_documents": []
+            }
+    
+    async def _exploration_reasoning(self, context: ReasoningContext) -> Dict[str, Any]:
+        """Discover related information and connections"""
+        
+        # Start with initial query
+        docs = await asyncio.to_thread(self.retriever.get_relevant_documents, context.query)
+        
+        # Explore related concepts
+        exploration_queries = self._generate_exploration_queries(context.query)
+        explored_data = {}
+        
+        for exp_query in exploration_queries[:3]:  # Limit exploration depth
+            exp_docs = await asyncio.to_thread(self.retriever.get_relevant_documents, exp_query)
+            explored_data[exp_query] = exp_docs[:2]
+        
+        exploration_prompt = f"""
+        Explore and discover information related to this query:
+        
+        Original Query: "{context.query}"
+        
+        Primary Information:
+        {self._format_documents(docs)}
+        
+        Explored Related Areas:
+        {self._format_exploration_data(explored_data)}
+        
+        Please:
+        1. Answer the original query
+        2. Highlight interesting connections you discovered
+        3. Suggest related areas the user might want to explore
+        4. Provide a confidence assessment
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=exploration_prompt)]
+            )
+            
+            return {
+                "answer": response.content,
+                "confidence": self._extract_confidence(response.content),
+                "reasoning_steps": ["Explored primary information", "Investigated related areas", "Identified connections"],
+                "discovered_context": {"exploration_queries": exploration_queries, "connections_found": list(explored_data.keys())},
+                "source_documents": [doc.page_content[:200] + "..." for doc in docs[:3]]
+            }
+        except Exception as e:
+            return {
+                "answer": "I couldn't complete the exploration reasoning.",
+                "confidence": 0.1,
+                "reasoning_steps": [f"Error during exploration: {str(e)}"],
+                "discovered_context": {},
+                "source_documents": []
+            }
+    
+    async def _validation_reasoning(self, context: ReasoningContext) -> Dict[str, Any]:
+        """Cross-check and validate information"""
+        
+        docs = await asyncio.to_thread(self.retriever.get_relevant_documents, context.query)
+        
+        # Look for validation sources
+        validation_queries = [
+            f"verify {context.query}",
+            f"confirm {context.query}",
+            f"cross-reference {context.query}"
+        ]
+        
+        validation_data = []
+        for val_query in validation_queries[:2]:
+            val_docs = await asyncio.to_thread(self.retriever.get_relevant_documents, val_query)
+            validation_data.extend(val_docs[:2])
+        
+        validation_prompt = f"""
+        Validate and cross-check information for this query:
+        
+        Query: "{context.query}"
+        
+        Primary Sources:
+        {self._format_documents(docs)}
+        
+        Validation Sources:
+        {self._format_documents(validation_data)}
+        
+        Please:
+        1. Provide the best answer based on available data
+        2. Cross-reference information between sources
+        3. Note any inconsistencies or gaps
+        4. Provide a reliability assessment
+        5. Suggest ways to improve answer confidence
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=validation_prompt)]
+            )
+            
+            return {
+                "answer": response.content,
+                "confidence": self._extract_confidence(response.content),
+                "reasoning_steps": ["Gathered primary sources", "Sought validation data", "Cross-referenced information"],
+                "discovered_context": {"validation_attempted": True, "sources_compared": len(docs) + len(validation_data)},
+                "source_documents": [doc.page_content[:200] + "..." for doc in (docs + validation_data)[:5]]
+            }
+        except Exception as e:
+            return {
+                "answer": "I couldn't complete the validation reasoning.",
+                "confidence": 0.1,
+                "reasoning_steps": [f"Error during validation: {str(e)}"],
+                "discovered_context": {},
+                "source_documents": []
+            }
+    
+    # Helper methods
+    def _format_documents(self, docs: List[Document]) -> str:
+        """Format documents for prompt inclusion"""
+        formatted = []
+        for i, doc in enumerate(docs[:5]):  # Limit to avoid token issues
+            content = doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content
+            formatted.append(f"Source {i+1}:\n{content}")
+        return "\n\n".join(formatted)
+    
+    def _format_exploration_data(self, explored_data: Dict[str, List[Document]]) -> str:
+        """Format exploration data"""
+        formatted = []
+        for query, docs in explored_data.items():
+            formatted.append(f"Exploration: {query}")
+            for doc in docs[:2]:
+                content = doc.page_content[:300] + "..." if len(doc.page_content) > 300 else doc.page_content
+                formatted.append(f"  - {content}")
+        return "\n".join(formatted)
+    
+    def _generate_related_queries(self, original_query: str) -> List[str]:
+        """Generate related queries for synthesis"""
+        base_terms = re.findall(r'\w+', original_query.lower())
+        related = []
+        
+        # Add context-aware related queries
+        if any(term in original_query.lower() for term in ['api', 'active', 'ingredient']):
+            related.extend(['excipients', 'formulation composition', 'drug substance'])
+        if any(term in original_query.lower() for term in ['batch', 'size']):
+            related.extend(['scale up', 'manufacturing capacity', 'production volume'])
+        if any(term in original_query.lower() for term in ['temperature', 'temp']):
+            related.extend(['process parameters', 'operating conditions'])
+        
+        return related[:3]
+    
+    def _generate_exploration_queries(self, original_query: str) -> List[str]:
+        """Generate exploration queries"""
+        return [
+            f"related to {original_query}",
+            f"associated with {original_query}",
+            f"connected to {original_query}"
+        ]
+    
+    def _extract_confidence(self, response_content: str) -> float:
+        """Extract confidence score from response"""
+        # Look for confidence indicators in the response
+        confidence_patterns = [
+            r'confidence[:\s]*(\d+(?:\.\d+)?)',
+            r'certainty[:\s]*(\d+(?:\.\d+)?)',
+            r'(\d+(?:\.\d+)?)%?\s*confident'
+        ]
+        
+        for pattern in confidence_patterns:
+            match = re.search(pattern, response_content.lower())
+            if match:
+                score = float(match.group(1))
+                return score / 100 if score > 1 else score
+        
+        # Default confidence based on response characteristics
+        if "uncertain" in response_content.lower() or "unclear" in response_content.lower():
+            return 0.3
+        elif "likely" in response_content.lower() or "probably" in response_content.lower():
+            return 0.7
+        else:
+            return 0.8
+    
+    def _extract_reasoning_steps(self, response_content: str) -> List[str]:
+        """Extract reasoning steps from response"""
+        steps = []
+        
+        # Look for numbered lists or step indicators
+        step_patterns = [
+            r'(\d+\.?\s+[^.]+\.)',
+            r'(Step \d+[^.]+\.)',
+            r'(First[^.]+\.)',
+            r'(Then[^.]+\.)',
+            r'(Finally[^.]+\.)'
+        ]
+        
+        for pattern in step_patterns:
+            matches = re.findall(pattern, response_content)
+            steps.extend([match.strip() for match in matches])
+        
+        return steps[:5]  # Limit to 5 steps
+    
+    async def _generate_followups(self, context: ReasoningContext, result: Dict[str, Any]) -> List[str]:
+        """Generate intelligent follow-up questions"""
+        followups = []
+        
+        # Based on reasoning type
+        if result.get("reasoning_type") == "analytical":
+            followups.append("Would you like me to dive deeper into any specific aspect?")
+        elif result.get("reasoning_type") == "exploration":
+            followups.append("Would you like me to explore any of the related areas I discovered?")
+        
+        # Based on discovered context
+        if "related_queries" in result.get("discovered_context", {}):
+            followups.append("I found some related topics - would you like to know more about them?")
+        
+        # Based on confidence
+        if result.get("confidence", 0) < 0.6:
+            followups.append("I can try to find more specific information if you can provide additional context.")
+        
+        return followups[:3]
+    
+    async def _update_memory(self, context: ReasoningContext, result: Dict[str, Any]):
+        """Update agent memory with learned information"""
+        # Update episodic memory
+        self.memory.episodic_memory.append({
+            "query": context.query,
+            "reasoning_type": result.get("reasoning_type"),
+            "confidence": result.get("confidence"),
+            "timestamp": datetime.now().isoformat()
+        })
+        
+        # Update semantic memory with successful patterns
+        if result.get("confidence", 0) > 0.7:
+            query_hash = hashlib.md5(context.query.encode()).hexdigest()[:8]
+            self.memory.semantic_memory[query_hash] = {
+                "query": context.query,
+                "successful_approach": result.get("reasoning_type"),
+                "key_concepts": re.findall(r'\w+', context.query.lower())
             }
 
-# ─── ENHANCED AGENT CLASSES ──────────────────────────────────────
-
-class ZeroHallucinationAgent:
-    """Agent that guarantees zero hallucination by using only exact data matches."""
+class IntelligentCoordinator:
+    """
+    Autonomous coordinator that orchestrates agent collaboration
+    """
     
-    def __init__(self, name: str, json_data: Dict[str, Any]):
-        self.name = name
-        self.query_engine = StructuredQueryEngine(json_data, name)
-        self.llm_classifier = LLMQueryClassifier(chat_model)
-        
-        # Get available fields for LLM classification
-        self.available_fields = list(self.query_engine.field_map.keys())
+    def __init__(self, agents: List[IntelligentChildAgent]):
+        self.agents = agents
+        self.collaboration_history = []
+        self.performance_metrics = defaultdict(list)
     
-    def ask(self, query: str) -> QueryResult:
+    async def orchestrate_response(self, query: str) -> Dict[str, Any]:
         """
-        Answer query with zero hallucination guarantee.
+        Intelligently coordinate multiple agents for optimal response
         """
-        try:
-            # Step 1: Use LLM only for query classification (no data generation)
-            classification = self.llm_classifier.classify_and_extract(query, self.available_fields)
-            
-            # Step 2: Use structured engine for exact data extraction
-            result = self.query_engine.extract_exact_data(query)
-            
-            # Step 3: Enhance with classification insights if available
-            if classification.get('relevant_fields'):
-                # Double-check with LLM-suggested fields
-                additional_matches = []
-                for field in classification['relevant_fields']:
-                    if field.lower() in self.query_engine.field_map:
-                        field_info = self.query_engine.field_map[field.lower()]
-                        value = self.query_engine._get_value_by_path(field_info.path)
-                        if value is not None:
-                            additional_matches.append(f"{field_info.path}: {value}")
-                
-                # If we found additional relevant data, include it
-                if additional_matches and not result.source_data:
-                    result.answer = "Found the following relevant information:\n" + "\n".join(additional_matches)
-                    result.confidence = classification.get('confidence', 0.8)
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error in ZeroHallucinationAgent {self.name}: {e}")
-            return QueryResult(
-                answer="Error processing query. Please try rephrasing your question.",
-                source_data={},
-                confidence=1.0,
-                query_type="error",
-                field_paths=[]
-            )
-
-class CoordinatorAgent:
-    def __init__(self, children: List[ZeroHallucinationAgent]):
-        self.children = children
-
-    def coordinate(self, query: str) -> Union[QueryResult, None]:
-        best_result = None
-        best_confidence = 0
+        context = ReasoningContext(query=query)
         
-        for child in self.children:
-            try:
-                result = child.ask(query)
-                if result.source_data and result.confidence > best_confidence:
-                    best_result = result
-                    best_confidence = result.confidence
-                    logger.info(f"Coordinator selected {child.name} (confidence: {result.confidence})")
-            except Exception as e:
-                logger.warning(f"Child agent {child.name} error: {str(e)}")
+        # Phase 1: Agent Selection
+        selected_agents = await self._intelligent_agent_selection(query)
         
-        return best_result
-
-class AgentManager:
-    def __init__(self, agents: List[ZeroHallucinationAgent]):
-        self.coordinator = CoordinatorAgent(agents)
-        self.query_logs: List[Dict] = []
+        # Phase 2: Parallel Reasoning
+        agent_tasks = []
+        for agent in selected_agents:
+            task = asyncio.create_task(agent.reason_and_respond(context))
+            agent_tasks.append(task)
+        
+        agent_results = await asyncio.gather(*agent_tasks, return_exceptions=True)
+        
+        # Phase 3: Result Synthesis
+        final_response = await self._synthesize_responses(query, agent_results, selected_agents)
+        
+        # Phase 4: Learning Update
+        await self._update_coordination_learning(query, agent_results, final_response)
+        
+        return final_response
     
-    def handle_query(self, query: str) -> str:
-        result = self.coordinator.coordinate(query)
+    async def _intelligent_agent_selection(self, query: str) -> List[IntelligentChildAgent]:
+        """Select best agents for the query"""
         
-        if result:
-            # Log the query and result for analysis
-            self.query_logs.append({
-                "query": query,
-                "answer": result.answer,
-                "confidence": result.confidence,
-                "query_type": result.query_type,
-                "field_paths": result.field_paths,
-                "has_source_data": bool(result.source_data)
-            })
+        # Score each agent based on relevance
+        agent_scores = []
+        
+        for agent in self.agents:
+            score = 0
             
-            return result.answer
+            # Domain relevance
+            for domain in agent.capabilities.data_domains:
+                if domain.lower() in query.lower():
+                    score += 0.3
+            
+            # Specialization match
+            if agent.capabilities.specialization.lower() in query.lower():
+                score += 0.4
+            
+            # Historical performance
+            recent_performance = self.performance_metrics.get(agent.name, [0.5])
+            score += 0.3 * (sum(recent_performance) / len(recent_performance))
+            
+            agent_scores.append((agent, score))
+        
+        # Select top agents (at least 1, max 3)
+        agent_scores.sort(key=lambda x: x[1], reverse=True)
+        selected = [agent for agent, score in agent_scores[:3] if score > 0.2]
+        
+        if not selected:  # Fallback: select best agent
+            selected = [agent_scores[0][0]]
+        
+        logger.info(f"Selected agents: {[agent.name for agent in selected]}")
+        return selected
+    
+    async def _synthesize_responses(self, query: str, agent_results: List, selected_agents: List) -> Dict[str, Any]:
+        """Synthesize multiple agent responses"""
+        
+        valid_results = []
+        for i, result in enumerate(agent_results):
+            if not isinstance(result, Exception) and isinstance(result, dict):
+                result['agent_name'] = selected_agents[i].name
+                valid_results.append(result)
+        
+        if not valid_results:
+            return {
+                "answer": "I apologize, but I encountered technical difficulties processing your query.",
+                "confidence": 0.1,
+                "reasoning_type": "error",
+                "agent_responses": []
+            }
+        
+        # Find best response
+        best_result = max(valid_results, key=lambda x: x.get('confidence', 0))
+        
+        # If multiple high-confidence responses, combine them
+        high_conf_results = [r for r in valid_results if r.get('confidence', 0) > 0.7]
+        
+        if len(high_conf_results) > 1:
+            # Intelligent combination
+            combined_answer = await self._combine_responses(query, high_conf_results)
+            return {
+                "answer": combined_answer,
+                "confidence": min(1.0, sum(r.get('confidence', 0) for r in high_conf_results) / len(high_conf_results)),
+                "reasoning_type": "collaborative",
+                "agent_responses": high_conf_results,
+                "synthesis_method": "multi_agent_collaboration"
+            }
         else:
-            fallback = "I don't have the specific information you're looking for in the current dataset. Please try rephrasing your question or ask about available data fields."
-            self.query_logs.append({
-                "query": query,
-                "answer": fallback,
-                "confidence": 1.0,
-                "query_type": "no_match",
-                "field_paths": [],
-                "has_source_data": False
-            })
-            return fallback
+            # Single best response
+            best_result['agent_responses'] = valid_results
+            return best_result
+    
+    async def _combine_responses(self, query: str, responses: List[Dict]) -> str:
+        """Intelligently combine multiple high-quality responses"""
+        
+        combination_prompt = f"""
+        Combine these expert responses into a comprehensive answer:
+        
+        Query: "{query}"
+        
+        Expert Responses:
+        {self._format_agent_responses(responses)}
+        
+        Please provide a cohesive, comprehensive answer that:
+        1. Incorporates insights from all experts
+        2. Resolves any conflicts or contradictions
+        3. Provides the most complete answer possible
+        4. Maintains accuracy and credibility
+        """
+        
+        try:
+            response = await asyncio.to_thread(
+                chat_model.invoke,
+                [SystemMessage(content=combination_prompt)]
+            )
+            return response.content
+        except Exception as e:
+            # Fallback: concatenate responses
+            return "\n\n".join([f"From {r['agent_name']}: {r['answer']}" for r in responses])
+    
+    def _format_agent_responses(self, responses: List[Dict]) -> str:
+        """Format agent responses for combination"""
+        formatted = []
+        for r in responses:
+            formatted.append(f"Expert {r.get('agent_name', 'Unknown')} ({r.get('reasoning_type', 'N/A')}):\n{r.get('answer', 'No answer')}")
+        return "\n\n".join(formatted)
+    
+    async def _update_coordination_learning(self, query: str, agent_results: List, final_response: Dict):
+        """Update coordination learning based on results"""
+        
+        # Track agent performance
+        for i, result in enumerate(agent_results):
+            if not isinstance(result, Exception) and isinstance(result, dict):
+                agent_name = getattr(self.agents[i] if i < len(self.agents) else None, 'name', 'unknown')
+                confidence = result.get('confidence', 0)
+                self.performance_metrics[agent_name].append(confidence)
+                
+                # Keep only recent performance data
+                if len(self.performance_metrics[agent_name]) > 20:
+                    self.performance_metrics[agent_name] = self.performance_metrics[agent_name][-20:]
+        
+        # Log collaboration pattern
+        self.collaboration_history.append({
+            "query": query,
+            "agents_used": [agent.name for agent in self.agents],
+            "final_confidence": final_response.get('confidence', 0),
+            "synthesis_method": final_response.get('synthesis_method', 'single_agent'),
+            "timestamp": datetime.now().isoformat()
+        })
 
-# ─── DATA LOADING WITHOUT CHUNKING ──────────────────────────────
+class AutonomousAgentManager:
+    """
+    High-level manager that provides autonomous decision-making
+    """
+    
+    def __init__(self, agents: List[IntelligentChildAgent]):
+        self.coordinator = IntelligentCoordinator(agents)
+        self.conversation_context = deque(maxlen=50)  # Maintain conversation history
+        self.user_preferences = {}  # Learn user preferences over time
+        self.performance_analytics = defaultdict(list)
+    
+    async def handle_intelligent_query(self, query: str, user_context: Dict = None) -> Dict[str, Any]:
+        """
+        Handle query with full autonomous intelligence
+        """
+        
+        # Enhance query with conversation context
+        enhanced_context = self._build_enhanced_context(query, user_context)
+        
+        # Get coordinated response
+        response = await self.coordinator.orchestrate_response(enhanced_context['enhanced_query'])
+        
+        # Add conversation management
+        response['conversation_management'] = await self._manage_conversation_flow(query, response)
+        
+        # Learn from interaction
+        await self._update_user_model(query, response, user_context)
+        
+        # Update conversation context
+        self.conversation_context.append({
+            'query': query,
+            'response': response,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+        return response
+    
+    def _build_enhanced_context(self, query: str, user_context: Dict = None) -> Dict[str, Any]:
+        """Build enhanced context from conversation history"""
+        
+        enhanced_query = query
+        context_insights = []
+        
+        # Add conversation context if relevant
+        if self.conversation_context:
+            recent_topics = []
+            for conv in list(self.conversation_context)[-3:]:  # Last 3 interactions
+                recent_topics.extend(re.findall(r'\w+', conv['query'].lower()))
+            
+            # If current query references recent topics, enhance it
+            current_terms = set(re.findall(r'\w+', query.lower()))
+            overlapping_terms = current_terms.intersection(set(recent_topics))
+            
+            if overlapping_terms and any(word in query.lower() for word in ['it', 'that', 'this', 'they']):
+                enhanced_query = f"{query} (Context: recent discussion about {', '.join(list(overlapping_terms)[:3])})"
+                context_insights.append("Added conversation context")
+        
+        # Add user preferences
+        if user_context:
+            for pref_key, pref_value in user_context.items():
+                if pref_key in self.user_preferences:
+                    context_insights.append(f"Applied user preference: {pref_key}")
+        
+        return {
+            'enhanced_query': enhanced_query,
+            'original_query': query,
+            'context_insights': context_insights,
+            'conversation_depth': len(self.conversation_context)
+        }
+    
+    async def _manage_conversation_flow(self, query: str, response: Dict[str, Any]) -> Dict[str, Any]:
+        """Manage natural conversation flow"""
+        
+        flow_management = {
+            'suggested_actions': [],
+            'conversation_state': 'active',
+            'follow_up_recommendations': [],
+            'clarification_needed': False
+        }
+        
+        # Analyze response quality and suggest improvements
+        confidence = response.get('confidence', 0)
+        
+        if confidence < 0.5:
+            flow_management['clarification_needed'] = True
+            flow_management['suggested_actions'].append("ask_for_clarification")
+            flow_management['follow_up_recommendations'].append(
+                "I'd like to provide a more accurate answer. Could you provide more specific details about what you're looking for?"
+            )
+        
+        elif confidence > 0.8:
+            # High confidence - suggest related explorations
+            flow_management['suggested_actions'].append("suggest_exploration")
+            
+            if 'suggested_followups' in response:
+                flow_management['follow_up_recommendations'].extend(response['suggested_followups'])
+            else:
+                flow_management['follow_up_recommendations'].append(
+                    "I'm confident in this answer. Would you like me to explore any related aspects?"
+                )
+        
+        # Detect conversation patterns
+        if len(self.conversation_context) > 3:
+            recent_queries = [conv['query'] for conv in list(self.conversation_context)[-3:]]
+            if all('how' in q.lower() for q in recent_queries):
+                flow_management['follow_up_recommendations'].append(
+                    "I notice you're asking several 'how' questions. Would you like a comprehensive process overview?"
+                )
+        
+        return flow_management
+    
+    async def _update_user_model(self, query: str, response: Dict[str, Any], user_context: Dict = None):
+        """Learn and adapt to user preferences"""
+        
+        # Extract query patterns
+        query_type = response.get('reasoning_type', 'unknown')
+        confidence = response.get('confidence', 0)
+        
+        # Update performance analytics
+        self.performance_analytics['query_types'].append(query_type)
+        self.performance_analytics['confidence_scores'].append(confidence)
+        
+        # Learn user preferences from successful interactions
+        if confidence > 0.8:
+            query_terms = re.findall(r'\w+', query.lower())
+            
+            # Update preferred query patterns
+            if 'preferred_topics' not in self.user_preferences:
+                self.user_preferences['preferred_topics'] = defaultdict(int)
+            
+            for term in query_terms:
+                if len(term) > 3:  # Skip short words
+                    self.user_preferences['preferred_topics'][term] += 1
+            
+            # Update preferred reasoning types
+            if 'preferred_reasoning' not in self.user_preferences:
+                self.user_preferences['preferred_reasoning'] = defaultdict(int)
+            
+            self.user_preferences['preferred_reasoning'][query_type] += 1
+    
+    def get_analytics(self) -> Dict[str, Any]:
+        """Get system analytics and insights"""
+        
+        if not self.performance_analytics['confidence_scores']:
+            return {"message": "No analytics data available yet"}
+        
+        return {
+            "conversation_stats": {
+                "total_interactions": len(self.conversation_context),
+                "average_confidence": sum(self.performance_analytics['confidence_scores']) / len(self.performance_analytics['confidence_scores']),
+                "high_confidence_rate": sum(1 for score in self.performance_analytics['confidence_scores'] if score > 0.8) / len(self.performance_analytics['confidence_scores'])
+            },
+            "reasoning_distribution": dict(defaultdict(int, {k: self.performance_analytics['query_types'].count(k) for k in set(self.performance_analytics['query_types'])})),
+            "user_preferences": dict(self.user_preferences) if self.user_preferences else {},
+            "agent_performance": dict(self.coordinator.performance_metrics)
+        }
 
-def load_structured_json_data(paths: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+# ─── SMART DATA LOADING WITH CONTEXT MANAGEMENT ─────────────────
+
+def smart_chunk_json_with_context(data: Any, chunk_size: int = 3000, preserve_structure: bool = True) -> List[Document]:
     """
-    Load JSON data as complete structures (no chunking).
+    Intelligently chunk JSON while preserving semantic context
     """
-    datasets: Dict[str, Dict[str, Any]] = {}
+    documents = []
+    
+    def create_contextual_chunks(obj, path="", parent_context=""):
+        if isinstance(obj, dict):
+            # For dictionaries, create chunks that preserve object boundaries
+            current_chunk = {}
+            current_size = 0
+            
+            for key, value in obj.items():
+                current_path = f"{path}.{key}" if path else key
+                full_context = f"{parent_context} > {key}" if parent_context else key
+                
+                # Estimate size
+                item_str = json.dumps({key: value}, ensure_ascii=False, separators=(',', ':'))
+                item_tokens = len(tokenizer.encode(item_str))
+                
+                # If adding this item would exceed chunk size, finalize current chunk
+                if current_size + item_tokens > chunk_size and current_chunk:
+                    chunk_content = json.dumps(current_chunk, ensure_ascii=False, indent=2)
+                    documents.append(Document(
+                        page_content=chunk_content,
+                        metadata={
+                            "path": path,
+                            "context": parent_context,
+                            "chunk_type": "dict_chunk",
+                            "token_count": current_size
+                        }
+                    ))
+                    current_chunk = {}
+                    current_size = 0
+                
+                # Handle large individual items
+                if item_tokens > chunk_size:
+                    if isinstance(value, (dict, list)):
+                        # Recursively chunk large nested structures
+                        create_contextual_chunks(value, current_path, full_context)
+                    else:
+                        # For large primitive values, create a dedicated chunk
+                        documents.append(Document(
+                            page_content=json.dumps({key: value}, ensure_ascii=False, indent=2),
+                            metadata={
+                                "path": current_path,
+                                "context": full_context,
+                                "chunk_type": "large_item",
+                                "token_count": item_tokens
+                            }
+                        ))
+                else:
+                    # Add to current chunk
+                    current_chunk[key] = value
+                    current_size += item_tokens
+            
+            # Finalize remaining chunk
+            if current_chunk:
+                chunk_content = json.dumps(current_chunk, ensure_ascii=False, indent=2)
+                documents.append(Document(
+                    page_content=chunk_content,
+                    metadata={
+                        "path": path,
+                        "context": parent_context,
+                        "chunk_type": "dict_chunk",
+                        "token_count": current_size
+                    }
+                ))
+        
+        elif isinstance(obj, list):
+            # For lists, group items intelligently
+            current_chunk = []
+            current_size = 0
+            
+            for i, item in enumerate(obj):
+                item_str = json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+                item_tokens = len(tokenizer.encode(item_str))
+                
+                if current_size + item_tokens > chunk_size and current_chunk:
+                    chunk_content = json.dumps(current_chunk, ensure_ascii=False, indent=2)
+                    documents.append(Document(
+                        page_content=chunk_content,
+                        metadata={
+                            "path": f"{path}[{i-len(current_chunk)}:{i}]",
+                            "context": f"{parent_context} (array items)",
+                            "chunk_type": "list_chunk",
+                            "token_count": current_size
+                        }
+                    ))
+                    current_chunk = []
+                    current_size = 0
+                
+                if item_tokens > chunk_size and isinstance(item, (dict, list)):
+                    # Recursively handle large list items
+                    create_contextual_chunks(item, f"{path}[{i}]", f"{parent_context}[{i}]")
+                else:
+                    current_chunk.append(item)
+                    current_size += item_tokens
+            
+            # Finalize remaining chunk
+            if current_chunk:
+                chunk_content = json.dumps(current_chunk, ensure_ascii=False, indent=2)
+                documents.append(Document(
+                    page_content=chunk_content,
+                    metadata={
+                        "path": f"{path}[{len(obj)-len(current_chunk)}:{len(obj)}]",
+                        "context": f"{parent_context} (array items)",
+                        "chunk_type": "list_chunk",
+                        "token_count": current_size
+                    }
+                ))
+    
+    create_contextual_chunks(data)
+    return documents
+
+def load_and_intelligently_chunk_data(paths: Dict[str, str]) -> Dict[str, List[Document]]:
+    """
+    Load and intelligently chunk JSON data for optimal retrieval
+    """
+    chunked_datasets: Dict[str, List[Document]] = {}
     
     for name, path in paths.items():
         if not path:
             continue
         
         try:
-            logger.info(f"[Data] Loading complete JSON structure for '{name}' from {path}")
+            logger.info(f"[Data] Loading and chunking '{name}' from {path}")
             
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            datasets[name] = data
+            # Create contextual chunks
+            chunks = smart_chunk_json_with_context(data)
             
-            # Log structure information
-            def count_items(obj):
-                if isinstance(obj, dict):
-                    return sum(count_items(v) for v in obj.values()) + len(obj)
-                elif isinstance(obj, list):
-                    return sum(count_items(item) for item in obj) + len(obj)
-                else:
-                    return 1
+            logger.info(f"[Data] '{name}' chunked into {len(chunks)} contextual pieces")
             
-            total_items = count_items(data)
-            logger.info(f"[Data] '{name}' loaded with {total_items} total data items")
+            # Log chunk statistics
+            token_counts = [chunk.metadata.get('token_count', 0) for chunk in chunks]
+            avg_tokens = sum(token_counts) / len(token_counts) if token_counts else 0
+            max_tokens = max(token_counts) if token_counts else 0
+            
+            logger.info(f"[Data] '{name}' chunks: avg {avg_tokens:.0f} tokens, max {max_tokens} tokens")
+            
+            chunked_datasets[name] = chunks
             
         except Exception as e:
-            logger.error(f"[Data] Failed to load '{name}': {e}")
+            logger.error(f"[Data] Failed to load and chunk '{name}': {e}")
     
-    return datasets
+    return chunked_datasets
 
-def build_zero_hallucination_agents(datasets: Dict[str, Dict[str, Any]]) -> List[ZeroHallucinationAgent]:
+def build_intelligent_agents(chunked_datasets: Dict[str, List[Document]]) -> List[IntelligentChildAgent]:
     """
-    Build zero-hallucination agents from complete JSON datasets.
+    Build intelligent agents with specialized capabilities
     """
-    agents: List[ZeroHallucinationAgent] = []
+    agents: List[IntelligentChildAgent] = []
     
-    for name, data in datasets.items():
-        try:
-            logger.info(f"[Agent] Building zero-hallucination agent for '{name}'")
-            
-            agent = ZeroHallucinationAgent(name, data)
-            agents.append(agent)
-            
-            logger.info(f"[Agent] Successfully built agent '{name}' with {len(agent.available_fields)} mapped fields")
-            
-        except Exception as e:
-            logger.error(f"[Agent] Failed to build agent for '{name}': {e}")
+    # Define agent capabilities based on data characteristics
+    agent_configs = [
+        {
+            "name_suffix": "_analytical",
+            "specialization": "pharmaceutical_analysis",
+            "data_domains": ["pharmaceutical", "formulation", "analytical"],
+            "reasoning_types": [ReasoningType.ANALYTICAL, ReasoningType.VALIDATION],
+            "confidence_threshold": 0.8
+        },
+        {
+            "name_suffix": "_synthesis",
+            "specialization": "process_integration",
+            "data_domains": ["manufacturing", "process", "equipment"],
+            "reasoning_types": [ReasoningType.SYNTHESIS, ReasoningType.EXPLORATION],
+            "confidence_threshold": 0.7
+        },
+        {
+            "name_suffix": "_explorer",
+            "specialization": "knowledge_discovery",
+            "data_domains": ["general", "relationships", "patterns"],
+            "reasoning_types": [ReasoningType.EXPLORATION, ReasoningType.INFERENCE],
+            "confidence_threshold": 0.6
+        }
+    ]
+    
+    for dataset_name, chunks in chunked_datasets.items():
+        for config in agent_configs:
+            try:
+                agent_name = f"{dataset_name}{config['name_suffix']}"
+                
+                capabilities = AgentCapability(
+                    specialization=config["specialization"],
+                    data_domains=config["data_domains"],
+                    reasoning_types=config["reasoning_types"],
+                    confidence_threshold=config["confidence_threshold"]
+                )
+                
+                agent = IntelligentChildAgent(agent_name, chunks, capabilities)
+                agents.append(agent)
+                
+                logger.info(f"[Agent] Created {agent_name} with {len(chunks)} chunks")
+                
+            except Exception as e:
+                logger.error(f"[Agent] Failed to create agent for {dataset_name}: {e}")
     
     return agents
 
-# Initialize the zero-hallucination system
-logger.info("[Startup] Loading complete JSON structures...")
-DATASETS = load_structured_json_data(EMBEDDED_FILES)
+# Initialize the intelligent autonomous system
+logger.info("[Startup] Loading and intelligently chunking data...")
+CHUNKED_DATASETS = load_and_intelligently_chunk_data(EMBEDDED_FILES)
 
-logger.info("[Startup] Building zero-hallucination agents...")
-AGENTS = build_zero_hallucination_agents(DATASETS)
+logger.info("[Startup] Building intelligent autonomous agents...")
+INTELLIGENT_AGENTS = build_intelligent_agents(CHUNKED_DATASETS)
 
-logger.info("[Startup] Initializing agent manager...")
-MANAGER = AgentManager(AGENTS)
+logger.info("[Startup] Initializing autonomous agent manager...")
+AUTONOMOUS_MANAGER = AutonomousAgentManager(INTELLIGENT_AGENTS)
 
 recognizer = sr.Recognizer()
 
-# ─── FASTAPI APP ─────────────────────────────────────────────────
+# ─── FASTAPI APP WITH AUTONOMOUS INTELLIGENCE ───────────────────
 
-app = FastAPI(title="Zero-Hallucination JSON Chatbot")
+app = FastAPI(title="Intelligent Autonomous Multi-Agent JSON Chatbot")
 
 # CORS for your React frontend on :5173
 app.add_middleware(
@@ -668,8 +1213,9 @@ app.add_middleware(
 # Request models
 class ChatRequest(BaseModel):
     message: str
+    user_context: Optional[Dict[str, Any]] = None
 
-# ─── ENDPOINTS ────────────────────────────────────────────────────
+# ─── AUTONOMOUS ENDPOINTS ────────────────────────────────────────
 
 @app.get("/sample-tiles")
 def sample_tiles():
@@ -677,42 +1223,73 @@ def sample_tiles():
     return JSONResponse(TILE_QUESTIONS)
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+async def intelligent_chat(req: ChatRequest):
+    """
+    Autonomous intelligent chat with multi-agent reasoning
+    """
     q = req.message.strip()
     if not q:
         raise HTTPException(400, "Empty query")
     
-    logger.info(f"[API] /chat query='{q}'")
+    logger.info(f"[API] Autonomous chat query: '{q}'")
     
     try:
-        ans = MANAGER.handle_query(q)
-        return {"response": ans}
-    except Exception as e:
-        logger.error(f"[API] Error processing query: {e}")
-        return {"response": "Sorry, I encountered an error processing your request. Please try again."}
-
-@app.get("/available-fields")
-def get_available_fields():
-    """Get all available fields across all datasets."""
-    all_fields = {}
-    
-    for agent in AGENTS:
-        all_fields[agent.name] = {
-            "total_fields": len(agent.available_fields),
-            "sample_fields": agent.available_fields[:20],  # Show first 20 as sample
-            "field_categories": {}
+        # Use autonomous agent manager for intelligent processing
+        response = await AUTONOMOUS_MANAGER.handle_intelligent_query(q, req.user_context)
+        
+        return {
+            "response": response.get('answer', 'I encountered an issue processing your request.'),
+            "confidence": response.get('confidence', 0.5),
+            "reasoning_type": response.get('reasoning_type', 'unknown'),
+            "agent_insights": {
+                "agents_involved": [r.get('agent_name', 'unknown') for r in response.get('agent_responses', [])],
+                "synthesis_method": response.get('synthesis_method', 'single_agent'),
+                "reasoning_steps": response.get('reasoning_steps', [])
+            },
+            "conversation_management": response.get('conversation_management', {}),
+            "suggested_followups": response.get('suggested_followups', [])
         }
-    
-    return all_fields
+        
+    except Exception as e:
+        logger.error(f"[API] Error in autonomous chat: {e}")
+        return {
+            "response": "I apologize, but I encountered a technical issue. Please try rephrasing your question.",
+            "confidence": 0.1,
+            "reasoning_type": "error",
+            "agent_insights": {"error": str(e)},
+            "conversation_management": {},
+            "suggested_followups": []
+        }
 
-@app.get("/query-logs")
-def get_query_logs():
-    """Get recent query logs for analysis."""
-    return {
-        "total_queries": len(MANAGER.query_logs),
-        "recent_queries": MANAGER.query_logs[-10:] if MANAGER.query_logs else [],
-        "success_rate": sum(1 for log in MANAGER.query_logs if log['has_source_data']) / max(len(MANAGER.query_logs), 1)
+@app.get("/system-analytics")
+async def get_system_analytics():
+    """Get comprehensive system analytics and performance insights"""
+    return AUTONOMOUS_MANAGER.get_analytics()
+
+@app.get("/agent-status")
+def get_agent_status():
+    """Get current status of all agents"""
+    status = {
+        "total_agents": len(INTELLIGENT_AGENTS),
+        "agents": [],
+        "system_health": "operational"
     }
+    
+    for agent in INTELLIGENT_AGENTS:
+        agent_info = {
+            "name": agent.name,
+            "specialization": agent.capabilities.specialization,
+            "data_domains": agent.capabilities.data_domains,
+            "reasoning_types": [rt.value for rt in agent.capabilities.reasoning_types],
+            "memory_stats": {
+                "episodic_entries": len(agent.memory.episodic_memory),
+                "semantic_entries": len(agent.memory.semantic_memory),
+                "learned_patterns": len(agent.memory.learned_patterns)
+            }
+        }
+        status["agents"].append(agent_info)
+    
+    return status
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
@@ -742,14 +1319,35 @@ def text_to_speech(text: str):
 
 @app.get("/health")
 def health():
-    """Health check with zero-hallucination system status."""
-    return {
-        "status": "ok",
-        "system_type": "zero_hallucination",
-        "agents": [{"name": a.name, "fields_mapped": len(a.available_fields)} for a in AGENTS],
-        "total_datasets": len(DATASETS),
-        "query_success_rate": sum(1 for log in MANAGER.query_logs if log['has_source_data']) / max(len(MANAGER.query_logs), 1) if MANAGER.query_logs else 0
-    }
+    """Comprehensive health check for autonomous system"""
+    try:
+        analytics = AUTONOMOUS_MANAGER.get_analytics()
+        
+        return {
+            "status": "operational",
+            "system_type": "intelligent_autonomous_multi_agent",
+            "agents": {
+                "total": len(INTELLIGENT_AGENTS),
+                "specializations": list(set(agent.capabilities.specialization for agent in INTELLIGENT_AGENTS))
+            },
+            "performance": {
+                "conversation_count": analytics.get("conversation_stats", {}).get("total_interactions", 0),
+                "average_confidence": analytics.get("conversation_stats", {}).get("average_confidence", 0),
+                "success_rate": analytics.get("conversation_stats", {}).get("high_confidence_rate", 0)
+            },
+            "capabilities": {
+                "autonomous_reasoning": True,
+                "multi_agent_collaboration": True,
+                "context_awareness": True,
+                "continuous_learning": True
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "error": str(e),
+            "system_type": "intelligent_autonomous_multi_agent"
+        }
 
 if __name__ == "__main__":
     import uvicorn
