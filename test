@@ -362,10 +362,24 @@ def product_details(req: QARequest):
         def _tokens(s: str):
             return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
 
+        # helper: simple normalization (keep spaces)
+        def _normalize_simple(s: str) -> str:
+            return re.sub(r'[^a-z0-9\s]', ' ', (s or "").lower())
+
         # BEGIN DEBUG LOG
         print("=== /product/details called ===")
         print("Question:", q_text)
         # END DEBUG LOG
+
+        # Detect if the question mentions any reaction-type keyword (so we must run detection/retrieval)
+        q_norm_simple = _normalize_simple(q_text)
+        contains_reaction_keyword = False
+        for rt in REACTION_TYPES:
+            rt_norm = _normalize_simple(rt)
+            if rt_norm.strip() and rt_norm.strip() in q_norm_simple:
+                contains_reaction_keyword = True
+                break
+        print(f"DEBUG: contains_reaction_keyword={contains_reaction_keyword}")
 
         # helper to detect product by multiple strategies
         def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
@@ -551,10 +565,10 @@ def product_details(req: QARequest):
             print("DEBUG: structured extraction completed and cached")
             return parsed
 
-        # If the question is very short or looks like a greeting, skip detection and go straight to generative LLM.
-        # This prevents "hi"/"hello" from being mistakenly sent to detection/retrieval logic.
-        if len(q_text) < 4 or (len(_tokens(q_text)) <= 1 and not any(c.isdigit() for c in q_text)):
-            print("DEBUG: Short/greeting query detected, skipping product detection and using generative model.")
+        # If the question is very short or looks like a greeting, skip detection and go straight to generative LLM,
+        # BUT DO NOT skip if the question contains any reaction-type keyword (in that case detection/retrieval must run).
+        if (not contains_reaction_keyword) and (len(q_text) < 4 or (len(_tokens(q_text)) <= 1 and not any(c.isdigit() for c in q_text))):
+            print("DEBUG: Short/greeting query detected and no reaction keyword present -> using generative model.")
             prompt_for_gen = QA_PROMPT
             llm_chain = LLMChain(llm=chat_model, prompt=prompt_for_gen)
             try:
@@ -564,11 +578,11 @@ def product_details(req: QARequest):
                 raise HTTPException(status_code=500, detail=f"Generative model call failed: {e}")
             return {"response": raw_response}
 
-        # 2) no explicit product_id: attempt detection from free-text
+        # 2) no explicit product_id: attempt detection from free-text (this will run if contains_reaction_keyword True OR question isn't a short greeting)
         detected = _detect_product_by_name(q_text)
         if detected:
             # IMPORTANT: run retrieval on detected product
-            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
+            print(f"DEBUG: Detected product by name: {detected['name']}' (id: {detected['id']}) -> running retrieval")
             return _run_retrieval_for_product(detected, q_text, k=3)
 
         # 3) fallback: generative response (concise QA prompt)
