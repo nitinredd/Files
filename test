@@ -1,4 +1,4 @@
-# batch_similarity_analyzer_market_autoscan_with_profiles.py
+# batch_similarity_analyzer_with_bootstrap_interval_profiles.py
 import os
 import math
 import streamlit as st
@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ----------------------------------------
-# Required Helper Functions (unchanged / improved)
+# Required Helper Functions (improved)
 # ----------------------------------------
 
 def prepare_data(reference_df, test_df):
@@ -33,25 +33,17 @@ def conventional_f2(ref_means, test_means):
 
 def expected_f2(ref_df, test_df):
     """Calculate expected f2 from full dataframes (first col time, rest units)"""
-    # Means per timepoint
     ref_means = ref_df.iloc[:, 1:].mean(axis=1)
     test_means = test_df.iloc[:, 1:].mean(axis=1)
-    
-    # Conventional f2 component
     diff = test_means - ref_means
     sum_sq_diff = (diff ** 2).sum()
-    
-    # Variance components
     ref_var = row_variance(ref_df)
     test_var = row_variance(test_df)
     sum_var = (ref_var + test_var).sum()
-    
-    n = ref_df.shape[1] - 1  # Number of units per time point
+    n = ref_df.shape[1] - 1
     p = len(ref_means)
-    
     if n == 0 or p == 0:
         return None
-    
     adjustment = (1/n) * sum_var
     return 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
 
@@ -96,16 +88,33 @@ def row_variance(df):
     return df.iloc[:, 1:].var(axis=1, ddof=1)
 
 def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
-    """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
+    """
+    Bootstrap f2 calculation.
+    Returns:
+      original_f2,
+      lower_bound (5th percentile of bootstrapped f2s) or None,
+      upper_bound (95th percentile) or None,
+      mean_f2,
+      median_f2,
+      skewness_f2,
+      kurtosis_f2,
+      f2_values (np.array),
+      ref_mean_profiles (np.array shape [n_iterations, n_timepoints]),
+      test_mean_profiles (np.array shape [n_iterations, n_timepoints])
+    """
     n_ref_units = max(0, ref_df.shape[1] - 1)
     n_test_units = max(0, test_df.shape[1] - 1)
 
     original_f2 = calc_func(ref_df, test_df)
     f2_values = []
     
+    # To collect per-iteration mean profiles
+    ref_profiles = []
+    test_profiles = []
+
     if n_ref_units == 0 or n_test_units == 0:
-        return original_f2, None, None, None, None, None, None, []
-    
+        return original_f2, None, None, None, None, None, None, np.array([]), np.array([]), np.array([])
+
     for _ in range(n_iterations):
         ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
         test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
@@ -115,21 +124,36 @@ def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
 
         f2_val = calc_func(ref_sample, test_sample)
 
+        # collect mean profiles regardless of whether f2 was valid (but keep consistent)
+        ref_mean_profile = ref_sample.iloc[:, 1:].mean(axis=1).to_numpy()
+        test_mean_profile = test_sample.iloc[:, 1:].mean(axis=1).to_numpy()
+        ref_profiles.append(ref_mean_profile)
+        test_profiles.append(test_mean_profile)
+
         if f2_val is not None and isinstance(f2_val, (int, float, np.floating, np.integer)):
             f2_values.append(float(f2_val))
     
     if not f2_values:
-        return original_f2, None, None, None, None, None, None, []
-    
-    f2_values = np.array(f2_values)
-    mean_f2 = np.mean(f2_values)
-    median_f2 = np.median(f2_values)
-    skewness_f2 = skew(f2_values)
-    kurtosis_f2 = kurtosis(f2_values)
-    lower_bound = np.percentile(f2_values, 5)
-    upper_bound = np.percentile(f2_values, 95)
+        f2_arr = np.array([])
+        mean_f2 = None
+        median_f2 = None
+        skewness_f2 = None
+        kurtosis_f2 = None
+        lower_bound = None
+        upper_bound = None
+    else:
+        f2_arr = np.array(f2_values)
+        mean_f2 = np.mean(f2_arr)
+        median_f2 = np.median(f2_arr)
+        skewness_f2 = skew(f2_arr)
+        kurtosis_f2 = kurtosis(f2_arr)
+        lower_bound = np.percentile(f2_arr, 5)
+        upper_bound = np.percentile(f2_arr, 95)
 
-    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
+    ref_profiles = np.array(ref_profiles)  # shape (n_iterations, n_timepoints)
+    test_profiles = np.array(test_profiles)
+
+    return original_f2, lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_arr, ref_profiles, test_profiles
 
 def simulate_lilliefors_critical_value(n, alpha=0.05, num_simulations=1000):
     """Simulate Lilliefors critical value for confidence bands"""
@@ -152,276 +176,69 @@ def create_jmp_style_qq_plot(data, title, method_name, file_name):
         return None
     
     n = len(data)
-    
-    # Sort data and calculate plotting positions
     sorted_data = np.sort(data)
     plotting_positions = norm.ppf((np.arange(1, n + 1)) / (n + 2))
-    
-    # Fit line for normal distribution
     slope, intercept, r, _, _ = stats.linregress(plotting_positions, sorted_data)
     fit_line = intercept + slope * plotting_positions
-    
-    # Calculate empirical CDF
     ecdf = (np.arange(1, n + 1)) / (n + 1)
-    
-    # Get Lilliefors critical value for confidence bands
     D_critical = simulate_lilliefors_critical_value(n=n, alpha=0.05)
-    
-    # Calculate confidence bands using ECDF approach
     lower_quantile = norm.ppf(np.clip(ecdf - D_critical, 1e-10, 1 - 1e-10))
     upper_quantile = norm.ppf(np.clip(ecdf + D_critical, 1e-10, 1 - 1e-10))
-    
-    # Transform quantile bands to data space using the fitted line
     lower_band = intercept + slope * lower_quantile
     upper_band = intercept + slope * upper_quantile
     
-    # Create the plot
     fig = go.Figure()
-    
-    # Add curved confidence bands first (so they appear behind)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=upper_band,
-        mode='lines',
-        name='Upper Confidence Band',
-        line=dict(color='red', width=1, dash='dot'),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-    
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=lower_band,
-        mode='lines',
-        name='Lower Confidence Band', 
-        line=dict(color='red', width=1, dash='dot'),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-    
-    # Add the main reference line (solid red)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=fit_line,
-        mode='lines',
-        name='Normal Reference Line',
-        line=dict(color='red', width=2, dash='solid'),
-        showlegend=False,
-        hovertemplate='Normal Reference Line<extra></extra>'
-    ))
-    
-    # Add the data points (black circles)
-    fig.add_trace(go.Scatter(
-        x=plotting_positions,
-        y=sorted_data,
-        mode='markers',
-        name='Data Points',
-        marker=dict(
-            color='black',
-            size=6,
-            symbol='circle',
-            line=dict(width=0)
-        ),
-        showlegend=False,
-        hovertemplate=
-        '<b>Normal Quantile:</b> %{x:.3f}<br>' +
-        '<b>Sample Quantile:</b> %{y:.3f}<br>' +
-        '<extra></extra>'
-    ))
-    
-    # Calculate nice axis ranges
+    fig.add_trace(go.Scatter(x=plotting_positions, y=upper_band, mode='lines', name='Upper Confidence Band', line=dict(color='red', width=1, dash='dot'), showlegend=False, hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=lower_band, mode='lines', name='Lower Confidence Band', line=dict(color='red', width=1, dash='dot'), showlegend=False, hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=fit_line, mode='lines', name='Normal Reference Line', line=dict(color='red', width=2, dash='solid'), showlegend=False, hovertemplate='Normal Reference Line<extra></extra>'))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=sorted_data, mode='markers', name='Data Points', marker=dict(color='black', size=6, symbol='circle', line=dict(width=0)), showlegend=False, hovertemplate='<b>Normal Quantile:</b> %{x:.3f}<br><b>Sample Quantile:</b> %{y:.3f}<br><extra></extra>'))
     x_range = max(plotting_positions) - min(plotting_positions)
     y_range = max(sorted_data) - min(sorted_data)
     x_margin = x_range * 0.1
     y_margin = y_range * 0.1
-    
-    # Set up axis ticks similar to JMP
     x_ticks = [-2.5, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
     x_ticks = [tick for tick in x_ticks if min(plotting_positions)-x_margin <= tick <= max(plotting_positions)+x_margin]
-    
-    # Calculate statistics for annotation
     mean_val = np.mean(data)
     std_val = np.std(data)
     skewness_val = skew(data)
     kurtosis_val = kurtosis(data)
-    
-    
     fig.update_layout(
-        title=dict(
-            text=f'<b>Normal Quantile Plot</b><br><span style="font-size: 12px;">{method_name} - {file_name.replace(".xlsx", "")}</span>',
-            x=0.5,
-            y=0.95,
-            font=dict(size=14, color='black', family='Arial')
-        ),
-        xaxis=dict(
-            title=dict(
-                text='<b>Normal Quantile</b>',
-                font=dict(size=12, color='black', family='Arial')
-            ),
-            range=[min(plotting_positions)-x_margin, max(plotting_positions)+x_margin],
-            tickvals=x_ticks,
-            tickmode='array',
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        yaxis=dict(
-            title=dict(
-                text='<b>Sample Quantile</b>',
-                font=dict(size=12, color='black', family='Arial')
-            ),
-            range=[min(sorted_data)-y_margin, max(sorted_data)+y_margin],
-            gridcolor='lightgray',
-            gridwidth=0.5,
-            showgrid=True,
-            zeroline=True,
-            zerolinecolor='lightgray',
-            zerolinewidth=0.8,
-            tickfont=dict(size=10, color='black', family='Arial'),
-            linecolor='black',
-            linewidth=1,
-            mirror=True
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(family="Arial, sans-serif"),
-        hovermode='closest',
-        width=600,
-        height=500,
-        margin=dict(l=80, r=100, t=80, b=60),
-        showlegend=False
+        title=dict(text=f'<b>Normal Quantile Plot</b><br><span style="font-size: 12px;">{method_name} - {file_name.replace(".xlsx", "")}</span>', x=0.5, y=0.95, font=dict(size=14, color='black', family='Arial')),
+        xaxis=dict(title=dict(text='<b>Normal Quantile</b>', font=dict(size=12)), range=[min(plotting_positions)-x_margin, max(plotting_positions)+x_margin], tickvals=x_ticks, tickmode='array', gridcolor='lightgray', gridwidth=0.5, showgrid=True, zeroline=True, zerolinecolor='lightgray', zerolinewidth=0.8, tickfont=dict(size=10), linecolor='black', linewidth=1, mirror=True),
+        yaxis=dict(title=dict(text='<b>Sample Quantile</b>', font=dict(size=12)), range=[min(sorted_data)-y_margin, max(sorted_data)+y_margin], gridcolor='lightgray', gridwidth=0.5, showgrid=True, zeroline=True, zerolinecolor='lightgray', zerolinewidth=0.8, tickfont=dict(size=10), linecolor='black', linewidth=1, mirror=True),
+        plot_bgcolor='white', paper_bgcolor='white', font=dict(family="Arial, sans-serif"), hovermode='closest', width=600, height=500, margin=dict(l=80, r=100, t=80, b=60), showlegend=False
     )
-    
-    
-    stats_text = (
-        f'<b>Statistics:</b><br>'
-        f'Mean: {mean_val:.4f}<br>'
-        f'Std Dev: {std_val:.4f}<br>'
-        f'Skewness: {skewness_val:.4f}<br>'
-        f'Kurtosis: {kurtosis_val:.4f}<br>'
-        f'R²: {r**2:.4f}<br>'
-        f'N: {n:,}'
-    )
-    
-    fig.add_annotation(
-        x=0.98,
-        y=0.98,
-        xref="paper",
-        yref="paper",
-        text=stats_text,
-        showarrow=False,
-        align="left",
-        bgcolor="white",
-        bordercolor="black",
-        borderwidth=1,
-        borderpad=6,
-        font=dict(size=9, color='black', family='Arial')
-    )
-    
+    stats_text = (f'<b>Statistics:</b><br>Mean: {mean_val:.4f}<br>Std Dev: {std_val:.4f}<br>Skewness: {skewness_val:.4f}<br>Kurtosis: {kurtosis_val:.4f}<br>R²: {r**2:.4f}<br>N: {n:,}')
+    fig.add_annotation(x=0.98, y=0.98, xref="paper", yref="paper", text=stats_text, showarrow=False, align="left", bgcolor="white", bordercolor="black", borderwidth=1, borderpad=6, font=dict(size=9))
     return fig
 
 def create_combined_qq_plots(bootstrap_results, file_name):
     """Create a combined view of all QQ plots for a file"""
     methods_with_data = [(method, data) for method, data in bootstrap_results.items() if data and len(data) > 0]
-    
     if not methods_with_data:
         return None
-    
     n_methods = len(methods_with_data)
     cols = min(3, n_methods)
     rows = (n_methods + cols - 1) // cols
-    
     subplot_titles = [method for method, _ in methods_with_data]
-    
-    fig = make_subplots(
-        rows=rows,
-        cols=cols,
-        subplot_titles=subplot_titles,
-        vertical_spacing=0.12,
-        horizontal_spacing=0.1
-    )
-    
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles, vertical_spacing=0.12, horizontal_spacing=0.1)
     colors = ['#3498DB', '#E74C3C', '#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C']
-    
     for idx, (method, data) in enumerate(methods_with_data):
         row = idx // cols + 1
         col = idx % cols + 1
         color = colors[idx % len(colors)]
-        
-        # Calculate QQ plot data
         (osm, osr), (slope, intercept, r) = probplot(np.array(data), dist="norm", plot=None)
         line_x = np.linspace(osm.min(), osm.max(), 100)
         line_y = slope * line_x + intercept
-        
-        # Add reference line
-        fig.add_trace(
-            go.Scatter(
-                x=line_x,
-                y=line_y,
-                mode='lines',
-                line=dict(color='#E74C3C', width=2),
-                showlegend=False,
-                hoverinfo='skip'
-            ),
-            row=row, col=col
-        )
-        
-        # Add data points
-        fig.add_trace(
-            go.Scatter(
-                x=osm,
-                y=osr,
-                mode='markers',
-                marker=dict(
-                    color=color,
-                    size=6,
-                    opacity=0.7,
-                    line=dict(width=1, color=color)
-                ),
-                showlegend=False,
-                hovertemplate=f'<b>{method}</b><br>Theoretical: %{{x:.3f}}<br>Sample: %{{y:.3f}}<extra></extra>'
-            ),
-            row=row, col=col
-        )
-    
-    fig.update_layout(
-        title=dict(
-            text=f'<b>Normal Quantile Plots Comparison</b><br><sub>{file_name}</sub>',
-            x=0.5,
-            font=dict(size=16, color='#2C3E50')
-        ),
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(family="Arial, sans-serif"),
-        height=300 * rows,
-        margin=dict(l=60, r=40, t=80, b=40)
-    )
-    
-    fig.update_xaxes(
-        title_text="Normal Quantile",
-        gridcolor='#ECF0F1',
-        showgrid=True,
-        tickfont=dict(size=9)
-    )
-    
-    fig.update_yaxes(
-        title_text="f2 Value",
-        gridcolor='#ECF0F1',
-        showgrid=True,
-        tickfont=dict(size=9)
-    )
-    
+        fig.add_trace(go.Scatter(x=line_x, y=line_y, mode='lines', line=dict(color='#E74C3C', width=2), showlegend=False, hoverinfo='skip'), row=row, col=col)
+        fig.add_trace(go.Scatter(x=osm, y=osr, mode='markers', marker=dict(color=color, size=6, opacity=0.7, line=dict(width=1, color=color)), showlegend=False, hovertemplate=f'<b>{method}</b><br>Theoretical: %{{x:.3f}}<br>Sample: %{{y:.3f}}<extra></extra>'), row=row, col=col)
+    fig.update_layout(title=dict(text=f'<b>Normal Quantile Plots Comparison</b><br><sub>{file_name}</sub>', x=0.5, font=dict(size=16, color='#2C3E50')), plot_bgcolor='white', paper_bgcolor='white', font=dict(family="Arial, sans-serif"), height=300 * rows, margin=dict(l=60, r=40, t=80, b=40))
+    fig.update_xaxes(title_text="Normal Quantile", gridcolor='#ECF0F1', showgrid=True, tickfont=dict(size=9))
+    fig.update_yaxes(title_text="f2 Value", gridcolor='#ECF0F1', showgrid=True, tickfont=dict(size=9))
     return fig
 
 # ----------------------------------------
-# Market-specific CV & trimming rules (unchanged)
+# Market-specific CV & trimming rules
 # ----------------------------------------
 
 def compute_cv_per_timepoint(df):
@@ -430,11 +247,10 @@ def compute_cv_per_timepoint(df):
         return pd.Series([np.nan]*df.shape[0])
     means = df.iloc[:, 1:].mean(axis=1)
     stds = df.iloc[:, 1:].std(axis=1, ddof=1)
-    # avoid division by zero
     with np.errstate(divide='ignore', invalid='ignore'):
         cvs = (stds / means) * 100.0
     cvs = cvs.replace([np.inf, -np.inf], np.nan)
-    return cvs.fillna(999.0)  # very large CV if mean is 0 (signals failure)
+    return cvs.fillna(999.0)
 
 def check_cv_criteria(ref_df, test_df, market):
     """
@@ -446,12 +262,9 @@ def check_cv_criteria(ref_df, test_df, market):
     times = pd.to_numeric(ref_df.iloc[:, 0], errors='coerce')
     if times.isnull().all():
         return False
-
     ref_cvs = compute_cv_per_timepoint(ref_df)
     test_cvs = compute_cv_per_timepoint(test_df)
-
     pass_criteria = True
-
     if m in ['EMA', 'CHINA', 'ASEAN', 'CANADA', 'WHO']:
         early_mask = times <= 10
         for i in range(len(times)):
@@ -463,7 +276,6 @@ def check_cv_criteria(ref_df, test_df, market):
                 if ref_cvs.iloc[i] > 10 or test_cvs.iloc[i] > 10:
                     pass_criteria = False
                     break
-
     elif m in ['USFDA', 'FDA']:
         early_mask = times <= 15
         for i in range(len(times)):
@@ -475,7 +287,6 @@ def check_cv_criteria(ref_df, test_df, market):
                 if ref_cvs.iloc[i] > 10 or test_cvs.iloc[i] > 10:
                     pass_criteria = False
                     break
-
     elif m == 'ANVISA':
         p = len(times)
         num_early = max(1, int(math.ceil(0.4 * p)))
@@ -490,7 +301,6 @@ def check_cv_criteria(ref_df, test_df, market):
                     break
     else:
         pass_criteria = False
-
     return pass_criteria
 
 def trim_by_85_rule(ref_df, test_df, market):
@@ -500,17 +310,12 @@ def trim_by_85_rule(ref_df, test_df, market):
     times = pd.to_numeric(ref_df.iloc[:, 0], errors='coerce')
     ref_means = ref_df.iloc[:, 1:].mean(axis=1)
     test_means = test_df.iloc[:, 1:].mean(axis=1)
-
     both_mask = (ref_means >= 85) & (test_means >= 85)
     either_mask = (ref_means >= 85) | (test_means >= 85)
-
     idx_both = np.where(both_mask)[0]
     idx_either = np.where(either_mask)[0]
-
     trim_idx = None
-
     m = (market or "").strip().upper()
-
     if m in ['USFDA', 'FDA']:
         idx_time15 = np.where(times <= 15)[0]
         last_idx_time15 = idx_time15[-1] if len(idx_time15) > 0 else None
@@ -522,13 +327,11 @@ def trim_by_85_rule(ref_df, test_df, market):
                 trim_idx = first_both
         else:
             trim_idx = last_idx_time15
-
     elif m == 'ANVISA':
         if len(idx_both) > 0:
             trim_idx = int(idx_both[0])
         else:
             trim_idx = None
-
     elif m in ['EMA', 'CHINA', 'ASEAN']:
         if len(idx_either) > 0:
             trim_idx = int(idx_either[0])
@@ -536,15 +339,12 @@ def trim_by_85_rule(ref_df, test_df, market):
             trim_idx = None
     else:
         trim_idx = None
-
     if trim_idx is None:
         return ref_df.copy().reset_index(drop=True), test_df.copy().reset_index(drop=True)
     else:
         ref_trim = ref_df.iloc[: trim_idx + 1].reset_index(drop=True)
         test_trim = test_df.iloc[: trim_idx + 1].reset_index(drop=True)
         return ref_trim, test_trim
-
-# Wrappers that trim based on market then call the actual calculation
 
 def calc_conventional_f2_for_market(ref_df, test_df, market):
     r_trim, t_trim = trim_by_85_rule(ref_df, test_df, market)
@@ -571,7 +371,6 @@ def create_profile_plot(file_name, ref_trim, test_trim, bootstrap_summary):
     Create a plot showing mean dissolution profiles and ±SD bands for ref and test.
     bootstrap_summary: dict of method -> {'lower':..., 'upper':..., 'mean':..., 'median':...}
     """
-    # handle empty
     if ref_trim is None or test_trim is None or ref_trim.shape[0] == 0:
         return None
 
@@ -582,50 +381,15 @@ def create_profile_plot(file_name, ref_trim, test_trim, bootstrap_summary):
     test_sd = test_trim.iloc[:, 1:].std(axis=1, ddof=1).fillna(0)
 
     fig = go.Figure()
+    fig.add_trace(go.Scatter(x=np.concatenate([times, times[::-1]]),
+                             y=np.concatenate([ref_means + ref_sd, (ref_means - ref_sd)[::-1]]),
+                             fill='toself', fillcolor='rgba(52,152,219,0.2)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Ref ± SD'))
+    fig.add_trace(go.Scatter(x=times, y=ref_means, mode='lines+markers', name='Reference Mean', line=dict(color='#3498DB'), marker=dict(size=6)))
+    fig.add_trace(go.Scatter(x=np.concatenate([times, times[::-1]]),
+                             y=np.concatenate([test_means + test_sd, (test_means - test_sd)[::-1]]),
+                             fill='toself', fillcolor='rgba(231,76,60,0.18)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Test ± SD'))
+    fig.add_trace(go.Scatter(x=times, y=test_means, mode='lines+markers', name='Test Mean', line=dict(color='#E74C3C'), marker=dict(size=6)))
 
-    # Reference band
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([times, times[::-1]]),
-        y=np.concatenate([ref_means + ref_sd, (ref_means - ref_sd)[::-1]]),
-        fill='toself',
-        fillcolor='rgba(52,152,219,0.2)',
-        line=dict(color='rgba(255,255,255,0)'),
-        hoverinfo='skip',
-        showlegend=False,
-        name='Ref ± SD'
-    ))
-    # Reference mean line
-    fig.add_trace(go.Scatter(
-        x=times,
-        y=ref_means,
-        mode='lines+markers',
-        name='Reference Mean',
-        line=dict(color='#3498DB'),
-        marker=dict(size=6)
-    ))
-
-    # Test band
-    fig.add_trace(go.Scatter(
-        x=np.concatenate([times, times[::-1]]),
-        y=np.concatenate([test_means + test_sd, (test_means - test_sd)[::-1]]),
-        fill='toself',
-        fillcolor='rgba(231,76,60,0.18)',
-        line=dict(color='rgba(255,255,255,0)'),
-        hoverinfo='skip',
-        showlegend=False,
-        name='Test ± SD'
-    ))
-    # Test mean line
-    fig.add_trace(go.Scatter(
-        x=times,
-        y=test_means,
-        mode='lines+markers',
-        name='Test Mean',
-        line=dict(color='#E74C3C'),
-        marker=dict(size=6)
-    ))
-
-    # Annotations with bootstrap summaries
     ann_texts = []
     for method, stats_dict in bootstrap_summary.items():
         if stats_dict:
@@ -652,24 +416,67 @@ def create_profile_plot(file_name, ref_trim, test_trim, bootstrap_summary):
         height=450
     )
 
-    fig.add_annotation(
-        x=1.02,
-        y=1,
-        xref="paper",
-        yref="paper",
-        text=ann_full,
-        showarrow=False,
-        align="left",
-        bordercolor="black",
-        borderwidth=1,
-        bgcolor="white",
-        font=dict(size=10)
+    fig.add_annotation(x=1.02, y=1, xref="paper", yref="paper", text=ann_full, showarrow=False, align="left", bordercolor="black", borderwidth=1, bgcolor="white", font=dict(size=10))
+
+    return fig
+
+# ----------------------------------------
+# Create Bootstrap profile plot (intervals) and save HTML
+# ----------------------------------------
+
+def create_bootstrap_profile_plot(file_name, times, ref_profiles, test_profiles, method_name):
+    """
+    Create a plot showing median and 5-95 percentile bands from bootstrap profiles.
+    ref_profiles/test_profiles: np.array shape (n_iterations, n_timepoints)
+    times: array-like length n_timepoints
+    """
+    if ref_profiles.size == 0 or test_profiles.size == 0:
+        return None
+
+    # compute percentiles per timepoint
+    ref_p05 = np.percentile(ref_profiles, 5, axis=0)
+    ref_p50 = np.percentile(ref_profiles, 50, axis=0)
+    ref_p95 = np.percentile(ref_profiles, 95, axis=0)
+
+    test_p05 = np.percentile(test_profiles, 5, axis=0)
+    test_p50 = np.percentile(test_profiles, 50, axis=0)
+    test_p95 = np.percentile(test_profiles, 95, axis=0)
+
+    fig = go.Figure()
+    # Reference shaded band
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([times, times[::-1]]),
+        y=np.concatenate([ref_p95, ref_p05[::-1]]),
+        fill='toself', fillcolor='rgba(52,152,219,0.18)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Ref 5-95%'
+    ))
+    # Reference median
+    fig.add_trace(go.Scatter(x=times, y=ref_p50, mode='lines+markers', name='Ref median', line=dict(color='#3498DB')))
+
+    # Test shaded band
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([times, times[::-1]]),
+        y=np.concatenate([test_p95, test_p05[::-1]]),
+        fill='toself', fillcolor='rgba(231,76,60,0.18)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Test 5-95%'
+    ))
+    # Test median
+    fig.add_trace(go.Scatter(x=times, y=test_p50, mode='lines+markers', name='Test median', line=dict(color='#E74C3C')))
+
+    fig.update_layout(
+        title=dict(text=f"<b>Bootstrap Profile (5-95%) — {file_name.replace('.xlsx','')} — {method_name}</b>", x=0.5),
+        xaxis_title="Time",
+        yaxis_title="Dissolution (%)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='white',
+        hovermode='closest',
+        margin=dict(l=60, r=60, t=80, b=60),
+        width=900,
+        height=500
     )
 
     return fig
 
 # ----------------------------------------
-# Batch Processing Functions (updated to produce profile figs)
+# Batch Processing Functions (updated to produce bootstrap profile matrices)
 # ----------------------------------------
 
 def load_batch_data(folder_path):
@@ -689,9 +496,6 @@ def load_batch_data(folder_path):
     return workbook_data
 
 def choose_methods_for_file(market, cv_pass):
-    """
-    Mapping to recommended methods depending on market and whether CV criteria passed.
-    """
     m = (market or "").strip().upper()
     if cv_pass:
         if m in ['EMA', 'CHINA', 'ASEAN', 'CANADA', 'WHO']:
@@ -711,42 +515,38 @@ def choose_methods_for_file(market, cv_pass):
 def process_batch(workbook_data, selected_methods_extra, market, use_recommended=True, n_iterations=10000):
     """
     Process multiple workbooks and calculate f2 metrics.
-    Returns DataFrame, bootstrap_data (for QQ), profile_figs (for profile HTMLs).
+    Returns DataFrame, bootstrap_data (for QQ), profile_figs (for profile HTMLs),
+            bootstrap_profile_matrices (dict for bootstrap profile plotting).
     """
     all_results = []
     bootstrap_data = {}  # Store bootstrap arrays for QQ plots
     profile_figs = {}    # Store profile plotly figures per file
-    
+    bootstrap_profile_matrices = {}  # store profile matrices per file per method
+
     for file_name, (reference_df, test_df) in workbook_data.items():
         try:
             ref_clean, test_clean = prepare_data(reference_df.copy(), test_df.copy())
             results = {"File Name": file_name}
             file_bootstrap_data = {}
-            bootstrap_summary = {}  # method -> summary dict for annotation
+            bootstrap_summary = {}
+            bootstrap_profile_matrices[file_name] = {}
 
-            # Determine recommended methods
             cv_pass = check_cv_criteria(ref_clean, test_clean, market)
             methods_to_run = []
             if use_recommended:
                 recommended = choose_methods_for_file(market, cv_pass)
                 methods_to_run.extend(recommended)
-                # If user supplied extras, add them
                 if selected_methods_extra:
                     methods_to_run.extend(selected_methods_extra)
-                # unify
                 methods_to_run = list(dict.fromkeys(methods_to_run))
                 results['Market'] = market
                 results['CV Criteria Pass'] = cv_pass
                 results['Recommended Methods'] = ", ".join(recommended)
             else:
-                # honor selected_methods_extra only
                 methods_to_run = selected_methods_extra
 
-            # Also compute r_trim/t_trim once for profile plot and for non-bootstrap calculators
             r_trim, t_trim = trim_by_85_rule(ref_clean, test_clean, market)
 
-            # Compute profile plot later after collecting bootstrap summaries
-            # Loop methods and compute values
             for method in methods_to_run:
                 if method == "Conventional":
                     val = calc_conventional_f2_for_market(ref_clean, test_clean, market)
@@ -763,54 +563,66 @@ def process_batch(workbook_data, selected_methods_extra, market, use_recommended
                 elif method == "Conventional Bootstrap":
                     def conv_func(r, t):
                         return calc_conventional_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
-                    orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    (orig, lower, upper, mean, median, skewness_val, kurt, f2_vals, ref_profiles, test_profiles) = bootstrap_f2(
                         ref_clean, test_clean, conv_func, n_iterations)
                     results["Conventional Bootstrap f2"] = orig
                     results["Conventional Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
                     results["Conventional Bootstrap Mean"] = mean
                     results["Conventional Bootstrap Median"] = median
-                    results["Conventional Bootstrap Skewness"] = skewness
+                    results["Conventional Bootstrap Skewness"] = skewness_val
                     results["Conventional Bootstrap Kurtosis"] = kurt
-                    file_bootstrap_data["Conventional Bootstrap"] = list(vals)
+                    file_bootstrap_data["Conventional Bootstrap"] = list(f2_vals) if f2_vals.size else []
                     bootstrap_summary["Conventional Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
+                    # store profile matrices (n_iterations, n_timepoints)
+                    bootstrap_profile_matrices[file_name]["Conventional Bootstrap"] = {
+                        'ref_profiles': ref_profiles,
+                        'test_profiles': test_profiles,
+                        'times': ref_clean.iloc[:, 0].to_numpy()
+                    }
 
                 elif method == "Expected Bootstrap":
                     def exp_func(r, t):
                         return calc_expected_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
-                    orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    (orig, lower, upper, mean, median, skewness_val, kurt, f2_vals, ref_profiles, test_profiles) = bootstrap_f2(
                         ref_clean, test_clean, exp_func, n_iterations)
                     results["Expected Bootstrap f2"] = orig
                     results["Expected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
                     results["Expected Bootstrap Mean"] = mean
                     results["Expected Bootstrap Median"] = median
-                    results["Expected Bootstrap Skewness"] = skewness
+                    results["Expected Bootstrap Skewness"] = skewness_val
                     results["Expected Bootstrap Kurtosis"] = kurt
-                    file_bootstrap_data["Expected Bootstrap"] = list(vals)
+                    file_bootstrap_data["Expected Bootstrap"] = list(f2_vals) if f2_vals.size else []
                     bootstrap_summary["Expected Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
+                    bootstrap_profile_matrices[file_name]["Expected Bootstrap"] = {
+                        'ref_profiles': ref_profiles,
+                        'test_profiles': test_profiles,
+                        'times': ref_clean.iloc[:, 0].to_numpy()
+                    }
 
                 elif method == "Bias Corrected Bootstrap":
                     def bc_func(r, t):
                         return calc_bias_corrected_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
-                    orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
+                    (orig, lower, upper, mean, median, skewness_val, kurt, f2_vals, ref_profiles, test_profiles) = bootstrap_f2(
                         ref_clean, test_clean, bc_func, n_iterations)
                     results["Bias Corrected Bootstrap f2"] = orig
                     results["Bias Corrected Bootstrap CI"] = f"{lower:.2f} - {upper:.2f}" if lower is not None and upper is not None else None
                     results["Bias Corrected Bootstrap Mean"] = mean
                     results["Bias Corrected Bootstrap Median"] = median
-                    results["Bias Corrected Bootstrap Skewness"] = skewness
+                    results["Bias Corrected Bootstrap Skewness"] = skewness_val
                     results["Bias Corrected Bootstrap Kurtosis"] = kurt
-                    file_bootstrap_data["Bias Corrected Bootstrap"] = list(vals)
+                    file_bootstrap_data["Bias Corrected Bootstrap"] = list(f2_vals) if f2_vals.size else []
                     bootstrap_summary["Bias Corrected Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
+                    bootstrap_profile_matrices[file_name]["Bias Corrected Bootstrap"] = {
+                        'ref_profiles': ref_profiles,
+                        'test_profiles': test_profiles,
+                        'times': ref_clean.iloc[:, 0].to_numpy()
+                    }
 
                 else:
-                    # If the user selected a string equal to "Conventional Bootstrap" etc. with some variation,
-                    # currently we only accept exact strings in the main options list.
                     pass
 
-            # produce profile figure (mean ± SD) and annotate bootstrap summaries
             profile_fig = create_profile_plot(file_name, r_trim, t_trim, bootstrap_summary)
             profile_figs[file_name] = profile_fig
-
             all_results.append(results)
             bootstrap_data[file_name] = file_bootstrap_data
 
@@ -821,22 +633,19 @@ def process_batch(workbook_data, selected_methods_extra, market, use_recommended
         df = pd.DataFrame(all_results)
     else:
         df = pd.DataFrame(columns=["File Name"])
-    return df, bootstrap_data, profile_figs
+    return df, bootstrap_data, profile_figs, bootstrap_profile_matrices
 
 # ----------------------------------------
-# ZIP & plotting helpers (include profile plots)
+# ZIP & plotting helpers (include bootstrap profile plots)
 # ----------------------------------------
 
-def create_zip_report(report_df, qq_plots_data=None, profile_plots=None):
-    """Create a ZIP file containing the report CSV and QQ/profile plots."""
+def create_zip_report(report_df, qq_plots_data=None, profile_plots=None, bootstrap_profile_matrices=None):
+    """Create a ZIP file containing the report CSV and QQ/profile/bootstrap plots."""
     report_file = "f2_similarities_report.csv"
     zip_file = "f2_similarities_report.zip"
-    
     report_df.to_csv(report_file, index=False)
-    
     with ZipFile(zip_file, "w") as zipf:
         zipf.write(report_file)
-        
         # Add QQ plots if available
         if qq_plots_data:
             for file_name, plots in qq_plots_data.items():
@@ -851,7 +660,6 @@ def create_zip_report(report_df, qq_plots_data=None, profile_plots=None):
                     plots['combined'].write_html(combined_filename)
                     zipf.write(combined_filename)
                     os.remove(combined_filename)
-        
         # Add profile plots
         if profile_plots:
             for file_name, fig in profile_plots.items():
@@ -860,65 +668,61 @@ def create_zip_report(report_df, qq_plots_data=None, profile_plots=None):
                     fig.write_html(profile_filename)
                     zipf.write(profile_filename)
                     os.remove(profile_filename)
-    
+        # Add bootstrap profile interval plots
+        if bootstrap_profile_matrices:
+            for file_name, methods_dict in bootstrap_profile_matrices.items():
+                for method_name, matrices in methods_dict.items():
+                    ref_profiles = matrices.get('ref_profiles')
+                    test_profiles = matrices.get('test_profiles')
+                    times = matrices.get('times')
+                    # create fig
+                    fig = create_bootstrap_profile_plot(file_name, times, ref_profiles, test_profiles, method_name)
+                    if fig:
+                        bs_profile_filename = f"Bootstrap_Profile_{file_name.replace('.xlsx','')}_{method_name.replace(' ','_')}.html"
+                        fig.write_html(bs_profile_filename)
+                        zipf.write(bs_profile_filename)
+                        os.remove(bs_profile_filename)
     if os.path.exists(report_file):
         os.remove(report_file)
-    
     return zip_file
 
 def generate_qq_plots(bootstrap_data):
     """Generate all QQ plots and return them as a dictionary."""
     qq_plots_data = {}
-    
     for file_name, file_bootstrap_data in bootstrap_data.items():
-        plots = {
-            'individual': {},
-            'combined': None
-        }
-        
+        plots = {'individual': {}, 'combined': None}
         for method, data in file_bootstrap_data.items():
             if data and len(data) > 0:
                 fig = create_jmp_style_qq_plot(np.array(data), f"QQ Plot", method, file_name)
                 plots['individual'][method] = fig
-        
         combined_fig = create_combined_qq_plots(file_bootstrap_data, file_name)
         plots['combined'] = combined_fig
-        
         qq_plots_data[file_name] = plots
-    
     return qq_plots_data
 
 # ----------------------------------------
-# Streamlit: autoscan behaviour using session_state
+# Streamlit: autoscan behaviour using session_state (unchanged)
 # ----------------------------------------
 
 def scan_folder_callback():
-    """
-    Callback when the user inputs folder path: load files and compute recommendations.
-    Stores results into st.session_state for UI display.
-    """
     path = st.session_state.get("folder_path_input", "")
     session = st.session_state
     session['scan_error'] = None
     session['workbook_data'] = {}
     session['recommendations'] = {}
-
     if not path:
         session['scan_error'] = "No path provided."
         return
     if not os.path.isdir(path):
         session['scan_error'] = "Invalid folder path."
         return
-
     workbook_data = load_batch_data(path)
     if not workbook_data:
         session['scan_error'] = "No valid Excel files found in folder."
         session['workbook_data'] = {}
         session['recommendations'] = {}
         return
-
     session['workbook_data'] = workbook_data
-    # compute recommendations (CV pass/fail and recommended methods) for display
     rec_map = {}
     for file_name, (ref_df, test_df) in workbook_data.items():
         ref_clean, test_clean = prepare_data(ref_df.copy(), test_df.copy())
@@ -928,19 +732,18 @@ def scan_folder_callback():
     session['recommendations'] = rec_map
 
 # ----------------------------------------
-# Streamlit App Code
+# Streamlit App Code (auto-scan + generate; bootstrap profile plots saved to ZIP only)
 # ----------------------------------------
 
 def main():
-    st.set_page_config(page_title="Batch Similarity Analyzer (Auto-scan & Profiles)", layout="wide")
-    st.title("Batch Similarity Analyzer — Auto-scan + Profiles")
+    st.set_page_config(page_title="Batch Similarity Analyzer (Bootstrap Intervals)", layout="wide")
+    st.title("Batch Similarity Analyzer — Bootstrap Interval Profiles")
     st.markdown("""
     Paste a folder path containing Excel files (sheet0=reference, sheet1=test).
-    The app will auto-scan and **recommend methods per file** based on market CV rules.
-    You can then add extra methods from the dropdown and click *Calculate and Generate Report*.
+    The app auto-scans and recommends methods per file. Add extra methods if needed and click *Calculate and Generate Report*.
+    Bootstrap interval profile plots are generated and included in the ZIP (not shown inline).
     """)
 
-    # Market selection first so scan callback can use it
     market_options = ['EMA', 'CHINA', 'ASEAN', 'USFDA', 'ANVISA', 'WHO', 'CANADA', 'FDA']
     selected_market = st.selectbox("Select target market (affects CV rules & recommendations):", market_options, index=0)
     st.session_state['selected_market'] = selected_market
@@ -948,7 +751,6 @@ def main():
     folder_path = st.text_input("Enter path to folder containing Excel files:", key="folder_path_input", on_change=scan_folder_callback)
     st.caption("The app will scan the folder and show recommendations as soon as the path is provided.")
 
-    # Show scan results (if any)
     if st.session_state.get('scan_error'):
         st.error(st.session_state['scan_error'])
     elif st.session_state.get('workbook_data'):
@@ -959,50 +761,44 @@ def main():
             cv_text = "PASS" if info['cv_pass'] else "FAIL"
             st.write(f"**{fn}** — CV: {cv_text} — Recommended: {', '.join(info['recommended'])}")
 
-    # global extra methods user wants to add (applied to all files)
     options = ["Conventional", "Expected", "Bias Corrected",
                "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
     additional_methods = st.multiselect("Add extra methods to run for all files (optional):", options)
 
     n_iterations = st.slider("Number of bootstrap iterations:", 1000, 50000, 10000, 1000)
 
-    # Calculate & generate report button
     if st.button("Calculate and Generate Report"):
         if not st.session_state.get('workbook_data'):
             st.error("No workbook data loaded. Please provide a valid folder path first.")
         else:
             with st.spinner("Processing files..."):
                 workbook_data = st.session_state['workbook_data']
-                report_df, bootstrap_data, profile_figs = process_batch(
+                report_df, bootstrap_data, profile_figs, bootstrap_profile_matrices = process_batch(
                     workbook_data, additional_methods, selected_market, use_recommended=True, n_iterations=n_iterations
                 )
 
                 st.subheader("📊 Results Preview")
                 st.dataframe(report_df.head(50))
 
-                # Generate QQ Plots for bootstrap methods
                 qq_plots_data = None
                 any_bootstrap = any(len(v) > 0 for file_v in bootstrap_data.values() for v in file_v.values())
                 if any_bootstrap:
                     with st.spinner("Generating QQ plots..."):
                         qq_plots_data = generate_qq_plots(bootstrap_data)
                         st.success("✅ QQ plots generated.")
-                        # Show small summary
                         for file_name, plots in qq_plots_data.items():
                             indiv = len([p for p in plots['individual'].values() if p is not None]) if plots['individual'] else 0
                             combined = 1 if plots['combined'] is not None else 0
                             st.write(f"**{file_name}:** {indiv} QQ plots + {combined} combined")
 
-                # Show profile plots inline (one tab per file)
                 st.subheader("📈 Dissolution Profiles (Mean ± SD)")
                 for file_name, fig in profile_figs.items():
                     if fig:
                         st.markdown(f"**{file_name}**")
                         st.plotly_chart(fig, use_container_width=True)
 
-                # Create ZIP containing CSV + QQ + profile plots
-                with st.spinner("Creating downloadable ZIP file..."):
-                    zip_file_path = create_zip_report(report_df, qq_plots_data, profile_figs)
+                with st.spinner("Creating downloadable ZIP file (includes bootstrap interval profiles)..."):
+                    zip_file_path = create_zip_report(report_df, qq_plots_data, profile_figs, bootstrap_profile_matrices)
 
                 with open(zip_file_path, "rb") as f:
                     file_content = f.read()
@@ -1014,21 +810,23 @@ def main():
                     data=file_content,
                     file_name="f2_similarities_report_with_plots.zip",
                     mime="application/zip",
-                    help="CSV report + QQ plot HTMLs + Profile plot HTMLs"
+                    help="CSV report + QQ plot HTMLs + Profile plot HTMLs + Bootstrap Profile Interval HTMLs"
                 )
-                st.success("Report and plots are ready for download!")
+                st.success("Report and plots (including bootstrap interval profiles) are ready for download!")
 
-    # Help/information
     with st.expander("ℹ️ Behaviour & rules implemented"):
         st.markdown("""
-        - On pasting a folder path the app automatically scans the Excel files and recommends methods per file (based on the chosen market and CV rules).
-        - You may add extra methods (global) via the dropdown before clicking **Calculate and Generate Report**.
-        - Profile plots show mean ± SD bands for trimmed (by 85% rule) timepoints. Bootstrap f2 summaries (CI, mean) are annotated on the plot.
+        - On pasting a folder path the app automatically scans Excel files and recommends methods per file (market + CV rules).
+        - Add extra methods (global) via the dropdown before clicking **Calculate and Generate Report**.
+        - Profile plots shown inline are mean ± SD (trimmed by 85% rule if applicable).
+        - Bootstrap interval profile plots (median and 5–95% bands) are generated for each bootstrap method and added to the ZIP file as:
+          `Bootstrap_Profile_[FileName]_[Method].html`
         - ZIP contains:
           - `f2_similarities_report.csv`
           - `QQ_Plot_[File]_[Method].html` (if bootstrap run)
           - `QQ_Plot_Combined_[File].html` (if applicable)
           - `Profile_[File].html`
+          - `Bootstrap_Profile_[File]_[Method].html`
         """)
 
 if __name__ == "__main__":
