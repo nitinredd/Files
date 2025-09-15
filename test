@@ -1,4 +1,4 @@
-# batch_similarity_analyzer_with_market_rules.py
+# batch_similarity_analyzer_market_autoscan_with_profiles.py
 import os
 import math
 import streamlit as st
@@ -8,11 +8,10 @@ from zipfile import ZipFile
 from scipy.stats import skew, kurtosis, norm, probplot
 from scipy import stats
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 
 # ----------------------------------------
-# Required Helper Functions
+# Required Helper Functions (unchanged / improved)
 # ----------------------------------------
 
 def prepare_data(reference_df, test_df):
@@ -98,7 +97,6 @@ def row_variance(df):
 
 def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
     """Bootstrap f2 calculation (returns mean, median, skewness, and kurtosis)."""
-    # Number of units (columns excluding time)
     n_ref_units = max(0, ref_df.shape[1] - 1)
     n_test_units = max(0, test_df.shape[1] - 1)
 
@@ -331,7 +329,7 @@ def create_jmp_style_qq_plot(data, title, method_name, file_name):
 
 def create_combined_qq_plots(bootstrap_results, file_name):
     """Create a combined view of all QQ plots for a file"""
-    methods_with_data = [(method, data) for method, data in bootstrap_results.items() if len(data) > 0]
+    methods_with_data = [(method, data) for method, data in bootstrap_results.items() if data and len(data) > 0]
     
     if not methods_with_data:
         return None
@@ -358,7 +356,7 @@ def create_combined_qq_plots(bootstrap_results, file_name):
         color = colors[idx % len(colors)]
         
         # Calculate QQ plot data
-        (osm, osr), (slope, intercept, r) = probplot(data, dist="norm", plot=None)
+        (osm, osr), (slope, intercept, r) = probplot(np.array(data), dist="norm", plot=None)
         line_x = np.linspace(osm.min(), osm.max(), 100)
         line_y = slope * line_x + intercept
         
@@ -423,7 +421,7 @@ def create_combined_qq_plots(bootstrap_results, file_name):
     return fig
 
 # ----------------------------------------
-# New: Market-specific CV & trimming rules
+# Market-specific CV & trimming rules (unchanged)
 # ----------------------------------------
 
 def compute_cv_per_timepoint(df):
@@ -441,32 +439,21 @@ def compute_cv_per_timepoint(df):
 def check_cv_criteria(ref_df, test_df, market):
     """
     Return True if CV criteria PASS for given market.
-    Rules implemented from user's specification:
-    - EMA/CHINA/ASEAN/CANADA/WHO: CV <=20% for timepoints up to 10 min, <=10% for rest.
-    - USFDA/FDA: CV <=20% for early timepoints up to 15 min, <=10% for rest.
-    - ANVISA: CV <=20% for first 40% of points, <=10% for rest.
-    We check both reference and test CVs and require both to meet criteria.
     """
-    # Normalize market string
     m = (market or "").strip().upper()
-    # get time vector
     if ref_df.shape[0] == 0:
         return False
     times = pd.to_numeric(ref_df.iloc[:, 0], errors='coerce')
     if times.isnull().all():
-        # cannot evaluate time-based rules -> conservative fail
         return False
 
     ref_cvs = compute_cv_per_timepoint(ref_df)
     test_cvs = compute_cv_per_timepoint(test_df)
 
-    # default pass True until failure
     pass_criteria = True
 
     if m in ['EMA', 'CHINA', 'ASEAN', 'CANADA', 'WHO']:
-        # early if time <= 10
         early_mask = times <= 10
-        # for early: <=20, for rest <=10
         for i in range(len(times)):
             if early_mask.iloc[i]:
                 if ref_cvs.iloc[i] > 20 or test_cvs.iloc[i] > 20:
@@ -490,7 +477,6 @@ def check_cv_criteria(ref_df, test_df, market):
                     break
 
     elif m == 'ANVISA':
-        # first 40% of the total collected points are early
         p = len(times)
         num_early = max(1, int(math.ceil(0.4 * p)))
         for i in range(len(times)):
@@ -503,26 +489,18 @@ def check_cv_criteria(ref_df, test_df, market):
                     pass_criteria = False
                     break
     else:
-        # Unknown market: be conservative (fail)
         pass_criteria = False
 
     return pass_criteria
 
 def trim_by_85_rule(ref_df, test_df, market):
     """
-    Trim timepoints to the appropriate stopping time according to market rules for >85% truncation:
-    - FDA & ANVISA: f2 calculated up to the first timepoint where BOTH test and ref mean >=85% (inclusive).
-      For FDA additionally, maximum cutting timepoint = 15 min (so we take min(index_of_15min, index_of_both85) if both exist).
-    - EMA/CHINA/ASEAN: f2 calculated up to the earliest timepoint where EITHER test or ref mean >=85% (inclusive).
-    - Otherwise: no trimming.
-    Returns trimmed (ref_df_trimmed, test_df_trimmed)
+    Trim timepoints according to market rules for >85% truncation.
     """
-    # Ensure numeric times
     times = pd.to_numeric(ref_df.iloc[:, 0], errors='coerce')
     ref_means = ref_df.iloc[:, 1:].mean(axis=1)
     test_means = test_df.iloc[:, 1:].mean(axis=1)
 
-    # find first index where both >=85
     both_mask = (ref_means >= 85) & (test_means >= 85)
     either_mask = (ref_means >= 85) | (test_means >= 85)
 
@@ -534,40 +512,34 @@ def trim_by_85_rule(ref_df, test_df, market):
     m = (market or "").strip().upper()
 
     if m in ['USFDA', 'FDA']:
-        # index of last time <= 15 min
         idx_time15 = np.where(times <= 15)[0]
         last_idx_time15 = idx_time15[-1] if len(idx_time15) > 0 else None
         if len(idx_both) > 0:
             first_both = int(idx_both[0])
             if last_idx_time15 is not None:
-                # cutting point is the earlier of the two (min index)
                 trim_idx = min(first_both, last_idx_time15)
             else:
                 trim_idx = first_both
         else:
-            # no both85, cut at 15 min if present else keep all
             trim_idx = last_idx_time15
 
     elif m == 'ANVISA':
         if len(idx_both) > 0:
             trim_idx = int(idx_both[0])
         else:
-            trim_idx = None  # keep all if no both85
+            trim_idx = None
 
     elif m in ['EMA', 'CHINA', 'ASEAN']:
         if len(idx_either) > 0:
             trim_idx = int(idx_either[0])
         else:
             trim_idx = None
-
     else:
-        # other markets: keep all
         trim_idx = None
 
     if trim_idx is None:
         return ref_df.copy().reset_index(drop=True), test_df.copy().reset_index(drop=True)
     else:
-        # keep rows up to and including trim_idx
         ref_trim = ref_df.iloc[: trim_idx + 1].reset_index(drop=True)
         test_trim = test_df.iloc[: trim_idx + 1].reset_index(drop=True)
         return ref_trim, test_trim
@@ -591,7 +563,113 @@ def calc_bias_corrected_f2_for_market(ref_df, test_df, market):
     return bias_corrected_f2(r_trim, t_trim)
 
 # ----------------------------------------
-# Batch Processing Functions (updated)
+# Helper: Profile plot (mean ± SD, annotate bootstrap CI)
+# ----------------------------------------
+
+def create_profile_plot(file_name, ref_trim, test_trim, bootstrap_summary):
+    """
+    Create a plot showing mean dissolution profiles and ±SD bands for ref and test.
+    bootstrap_summary: dict of method -> {'lower':..., 'upper':..., 'mean':..., 'median':...}
+    """
+    # handle empty
+    if ref_trim is None or test_trim is None or ref_trim.shape[0] == 0:
+        return None
+
+    times = pd.to_numeric(ref_trim.iloc[:, 0], errors='coerce')
+    ref_means = ref_trim.iloc[:, 1:].mean(axis=1)
+    ref_sd = ref_trim.iloc[:, 1:].std(axis=1, ddof=1).fillna(0)
+    test_means = test_trim.iloc[:, 1:].mean(axis=1)
+    test_sd = test_trim.iloc[:, 1:].std(axis=1, ddof=1).fillna(0)
+
+    fig = go.Figure()
+
+    # Reference band
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([times, times[::-1]]),
+        y=np.concatenate([ref_means + ref_sd, (ref_means - ref_sd)[::-1]]),
+        fill='toself',
+        fillcolor='rgba(52,152,219,0.2)',
+        line=dict(color='rgba(255,255,255,0)'),
+        hoverinfo='skip',
+        showlegend=False,
+        name='Ref ± SD'
+    ))
+    # Reference mean line
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=ref_means,
+        mode='lines+markers',
+        name='Reference Mean',
+        line=dict(color='#3498DB'),
+        marker=dict(size=6)
+    ))
+
+    # Test band
+    fig.add_trace(go.Scatter(
+        x=np.concatenate([times, times[::-1]]),
+        y=np.concatenate([test_means + test_sd, (test_means - test_sd)[::-1]]),
+        fill='toself',
+        fillcolor='rgba(231,76,60,0.18)',
+        line=dict(color='rgba(255,255,255,0)'),
+        hoverinfo='skip',
+        showlegend=False,
+        name='Test ± SD'
+    ))
+    # Test mean line
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=test_means,
+        mode='lines+markers',
+        name='Test Mean',
+        line=dict(color='#E74C3C'),
+        marker=dict(size=6)
+    ))
+
+    # Annotations with bootstrap summaries
+    ann_texts = []
+    for method, stats_dict in bootstrap_summary.items():
+        if stats_dict:
+            lower = stats_dict.get('lower')
+            upper = stats_dict.get('upper')
+            mean = stats_dict.get('mean')
+            median = stats_dict.get('median')
+            if lower is not None and upper is not None:
+                ann_texts.append(f"{method}: CI(5-95)={lower:.2f}-{upper:.2f}, mean={mean:.2f}")
+            elif mean is not None:
+                ann_texts.append(f"{method}: mean={mean:.2f}")
+
+    ann_full = "<br>".join(ann_texts) if ann_texts else "No bootstrap run"
+
+    fig.update_layout(
+        title=dict(text=f"<b>Dissolution Profile — {file_name.replace('.xlsx','')}</b>", x=0.5),
+        xaxis_title="Time",
+        yaxis_title="Dissolution (%)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='white',
+        hovermode='closest',
+        margin=dict(l=60, r=30, t=80, b=60),
+        width=800,
+        height=450
+    )
+
+    fig.add_annotation(
+        x=1.02,
+        y=1,
+        xref="paper",
+        yref="paper",
+        text=ann_full,
+        showarrow=False,
+        align="left",
+        bordercolor="black",
+        borderwidth=1,
+        bgcolor="white",
+        font=dict(size=10)
+    )
+
+    return fig
+
+# ----------------------------------------
+# Batch Processing Functions (updated to produce profile figs)
 # ----------------------------------------
 
 def load_batch_data(folder_path):
@@ -602,7 +680,6 @@ def load_batch_data(folder_path):
         if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
             file_path = os.path.join(folder_path, file_name)
             try:
-                # Expect sheet 0 = reference, sheet 1 = test
                 reference_df = pd.read_excel(file_path, sheet_name=0)
                 test_df = pd.read_excel(file_path, sheet_name=1)
                 workbook_data[file_name] = (reference_df, test_df)
@@ -613,26 +690,15 @@ def load_batch_data(folder_path):
 
 def choose_methods_for_file(market, cv_pass):
     """
-    Map to recommended methods depending on market and whether CV criteria passed.
-    Returns a list of method keys to compute for this file.
-    Method keys: 'Conventional', 'Expected', 'Bias Corrected',
-                 'Conventional Bootstrap', 'Expected Bootstrap', 'Bias Corrected Bootstrap'
+    Mapping to recommended methods depending on market and whether CV criteria passed.
     """
     m = (market or "").strip().upper()
-
-    # If CV pass:
-    # - EMA/CHINA/ASEAN/CANADA/WHO -> Expected (non-bootstrap)
-    # - USFDA/FDA/ANVISA -> Conventional (non-bootstrap)
-    # If CV fail:
-    # - EMA/CHINA/ASEAN/CANADA/WHO -> Expected Bootstrap
-    # - USFDA/FDA/ANVISA -> Conventional Bootstrap
     if cv_pass:
         if m in ['EMA', 'CHINA', 'ASEAN', 'CANADA', 'WHO']:
             return ['Expected']
         elif m in ['USFDA', 'FDA', 'ANVISA']:
             return ['Conventional']
         else:
-            # conservative fallback: run both Conventional and Expected
             return ['Conventional', 'Expected']
     else:
         if m in ['EMA', 'CHINA', 'ASEAN', 'CANADA', 'WHO']:
@@ -642,46 +708,59 @@ def choose_methods_for_file(market, cv_pass):
         else:
             return ['Conventional Bootstrap', 'Expected Bootstrap']
 
-def process_batch(workbook_data, selected_methods, market, use_recommended=True, n_iterations=10000):
+def process_batch(workbook_data, selected_methods_extra, market, use_recommended=True, n_iterations=10000):
     """
     Process multiple workbooks and calculate f2 metrics.
-    If use_recommended is True, selected_methods is ignored and mapping per-file is used.
+    Returns DataFrame, bootstrap_data (for QQ), profile_figs (for profile HTMLs).
     """
     all_results = []
-    bootstrap_data = {}  # Store bootstrap data for QQ plots
+    bootstrap_data = {}  # Store bootstrap arrays for QQ plots
+    profile_figs = {}    # Store profile plotly figures per file
     
     for file_name, (reference_df, test_df) in workbook_data.items():
         try:
             ref_clean, test_clean = prepare_data(reference_df.copy(), test_df.copy())
             results = {"File Name": file_name}
             file_bootstrap_data = {}
+            bootstrap_summary = {}  # method -> summary dict for annotation
 
-            # Decide which methods to run for this file
+            # Determine recommended methods
+            cv_pass = check_cv_criteria(ref_clean, test_clean, market)
+            methods_to_run = []
             if use_recommended:
-                cv_pass = check_cv_criteria(ref_clean, test_clean, market)
-                methods_to_run = choose_methods_for_file(market, cv_pass)
+                recommended = choose_methods_for_file(market, cv_pass)
+                methods_to_run.extend(recommended)
+                # If user supplied extras, add them
+                if selected_methods_extra:
+                    methods_to_run.extend(selected_methods_extra)
+                # unify
+                methods_to_run = list(dict.fromkeys(methods_to_run))
                 results['Market'] = market
                 results['CV Criteria Pass'] = cv_pass
-                results['Recommended Methods'] = ", ".join(methods_to_run)
+                results['Recommended Methods'] = ", ".join(recommended)
             else:
-                methods_to_run = selected_methods
+                # honor selected_methods_extra only
+                methods_to_run = selected_methods_extra
 
-            # For each method, compute f2 (and bootstrap if requested)
+            # Also compute r_trim/t_trim once for profile plot and for non-bootstrap calculators
+            r_trim, t_trim = trim_by_85_rule(ref_clean, test_clean, market)
+
+            # Compute profile plot later after collecting bootstrap summaries
+            # Loop methods and compute values
             for method in methods_to_run:
-                # Non-bootstrap Conventional
                 if method == "Conventional":
                     val = calc_conventional_f2_for_market(ref_clean, test_clean, market)
                     results["Conventional f2"] = val
+
                 elif method == "Expected":
                     val = calc_expected_f2_for_market(ref_clean, test_clean, market)
                     results["Expected f2"] = val
+
                 elif method == "Bias Corrected":
                     val = calc_bias_corrected_f2_for_market(ref_clean, test_clean, market)
                     results["Bias Corrected f2"] = val
 
-                # Bootstrap variants
                 elif method == "Conventional Bootstrap":
-                    # define calc_func that accepts dfs and applies conventional wrapper
                     def conv_func(r, t):
                         return calc_conventional_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
                     orig, lower, upper, mean, median, skewness, kurt, vals = bootstrap_f2(
@@ -693,6 +772,7 @@ def process_batch(workbook_data, selected_methods, market, use_recommended=True,
                     results["Conventional Bootstrap Skewness"] = skewness
                     results["Conventional Bootstrap Kurtosis"] = kurt
                     file_bootstrap_data["Conventional Bootstrap"] = list(vals)
+                    bootstrap_summary["Conventional Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
 
                 elif method == "Expected Bootstrap":
                     def exp_func(r, t):
@@ -706,6 +786,7 @@ def process_batch(workbook_data, selected_methods, market, use_recommended=True,
                     results["Expected Bootstrap Skewness"] = skewness
                     results["Expected Bootstrap Kurtosis"] = kurt
                     file_bootstrap_data["Expected Bootstrap"] = list(vals)
+                    bootstrap_summary["Expected Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
 
                 elif method == "Bias Corrected Bootstrap":
                     def bc_func(r, t):
@@ -719,11 +800,16 @@ def process_batch(workbook_data, selected_methods, market, use_recommended=True,
                     results["Bias Corrected Bootstrap Skewness"] = skewness
                     results["Bias Corrected Bootstrap Kurtosis"] = kurt
                     file_bootstrap_data["Bias Corrected Bootstrap"] = list(vals)
+                    bootstrap_summary["Bias Corrected Bootstrap"] = {'lower': lower, 'upper': upper, 'mean': mean, 'median': median}
 
                 else:
-                    # Unknown method requested (allow original selected strings to pass)
-                    # Try to handle if the user passed "Conventional Bootstrap" aliases etc.
+                    # If the user selected a string equal to "Conventional Bootstrap" etc. with some variation,
+                    # currently we only accept exact strings in the main options list.
                     pass
+
+            # produce profile figure (mean ± SD) and annotate bootstrap summaries
+            profile_fig = create_profile_plot(file_name, r_trim, t_trim, bootstrap_summary)
+            profile_figs[file_name] = profile_fig
 
             all_results.append(results)
             bootstrap_data[file_name] = file_bootstrap_data
@@ -731,15 +817,18 @@ def process_batch(workbook_data, selected_methods, market, use_recommended=True,
         except Exception as e:
             st.warning(f"Error processing file `{file_name}`: {e}")
     
-    # Convert results to DataFrame (fill missing keys)
     if all_results:
         df = pd.DataFrame(all_results)
     else:
         df = pd.DataFrame(columns=["File Name"])
-    return df, bootstrap_data
+    return df, bootstrap_data, profile_figs
 
-def create_zip_report(report_df, qq_plots_data=None):
-    """Create a ZIP file containing the report CSV and QQ plots."""
+# ----------------------------------------
+# ZIP & plotting helpers (include profile plots)
+# ----------------------------------------
+
+def create_zip_report(report_df, qq_plots_data=None, profile_plots=None):
+    """Create a ZIP file containing the report CSV and QQ/profile plots."""
     report_file = "f2_similarities_report.csv"
     zip_file = "f2_similarities_report.zip"
     
@@ -751,22 +840,27 @@ def create_zip_report(report_df, qq_plots_data=None):
         # Add QQ plots if available
         if qq_plots_data:
             for file_name, plots in qq_plots_data.items():
-                # Create individual plots
-                for method, fig in plots['individual'].items():
+                for method, fig in plots.get('individual', {}).items():
                     if fig:
                         plot_filename = f"QQ_Plot_{file_name.replace('.xlsx', '')}_{method.replace(' ', '_')}.html"
                         fig.write_html(plot_filename)
                         zipf.write(plot_filename)
-                        os.remove(plot_filename)  # Clean up temp file
-                
-                # Add combined plot
-                if plots['combined']:
+                        os.remove(plot_filename)
+                if plots.get('combined'):
                     combined_filename = f"QQ_Plot_Combined_{file_name.replace('.xlsx', '')}.html"
                     plots['combined'].write_html(combined_filename)
                     zipf.write(combined_filename)
-                    os.remove(combined_filename)  # Clean up temp file
+                    os.remove(combined_filename)
+        
+        # Add profile plots
+        if profile_plots:
+            for file_name, fig in profile_plots.items():
+                if fig:
+                    profile_filename = f"Profile_{file_name.replace('.xlsx', '')}.html"
+                    fig.write_html(profile_filename)
+                    zipf.write(profile_filename)
+                    os.remove(profile_filename)
     
-    # Clean up temp CSV file
     if os.path.exists(report_file):
         os.remove(report_file)
     
@@ -782,13 +876,11 @@ def generate_qq_plots(bootstrap_data):
             'combined': None
         }
         
-        # Generate individual plots
         for method, data in file_bootstrap_data.items():
             if data and len(data) > 0:
                 fig = create_jmp_style_qq_plot(np.array(data), f"QQ Plot", method, file_name)
                 plots['individual'][method] = fig
         
-        # Generate combined plot
         combined_fig = create_combined_qq_plots(file_bootstrap_data, file_name)
         plots['combined'] = combined_fig
         
@@ -797,121 +889,147 @@ def generate_qq_plots(bootstrap_data):
     return qq_plots_data
 
 # ----------------------------------------
+# Streamlit: autoscan behaviour using session_state
+# ----------------------------------------
+
+def scan_folder_callback():
+    """
+    Callback when the user inputs folder path: load files and compute recommendations.
+    Stores results into st.session_state for UI display.
+    """
+    path = st.session_state.get("folder_path_input", "")
+    session = st.session_state
+    session['scan_error'] = None
+    session['workbook_data'] = {}
+    session['recommendations'] = {}
+
+    if not path:
+        session['scan_error'] = "No path provided."
+        return
+    if not os.path.isdir(path):
+        session['scan_error'] = "Invalid folder path."
+        return
+
+    workbook_data = load_batch_data(path)
+    if not workbook_data:
+        session['scan_error'] = "No valid Excel files found in folder."
+        session['workbook_data'] = {}
+        session['recommendations'] = {}
+        return
+
+    session['workbook_data'] = workbook_data
+    # compute recommendations (CV pass/fail and recommended methods) for display
+    rec_map = {}
+    for file_name, (ref_df, test_df) in workbook_data.items():
+        ref_clean, test_clean = prepare_data(ref_df.copy(), test_df.copy())
+        cv_pass = check_cv_criteria(ref_clean, test_clean, session.get('selected_market', 'EMA'))
+        recommended = choose_methods_for_file(session.get('selected_market', 'EMA'), cv_pass)
+        rec_map[file_name] = {"cv_pass": cv_pass, "recommended": recommended}
+    session['recommendations'] = rec_map
+
+# ----------------------------------------
 # Streamlit App Code
 # ----------------------------------------
 
 def main():
-    st.set_page_config(page_title="Batch Similarity Analyzer (Market Rules)", layout="wide")
-    st.title("Batch Similarity Analyzer — Market-aware Recommendations")
+    st.set_page_config(page_title="Batch Similarity Analyzer (Auto-scan & Profiles)", layout="wide")
+    st.title("Batch Similarity Analyzer — Auto-scan + Profiles")
     st.markdown("""
-    This tool calculates f2 similarity for multiple Excel workbooks at once.
-    It includes market-specific CV rules and recommended calculation methods per market.
+    Paste a folder path containing Excel files (sheet0=reference, sheet1=test).
+    The app will auto-scan and **recommend methods per file** based on market CV rules.
+    You can then add extra methods from the dropdown and click *Calculate and Generate Report*.
     """)
 
-    folder_path = st.text_input("Enter path to folder containing Excel files:", "")
-    
-    # Market selection (single market to apply rules)
+    # Market selection first so scan callback can use it
     market_options = ['EMA', 'CHINA', 'ASEAN', 'USFDA', 'ANVISA', 'WHO', 'CANADA', 'FDA']
-    market = st.selectbox("Select target market (affects CV rules & recommended methods):", market_options, index=0)
-    
-    # Let the user still pick methods if they don't want recommendations
+    selected_market = st.selectbox("Select target market (affects CV rules & recommendations):", market_options, index=0)
+    st.session_state['selected_market'] = selected_market
+
+    folder_path = st.text_input("Enter path to folder containing Excel files:", key="folder_path_input", on_change=scan_folder_callback)
+    st.caption("The app will scan the folder and show recommendations as soon as the path is provided.")
+
+    # Show scan results (if any)
+    if st.session_state.get('scan_error'):
+        st.error(st.session_state['scan_error'])
+    elif st.session_state.get('workbook_data'):
+        st.success(f"Found {len(st.session_state['workbook_data'])} Excel files. Recommendations ready.")
+        rec_map = st.session_state.get('recommendations', {})
+        st.subheader("Recommended methods per file (based on CV rules)")
+        for fn, info in rec_map.items():
+            cv_text = "PASS" if info['cv_pass'] else "FAIL"
+            st.write(f"**{fn}** — CV: {cv_text} — Recommended: {', '.join(info['recommended'])}")
+
+    # global extra methods user wants to add (applied to all files)
     options = ["Conventional", "Expected", "Bias Corrected",
                "Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"]
-    selected_methods = st.multiselect("(Optional) Select calculation methods to run (ignored if using recommendations):", options, 
-                                    default=["Conventional Bootstrap", "Expected Bootstrap", "Bias Corrected Bootstrap"])
-    
-    use_recommended = st.checkbox("Use recommended methods for chosen market (per-file, based on CV pass/fail)", value=True)
-    
+    additional_methods = st.multiselect("Add extra methods to run for all files (optional):", options)
+
     n_iterations = st.slider("Number of bootstrap iterations:", 1000, 50000, 10000, 1000)
-    
+
+    # Calculate & generate report button
     if st.button("Calculate and Generate Report"):
-        if os.path.isdir(folder_path):
-            with st.spinner("Processing files and generating QQ plots..."):
-                workbook_data = load_batch_data(folder_path)
-                if workbook_data:
-                    report_df, bootstrap_data = process_batch(workbook_data, selected_methods, market, use_recommended, n_iterations)
-                    
-                    st.subheader("📊 Results Preview")
-                    st.dataframe(report_df.head(50))
-                    
-                    # Generate QQ Plots for bootstrap methods
-                    qq_plots_data = None
-                    # If any bootstrap data exists, create QQ plots
-                    any_bootstrap = any(len(v) > 0 for file_v in bootstrap_data.values() for v in file_v.values())
-                    if any_bootstrap:
-                        with st.spinner("Generating QQ plots for download..."):
-                            qq_plots_data = generate_qq_plots(bootstrap_data)
-                            
-                            # Show summary of generated plots
-                            st.subheader("📈 QQ Plot Generation Summary")
-                            st.success("✅ QQ plots have been generated successfully!")
-                            
-                            total_plots = 0
-                            for file_name, plots in qq_plots_data.items():
-                                individual_count = len([fig for fig in plots['individual'].values() if fig is not None])
-                                combined_count = 1 if plots['combined'] is not None else 0
-                                file_total = individual_count + combined_count
-                                total_plots += file_total
-                                
-                                st.write(f"**{file_name}:** {individual_count} individual plots + {combined_count} combined plot = {file_total} plots")
-                            
-                            st.info(f"📊 **Total QQ plots generated:** {total_plots}")
-                            st.markdown("""
-                            **QQ Plot Files Included in Download:**
-                            - Individual method plots: `QQ_Plot_[FileName]_[Method].html`
-                            - Combined comparison plots: `QQ_Plot_Combined_[FileName].html`
-                
-                            """)
-                    
-                    # Download report with QQ plots
-                    with st.spinner("Creating downloadable ZIP file..."):
-                        zip_file_path = create_zip_report(report_df, qq_plots_data)
-                    
-                    with open(zip_file_path, "rb") as f:
-                        file_content = f.read()
-                    
-                    # Clean up the zip file
-                    if os.path.exists(zip_file_path):
-                        os.remove(zip_file_path)
-                    
-                    st.download_button(
-                        label="📥 Download Complete Report with QQ Plots (ZIP)",
-                        data=file_content,
-                        file_name="f2_similarities_report_with_plots.zip",
-                        mime="application/zip",
-                        help="Download includes CSV report and all QQ plot HTML files"
-                    )
-                    
-                    st.success("Report and QQ plots are ready for download!")
-                    
-                else:
-                    st.warning("No valid Excel files found in selected folder.")
+        if not st.session_state.get('workbook_data'):
+            st.error("No workbook data loaded. Please provide a valid folder path first.")
         else:
-            st.error("Invalid folder path. Please check the path and try again.")
-    
-    # Add information section
-    with st.expander("ℹ️ About Similarity Analyzer (market & CV behavior)"):
+            with st.spinner("Processing files..."):
+                workbook_data = st.session_state['workbook_data']
+                report_df, bootstrap_data, profile_figs = process_batch(
+                    workbook_data, additional_methods, selected_market, use_recommended=True, n_iterations=n_iterations
+                )
+
+                st.subheader("📊 Results Preview")
+                st.dataframe(report_df.head(50))
+
+                # Generate QQ Plots for bootstrap methods
+                qq_plots_data = None
+                any_bootstrap = any(len(v) > 0 for file_v in bootstrap_data.values() for v in file_v.values())
+                if any_bootstrap:
+                    with st.spinner("Generating QQ plots..."):
+                        qq_plots_data = generate_qq_plots(bootstrap_data)
+                        st.success("✅ QQ plots generated.")
+                        # Show small summary
+                        for file_name, plots in qq_plots_data.items():
+                            indiv = len([p for p in plots['individual'].values() if p is not None]) if plots['individual'] else 0
+                            combined = 1 if plots['combined'] is not None else 0
+                            st.write(f"**{file_name}:** {indiv} QQ plots + {combined} combined")
+
+                # Show profile plots inline (one tab per file)
+                st.subheader("📈 Dissolution Profiles (Mean ± SD)")
+                for file_name, fig in profile_figs.items():
+                    if fig:
+                        st.markdown(f"**{file_name}**")
+                        st.plotly_chart(fig, use_container_width=True)
+
+                # Create ZIP containing CSV + QQ + profile plots
+                with st.spinner("Creating downloadable ZIP file..."):
+                    zip_file_path = create_zip_report(report_df, qq_plots_data, profile_figs)
+
+                with open(zip_file_path, "rb") as f:
+                    file_content = f.read()
+                if os.path.exists(zip_file_path):
+                    os.remove(zip_file_path)
+
+                st.download_button(
+                    label="📥 Download Complete Report with Plots (ZIP)",
+                    data=file_content,
+                    file_name="f2_similarities_report_with_plots.zip",
+                    mime="application/zip",
+                    help="CSV report + QQ plot HTMLs + Profile plot HTMLs"
+                )
+                st.success("Report and plots are ready for download!")
+
+    # Help/information
+    with st.expander("ℹ️ Behaviour & rules implemented"):
         st.markdown("""
-        **CV Rules implemented (from provided spec):**
-        - EMA / CHINA / ASEAN / CANADA / WHO: CV ≤ 20% for timepoints up to 10 min; CV ≤ 10% for other timepoints.
-        - USFDA / FDA: CV ≤ 20% for early timepoints up to 15 min; CV ≤ 10% for others.
-        - ANVISA: CV ≤ 20% for the first 40% of collected points; CV ≤ 10% for the rest.
-        
-        **Recommended behavior implemented:**
-        - If CV criteria PASS:
-            - EMA/CHINA/ASEAN/CANADA/WHO → **Expected f2**
-            - USFDA / ANVISA → **Conventional f2**
-        - If CV criteria FAIL:
-            - EMA/CHINA/ASEAN/CANADA/WHO → **Expected Bootstrap**
-            - USFDA / ANVISA → **Conventional Bootstrap**
-        
-        **f2 truncation by 85% rule (implemented):**
-        - For FDA & ANVISA: f2 is calculated up to the first timepoint where **both** test and reference mean ≥ 85% (inclusive). For FDA additionally the maximum timepoint used is 15 min (whichever is earlier).
-        - For EMA/CHINA/ASEAN: f2 is calculated up to the earliest timepoint where **either** test or reference mean ≥ 85% (inclusive).
-        - Otherwise, all timepoints are considered.
-        
-        These rules are applied per-file (so different files in the folder can get different recommended methods based on their CV pass/fail).
+        - On pasting a folder path the app automatically scans the Excel files and recommends methods per file (based on the chosen market and CV rules).
+        - You may add extra methods (global) via the dropdown before clicking **Calculate and Generate Report**.
+        - Profile plots show mean ± SD bands for trimmed (by 85% rule) timepoints. Bootstrap f2 summaries (CI, mean) are annotated on the plot.
+        - ZIP contains:
+          - `f2_similarities_report.csv`
+          - `QQ_Plot_[File]_[Method].html` (if bootstrap run)
+          - `QQ_Plot_Combined_[File].html` (if applicable)
+          - `Profile_[File].html`
         """)
-    
+
 if __name__ == "__main__":
     main()
