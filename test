@@ -1,1 +1,575 @@
-Noobs
+# main.py
+import os
+import io
+import threading
+import time
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import pandas as pd
+import numpy as np
+
+# Optimization imports (your provided code pieces)
+from summit.domain import Domain, ContinuousVariable
+from summit.strategies import TSEMO, SNOBFIT
+from summit.utils.dataset import DataSet
+
+# For folder watching
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+app = FastAPI()
+
+# Allow CORS for local React development
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ========= In-memory store =========
+store = {
+    "lhs_table": None,               # pandas DataFrame (11 experiments)
+    "optimization_result": None,     # pandas DataFrame
+    "hplc_responses": {},            # mapping filename -> response vector
+    "watching": False,
+    "watch_path": None
+}
+
+# ========= Utility functions =========
+
+def latin_hypercube_sampling(bounds: List[List[float]], n_samples: int, random_state: Optional[int]=None):
+    """
+    Simple LHS implementation:
+    bounds: list of [low, high] per variable
+    returns: numpy array n_samples x n_vars
+    """
+    rng = np.random.RandomState(random_state)
+    n_vars = len(bounds)
+    # stratified intervals
+    cut = np.linspace(0, 1, n_samples + 1)
+    u = rng.rand(n_samples, n_vars)
+    samples = np.zeros_like(u)
+    for j in range(n_vars):
+        # pick sample in each interval
+        a = cut[:-1]
+        b = cut[1:]
+        pts = a + u[:, j] * (b - a)
+        rng.shuffle(pts)
+        samples[:, j] = pts
+    # scale to bounds
+    scaled = np.zeros_like(samples)
+    for j in range(n_vars):
+        low, high = bounds[j]
+        scaled[:, j] = low + samples[:, j] * (high - low)
+    return scaled
+
+# Compute the table according to your formulas
+def compute_sor_table(
+    eq1_vals, eq2_vals, eq3_vals, rt3_vals, temp_vals,
+    molecular_weights=[90.05, 101.19, 318.18, 532.09],
+    densities=[1.00, 0.726, 1.08, 0.90]
+):
+    """
+    returns pandas DataFrame of 11 experiments with columns:
+    Equiv1, Equiv2, Equiv3, ResidenceTime3, ReactionTemperature,
+    ReactionTime, Flowrate1..4, TotalFlowrate
+    and other intermediate columns if helpful.
+    """
+    n = len(eq1_vals)
+    rows = []
+    # constants from your description
+    coil1 = 5.00
+    coil2 = 10.00
+    coil3 = 10.00
+    mw1, mw2, mw3, mw4 = molecular_weights
+    d1, d2, d3, d4 = densities
+
+    for i in range(n):
+        E1 = float(eq1_vals[i])
+        E2 = float(eq2_vals[i])
+        E3 = float(eq3_vals[i])
+        RT3 = float(rt3_vals[i])
+        TEMP = float(temp_vals[i])
+
+        # volume per g formulas (simplified ratios from your expressions)
+        vol_g_1 = 5 * E1 / 2.5         # -> 2 * E1
+        vol_g_2 = 2 * E2 / 7.5        # -> (2/7.5) * E2
+        vol_g_3 = 2.5 * E3 / 3.125    # -> 0.8 * E3
+        vol_g_4 = 7.0                  # constant
+
+        # Mass and moles
+        mass4 = 1.00
+        moles4 = mass4 / mw4
+
+        mass1 = E1 * moles4 * mw1
+        mass2 = E2 * moles4 * mw2
+        mass3 = E3 * moles4 * mw3
+        mass4 = mass4
+
+        moles1 = mass1 / mw1
+        moles2 = mass2 / mw2
+        moles3 = mass3 / mw3
+
+        # Volumes (ml)
+        vol1 = mass1 / d1
+        vol2 = vol_g_1 * mass4
+        vol3 = mass2 / d2
+        vol4 = vol_g_2 * mass4
+        vol5 = mass3 / (0.5 * d3)   # note division by 0.5*d3
+        vol6 = vol_g_3 * mass4
+        vol7 = mass4
+        vol8 = vol_g_4 * mass4
+
+        obs1 = vol1 + vol2
+        obs2 = vol3 + vol4
+        obs3 = vol5 + vol6
+        obs4 = vol7 + vol8
+        total_obs = obs1 + obs2 + obs3 + obs4 if (obs1+obs2+obs3+obs4) != 0 else 1e-12
+
+        # Total flowrate from coil3 and RT3
+        total_flowrate = coil3 / RT3 if RT3 != 0 else 1e-12
+
+        # Individual flowrates proportional to observed totals
+        f1 = obs1 / total_obs * total_flowrate
+        f2 = obs2 / total_obs * total_flowrate
+        f3 = obs3 / total_obs * total_flowrate
+        f4 = obs4 / total_obs * total_flowrate
+
+        # Residence times
+        rt1 = coil1 / (f1 + f2) if (f1 + f2) != 0 else float('inf')
+        rt2 = coil2 / (f1 + f2 + f3) if (f1 + f2 + f3) != 0 else float('inf')
+        reaction_time = rt1 + rt2 + RT3
+
+        row = dict(
+            Equiv1=E1, Equiv2=E2, Equiv3=E3,
+            ResidenceTime3=RT3,
+            ReactionTemperature=TEMP,
+            ReactionTime=reaction_time,
+            Flowrate1=f1, Flowrate2=f2, Flowrate3=f3, Flowrate4=f4,
+            TotalFlowrate=total_flowrate,
+            # diagnostics / intermediate columns (optional)
+            Obs1=obs1, Obs2=obs2, Obs3=obs3, Obs4=obs4,
+            Vol1=vol1, Vol2=vol2, Vol3=vol3, Vol4=vol4,
+            Vol5=vol5, Vol6=vol6, Vol7=vol7, Vol8=vol8,
+            Mass1=mass1, Mass2=mass2, Mass3=mass3, Mass4=mass4
+        )
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    # re-order to put primary columns first
+    cols_order = ["Equiv1","Equiv2","Equiv3","ResidenceTime3","ReactionTemperature",
+                  "ReactionTime","Flowrate1","Flowrate2","Flowrate3","Flowrate4","TotalFlowrate"]
+    # keep other cols appended
+    for c in cols_order:
+        if c not in df.columns:
+            cols_order.remove(c)
+    remaining = [c for c in df.columns if c not in cols_order]
+    df = df[cols_order + remaining]
+    return df
+
+# ========= Endpoints =========
+
+class GenerateRequest(BaseModel):
+    n_experiments: int = 11
+    random_seed: Optional[int] = None
+    # optional custom molecular weights/densities can be added later
+
+@app.post("/generate_lhs")
+async def generate_lhs(req: GenerateRequest, excel: Optional[UploadFile] = File(None)):
+    """
+    Generate LHS table (11 experiments). If an Excel is uploaded and contains parameter values,
+    we will use them; otherwise defaults used.
+    """
+    # defaults from your example
+    mw = [90.05, 101.19, 318.18, 532.09]
+    dens = [1.00, 0.726, 1.08, 0.90]
+
+    # If excel is uploaded and has a sheet 'params' or first sheet with mw/density rows, try to use
+    if excel is not None:
+        try:
+            content = await excel.read()
+            x = pd.read_excel(io.BytesIO(content), sheet_name=None)
+            # try to find columns named molecular_weights/densities
+            for sheet in x.values():
+                if {"molecular_weights"}.issubset(set([str(c).lower() for c in sheet.columns])):
+                    # optional parsing (user Excel formats vary) - best-effort
+                    pass
+            # fallback: keep defaults to avoid failing
+        except Exception:
+            pass
+
+    # define bounds per user
+    bounds = [
+        [1.5, 3.0],   # Equiv1
+        [6.0, 12.0],  # Equiv2
+        [1.5, 3.0],   # Equiv3
+        [1.5, 3.0],   # ResidenceTime3
+        [35.0, 65.0]  # ReactionTemperature
+    ]
+    samples = latin_hypercube_sampling(bounds, req.n_experiments, random_state=req.random_seed)
+    eq1_vals = samples[:,0]
+    eq2_vals = samples[:,1]
+    eq3_vals = samples[:,2]
+    rt3_vals = samples[:,3]
+    temp_vals = samples[:,4]
+
+    df = compute_sor_table(eq1_vals, eq2_vals, eq3_vals, rt3_vals, temp_vals, molecular_weights=mw, densities=dens)
+    store["lhs_table"] = df
+    return {"status":"ok", "n": req.n_experiments, "table": df.to_dict(orient="records")}
+
+# HPLC functions (from your provided code)
+def HPLC_data_read_csv(file_path: str) -> np.ndarray:
+    try:
+        data = pd.read_csv(file_path)
+        data_final = pd.DataFrame()
+        data_final['Peak_Area'] = data['Area']
+        data_final['RT'] = data['RT']
+        return data_final.to_numpy()
+    except Exception as e:
+        print(f"Error reading HPLC CSV file {file_path}: {e}")
+        return np.array([])
+
+def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
+    areaB = 0
+    for i in range(data_np.shape[0]):
+        if IminRT <= data_np[i, 1] <= ImaxRT:
+            areaB += data_np[i, 0]
+    return areaB / areaISO if areaISO != 0 else 0.0
+
+def response_HPLC_csv(
+    data_np: np.ndarray,
+    YminRT: float, YmaxRT: float,
+    IminRT_list: List[float], ImaxRT_list: List[float],
+    minRTISO: float, maxRTISO: float,
+    nobj: int
+) -> List[float]:
+    if data_np.size == 0:
+        return [float('inf')] * nobj
+
+    areaA = 0
+    for i in range(data_np.shape[0]):
+        if YminRT <= data_np[i, 1] <= YmaxRT:
+            areaA += data_np[i, 0]
+
+    areaISO = 0
+    for i in range(data_np.shape[0]):
+        if minRTISO <= data_np[i, 1] <= maxRTISO:
+            areaISO += data_np[i, 0]
+
+    response = []
+    yield_result = areaA / areaISO if areaISO != 0 else 0.0
+    response.append(-np.log(yield_result) if yield_result > 0 else float('inf'))
+
+    for i in range(nobj - 1):
+        if i < len(IminRT_list) and i < len(ImaxRT_list):
+            impurities_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
+            response.append(impurities_result)
+        else:
+            response.append(0.0)
+
+    return response
+
+# ===== Folder watcher =====
+class HPLCHandler(FileSystemEventHandler):
+    def __init__(self, nobj, y_min, y_max, imin_list, imax_list, iso_min, iso_max):
+        self.nobj = nobj
+        self.YminRT = y_min
+        self.YmaxRT = y_max
+        self.IminRT_list = imin_list
+        self.ImaxRT_list = imax_list
+        self.minRTISO = iso_min
+        self.maxRTISO = iso_max
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        filepath = event.src_path
+        if filepath.lower().endswith(".csv"):
+            try:
+                data = HPLC_data_read_csv(filepath)
+                response = response_HPLC_csv(data, self.YminRT, self.YmaxRT, self.IminRT_list, self.ImaxRT_list, self.minRTISO, self.maxRTISO, self.nobj)
+                store["hplc_responses"][os.path.basename(filepath)] = response
+                print(f"[watcher] processed {filepath}, response={response}")
+            except Exception as e:
+                print(f"[watcher] error processing {filepath}: {e}")
+
+observer = None
+
+@app.post("/start_watch")
+async def start_watch(path: str, nobj: int = 2,
+                      YminRT: float = 2.0, YmaxRT: float = 4.0,
+                      IminRT_list: List[float] = [0.5], ImaxRT_list: List[float] = [1.0],
+                      minRTISO: float = 10.0, maxRTISO: float = 12.0):
+    """
+    Start watching a folder path for CSV HPLC files. Will update store['hplc_responses'] upon new files.
+    """
+    global observer
+    if store["watching"]:
+        return {"status":"already_watching", "path": store["watch_path"]}
+
+    if not os.path.isdir(path):
+        return {"status":"error", "message":"Path does not exist or is not a directory"}
+
+    handler = HPLCHandler(
+        nobj=nobj,
+        y_min=YminRT, y_max=YmaxRT,
+        imin_list=IminRT_list, imax_list=ImaxRT_list,
+        iso_min=minRTISO, iso_max=maxRTISO
+    )
+    observer = Observer()
+    observer.schedule(handler, path=path, recursive=False)
+    observer.start()
+
+    store["watching"] = True
+    store["watch_path"] = path
+    return {"status":"watching", "path": path}
+
+@app.post("/stop_watch")
+async def stop_watch():
+    global observer
+    if observer:
+        observer.stop()
+        observer.join()
+    store["watching"] = False
+    store["watch_path"] = None
+    return {"status":"stopped"}
+
+# ===== Optimization wrapper (using your provided functions adapted) =====
+
+def create_domain_from_ranges(ranges: Dict[str, List[float]], objectives: List[Dict[str, Any]]):
+    """
+    Build a Summit Domain from ranges.
+    ranges: {"Equiv1":[lb,ub], ...}
+    objectives: list of {"name":str, "maximize":bool}
+    """
+    domain = Domain()
+    for k, bounds in ranges.items():
+        domain += ContinuousVariable(name=k, description=k, bounds=bounds)
+    for obj in objectives:
+        domain += ContinuousVariable(name=obj["name"], description=obj["name"], bounds=[0,100], is_objective=True, maximize=obj.get("maximize", False))
+    return domain
+
+def run_summit_optimization(domain: Domain, lhs_exp: pd.DataFrame, nobj: int):
+    # reuse your run_optimization logic (multi_tsemo / single_snobfit)
+    if nobj > 1:
+        strat_TSEMO = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
+        lhs_ds = DataSet.from_df(lhs_exp)
+        out = strat_TSEMO.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
+    else:
+        strat_SNOBFIT = SNOBFIT(domain)
+        lhs_ds = DataSet.from_df(lhs_exp)
+        out = strat_SNOBFIT.suggest_experiments(1, lhs_ds)
+
+    out.columns = [col[0] for col in out.columns]
+    out = out.drop(columns={"strategy"}) if "strategy" in out.columns else out
+    # keep same columns as lhs_exp
+    common_cols = [c for c in lhs_exp.columns if c in out.columns]
+    try:
+        out = out[common_cols]
+    except Exception:
+        pass
+    return out
+
+class OptimizeRequest(BaseModel):
+    objectives: List[Dict[str, Any]]   # e.g. [{"name":"Yield","maximize":True}, {"name":"Impurity1","maximize":False}]
+    sor_iterations: int = 10
+    nobj: int = 2
+
+@app.post("/optimize")
+async def optimize(req: OptimizeRequest):
+    """
+    Run optimization using current LHS table as starting experiments.
+    """
+    lhs_df = store.get("lhs_table")
+    if lhs_df is None:
+        return {"status":"error", "message":"No LHS table present. Generate it first via /generate_lhs"}
+
+    # Build domain from lhs_df ranges (min/max per decision variable)
+    ranges = {
+        "Equiv1": [lhs_df["Equiv1"].min(), lhs_df["Equiv1"].max()],
+        "Equiv2": [lhs_df["Equiv2"].min(), lhs_df["Equiv2"].max()],
+        "Equiv3": [lhs_df["Equiv3"].min(), lhs_df["Equiv3"].max()],
+        "ResidenceTime3": [lhs_df["ResidenceTime3"].min(), lhs_df["ResidenceTime3"].max()],
+        "ReactionTemperature": [lhs_df["ReactionTemperature"].min(), lhs_df["ReactionTemperature"].max()]
+    }
+    domain = create_domain_from_ranges(ranges, req.objectives)
+    # run optimization (this may take time)
+    try:
+        out = run_summit_optimization(domain, lhs_df, req.nobj)
+    except Exception as e:
+        return {"status":"error", "message": f"Optimization failed: {e}"}
+
+    # store result
+    store["optimization_result"] = out
+    return {"status":"ok", "result": out.to_dict(orient="records")}
+
+@app.get("/results")
+async def get_results():
+    """
+    Returns stored LHS table, optimization result, and HPLC responses.
+    """
+    lhs = store.get("lhs_table")
+    opt = store.get("optimization_result")
+    return {
+        "lhs_table": lhs.to_dict(orient="records") if lhs is not None else None,
+        "optimization_result": opt.to_dict(orient="records") if opt is not None else None,
+        "hplc_responses": store.get("hplc_responses", {})
+    }
+
+# Run uvicorn: uvicorn main:app --reload
+#############################################################
+{
+  "name": "sor-ui",
+  "version": "0.1.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "PORT=3000 react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+#############################
+import React, { useState, useEffect } from "react";
+
+function App() {
+  const [lhs, setLhs] = useState(null);
+  const [opt, setOpt] = useState(null);
+  const [hplc, setHplc] = useState({});
+  const [nexp, setNexp] = useState(11);
+  const [seed, setSeed] = useState(42);
+  const [objectivesText, setObjectivesText] = useState('Yield:Maximize,Imp1:Minimize');
+  const [sorIter, setSorIter] = useState(10);
+  const [watchPath, setWatchPath] = useState("");
+  const [watchStatus, setWatchStatus] = useState(null);
+
+  async function generate() {
+    const form = new FormData();
+    form.append("n_experiments", String(nexp));
+    form.append("random_seed", String(seed));
+    const res = await fetch("/generate_lhs", { method: "POST", body: form });
+    const data = await res.json();
+    setLhs(data.table);
+  }
+
+  async function startWatch() {
+    const body = { path: watchPath, nobj: 2 };
+    const res = await fetch("/start_watch?path=" + encodeURIComponent(watchPath), { method: "POST" });
+    const data = await res.json();
+    setWatchStatus(data);
+  }
+
+  async function stopWatch() {
+    const res = await fetch("/stop_watch", { method: "POST" });
+    const data = await res.json();
+    setWatchStatus(data);
+  }
+
+  async function runOptimize() {
+    // parse objectivesText minimally: e.g. "Yield:Maximize,Imp1:Minimize"
+    const parts = objectivesText.split(",").map(p => p.trim()).filter(Boolean);
+    const objs = parts.map(p => {
+      const [name, mode] = p.split(":").map(x => x.trim());
+      return { name, maximize: (mode||"Maximize").toLowerCase().startsWith("max") };
+    });
+    const res = await fetch("/optimize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objectives: objs, sor_iterations: Number(sorIter), nobj: Math.max(1, objs.length) })
+    });
+    const data = await res.json();
+    if (data.result) setOpt(data.result);
+    else alert(JSON.stringify(data));
+  }
+
+  async function pollResults() {
+    const res = await fetch("/results");
+    const data = await res.json();
+    if (data.lhs_table) setLhs(data.lhs_table);
+    if (data.optimization_result) setOpt(data.optimization_result);
+    if (data.hplc_responses) setHplc(data.hplc_responses);
+  }
+
+  useEffect(() => {
+    const id = setInterval(() => pollResults(), 3000);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div style={{ padding:20 }}>
+      <h2>SOR AI — Test UI</h2>
+      <div>
+        <label>Experiments: <input value={nexp} onChange={e=>setNexp(e.target.value)} /></label>
+        <label style={{marginLeft:10}}>Seed: <input value={seed} onChange={e=>setSeed(e.target.value)} /></label>
+        <button onClick={generate} style={{marginLeft:10}}>Generate LHS</button>
+      </div>
+
+      <div style={{marginTop:20}}>
+        <h3>LHS Table</h3>
+        {lhs ? (
+          <table border="1" cellPadding="6">
+            <thead>
+              <tr>
+                {Object.keys(lhs[0]).slice(0,12).map(k=> <th key={k}>{k}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {lhs.map((r, idx) => (
+                <tr key={idx}>
+                  {Object.keys(lhs[0]).slice(0,12).map(k=> <td key={k}>{String(r[k]).slice(0,10)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : <div>No table yet</div>}
+      </div>
+
+      <div style={{marginTop:20}}>
+        <h3>Optimization</h3>
+        <div>
+          <label>Objectives (comma-separated, name:Maximize or Minimize):</label><br/>
+          <input style={{width:'100%'}} value={objectivesText} onChange={e=>setObjectivesText(e.target.value)} />
+        </div>
+        <div style={{marginTop:8}}>
+          <label>SOR iterations: <input value={sorIter} onChange={e=>setSorIter(e.target.value)} /></label>
+          <button onClick={runOptimize} style={{marginLeft:10}}>Run Optimize</button>
+        </div>
+        <div style={{marginTop:12}}>
+          <h4>Optimization Result</h4>
+          {opt ? <pre style={{maxHeight:300, overflow:'auto'}}>{JSON.stringify(opt, null, 2)}</pre> : <div>None</div>}
+        </div>
+      </div>
+
+      <div style={{marginTop:20}}>
+        <h3>HPLC Watch</h3>
+        <div>
+          <label>Folder path on server to watch: </label>
+          <input value={watchPath} onChange={e=>setWatchPath(e.target.value)} style={{width:400}} />
+          <button onClick={startWatch} style={{marginLeft:8}}>Start Watch</button>
+          <button onClick={stopWatch} style={{marginLeft:8}}>Stop Watch</button>
+        </div>
+        <div style={{marginTop:8}}>
+          <strong>Watcher status:</strong> {JSON.stringify(watchStatus)}<br/>
+          <strong>HPLC responses:</strong>
+          <pre>{JSON.stringify(hplc, null, 2)}</pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
+#########################################
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+const container = document.getElementById('root');
+const root = createRoot(container);
+root.render(<App />);
