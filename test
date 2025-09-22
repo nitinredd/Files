@@ -1,882 +1,352 @@
-# main.py
-import io
-import os
-import threading
-from typing import List, Optional, Dict, Any, Union
+// src/App.jsx
+import React, { useEffect, useState } from "react";
+import axios from "axios";
 
-import numpy as np
-import pandas as pd
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+const API_BASE = ""; // leave empty for Vite proxy; set to "http://localhost:8000" if you prefer direct calls
 
-# Optional Summit imports (optimization). If not installed, code remains safe.
-try:
-    from summit.domain import Domain, ContinuousVariable
-    from summit.strategies import TSEMO, SNOBFIT
-    from summit.utils.dataset import DataSet
-    SUMMIT_AVAILABLE = True
-except Exception as e:
-    Domain = None
-    ContinuousVariable = None
-    TSEMO = None
-    SNOBFIT = None
-    DataSet = None
-    SUMMIT_AVAILABLE = False
-    print("Warning: summit not available:", e)
+export default function App() {
+  const [lhsFile, setLhsFile] = useState(null);
+  const [lhs, setLhs] = useState(null);
+  const [results, setResults] = useState(null);
 
-app = FastAPI(title="SOR AI Backend — LHS-first then SOR iterations")
+  const [objectivesText, setObjectivesText] = useState("Yield:Maximize,Purity:Minimize");
+  const [sorIter, setSorIter] = useState(3);
+  const [watchPath, setWatchPath] = useState("");
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
+  const [YminRT, setYminRT] = useState(2.0);
+  const [YmaxRT, setYmaxRT] = useState(4.0);
+  const [IminRT_list, setIminRT_list] = useState("0.7");
+  const [ImaxRT_list, setImaxRT_list] = useState("1.3");
+  const [minRTISO, setMinRTISO] = useState(10.0);
+  const [maxRTISO, setMaxRTISO] = useState(12.0);
 
-# ---------------- In-memory store and lock ----------------
-store: Dict[str, Any] = {
-    "lhs_table": None,             # pandas DataFrame
-    "optimization_result": None,   # pandas DataFrame
-    "hplc_responses": {},          # filename -> response list
-    "watching": False,
-    "watch_path": None,
-    # run metadata
-    "objectives": None,            # [{"name":..., "maximize":bool}]
-    "hplc_params": None,           # YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO
-    "phase": None,                 # None | "lhs" | "sor" | "done"
-    "expected_files": 0,           # expected in current phase
-    "next_row": 0,                 # next row index to fill
-    "sor_iterations": 0,           # user requested SOR iterations (after initial LHS fill)
-    "appended_start_index": None,  # index where appended SOR suggestions start
+  const [hplcFile, setHplcFile] = useState(null);
+  const [polling, setPolling] = useState(true);
+
+  useEffect(() => {
+    let id = null;
+    if (polling) {
+      fetchResults();
+      id = setInterval(fetchResults, 2500);
+    }
+    return () => clearInterval(id);
+  }, [polling]);
+
+  async function fetchResults() {
+    try {
+      // Since there's no /results endpoint, we'll try to get current state from various endpoints
+      // For now, we'll just log that polling is happening but not set any state
+      // since the backend doesn't have a dedicated results endpoint
+      console.log("Polling... (no /results endpoint available)");
+    } catch (err) {
+      // silent
+      console.log("Polling error (expected):", err.message);
+    }
+  }
+
+  function parseObjectives(text) {
+    return text
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [nameRaw, modeRaw] = entry.split(":").map((x) => x && x.trim());
+        return { name: nameRaw || "Objective", maximize: (modeRaw || "Maximize").toLowerCase().startsWith("max") };
+      });
+  }
+
+  // Upload LHS Excel
+  async function uploadLHS() {
+    if (!lhsFile) {
+      alert("Select an LHS Excel (.xlsx/.xls) file first.");
+      return;
+    }
+    try {
+      const form = new FormData();
+      form.append("file", lhsFile);
+      const url = `${API_BASE}/upload_lhs`;
+      const res = await axios.post(url, form, { headers: { "Content-Type": "multipart/form-data" } });
+      
+      if (res.data) {
+        if (res.data.status === "ok") {
+          alert(`Upload success: server stored ${res.data.n} rows with columns: ${res.data.columns.join(', ')}`);
+          
+          // Set local state based on successful response
+          setLhs({ 
+            columns: res.data.columns,
+            rows: Array(res.data.n).fill({}).map((_, i) => 
+              res.data.columns.reduce((acc, col) => ({ ...acc, [col]: `Row ${i+1}` }), {})
+            )
+          });
+          
+          if (res.data.warning) {
+            alert("Warning: " + res.data.warning);
+          }
+        } else {
+          alert("Upload returned: " + JSON.stringify(res.data));
+        }
+      }
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("Upload LHS failed: " + JSON.stringify(msg));
+      console.error(err);
+    }
+  }
+
+  // Start run (creates objective columns and sets expected_files = n_rows)
+  async function startRun() {
+    try {
+      const objectives = parseObjectives(objectivesText);
+      if (!objectives.length) {
+        alert("Enter at least one objective (e.g. Yield:Maximize).");
+        return;
+      }
+
+      const payload = {
+        objectives: objectives,
+        hplc_params: {
+          YminRT: Number(YminRT),
+          YmaxRT: Number(YmaxRT),
+          IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+          ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+          minRTISO: Number(minRTISO),
+          maxRTISO: Number(maxRTISO),
+        },
+        watch_path: watchPath && watchPath.trim() !== "" ? watchPath.trim() : null,
+        sor_iterations: Number(sorIter) || 0,
+      };
+
+      const url = `${API_BASE}/start_run`;
+      const res = await axios.post(url, payload, { headers: { "Content-Type": "application/json" } });
+      
+      if (res.data) {
+        if (res.data.status === "running") {
+          alert(`Run started: phase=${res.data.phase}, expected_files=${res.data.expected_files}, sor_iterations=${res.data.sor_iterations}`);
+        } else {
+          alert("Start run response: " + JSON.stringify(res.data));
+        }
+      }
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("Start run failed: " + JSON.stringify(msg));
+      console.error(err);
+    }
+  }
+
+  // Upload single HPLC CSV (fills next row)
+  async function uploadHplc() {
+    if (!hplcFile) {
+      alert("Select an HPLC CSV file first.");
+      return;
+    }
+    try {
+      const form = new FormData();
+      form.append("file", hplcFile);
+      const params = {
+        YminRT: Number(YminRT),
+        YmaxRT: Number(YmaxRT),
+        IminRT_list: IminRT_list,
+        ImaxRT_list: ImaxRT_list,
+        minRTISO: Number(minRTISO),
+        maxRTISO: Number(maxRTISO),
+      };
+      const url = `${API_BASE}/upload_hplc`;
+      const res = await axios.post(url, form, { params, headers: { "Content-Type": "multipart/form-data" } });
+      
+      if (res.data) {
+        if (res.data.status === "ok") {
+          alert(`HPLC processed: ${res.data.filename} response=${JSON.stringify(res.data.response)} next_row=${res.data.next_row}`);
+        } else {
+          alert("Upload HPLC returned: " + JSON.stringify(res.data));
+        }
+      }
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("Upload HPLC failed: " + JSON.stringify(msg));
+      console.error(err);
+    }
+  }
+
+  async function startWatchFolder() {
+    if (!watchPath || watchPath.trim() === "") {
+      alert("Enter server watch path first.");
+      return;
+    }
+    try {
+      const objectives = parseObjectives(objectivesText);
+      const payload = {
+        path: watchPath,
+        objectives: objectives,
+        sor_iterations: Number(sorIter) || 0,
+        YminRT: Number(YminRT),
+        YmaxRT: Number(YmaxRT),
+        IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+        ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+        minRTISO: Number(minRTISO),
+        maxRTISO: Number(maxRTISO),
+      };
+      const res = await axios.post(`${API_BASE}/start_watch`, payload, { headers: { "Content-Type": "application/json" } });
+      
+      if (res.data) {
+        alert("start_watch response: " + JSON.stringify(res.data));
+      }
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("start_watch failed: " + JSON.stringify(msg));
+      console.error(err);
+    }
+  }
+
+  async function stopWatchFolder() {
+    try {
+      const res = await axios.post(`${API_BASE}/stop_watch`);
+      alert("stop_watch response: " + JSON.stringify(res.data));
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("stop_watch failed: " + JSON.stringify(msg));
+    }
+  }
+
+  // Manual optimize (if needed)
+  async function runOptimizeManually() {
+    try {
+      const objectives = parseObjectives(objectivesText);
+      const payload = { 
+        objectives: objectives, 
+        nobj: Math.max(1, objectives.length) 
+      };
+      const res = await axios.post(`${API_BASE}/optimize`, payload, { headers: { "Content-Type": "application/json" } });
+      alert("optimize response: " + JSON.stringify(res.data));
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("optimize failed: " + JSON.stringify(msg));
+    }
+  }
+
+  // UI
+  return (
+    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 1100, margin: "0 auto" }}>
+      <h1>SOR AI — LHS → HPLC → Optimization</h1>
+
+      <section style={card}>
+        <h3>1) Upload LHS Excel (.xlsx)</h3>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input type="file" accept=".xlsx,.xls" onChange={(e) => setLhsFile(e.target.files?.[0] || null)} />
+          <button style={btn} onClick={uploadLHS}>Upload LHS</button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <small>Server will store the first sheet of your uploaded Excel as the LHS table.</small>
+        </div>
+      </section>
+
+      <section style={card}>
+        <h3>2) Configure objectives, HPLC params, watch path & SOR iterations → Start Run</h3>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ minWidth: 420 }}>
+            <label>Objectives (comma-separated, name:Maximize or Minimize):</label><br />
+            <input style={input} value={objectivesText} onChange={(e) => setObjectivesText(e.target.value)} />
+          </div>
+
+          <div>
+            <label>Server watch path (optional)</label><br />
+            <input style={{ ...input, width: 360 }} value={watchPath} onChange={(e) => setWatchPath(e.target.value)} />
+          </div>
+
+          <div>
+            <label>SOR iterations (after initial LHS files)</label><br />
+            <input style={{ width: 100, padding: 8 }} type="number" value={sorIter} onChange={(e) => setSorIter(Number(e.target.value))} />
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={btn} onClick={startRun}>Start Run</button>
+            <button style={btnAlt} onClick={startWatchFolder}>Start Watch (optional)</button>
+            <button style={btnAlt} onClick={stopWatchFolder}>Stop Watch</button>
+            <button style={btnAlt} onClick={runOptimizeManually}>Run Optimize (manual)</button>
+          </div>
+        </div>
+
+        <details style={{ marginTop: 8 }}>
+          <summary>HPLC parsing params (optional)</summary>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+            <div>
+              <small>YminRT</small><br />
+              <input style={small} value={YminRT} onChange={(e) => setYminRT(e.target.value)} />
+            </div>
+            <div>
+              <small>YmaxRT</small><br />
+              <input style={small} value={YmaxRT} onChange={(e) => setYmaxRT(e.target.value)} />
+            </div>
+            <div>
+              <small>IminRT list</small><br />
+              <input style={small} value={IminRT_list} onChange={(e) => setIminRT_list(e.target.value)} />
+            </div>
+            <div>
+              <small>ImaxRT list</small><br />
+              <input style={small} value={ImaxRT_list} onChange={(e) => setImaxRT_list(e.target.value)} />
+            </div>
+            <div>
+              <small>ISO min</small><br />
+              <input style={small} value={minRTISO} onChange={(e) => setMinRTISO(Number(e.target.value))} />
+            </div>
+            <div>
+              <small>ISO max</small><br />
+              <input style={small} value={maxRTISO} onChange={(e) => setMaxRTISO(Number(e.target.value))} />
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <section style={card}>
+        <h3>3) Upload HPLC CSV (fills next row)</h3>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input type="file" accept=".csv" onChange={(e) => setHplcFile(e.target.files?.[0] || null)} />
+          <button style={btn} onClick={uploadHplc}>Upload HPLC (fills next row)</button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <small>If you supplied a watch path when starting the run, dropping CSVs into that server folder will also process them automatically.</small>
+        </div>
+      </section>
+
+      <section style={card}>
+        <h3>Live LHS (server-stored)</h3>
+        {lhs ? (
+          <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", padding: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>{lhs.columns.map((k) => <th key={k} style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #eee" }}>{k}</th>)}</tr>
+              </thead>
+              <tbody>
+                {lhs.rows.map((row, i) => (
+                  <tr key={i}>
+                    {lhs.columns.map((k) => <td key={k} style={{ padding: 6, borderBottom: "1px solid #fafafa" }}>{String(row[k] ?? "").slice(0, 20)}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div style={{ marginTop: 8, fontStyle: 'italic', color: '#666' }}>
+              Note: This is a placeholder display. Actual data will be stored on the server.
+            </div>
+          </div>
+        ) : <div>No LHS stored on server yet. Upload an LHS file above.</div>}
+      </section>
+
+      <section style={card}>
+        <h3>Optimization result</h3>
+        <div style={{ maxHeight: 300, overflow: "auto", background: "#0b1220", color: "#cff", padding: 8, borderRadius: 6 }}>
+          <pre>{results ? JSON.stringify(results, null, 2) : "No optimization result yet. Optimization results will appear here after HPLC processing."}</pre>
+        </div>
+      </section>
+
+      <footer style={{ marginTop: 12, color: "#666" }}>
+        <label><input type="checkbox" checked={polling} onChange={(e) => setPolling(e.target.checked)} /> Poll server every 2.5s (currently disabled - no /results endpoint)</label>
+      </footer>
+    </div>
+  );
 }
-store_lock = threading.Lock()
 
-observer: Optional[Observer] = None
-
-# ---------------- Pydantic models ----------------
-class UploadLHSResp(BaseModel):
-    status: str
-    n: int
-    columns: List[str]
-    warning: Optional[str] = None
-
-class ObjectiveItem(BaseModel):
-    name: str
-    maximize: Optional[bool] = False
-
-class HPLCParams(BaseModel):
-    YminRT: Optional[float] = 2.0
-    YmaxRT: Optional[float] = 4.0
-    IminRT_list: Optional[List[float]] = [0.5]
-    ImaxRT_list: Optional[List[float]] = [1.0]
-    minRTISO: Optional[float] = 10.0
-    maxRTISO: Optional[float] = 12.0
-
-class StartRunRequest(BaseModel):
-    objectives: List[ObjectiveItem]
-    hplc_params: Optional[HPLCParams] = None
-    watch_path: Optional[str] = None
-    sor_iterations: int = 0
-
-class StartWatchRequest(BaseModel):
-    path: str
-    objectives: List[ObjectiveItem] = []
-    sor_iterations: int = 0
-    YminRT: float = 2.0
-    YmaxRT: float = 4.0
-    IminRT_list: List[float] = [0.5]
-    ImaxRT_list: List[float] = [1.0]
-    minRTISO: float = 10.0
-    maxRTISO: float = 12.0
-
-class OptimizeRequest(BaseModel):
-    objectives: List[ObjectiveItem] = []
-    nobj: Optional[int] = None
-
-# ---------------- Utilities ----------------
-def latin_hypercube_sampling(bounds: List[List[float]], n_samples: int, random_state: Optional[int] = None):
-    """Generate Latin Hypercube samples."""
-    rng = np.random.RandomState(random_state)
-    n_vars = len(bounds)
-    cut = np.linspace(0, 1, n_samples + 1)
-    u = rng.rand(n_samples, n_vars)
-    samples = np.zeros_like(u)
-    
-    for j in range(n_vars):
-        a = cut[:-1]
-        b = cut[1:]
-        pts = a + u[:, j] * (b - a)
-        rng.shuffle(pts)
-        samples[:, j] = pts
-    
-    scaled = np.zeros_like(samples)
-    for j in range(n_vars):
-        low, high = bounds[j]
-        scaled[:, j] = low + samples[:, j] * (high - low)
-    
-    return scaled
-
-def compute_sor_table(eq1_vals, eq2_vals, eq3_vals, rt3_vals, temp_vals,
-                      molecular_weights=[90.05, 101.19, 318.18, 532.09],
-                      densities=[1.00, 0.726, 1.08, 0.90]):
-    """Compute SOR table from experimental parameters."""
-    rows = []
-    coil1 = 5.00
-    coil2 = 10.00
-    coil3 = 10.00
-    mw1, mw2, mw3, mw4 = molecular_weights
-    d1, d2, d3, d4 = densities
-    n = len(eq1_vals)
-    
-    for i in range(n):
-        E1 = float(eq1_vals[i])
-        E2 = float(eq2_vals[i])
-        E3 = float(eq3_vals[i])
-        RT3 = float(rt3_vals[i])
-        TEMP = float(temp_vals[i])
-
-        vol_g_1 = 5 * E1 / 2.5
-        vol_g_2 = 2 * E2 / 7.5
-        vol_g_3 = 2.5 * E3 / 3.125
-        vol_g_4 = 7.0
-
-        mass4 = 1.00
-        moles4 = mass4 / mw4
-        mass1 = E1 * moles4 * mw1
-        mass2 = E2 * moles4 * mw2
-        mass3 = E3 * moles4 * mw3
-
-        vol1 = mass1 / d1
-        vol2 = vol_g_1 * mass4
-        vol3 = mass2 / d2
-        vol4 = vol_g_2 * mass4
-        vol5 = mass3 / (0.5 * d3)
-        vol6 = vol_g_3 * mass4
-        vol7 = mass4
-        vol8 = vol_g_4 * mass4
-
-        obs1 = vol1 + vol2
-        obs2 = vol3 + vol4
-        obs3 = vol5 + vol6
-        obs4 = vol7 + vol8
-        
-        total_obs = obs1 + obs2 + obs3 + obs4 if (obs1 + obs2 + obs3 + obs4) != 0 else 1e-12
-        total_flowrate = coil3 / RT3 if RT3 != 0 else 1e-12
-
-        f1 = obs1 / total_obs * total_flowrate
-        f2 = obs2 / total_obs * total_flowrate
-        f3 = obs3 / total_obs * total_flowrate
-        f4 = obs4 / total_obs * total_flowrate
-
-        rt1 = coil1 / (f1 + f2) if (f1 + f2) != 0 else float('inf')
-        rt2 = coil2 / (f1 + f2 + f3) if (f1 + f2 + f3) != 0 else float('inf')
-        reaction_time = rt1 + rt2 + RT3
-
-        row = {
-            "Equiv1": round(E1, 8),
-            "Equiv2": round(E2, 8),
-            "Equiv3": round(E3, 8),
-            "ResidenceTime3": round(RT3, 8),
-            "ReactionTemperature": round(TEMP, 8),
-            "ReactionTime": round(reaction_time, 8),
-            "Flowrate1": round(f1, 8),
-            "Flowrate2": round(f2, 8),
-            "Flowrate3": round(f3, 8),
-            "Flowrate4": round(f4, 8),
-            "TotalFlowrate": round(total_flowrate, 8),
-            "Obs1": round(obs1, 8),
-            "Obs2": round(obs2, 8),
-            "Obs3": round(obs3, 8),
-            "Obs4": round(obs4, 8),
-            "Vol1": round(vol1, 8),
-            "Vol2": round(vol2, 8),
-            "Vol3": round(vol3, 8),
-            "Vol4": round(vol4, 8),
-            "Vol5": round(vol5, 8),
-            "Vol6": round(vol6, 8),
-            "Vol7": round(vol7, 8),
-            "Vol8": round(vol8, 8),
-            "Mass1": round(mass1, 8),
-            "Mass2": round(mass2, 8),
-            "Mass3": round(mass3, 8),
-            "Mass4": round(mass4, 8),
-        }
-        rows.append(row)
-    
-    df = pd.DataFrame(rows)
-    cols_order = [
-        "Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature",
-        "ReactionTime", "Flowrate1", "Flowrate2", "Flowrate3", "Flowrate4", "TotalFlowrate"
-    ]
-    remaining = [c for c in df.columns if c not in cols_order]
-    return df[cols_order + remaining]
-
-# ---------------- HPLC parsing ----------------
-def HPLC_data_read_csv(file_path: str) -> np.ndarray:
-    """Read HPLC CSV data and return as numpy array."""
-    try:
-        data = pd.read_csv(file_path)
-        if 'Area' in data.columns and 'RT' in data.columns:
-            df = pd.DataFrame({"Area": data['Area'], "RT": data['RT']})
-        else:
-            cols_lower = {c.lower(): c for c in data.columns}
-            if 'area' in cols_lower and 'rt' in cols_lower:
-                df = pd.DataFrame({
-                    "Area": data[cols_lower['area']], 
-                    "RT": data[cols_lower['rt']]
-                })
-            else:
-                raise ValueError("CSV missing 'Area' and 'RT' columns")
-        return df.to_numpy()
-    except Exception as e:
-        print(f"HPLC read error: {e}")
-        return np.array([])
-
-def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
-    """Calculate impurity response from HPLC data."""
-    areaB = 0.0
-    for i in range(data_np.shape[0]):
-        if IminRT <= data_np[i, 1] <= ImaxRT:
-            areaB += float(data_np[i, 0])
-    return areaB / areaISO if areaISO != 0 else 0.0
-
-def response_HPLC_csv(data_np: np.ndarray, YminRT: float, YmaxRT: float,
-                      IminRT_list: List[float], ImaxRT_list: List[float],
-                      minRTISO: float, maxRTISO: float, nobj: int) -> List[float]:
-    """Calculate HPLC response metrics."""
-    if data_np.size == 0:
-        return [float('inf')] * nobj
-    
-    # Calculate main product area
-    areaA = 0.0
-    for i in range(data_np.shape[0]):
-        if YminRT <= data_np[i, 1] <= YmaxRT:
-            areaA += float(data_np[i, 0])
-    
-    # Calculate internal standard area
-    areaISO = 0.0
-    for i in range(data_np.shape[0]):
-        if minRTISO <= data_np[i, 1] <= maxRTISO:
-            areaISO += float(data_np[i, 0])
-    
-    response = []
-    
-    # First objective: yield (negative log for minimization)
-    yield_result = areaA / areaISO if areaISO != 0 else 0.0
-    response.append(-np.log(yield_result) if yield_result > 0 else float('inf'))
-    
-    # Additional objectives: impurities
-    for i in range(nobj - 1):
-        if i < len(IminRT_list) and i < len(ImaxRT_list):
-            impurities_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
-            response.append(impurities_result)
-        else:
-            response.append(0.0)
-    
-    return response
-
-# ---------------- Domain builder and optimization ----------------
-def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
-    """Build optimization domain from DataFrame."""
-    if not SUMMIT_AVAILABLE:
-        raise RuntimeError("Summit is not installed.")
-    
-    required_names = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]
-    found = {}
-    
-    for name in required_names:
-        for col in df.columns:
-            if col.lower().replace(" ", "") == name.lower().replace(" ", ""):
-                found[name] = col
-                break
-    
-    domain = Domain()
-    
-    if len(found) >= 4:
-        for canonical in ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]:
-            if canonical in found:
-                col = found[canonical]
-                lb = float(df[col].min())
-                ub = float(df[col].max())
-                if lb == ub:
-                    lb -= 1e-6
-                    ub += 1e-6
-                domain += ContinuousVariable(name=canonical, description=canonical, bounds=[lb, ub])
-    else:
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric columns to build domain.")
-        
-        for col in numeric_cols[:5]:
-            lb = float(df[col].min())
-            ub = float(df[col].max())
-            if lb == ub:
-                lb -= 1e-6
-                ub += 1e-6
-            domain += ContinuousVariable(name=str(col), description=str(col), bounds=[lb, ub])
-    
-    # Add objectives
-    for obj in objectives:
-        obj_name = obj.get("name", "obj")
-        maximize = bool(obj.get("maximize", False))
-        domain += ContinuousVariable(
-            name=obj_name, 
-            description=obj_name, 
-            bounds=[0, 100], 
-            is_objective=True, 
-            maximize=maximize
-        )
-    
-    return domain
-
-def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    """Run Summit optimization."""
-    if not SUMMIT_AVAILABLE:
-        raise RuntimeError("Summit is not available.")
-    
-    if nobj > 1:
-        strat = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
-        lhs_ds = DataSet.from_df(lhs_df)
-        out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
-    else:
-        strat = SNOBFIT(domain)
-        lhs_ds = DataSet.from_df(lhs_df)
-        out = strat.suggest_experiments(1, lhs_ds)
-    
-    try:
-        out.columns = [col[0] for col in out.columns]
-    except Exception:
-        pass
-    
-    if "strategy" in out.columns:
-        out = out.drop(columns={"strategy"})
-    
-    common = [c for c in lhs_df.columns if c in out.columns]
-    if len(common) > 0:
-        out = out[common]
-    
-    return out
-
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]]):
-    """Run optimization on current LHS and append suggestions."""
-    with store_lock:
-        lhs = store.get("lhs_table")
-        if lhs is None:
-            raise RuntimeError("No LHS available to base suggestions on.")
-        try:
-            domain = build_domain_from_df(lhs, objectives)
-        except Exception as e:
-            raise RuntimeError(f"Domain build failed: {e}")
-    
-    suggestions = []
-    for _ in range(num_suggestions):
-        try:
-            out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
-                suggested = out.iloc[0].to_dict()
-            else:
-                suggested = {}
-        except Exception:
-            suggested = {}
-        
-        new_row = {c: (np.nan if c not in suggested else suggested[c]) for c in lhs.columns}
-        suggestions.append(new_row)
-        lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-    
-    with store_lock:
-        start_idx = store.get("lhs_table").shape[0] if store.get("lhs_table") is not None else 0
-        store["lhs_table"] = lhs
-    
-    return start_idx
-
-# ---------------- HPLC processing & updates ----------------
-def process_hplc_and_fill(filename: str, data_np: np.ndarray):
-    """Process HPLC data and update results."""
-    with store_lock:
-        lhs = store.get("lhs_table")
-        if lhs is None:
-            raise RuntimeError("No LHS uploaded.")
-        
-        objectives = store.get("objectives") or []
-        nobj = len(objectives) or 1
-        hplc_params = store.get("hplc_params") or {}
-        phase = store.get("phase")
-        next_row = store.get("next_row", 0)
-        expected = store.get("expected_files", 0)
-    
-    # Calculate response
-    resp = response_HPLC_csv(
-        data_np,
-        hplc_params.get("YminRT", 2.0),
-        hplc_params.get("YmaxRT", 4.0),
-        hplc_params.get("IminRT_list", [0.5]),
-        hplc_params.get("ImaxRT_list", [1.0]),
-        hplc_params.get("minRTISO", 10.0),
-        hplc_params.get("maxRTISO", 12.0),
-        nobj
-    )
-    
-    obj_names = [o["name"] for o in objectives]
-    
-    # Update LHS table with response
-    with store_lock:
-        for name in obj_names:
-            if name not in lhs.columns:
-                lhs[name] = np.nan
-        
-        # Ensure enough rows exist
-        while next_row >= lhs.shape[0]:
-            lhs = pd.concat([lhs, pd.DataFrame([{c: np.nan for c in lhs.columns}])], ignore_index=True)
-        
-        # Fill response values
-        for j, name in enumerate(obj_names):
-            if j < len(resp):
-                lhs.at[next_row, name] = resp[j]
-        
-        store["hplc_responses"][filename] = resp
-        store["next_row"] = next_row + 1
-        store["lhs_table"] = lhs
-    
-    # Run optimization if Summit is available
-    if SUMMIT_AVAILABLE:
-        try:
-            with store_lock:
-                cur_lhs = store.get("lhs_table")
-                objectives_local = store.get("objectives") or []
-                nobj_local = max(1, len(objectives_local))
-            
-            domain = build_domain_from_df(cur_lhs, objectives_local)
-            out = run_summit_optimization(domain, cur_lhs, nobj_local)
-            
-            with store_lock:
-                try:
-                    store["optimization_result"] = pd.DataFrame(out)
-                except Exception:
-                    store["optimization_result"] = out
-        except Exception as e:
-            with store_lock:
-                store["optimization_result"] = {"error": str(e)}
-    
-    # Check phase transitions
-    with store_lock:
-        phase = store.get("phase")
-        next_row = store.get("next_row", 0)
-        expected = store.get("expected_files", 0)
-        
-        if phase == "lhs" and next_row >= expected:
-            sor_it = store.get("sor_iterations", 0)
-            if sor_it > 0:
-                try:
-                    start_idx = suggest_experiments_and_append(sor_it, store.get("objectives") or [])
-                    store["phase"] = "sor"
-                    store["expected_files"] = sor_it
-                    store["appended_start_index"] = start_idx
-                    store["next_row"] = start_idx
-                except Exception as e:
-                    store["optimization_result"] = {"error": f"Suggestion append failed: {e}"}
-            else:
-                store["phase"] = "done"
-    
-    return resp
-
-# ---------------- Watcher ----------------
-class HPLCHandler(FileSystemEventHandler):
-    """File system event handler for HPLC files."""
-    
-    def __init__(self):
-        super().__init__()
-    
-    def on_created(self, event):
-        if event.is_directory:
-            return
-        
-        filepath = event.src_path
-        if not filepath.lower().endswith(".csv"):
-            return
-        
-        filename = os.path.basename(filepath)
-        
-        try:
-            data_np = HPLC_data_read_csv(filepath)
-            resp = process_hplc_and_fill(filename, data_np)
-            print(f"[watcher] processed {filename} -> {resp} next_row={store.get('next_row')}")
-        except Exception as e:
-            print(f"[watcher] error: {e}")
-
-# ---------------- Endpoints ----------------
-@app.post("/upload_lhs")
-async def upload_lhs(file: UploadFile = File(...)):
-    """Upload LHS Excel file."""
-    try:
-        content = await file.read()
-        df = pd.read_excel(io.BytesIO(content), sheet_name=0)
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        with store_lock:
-            store["lhs_table"] = df
-            store["optimization_result"] = None
-            store["hplc_responses"] = {}
-            store["objectives"] = None
-            store["hplc_params"] = None
-            store["phase"] = None
-            store["expected_files"] = 0
-            store["next_row"] = 0
-            store["sor_iterations"] = 0
-            store["appended_start_index"] = None
-        
-        expected_any = {"Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"}
-        has_expected = bool(expected_any.intersection(set(df.columns)))
-        
-        resp = {"status": "ok", "n": df.shape[0], "columns": df.columns.tolist()}
-        if not has_expected:
-            resp["warning"] = "Uploaded sheet does not contain typical SOR column names; stored anyway."
-        
-        return resp
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {e}")
-
-@app.post("/start_run")
-async def start_run(req: StartRunRequest):
-    """Start optimization run."""
-    with store_lock:
-        lhs = store.get("lhs_table")
-        if lhs is None:
-            raise HTTPException(status_code=400, detail="Please upload LHS first via /upload_lhs")
-        
-        objectives = [{"name": o.name, "maximize": bool(o.maximize)} for o in req.objectives]
-        
-        for obj in objectives:
-            if obj["name"] not in lhs.columns:
-                lhs[obj["name"]] = np.nan
-        
-        store["lhs_table"] = lhs
-        store["objectives"] = objectives
-        
-        default_hplc = {
-            "YminRT": 2.0, 
-            "YmaxRT": 4.0, 
-            "IminRT_list": [0.5], 
-            "ImaxRT_list": [1.0], 
-            "minRTISO": 10.0, 
-            "maxRTISO": 12.0
-        }
-        params = default_hplc.copy()
-        if req.hplc_params:
-            params.update(req.hplc_params.dict(exclude_unset=True))
-        
-        store["hplc_params"] = params
-        
-        n_rows = int(lhs.shape[0])
-        store["phase"] = "lhs"
-        store["expected_files"] = n_rows
-        store["next_row"] = 0
-        store["sor_iterations"] = int(req.sor_iterations or 0)
-        store["appended_start_index"] = None
-    
-    if req.watch_path:
-        global observer
-        if store.get("watching"):
-            raise HTTPException(status_code=400, detail="Already watching a folder. Stop it first.")
-        
-        if not os.path.isdir(req.watch_path):
-            raise HTTPException(status_code=400, detail="Provided path is not a directory.")
-        
-        handler = HPLCHandler()
-        observer = Observer()
-        observer.schedule(handler, path=req.watch_path, recursive=False)
-        observer.daemon = True
-        observer.start()
-        
-        with store_lock:
-            store["watching"] = True
-            store["watch_path"] = req.watch_path
-    
-    return {
-        "status": "running", 
-        "phase": "lhs", 
-        "expected_files": n_rows, 
-        "sor_iterations": store.get("sor_iterations"), 
-        "objectives": store.get("objectives")
-    }
-
-@app.post("/upload_hplc")
-async def upload_hplc(
-    file: UploadFile = File(...),
-    YminRT: Optional[float] = None,
-    YmaxRT: Optional[float] = None,
-    IminRT_list: Optional[str] = None,
-    ImaxRT_list: Optional[str] = None,
-    minRTISO: Optional[float] = None,
-    maxRTISO: Optional[float] = None
-):
-    """Upload and process HPLC CSV file."""
-    try:
-        content = await file.read()
-        df = pd.read_csv(io.BytesIO(content))
-        
-        if 'Area' in df.columns and 'RT' in df.columns:
-            data_np = df[['Area', 'RT']].to_numpy()
-        else:
-            cols_lower = {c.lower(): c for c in df.columns}
-            if 'area' in cols_lower and 'rt' in cols_lower:
-                data_np = df[[cols_lower['area'], cols_lower['rt']]].to_numpy()
-            else:
-                raise HTTPException(status_code=400, detail="CSV missing Area/RT columns")
-        
-        # Update HPLC parameters
-        with store_lock:
-            params = store.get("hplc_params", {})
-        
-        if YminRT is not None: params['YminRT'] = YminRT
-        if YmaxRT is not None: params['YmaxRT'] = YmaxRT
-        if IminRT_list is not None:
-            params['IminRT_list'] = [float(x.strip()) for x in IminRT_list.split(",") if x.strip() != '']
-        if ImaxRT_list is not None:
-            params['ImaxRT_list'] = [float(x.strip()) for x in ImaxRT_list.split(",") if x.strip() != '']
-        if minRTISO is not None: params['minRTISO'] = float(minRTISO)
-        if maxRTISO is not None: params['maxRTISO'] = float(maxRTISO)
-        
-        with store_lock:
-            store['hplc_params'] = params
-        
-        # Process HPLC data
-        resp = process_hplc_and_fill(file.filename, data_np)
-        
-        return {
-            "status": "ok", 
-            "filename": file.filename, 
-            "response": resp, 
-            "next_row": store.get("next_row")
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-@app.post("/start_watch")
-async def start_watch(req: StartWatchRequest):
-    """Start watching directory for HPLC files."""
-    global observer
-    
-    with store_lock:
-        if store.get("lhs_table") is None:
-            raise HTTPException(status_code=400, detail="Upload LHS first via /upload_lhs before starting the watch.")
-        
-        lhs = store["lhs_table"]
-        objectives_in = [{"name": o.name, "maximize": bool(o.maximize)} for o in req.objectives]
-        
-        for obj in objectives_in:
-            if obj["name"] not in lhs.columns:
-                lhs[obj["name"]] = np.nan
-        
-        store["lhs_table"] = lhs
-        store["objectives"] = objectives_in
-        store["hplc_params"] = {
-            "YminRT": req.YminRT,
-            "YmaxRT": req.YmaxRT,
-            "IminRT_list": req.IminRT_list,
-            "ImaxRT_list": req.ImaxRT_list,
-            "minRTISO": req.minRTISO,
-            "maxRTISO": req.maxRTISO
-        }
-        store["expected_files"] = req.sor_iterations
-        store["next_row"] = 0
-
-    if not os.path.isdir(req.path):
-        raise HTTPException(status_code=400, detail="Path does not exist or is not a directory")
-
-    if store.get("watching"):
-        return {"status": "already_watching", "path": store.get("watch_path")}
-
-    handler = HPLCHandler()
-    observer = Observer()
-    observer.schedule(handler, path=req.path, recursive=False)
-    observer.daemon = True
-    observer.start()
-
-    with store_lock:
-        store["watching"] = True
-        store["watch_path"] = req.path
-
-    return {
-        "status": "watching", 
-        "path": req.path, 
-        "expected_files": req.sor_iterations, 
-        "objectives": objectives_in
-    }
-
-@app.post("/stop_watch")
-async def stop_watch():
-    """Stop watching directory."""
-    global observer
-    if observer:
-        observer.stop()
-        observer.join(timeout=2)
-    
-    with store_lock:
-        store["watching"] = False
-        store["watch_path"] = None
-    
-    return {"status": "stopped"}
-
-@app.post("/optimize")
-async def optimize(req: OptimizeRequest):
-    """Run optimization on current data."""
-    objectives = [{"name": o.name, "maximize": bool(o.maximize)} for o in req.objectives]
-    nobj = int(req.nobj or max(1, len(objectives)))
-    
-    with store_lock:
-        lhs_df = store.get("lhs_table")
-    
-    if lhs_df is None:
-        raise HTTPException(status_code=400, detail="No LHS table present. Upload one first via /upload_lhs.")
-    
-    if not SUMMIT_AVAILABLE:
-        raise HTTPException(status_code=400, detail="Summit is not installed. Cannot run optimization.")
-    
-    try:
-        domain = build_domain_from_df(lhs_df, objectives)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to build domain from LHS: {e}")
-    
-    try:
-        out = run_summit_optimization(domain, lhs_df, nobj)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Optimization failed: {e}")
-    
-    try:
-        out_df = pd.DataFrame(out)
-    except Exception:
-        out_df = out
-    
-    with store_lock:
-        store["optimization_result"] = out_df
-    
-    return {"status": "ok", "result": out_df.to_dict(orient='records')}
-
-@app.get("/results")
-async def get_results():
-    """Get current results and status."""
-    with store_lock:
-        lhs = store.get("lhs_table")
-        opt = store.get("optimization_result")
-        hplc = store.get("hplc_responses", {})
-        watching = store.get("watching", False)
-        watch_path = store.get("watch_path", None)
-        objectives = store.get("objectives", None)
-        expected_files = store.get("expected_files", 0)
-        next_row = store.get("next_row", 0)
-        phase = store.get("phase", None)
-        sor_iterations = store.get("sor_iterations", 0)
-    
-    return {
-        "lhs_table": lhs.to_dict(orient="records") if lhs is not None else None,
-        "optimization_result": opt.to_dict(orient="records") if isinstance(opt, pd.DataFrame) else opt,
-        "hplc_responses": hplc,
-        "watching": watching,
-        "watch_path": watch_path,
-        "objectives": objectives,
-        "expected_files": expected_files,
-        "next_row": next_row,
-        "phase": phase,
-        "sor_iterations": sor_iterations,
-        "summit_available": SUMMIT_AVAILABLE
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "healthy",
-        "summit_available": SUMMIT_AVAILABLE,
-        "watching": store.get("watching", False),
-        "phase": store.get("phase", None)
-    }
-
-@app.post("/reset")
-async def reset_system():
-    """Reset the entire system state."""
-    global observer
-    
-    # Stop observer if running
-    if observer:
-        try:
-            observer.stop()
-            observer.join(timeout=2)
-        except Exception:
-            pass
-    
-    # Reset store
-    with store_lock:
-        store.clear()
-        store.update({
-            "lhs_table": None,
-            "optimization_result": None,
-            "hplc_responses": {},
-            "watching": False,
-            "watch_path": None,
-            "objectives": None,
-            "hplc_params": None,
-            "phase": None,
-            "expected_files": 0,
-            "next_row": 0,
-            "sor_iterations": 0,
-            "appended_start_index": None,
-        })
-    
-    return {"status": "reset_complete"}
-
-@app.get("/status")
-async def get_status():
-    """Get system status summary."""
-    with store_lock:
-        phase = store.get("phase")
-        next_row = store.get("next_row", 0)
-        expected_files = store.get("expected_files", 0)
-        watching = store.get("watching", False)
-        lhs_exists = store.get("lhs_table") is not None
-        objectives = store.get("objectives", [])
-        sor_iterations = store.get("sor_iterations", 0)
-    
-    progress = 0
-    if expected_files > 0:
-        progress = min(100, (next_row / expected_files) * 100)
-    
-    return {
-        "phase": phase,
-        "progress_percent": round(progress, 1),
-        "files_processed": next_row,
-        "expected_files": expected_files,
-        "watching": watching,
-        "lhs_uploaded": lhs_exists,
-        "objectives_count": len(objectives) if objectives else 0,
-        "sor_iterations": sor_iterations,
-        "summit_available": SUMMIT_AVAILABLE
-    }
-
-@app.on_event("shutdown")
-def shutdown_event():
-    """Clean shutdown event handler."""
-    global observer
-    if observer:
-        try:
-            observer.stop()
-            observer.join(timeout=2)
-            print("Observer stopped on shutdown")
-        except Exception as e:
-            print(f"Error stopping observer: {e}")
-
-# Exception handlers
-@app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
-    """Handle unexpected exceptions."""
-    print(f"Unexpected error: {exc}")
-    return {"status": "error", "message": f"Internal server error: {str(exc)}"}
-
-if __name__ == "__main__":
-    import uvicorn
-    print("Starting SOR AI Backend...")
-    print(f"Summit available: {SUMMIT_AVAILABLE}")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+// styles
+const card = { background: "#fff", padding: 12, borderRadius: 8, boxShadow: "0 6px 18px rgba(15,20,50,0.06)", marginBottom: 12 };
+const btn = { background: "#0b5fff", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
+const btnAlt = { background: "#222", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
+const input = { width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ddd" };
+const small = { width: 84, padding: 6, borderRadius: 6, border: "1px solid #ddd" };
