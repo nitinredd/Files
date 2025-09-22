@@ -1,8 +1,8 @@
-// src/App.jsx (robust: verifies server stored LHS before start_run)
+// src/App.jsx
 import React, { useEffect, useState } from "react";
 import axios from "axios";
 
-const API_BASE = ""; // "" for proxy (recommended). Or "http://localhost:8000" to call backend directly.
+const API_BASE = ""; // leave empty for Vite proxy; set to "http://localhost:8000" if you prefer direct calls
 
 export default function App() {
   const [lhsFile, setLhsFile] = useState(null);
@@ -13,18 +13,18 @@ export default function App() {
   const [sorIter, setSorIter] = useState(3);
   const [watchPath, setWatchPath] = useState("");
 
-  // HPLC params
   const [YminRT, setYminRT] = useState(2.0);
   const [YmaxRT, setYmaxRT] = useState(4.0);
-  const [IminRT, setIminRT] = useState("0.7");
-  const [ImaxRT, setImaxRT] = useState("1.3");
+  const [IminRT_list, setIminRT_list] = useState("0.7");
+  const [ImaxRT_list, setImaxRT_list] = useState("1.3");
   const [minRTISO, setMinRTISO] = useState(10.0);
   const [maxRTISO, setMaxRTISO] = useState(12.0);
 
+  const [hplcFile, setHplcFile] = useState(null);
   const [polling, setPolling] = useState(true);
 
   useEffect(() => {
-    let id;
+    let id = null;
     if (polling) {
       fetchResults();
       id = setInterval(fetchResults, 2500);
@@ -36,50 +36,48 @@ export default function App() {
     try {
       const res = await axios.get(`${API_BASE}/results`);
       setResults(res.data);
-      setLhs(res.data.lhs_table || null);
+      if (res.data && res.data.lhs_table) setLhs(res.data.lhs_table);
     } catch (err) {
-      // ignore; might be backend down
+      // silent
     }
   }
 
   function parseObjectives(text) {
-    return text.split(",").map(p => p.trim()).filter(Boolean).map(entry => {
-      const [nameRaw, modeRaw] = entry.split(":").map(x => x && x.trim());
-      return { name: nameRaw || "obj", maximize: (modeRaw || "Maximize").toLowerCase().startsWith("max") };
-    });
+    return text
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [nameRaw, modeRaw] = entry.split(":").map((x) => x && x.trim());
+        return { name: nameRaw || "Objective", maximize: (modeRaw || "Maximize").toLowerCase().startsWith("max") };
+      });
   }
 
-  // Upload LHS and verify server stored it
+  // Upload LHS Excel
   async function uploadLHS() {
-    if (!lhsFile) { alert("Select an LHS Excel (.xlsx/.xls) file"); return; }
+    if (!lhsFile) {
+      alert("Select an LHS Excel (.xlsx/.xls) file first.");
+      return;
+    }
     try {
       const form = new FormData();
       form.append("file", lhsFile);
       const url = `${API_BASE}/upload_lhs`;
-      const res = await axios.post(url, form, { headers: { "Content-Type": "multipart/form-data" }});
-      // show server response immediately
+      const res = await axios.post(url, form, { headers: { "Content-Type": "multipart/form-data" } });
       if (res.data) {
         if (res.data.status === "ok") {
-          alert(`Upload success: server stored ${res.data.n} rows. Columns: ${res.data.columns.join(", ")}`);
+          alert(`Upload success: server stored ${res.data.n} rows.`);
         } else {
           alert("Upload returned: " + JSON.stringify(res.data));
         }
       }
-      // Immediately poll results to check server LHS presence
       await fetchResults();
-      if (!results || !results.lhs_table) {
-        // fetchResults sets state asynchronously; fetch directly to be sure
-        const check = await axios.get(`${API_BASE}/results`);
-        if (!check.data || !check.data.lhs_table) {
-          alert("Warning: server did not register uploaded LHS. Check backend logs and proxy configuration. Full response: " + JSON.stringify(res.data));
-          return;
-        } else {
-          setResults(check.data);
-          setLhs(check.data.lhs_table);
-          alert("Confirmed: server has stored LHS (rows = " + check.data.lhs_table.length + ").");
-        }
+      // verify server stored LHS
+      const check = await axios.get(`${API_BASE}/results`);
+      if (!check.data || !check.data.lhs_table) {
+        alert("Warning: server did not register uploaded LHS. Check backend/proxy. Response: " + JSON.stringify(res.data));
       } else {
-        alert("Confirmed: server has stored LHS (rows = " + results.lhs_table.length + ").");
+        alert("Confirmed server-side LHS rows: " + check.data.lhs_table.length);
       }
     } catch (err) {
       const msg = err.response?.data || err.message || String(err);
@@ -88,42 +86,45 @@ export default function App() {
     }
   }
 
-  // Start run after verifying server has LHS in memory
+  // Start run (creates objective columns and sets expected_files = n_rows)
   async function startRun() {
     try {
-      // check server has lhs
+      // verify server has LHS
       const chk = await axios.get(`${API_BASE}/results`);
       if (!chk.data || !chk.data.lhs_table) {
-        alert("Server reports no LHS stored. Please upload LHS first. Full /results response: " + JSON.stringify(chk.data));
+        alert("No LHS found on server. Upload LHS first.");
         return;
       }
-      // prepare payload
       const objectives = parseObjectives(objectivesText);
-      if (objectives.length === 0) { alert("Enter at least one objective"); return; }
+      if (!objectives.length) {
+        alert("Enter at least one objective (e.g. Yield:Maximize).");
+        return;
+      }
+
       const payload = {
         objectives: objectives,
         hplc_params: {
           YminRT: Number(YminRT),
           YmaxRT: Number(YmaxRT),
-          IminRT_list: IminRT.split(",").map(x => Number(x.trim())).filter(x => !Number.isNaN(x)),
-          ImaxRT_list: ImaxRT.split(",").map(x => Number(x.trim())).filter(x => !Number.isNaN(x)),
+          IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+          ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
           minRTISO: Number(minRTISO),
-          maxRTISO: Number(maxRTISO)
+          maxRTISO: Number(maxRTISO),
         },
-        watch_path: (watchPath && watchPath.trim() !== "") ? watchPath.trim() : null,
-        sor_iterations: Number(sorIter) || 0
+        watch_path: watchPath && watchPath.trim() !== "" ? watchPath.trim() : null,
+        sor_iterations: Number(sorIter) || 0,
       };
+
       const url = `${API_BASE}/start_run`;
-      const res = await axios.post(url, payload, { headers: { "Content-Type": "application/json" }});
+      const res = await axios.post(url, payload, { headers: { "Content-Type": "application/json" } });
       if (res.data) {
-        if (res.data.status === "running" || res.data.status === "watching" || res.data.status === "ok") {
-          alert("Run started successfully: " + JSON.stringify(res.data));
-          // refresh results
-          await fetchResults();
+        if (res.data.status === "running") {
+          alert("Run started: phase=lhs, expected_files=" + res.data.expected_files);
         } else {
           alert("Start run response: " + JSON.stringify(res.data));
         }
       }
+      await fetchResults();
     } catch (err) {
       const msg = err.response?.data || err.message || String(err);
       alert("Start run failed: " + JSON.stringify(msg));
@@ -131,28 +132,33 @@ export default function App() {
     }
   }
 
-  // Upload single HPLC CSV to fill next row
-  const [hplcFile, setHplcFile] = useState(null);
+  // Upload single HPLC CSV (fills next row)
   async function uploadHplc() {
-    if (!hplcFile) { alert("Select CSV file"); return; }
+    if (!hplcFile) {
+      alert("Select an HPLC CSV file first.");
+      return;
+    }
     try {
       const form = new FormData();
       form.append("file", hplcFile);
       const params = {
         YminRT: Number(YminRT),
         YmaxRT: Number(YmaxRT),
-        IminRT_list: IminRT,
-        ImaxRT_list: ImaxRT,
+        IminRT_list: IminRT_list,
+        ImaxRT_list: ImaxRT_list,
         minRTISO: Number(minRTISO),
-        maxRTISO: Number(maxRTISO)
+        maxRTISO: Number(maxRTISO),
       };
-      const res = await axios.post(`${API_BASE}/upload_hplc`, form, { params, headers: { "Content-Type": "multipart/form-data" }});
-      if (res.data && res.data.status === "ok") {
-        alert(`HPLC processed: ${res.data.filename} response=${JSON.stringify(res.data.response)} next_row=${res.data.next_row}`);
-        await fetchResults();
-      } else {
-        alert("Upload HPLC returned: " + JSON.stringify(res.data));
+      const url = `${API_BASE}/upload_hplc`;
+      const res = await axios.post(url, form, { params, headers: { "Content-Type": "multipart/form-data" } });
+      if (res.data) {
+        if (res.data.status === "ok") {
+          alert(`HPLC processed: ${res.data.filename} response=${JSON.stringify(res.data.response)} next_row=${res.data.next_row}`);
+        } else {
+          alert("Upload HPLC returned: " + JSON.stringify(res.data));
+        }
       }
+      await fetchResults();
     } catch (err) {
       const msg = err.response?.data || err.message || String(err);
       alert("Upload HPLC failed: " + JSON.stringify(msg));
@@ -160,74 +166,183 @@ export default function App() {
     }
   }
 
-  // Small UI
+  async function startWatchFolder() {
+    if (!watchPath || watchPath.trim() === "") {
+      alert("Enter server watch path first.");
+      return;
+    }
+    try {
+      // call existing start_watch for optional folder watcher (keeps older API available)
+      const objectives = parseObjectives(objectivesText);
+      const payload = {
+        path: watchPath,
+        objectives: objectives,
+        sor_iterations: Number(sorIter) || 0,
+        YminRT: Number(YminRT),
+        YmaxRT: Number(YmaxRT),
+        IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+        ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
+        minRTISO: Number(minRTISO),
+        maxRTISO: Number(maxRTISO),
+      };
+      const res = await axios.post(`${API_BASE}/start_watch`, payload, { headers: { "Content-Type": "application/json" } });
+      if (res.data) {
+        alert("start_watch response: " + JSON.stringify(res.data));
+      }
+      await fetchResults();
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("start_watch failed: " + JSON.stringify(msg));
+      console.error(err);
+    }
+  }
+
+  async function stopWatchFolder() {
+    try {
+      const res = await axios.post(`${API_BASE}/stop_watch`);
+      alert("stop_watch response: " + JSON.stringify(res.data));
+      await fetchResults();
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("stop_watch failed: " + JSON.stringify(msg));
+    }
+  }
+
+  // Manual optimize (if needed)
+  async function runOptimizeManually() {
+    try {
+      const objectives = parseObjectives(objectivesText);
+      const payload = { objectives: objectives.map((o) => ({ name: o.name, maximize: o.maximize })), sor_iterations: Number(sorIter) || 0, nobj: Math.max(1, objectives.length) };
+      const res = await axios.post(`${API_BASE}/optimize`, payload, { headers: { "Content-Type": "application/json" } });
+      alert("optimize response: " + JSON.stringify(res.data));
+      await fetchResults();
+    } catch (err) {
+      const msg = err.response?.data || err.message || String(err);
+      alert("optimize failed: " + JSON.stringify(msg));
+    }
+  }
+
+  // UI
   return (
-    <div style={{ padding: 20, maxWidth: 1100, margin: "0 auto", fontFamily: "Inter, Arial, sans-serif" }}>
-      <h2>SOR UI — robust start_run / upload_lhs flow</h2>
+    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 1100, margin: "0 auto" }}>
+      <h1>SOR AI — LHS → HPLC → Optimization</h1>
 
       <section style={card}>
-        <h3>1) Upload LHS (.xlsx)</h3>
-        <input type="file" accept=".xlsx,.xls" onChange={e => setLhsFile(e.target.files?.[0] || null)} />
-        <button style={btn} onClick={uploadLHS}>Upload LHS</button>
+        <h3>1) Upload LHS Excel (.xlsx)</h3>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input type="file" accept=".xlsx,.xls" onChange={(e) => setLhsFile(e.target.files?.[0] || null)} />
+          <button style={btn} onClick={uploadLHS}>Upload LHS</button>
+        </div>
         <div style={{ marginTop: 8 }}>
-          <small>After upload, this component will immediately check /results to confirm the server stored the table.</small>
+          <small>Server will store the first sheet of your uploaded Excel as the LHS table.</small>
         </div>
       </section>
 
       <section style={card}>
-        <h3>2) Configure run & start</h3>
-        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+        <h3>2) Configure objectives, HPLC params, watch path & SOR iterations → Start Run</h3>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <div style={{ minWidth: 420 }}>
-            <label>Objectives (e.g. Yield:Maximize,Purity:Minimize)</label><br/>
-            <input style={input} value={objectivesText} onChange={e => setObjectivesText(e.target.value)} />
+            <label>Objectives (comma-separated, name:Maximize or Minimize):</label><br />
+            <input style={input} value={objectivesText} onChange={(e) => setObjectivesText(e.target.value)} />
           </div>
+
           <div>
-            <label>Watch path (server absolute path; optional)</label><br/>
-            <input style={{...input, width: 320}} value={watchPath} onChange={e => setWatchPath(e.target.value)} />
+            <label>Server watch path (optional)</label><br />
+            <input style={{ ...input, width: 360 }} value={watchPath} onChange={(e) => setWatchPath(e.target.value)} />
           </div>
+
           <div>
-            <label>SOR iterations (after LHS files)</label><br/>
-            <input style={{ width: 90, padding: 8 }} type="number" value={sorIter} onChange={e => setSorIter(Number(e.target.value))} />
+            <label>SOR iterations (after initial LHS files)</label><br />
+            <input style={{ width: 100, padding: 8 }} type="number" value={sorIter} onChange={(e) => setSorIter(Number(e.target.value))} />
           </div>
-          <div style={{display:"flex", gap:8}}>
+
+          <div style={{ display: "flex", gap: 8 }}>
             <button style={btn} onClick={startRun}>Start Run</button>
+            <button style={btnAlt} onClick={startWatchFolder}>Start Watch (optional)</button>
+            <button style={btnAlt} onClick={stopWatchFolder}>Stop Watch</button>
+            <button style={btnAlt} onClick={runOptimizeManually}>Run Optimize (manual)</button>
           </div>
         </div>
 
         <details style={{ marginTop: 8 }}>
-          <summary>HPLC parse params</summary>
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <div><small>YminRT</small><br/><input style={small} value={YminRT} onChange={e=>setYminRT(e.target.value)} /></div>
-            <div><small>YmaxRT</small><br/><input style={small} value={YmaxRT} onChange={e=>setYmaxRT(e.target.value)} /></div>
-            <div><small>IminRTs</small><br/><input style={small} value={IminRT} onChange={e=>setIminRT(e.target.value)} /></div>
-            <div><small>ImaxRTs</small><br/><input style={small} value={ImaxRT} onChange={e=>setImaxRT(e.target.value)} /></div>
-            <div><small>ISO min</small><br/><input style={small} value={minRTISO} onChange={e=>setMinRTISO(e.target.value)} /></div>
-            <div><small>ISO max</small><br/><input style={small} value={maxRTISO} onChange={e=>setMaxRTISO(e.target.value)} /></div>
+          <summary>HPLC parsing params (optional)</summary>
+          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+            <div>
+              <small>YminRT</small><br />
+              <input style={small} value={YminRT} onChange={(e) => setYminRT(e.target.value)} />
+            </div>
+            <div>
+              <small>YmaxRT</small><br />
+              <input style={small} value={YmaxRT} onChange={(e) => setYmaxRT(e.target.value)} />
+            </div>
+            <div>
+              <small>IminRT list</small><br />
+              <input style={small} value={IminRT_list} onChange={(e) => setIminRT_list(e.target.value)} />
+            </div>
+            <div>
+              <small>ImaxRT list</small><br />
+              <input style={small} value={ImaxRT_list} onChange={(e) => setImaxRT_list(e.target.value)} />
+            </div>
+            <div>
+              <small>ISO min</small><br />
+              <input style={small} value={minRTISO} onChange={(e) => setMinRTISO(Number(e.target.value))} />
+            </div>
+            <div>
+              <small>ISO max</small><br />
+              <input style={small} value={maxRTISO} onChange={(e) => setMaxRTISO(Number(e.target.value))} />
+            </div>
           </div>
         </details>
       </section>
 
       <section style={card}>
         <h3>3) Upload HPLC CSV (fills next row)</h3>
-        <input type="file" accept=".csv" onChange={e => setHplcFile(e.target.files?.[0] || null)} />
-        <button style={btn} onClick={uploadHplc}>Upload HPLC</button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input type="file" accept=".csv" onChange={(e) => setHplcFile(e.target.files?.[0] || null)} />
+          <button style={btn} onClick={uploadHplc}>Upload HPLC (fills next row)</button>
+        </div>
+        <div style={{ marginTop: 8 }}>
+          <small>If you supplied a watch path when starting the run, dropping CSVs into that server folder will also process them automatically.</small>
+        </div>
       </section>
 
       <section style={card}>
-        <h3>Server /results (live)</h3>
-        <pre style={{ maxHeight: 260, overflow: "auto", background: "#0b1220", color: "#cff", padding: 8 }}>
-          {results ? JSON.stringify(results, null, 2) : "No data yet"}
-        </pre>
+        <h3>Live LHS (server-stored)</h3>
+        {lhs ? (
+          <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", padding: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>{Object.keys(lhs[0]).map((k) => <th key={k} style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #eee" }}>{k}</th>)}</tr>
+              </thead>
+              <tbody>
+                {lhs.map((row, i) => (
+                  <tr key={i}>
+                    {Object.keys(lhs[0]).map((k) => <td key={k} style={{ padding: 6, borderBottom: "1px solid #fafafa" }}>{String(row[k] ?? "").slice(0, 20)}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <div>No LHS stored on server yet.</div>}
       </section>
 
-      <footer style={{ marginTop: 12 }}>
-        <label><input type="checkbox" checked={polling} onChange={e => setPolling(e.target.checked)} /> Poll /results</label>
+      <section style={card}>
+        <h3>Optimization result</h3>
+        <div style={{ maxHeight: 300, overflow: "auto", background: "#0b1220", color: "#cff", padding: 8, borderRadius: 6 }}>
+          <pre>{results && results.optimization_result ? JSON.stringify(results.optimization_result, null, 2) : "No optimization result yet."}</pre>
+        </div>
+      </section>
+
+      <footer style={{ marginTop: 12, color: "#666" }}>
+        <label><input type="checkbox" checked={polling} onChange={(e) => setPolling(e.target.checked)} /> Poll server every 2.5s</label>
       </footer>
     </div>
   );
 }
 
-const card = { background: "#fff", padding: 12, borderRadius: 8, marginBottom: 12, boxShadow: "0 6px 18px rgba(15,20,50,0.06)" };
-const btn = { background: "#0b5fff", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6 };
+// styles
+const card = { background: "#fff", padding: 12, borderRadius: 8, boxShadow: "0 6px 18px rgba(15,20,50,0.06)", marginBottom: 12 };
+const btn = { background: "#0b5fff", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
+const btnAlt = { background: "#222", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
 const input = { width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ddd" };
 const small = { width: 84, padding: 6, borderRadius: 6, border: "1px solid #ddd" };
