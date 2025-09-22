@@ -1,756 +1,801 @@
-from .base import Strategy
-from .random import LHS
-from .factorial_doe import fullfact
-from summit.domain import *
-from summit.utils.multiobjective import pareto_efficient, hypervolume
-from summit.utils.dataset import DataSet
-from summit import get_summit_config_path
-
-from pymoo.core.problem import Problem
-
-from fastprogress.fastprogress import progress_bar
-from scipy.sparse import issparse
-import pathlib
+# main.py
+import io
 import os
+import threading
+from typing import List, Optional, Dict, Any
+
 import numpy as np
 import pandas as pd
-import uuid
-import logging
+from fastapi import FastAPI, UploadFile, File, Body, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
+# Optional Summit imports (optimization). If not installed, code remains safe.
+try:
+    from summit.domain import Domain, ContinuousVariable
+    from summit.strategies import TSEMO, SNOBFIT
+    from summit.utils.dataset import DataSet
+except Exception as e:
+    Domain = None
+    ContinuousVariable = None
+    TSEMO = None
+    SNOBFIT = None
+    DataSet = None
+    print("Warning: summit not available:", e)
 
-class TSEMO(Strategy):
-    """Thompson-Sampling for Efficient Multiobjective Optimization (TSEMO)
+app = FastAPI(title="SOR AI Backend — LHS-first then SOR iterations")
 
-    TSEMO is a multiobjective Bayesian optimisation strategy. It is designed
-    to find optimal values in as few iterations as possible. This comes at the price
-    of higher computational time.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
 
-    Parameters
-    ----------
+# ---------------- In-memory store and lock ----------------
+store: Dict[str, Any] = {
+    "lhs_table": None,             # pandas DataFrame
+    "optimization_result": None,   # DataFrame or dict
+    "hplc_responses": {},          # filename -> response list
+    "watching": False,
+    "watch_path": None,
+    # run metadata
+    "objectives": None,            # [{"name":..., "maximize":bool}]
+    "hplc_params": None,           # YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO
+    "phase": None,                 # None | "lhs" | "sor" | "done"
+    "expected_files": 0,           # expected in current phase
+    "next_row": 0,                 # next row index to fill
+    "sor_iterations": 0,           # user requested SOR iterations (after initial LHS fill)
+    "appended_start_index": None,  # index where appended SOR suggestions start
+}
+store_lock = threading.Lock()
 
-    domain : :class:`~summit.domain.Domain`
-        The domain of the optimization
-    transform : :class:`~summit.strategies.base.Transform`, optional
-        A transform object. By default no transformation will be done
-        on the input variables or objectives.
-    use_descriptors : bool, optional
-        Whether to use descriptors of categorical variables. Defaults to False.
-    kernel : :class:`~GPy.kern.Kern`, optional
-        A GPy kernel class (not instantiated). Must be Exponential,
-        Matern32, Matern52 or RBF. Default Exponential.
-    n_spectral_points : int, optional
-        Number of spectral points used in spectral sampling.
-        Default is 1500. Note that the Matlab TSEMO version uses 4000
-        which will improve accuracy but significantly slow down optimisation speed.
-    n_retries : int, optional
-        Number of retries to use for spectral sampling iF the singular value decomposition
-        fails. Retrying chooses a new Monte Carlo sampling which usually fixes the problem.
-        Defualt is 10.
-    generations : int, optional
-        Number of generations used in the internal optimisation with NSGAII.
-        Default is 100.
-    pop_size : int, optional
-        Population size used in the internal optimisation with NSGAII.
-        Default is 100.
+observer: Optional[Observer] = None
 
-    Attributes
-    ----------
+# ---------------- Utilities ----------------
+def latin_hypercube_sampling(bounds: List[List[float]], n_samples: int, random_state: Optional[int] = None):
+    rng = np.random.RandomState(random_state)
+    n_vars = len(bounds)
+    cut = np.linspace(0, 1, n_samples + 1)
+    u = rng.rand(n_samples, n_vars)
+    samples = np.zeros_like(u)
+    for j in range(n_vars):
+        a = cut[:-1]; b = cut[1:]
+        pts = a + u[:, j] * (b - a)
+        rng.shuffle(pts)
+        samples[:, j] = pts
+    scaled = np.zeros_like(samples)
+    for j in range(n_vars):
+        low, high = bounds[j]
+        scaled[:, j] = low + samples[:, j] * (high - low)
+    return scaled
 
+def compute_sor_table(eq1_vals, eq2_vals, eq3_vals, rt3_vals, temp_vals,
+                      molecular_weights=[90.05, 101.19, 318.18, 532.09],
+                      densities=[1.00, 0.726, 1.08, 0.90]):
+    rows = []
+    coil1 = 5.00; coil2 = 10.00; coil3 = 10.00
+    mw1, mw2, mw3, mw4 = molecular_weights
+    d1, d2, d3, d4 = densities
+    n = len(eq1_vals)
+    for i in range(n):
+        E1 = float(eq1_vals[i]); E2 = float(eq2_vals[i]); E3 = float(eq3_vals[i])
+        RT3 = float(rt3_vals[i]); TEMP = float(temp_vals[i])
 
+        vol_g_1 = 5 * E1 / 2.5
+        vol_g_2 = 2 * E2 / 7.5
+        vol_g_3 = 2.5 * E3 / 3.125
+        vol_g_4 = 7.0
 
-    Examples
-    --------
+        mass4 = 1.00; moles4 = mass4 / mw4
+        mass1 = E1 * moles4 * mw1
+        mass2 = E2 * moles4 * mw2
+        mass3 = E3 * moles4 * mw3
 
-    >>> from summit.domain import *
-    >>> from summit.strategies import TSEMO
-    >>> from summit.utils.dataset import DataSet
-    >>> domain = Domain()
-    >>> domain += ContinuousVariable(name='temperature', description='reaction temperature in celsius', bounds=[50, 100])
-    >>> domain += ContinuousVariable(name='flowrate_a', description='flow of reactant a in mL/min', bounds=[0.1, 0.5])
-    >>> domain += ContinuousVariable(name='flowrate_b', description='flow of reactant b in mL/min', bounds=[0.1, 0.5])
-    >>> columns = [v.name for v in domain.variables]
-    >>> values = {("temperature", "DATA"): 60,("flowrate_a", "DATA"): 0.5,("flowrate_b", "DATA"): 0.5,("yield_", "DATA"): 50,("de", "DATA"): 90}
-    >>> previous_results = DataSet([values], columns=columns)
-    >>> strategy = TSEMO(domain)
-    >>> result = strategy.suggest_experiments(5, prev_res=previous_results)
+        vol1 = mass1 / d1
+        vol2 = vol_g_1 * mass4
+        vol3 = mass2 / d2
+        vol4 = vol_g_2 * mass4
+        vol5 = mass3 / (0.5 * d3)
+        vol6 = vol_g_3 * mass4
+        vol7 = mass4
+        vol8 = vol_g_4 * mass4
 
-    Notes
-    -----
+        obs1 = vol1 + vol2; obs2 = vol3 + vol4; obs3 = vol5 + vol6; obs4 = vol7 + vol8
+        total_obs = obs1 + obs2 + obs3 + obs4 if (obs1+obs2+obs3+obs4) != 0 else 1e-12
+        total_flowrate = coil3 / RT3 if RT3 != 0 else 1e-12
 
-    TSEMO trains a gaussian process (GP) to model each objective. Internally, we use
-    `GPy <https://github.com/SheffieldML/GPy>`_ for GPs, and we accept any kernel in the Matérn family, including the
-    exponential and squared exponential kernel. See [Rasmussen]_ for more information about GPs.
+        f1 = obs1 / total_obs * total_flowrate
+        f2 = obs2 / total_obs * total_flowrate
+        f3 = obs3 / total_obs * total_flowrate
+        f4 = obs4 / total_obs * total_flowrate
 
-    A deterministic function is sampled from each of the trained GPs. We use spectral sampling available in `pyrff <https://github.com/michaelosthege/pyrff>`_.
-    These sampled functions are optimised using NSGAII (via `pymoo <https://pymoo.org/>`_) to find a selection of potential conditions.
-    Each of these conditions are evaluated using the hypervolume improvement (HVI) criterion, and the one(s) that offer the best
-    HVI are suggested as the next experiments. More details about TSEMO can be found in the original paper [Bradford]_.
+        rt1 = coil1 / (f1 + f2) if (f1 + f2) != 0 else float('inf')
+        rt2 = coil2 / (f1 + f2 + f3) if (f1 + f2 + f3) != 0 else float('inf')
+        reaction_time = rt1 + rt2 + RT3
 
-    The number of spectral points is the parameter that most affects TSEMO performance. By default, it's set at 1500,
-    but increase it to around 4000 to get the best performance at the cost of longer computational times.  You can change it using the n_spectral_points keyword argument.
+        row = {
+            "Equiv1": round(E1, 8), "Equiv2": round(E2, 8), "Equiv3": round(E3, 8),
+            "ResidenceTime3": round(RT3, 8), "ReactionTemperature": round(TEMP, 8),
+            "ReactionTime": round(reaction_time, 8),
+            "Flowrate1": round(f1, 8), "Flowrate2": round(f2, 8), "Flowrate3": round(f3, 8), "Flowrate4": round(f4, 8),
+            "TotalFlowrate": round(total_flowrate, 8),
+            "Obs1": round(obs1, 8), "Obs2": round(obs2, 8), "Obs3": round(obs3, 8), "Obs4": round(obs4, 8),
+            "Vol1": round(vol1, 8), "Vol2": round(vol2, 8), "Vol3": round(vol3, 8), "Vol4": round(vol4, 8),
+            "Vol5": round(vol5, 8), "Vol6": round(vol6, 8), "Vol7": round(vol7, 8), "Vol8": round(vol8, 8),
+            "Mass1": round(mass1, 8), "Mass2": round(mass2, 8), "Mass3": round(mass3, 8), "Mass4": round(mass4, 8),
+        }
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    cols_order = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature",
+                  "ReactionTime", "Flowrate1", "Flowrate2", "Flowrate3", "Flowrate4", "TotalFlowrate"]
+    remaining = [c for c in df.columns if c not in cols_order]
+    return df[cols_order + remaining]
 
-    The other two parameters are the number of generations and population size used in NSGA-II. Increasing their values can improve
-    performance in some cases.
+# ---------------- HPLC parsing ----------------
+def HPLC_data_read_csv(file_path: str) -> np.ndarray:
+    try:
+        data = pd.read_csv(file_path)
+        if 'Area' in data.columns and 'RT' in data.columns:
+            df = pd.DataFrame({"Area": data['Area'], "RT": data['RT']})
+        else:
+            cols_lower = {c.lower(): c for c in data.columns}
+            if 'area' in cols_lower and 'rt' in cols_lower:
+                df = pd.DataFrame({"Area": data[cols_lower['area']], "RT": data[cols_lower['rt']]})
+            else:
+                raise ValueError("CSV missing 'Area' and 'RT' columns")
+        return df.to_numpy()
+    except Exception as e:
+        print("HPLC read error:", e)
+        return np.array([])
 
+def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
+    areaB = 0.0
+    for i in range(data_np.shape[0]):
+        if IminRT <= data_np[i, 1] <= ImaxRT:
+            areaB += float(data_np[i, 0])
+    return areaB / areaISO if areaISO != 0 else 0.0
 
-    References
-    ----------
+def response_HPLC_csv(data_np: np.ndarray, YminRT: float, YmaxRT: float,
+                      IminRT_list: List[float], ImaxRT_list: List[float],
+                      minRTISO: float, maxRTISO: float, nobj: int) -> List[float]:
+    if data_np.size == 0:
+        return [float('inf')] * nobj
+    areaA = 0.0
+    for i in range(data_np.shape[0]):
+        if YminRT <= data_np[i, 1] <= YmaxRT:
+            areaA += float(data_np[i, 0])
+    areaISO = 0.0
+    for i in range(data_np.shape[0]):
+        if minRTISO <= data_np[i, 1] <= maxRTISO:
+            areaISO += float(data_np[i, 0])
+    response = []
+    yield_result = areaA / areaISO if areaISO != 0 else 0.0
+    response.append(-np.log(yield_result) if yield_result > 0 else float('inf'))
+    for i in range(nobj - 1):
+        if i < len(IminRT_list) and i < len(ImaxRT_list):
+            impurities_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
+            response.append(impurities_result)
+        else:
+            response.append(0.0)
+    return response
 
-    .. [Rasmussen] C. E. Rasmussen et al.
-       Gaussian Processes for Machine Learning, MIT Press, 2006.
+# ---------------- Domain builder and optimization ----------------
+def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
+    if Domain is None or ContinuousVariable is None:
+        raise RuntimeError("Summit is not installed.")
+    required_names = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]
+    found = {}
+    for name in required_names:
+        for col in df.columns:
+            if col.lower().replace(" ", "") == name.lower().replace(" ", ""):
+                found[name] = col; break
+    domain = Domain()
+    if len(found) >= 4:
+        for canonical in ["Equiv1","Equiv2","Equiv3","ResidenceTime3","ReactionTemperature"]:
+            if canonical in found:
+                col = found[canonical]; lb = float(df[col].min()); ub = float(df[col].max())
+                if lb == ub: lb -= 1e-6; ub += 1e-6
+                domain += ContinuousVariable(name=canonical, description=canonical, bounds=[lb, ub])
+    else:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) == 0:
+            raise ValueError("No numeric columns to build domain.")
+        for col in numeric_cols[:5]:
+            lb = float(df[col].min()); ub = float(df[col].max())
+            if lb == ub: lb -= 1e-6; ub += 1e-6
+            domain += ContinuousVariable(name=str(col), description=str(col), bounds=[lb, ub])
+    for obj in objectives:
+        obj_name = obj.get("name", "obj"); maximize = bool(obj.get("maximize", False))
+        domain += ContinuousVariable(name=obj_name, description=obj_name, bounds=[0, 100], is_objective=True, maximize=maximize)
+    return domain
 
-    .. [Bradford] E. Bradford et al.
-       "Efficient multiobjective optimization employing Gaussian processes, spectral sampling and a genetic algorithm."
-       J. Glob. Optim., 2018, 71, 407–438.
+def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
+    if TSEMO is None or SNOBFIT is None or DataSet is None:
+        raise RuntimeError("Summit is not available.")
+    if nobj > 1:
+        strat = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
+        lhs_ds = DataSet.from_df(lhs_df)
+        out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
+    else:
+        strat = SNOBFIT(domain)
+        lhs_ds = DataSet.from_df(lhs_df)
+        out = strat.suggest_experiments(1, lhs_ds)
+    try:
+        out.columns = [col[0] for col in out.columns]
+    except Exception:
+        pass
+    if "strategy" in out.columns: out = out.drop(columns={"strategy"})
+    common = [c for c in lhs_df.columns if c in out.columns]
+    if len(common) > 0: out = out[common]
+    return out
 
+def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]]):
     """
+    Run optimization on current LHS and append `num_suggestions` rows (decision columns filled,
+    objective columns NaN). Return appended start index.
+    """
+    with store_lock:
+        lhs = store.get("lhs_table")
+        if lhs is None:
+            raise RuntimeError("No LHS available to base suggestions on.")
+        # build domain & run optimization repeatedly to get suggestions
+        try:
+            domain = build_domain_from_df(lhs, objectives)
+        except Exception as e:
+            raise RuntimeError(f"Domain build failed: {e}")
+    suggestions = []
+    for _ in range(num_suggestions):
+        try:
+            out = run_summit_optimization(domain, lhs, len(objectives) or 1)
+            # out is DataFrame-like; take first suggested row
+            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
+                suggested = out.iloc[0].to_dict()
+            else:
+                suggested = {}
+        except Exception as e:
+            # if summit fails, create empty suggestion row
+            suggested = {}
+        # Map suggested keys to columns in lhs if possible, else leave blank
+        # Build a new row filled with NaN then set suggested decision vars
+        new_row = {c: (np.nan if c not in suggested else suggested[c]) for c in lhs.columns}
+        suggestions.append(new_row)
+        # also extend lhs so domain update next iter sees appended rows (optional)
+        lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+    # commit appended rows and return start index
+    with store_lock:
+        start_idx = store.get("lhs_table").shape[0] if store.get("lhs_table") is not None else 0
+        # overwrite with lhs that includes appended rows
+        store["lhs_table"] = lhs
+    return start_idx
 
-    def __init__(self, domain, transform=None, **kwargs):
-        Strategy.__init__(self, domain, transform, **kwargs)
-
-        # Categorical variable options
-        self.use_descriptors = kwargs.get("use_descriptors", False)
-        n_categoricals = len(
-            [v for v in self.domain.input_variables if v.variable_type == "categorical"]
-        )
-        if n_categoricals > 0:
-            self.categorical_combos = self.domain.get_categorical_combinations()
-        else:
-            self.categorical_combos = None
-
-        # Input columns
-        self.input_columns = []
-        for v in self.domain.input_variables:
-            if type(v) == ContinuousVariable:
-                self.input_columns.append(v.name)
-            elif (
-                type(v) == CategoricalVariable
-                and v.ds is not None
-                and self.use_descriptors
-            ):
-                self.input_columns += [c[0] for c in v.ds.columns]
-
-
-        # Spectral sampling settings
-        self.n_spectral_points = kwargs.get("n_spectral_points", 1500)
-        self.n_retries = kwargs.get("n_retries", 10)
-
-        # NSGA-II tsemo_settings
-        self.generations = kwargs.get("generations", 1000)
-        self.pop_size = kwargs.get("pop_size", 100)
-
-        self.logger = kwargs.get("logger", logging.getLogger(__name__))
-        self.reset()
-
-    def suggest_experiments(self, num_experiments, prev_res: DataSet = None, **kwargs):
-        """Suggest experiments using TSEMO
-
-        Parameters
-        ----------
-        num_experiments : int
-            The number of experiments (i.e., samples) to generate
-        prev_res : :class:`~summit.utils.data.DataSet`, optional
-            Dataset with data from previous experiments.
-            If no data is passed, then latin hypercube sampling will
-            be used to suggest an initial design.
-
-        Returns
-        -------
-        next_experiments : :class:`~summit.utils.data.DataSet`
-            A Dataset object with the suggested experiments
-            The lengthscales column tells the significance of each variable (assuming automatic relevance detection is turned on, which it is in Botorch).
-            Smaller values mean significant changes in output happen on a smaller change in the input, suggesting a more important input.
-            The variance column scales the output of the posterior of the kernel to the correct scale for your objective
-            The noise column is the constant noise in outputs (e.g., assumed uniform experiment error)
-
-        """
-        # Suggest lhs initial design or append new experiments to previous experiments
-        cat_method = "descriptors" if self.use_descriptors else None
-        if prev_res is None:
-            lhs = LHS(self.domain, categorical_method=cat_method)
-            self.iterations += 1
-            k = num_experiments if num_experiments > 1 else 2
-            return lhs.suggest_experiments(k, criterion="maximin")
-        elif prev_res is not None and self.all_experiments is None:
-            self.all_experiments = prev_res
-        elif prev_res is not None and self.all_experiments is not None:
-            self.all_experiments = pd.concat([self.all_experiments, prev_res], axis=0)
-        
-        if self.all_experiments.shape[0] <= 3:
-            lhs = LHS(self.domain, categorical_method=cat_method)
-            self.iterations += 1
-            return lhs.suggest_experiments(num_experiments)
-
-        # Get inputs (decision variables) and outputs (objectives)
-        cat_method = "descriptors" if self.use_descriptors else "one-hot"
-        inputs, outputs = self.transform.transform_inputs_outputs(
-            self.all_experiments,
-            categorical_method=cat_method,
-            min_max_scale_inputs=True,
-            standardize_outputs=True,
-        )
-        if inputs.shape[0] < self.domain.num_continuous_dimensions():
-            self.logger.warning(
-                (
-                    f"""The number of examples ({inputs.shape[0]}) is less the number"""
-                    f"""of input dimensions ({self.domain.num_continuous_dimensions()}."""
-                )
-            )
-
-        # Train and sample
-        n_outputs = len(self.domain.output_variables)
-        train_results = [0] * n_outputs
-        self.models = [0] * n_outputs
-        rmse_train_spectral = np.zeros(n_outputs)
-        for i, v in enumerate(self.domain.output_variables):
-            # Training
-            self.models[i] = ThompsonSampledModel(v.name)
-            train_results[i] = self.models[i].fit(
-                inputs,
-                outputs[[v.name]],
-                n_retries=self.n_retries,
-                n_spectral_points=self.n_spectral_points,
-            )
-
-            # Evaluate spectral sampled functions
-            sample_f = lambda x: np.atleast_2d(self.models[i].rff(x)).T
-            rmse_train_spectral[i] = rmse(
-                sample_f(inputs.to_numpy().astype("float")),
-                outputs[[v.name]].to_numpy().astype("float"),
-                mean=self.transform.output_means[v.name],
-                std=self.transform.output_stds[v.name],
-            )
-            self.logger.debug(
-                f"RMSE train spectral {v.name} = {rmse_train_spectral[i].round(2)}"
-            )
-
-        # NSGAII internal optimisation on spectrally sampled functions
-        self.logger.info("Optimizing models using NSGAII.")
-
-        # Categorical only domain
-        if (self.domain.num_continuous_dimensions() == 0) and (
-            self.domain.num_categorical_variables() == 1
-        ):
-            X, yhat = self._categorical_enumerate(self.models)
-        # Mixed domains
-        elif self.categorical_combos is not None and len(self.input_columns) > 1:
-            X, yhat = self._nsga_optimize_mixed(self.models)
-        # Continous domains
-        elif self.categorical_combos is None and len(self.input_columns) > 0:
-            X, yhat = self._nsga_optimize(self.models)
-
-        # Return if no suggestiosn found
-        if X.shape[0] == 0 and yhat.shape[0] == 0:
-            self.logger.warning("No suggestions found.")
-            self.iterations += 1
-            return None
-
-        # Select points that give maximum hypervolume improvement
-        self.hv_imp, indices = self._select_max_hvi(y=outputs, yhat=yhat, num_evals=num_experiments)
-
-        # Join to get single dataset with inputs and outputs and get suggestion
-        result = X.join(yhat)
-        result = result.iloc[indices, :]
-
-        # Do any necessary transformations back
-        result = self.transform.un_transform(
-            result,
-            categorical_method=cat_method,
-            min_max_scale_inputs=True,
-            standardize_outputs=True,
-        )
-
-        # Add model hyperparameters as metadata columns
-        result[("strategy", "METADATA")] = "TSEMO"
-        i = 0
-        for res in train_results:
-            output_name = res["name"]
-            result[(f"{output_name}_variance", "METADATA")] = res["outputscale"]
-            result[(f"{output_name}_noise", "METADATA")] = res["noise"]
-            result[f"rmse_train_spectral", "METADATA"] = rmse_train_spectral[i]
-            i += 1
-            for var, l in zip(self.domain.input_variables, res["lengthscales"]):
-                result[(f"{output_name}_{var.name}_lengthscale", "METADATA")] = l
-        self.iterations += 1
-        result[("iterations", "METADATA")] = self.iterations
-        return result
-
-    def _nsga_optimize(self, models):
-        """NSGA-II optimization with categorical domains"""
-        from pymoo.algorithms.moo.nsga2 import NSGA2
-        from pymoo.optimize import minimize
-        from pymoo.factory import get_termination
-
-        optimizer = NSGA2(pop_size=self.pop_size)
-        problem = TSEMOInternalWrapper(models, self.domain)
-        termination = get_termination("n_gen", self.generations)
-        self.internal_res = minimize(
-            problem, optimizer, termination, seed=1, verbose=False
-        )
-
-        X = np.atleast_2d(self.internal_res.X).tolist()
-        y = np.atleast_2d(self.internal_res.F).tolist()
-        X = DataSet(X, columns=problem.X_columns)
-        y = DataSet(y, columns=[v.name for v in self.domain.output_variables])
-        for v in self.domain.output_variables:
-            if v.maximize:
-                y[v.name] = -y[v.name]
-        return X, y
-
-    def _nsga_optimize_mixed(self, models):
-        """NSGA-II optimization with mixed continuous-categorical domains"""
-        from pymoo.algorithms.moo.nsga2 import NSGA2
-        from pymoo.optimize import minimize
-        from pymoo.factory import get_termination
-
-        combos = self.categorical_combos
-        transformed_combos = self._transform_categorical(combos)
-
-        X_list, y_list = [], []
-
-        # Loop through all combinations of categoricals and run optimization
-        bar = progress_bar(
-            transformed_combos.iterrows(), total=transformed_combos.shape[0]
-        )
-        for _, combo in bar:
-            # bar.comment = "NSGA Mixed Optimization"
-            optimizer = NSGA2(pop_size=self.pop_size)
-            problem = TSEMOInternalWrapper(
-                models, self.domain, fixed_variables=combo.to_dict()
-            )
-            termination = get_termination("n_gen", self.generations)
-            self.internal_res = minimize(
-                problem, optimizer, termination, seed=1, verbose=False
-            )
-
-            X = np.atleast_2d(self.internal_res.X).tolist()
-            y = np.atleast_2d(self.internal_res.F).tolist()
-            X = DataSet(X, columns=problem.X_columns)
-            y = DataSet(y, columns=[v.name for v in self.domain.output_variables])
-            for v in self.domain.output_variables:
-                if v.maximize:
-                    y[v.name] = -y[v.name]
-            # Add in categorical variables
-            for key, value in combo.to_dict().items():
-                X[key] = value
-            X_list.append(X)
-            y_list.append(y)
-
-        return pd.concat(X_list, axis=0), pd.concat(y_list, axis=0)
-
-    def _transform_categorical(self, X):
-        transformed_combos = {}
-        for v in self.domain.input_variables:
-            if v.variable_type == "categorical":
-                values = X[v.name].to_numpy()
-
-                # Descriptor transformation
-                if self.use_descriptors and v.ds is not None:
-                    transformed_values = v.ds.loc[values]
-                    for col in transformed_values:
-                        transformed_combos[col] = transformed_values[col[0]].to_numpy()
-                        var_max = v.ds[col[0]].max()
-                        var_min = v.ds[col[0]].min()
-                        transformed_combos[col] = (
-                            transformed_combos[col] - var_min
-                        ) / (var_max - var_min)
-                elif self.use_descriptors and v.ds is None:
-                    raise DomainError(
-                        f"use_descriptors is true, but {v.name} has no descriptors."
-                    )
-                # One hot encoding transformation
-                else:
-                    enc = self.transform.encoders[v.name]
-                    one_hot_values = enc.transform(values[:, np.newaxis])
-                    if issparse(one_hot_values):
-                        one_hot_values = one_hot_values.toarray()
-                    for loc, l in enumerate(v.levels):
-                        column_name = f"{v.name}_{l}"
-                        transformed_combos[(column_name, "DATA")] = one_hot_values[
-                            :, loc
-                        ]
-        return DataSet(transformed_combos)
-
-    def _categorical_enumerate(self, models):
-        """Make predictions on all combinations of categorical domain"""
-        combos = self.categorical_combos
-        X = self._transform_categorical(combos)
-        n_obj = len(self.domain.output_variables)
-        y = np.zeros([X.shape[0], n_obj])
-        for i, v in enumerate(self.domain.output_variables):
-            y[:, i] = models[i].predict(X)
-        y = DataSet(y, columns=[v.name for v in self.domain.output_variables])
-        return X, y
-
-    def reset(self):
-        """Reset TSEMO state"""
-        self.all_experiments = None
-        self.iterations = 0
-        self.sample_fs = [0 for i in range(len(self.domain.output_variables))]
-        self.uuid_val = uuid.uuid4()
-
-    def to_dict(self):
-        ae = (
-            self.all_experiments.to_dict() if self.all_experiments is not None else None
-        )
-        strategy_params = dict(
-            all_experiments=ae,
-            n_spectral_points=self.n_spectral_points,
-            n_retries=self.n_retries,
-            pop_size=self.pop_size,
-            generation=self.generations,
-        )
-        return super().to_dict(**strategy_params)
-
-    @classmethod
-    def from_dict(cls, d):
-
-        tsemo = super().from_dict(d)
-        ae = d["strategy_params"]["all_experiments"]
-        if ae is not None:
-            tsemo.all_experiments = DataSet.from_dict(ae)
-        return tsemo
-
-    def _select_max_hvi(self, y, yhat, num_evals=1):
-        """Returns the point(s) that maximimize hypervolume improvement
-
-        Parameters
-        ----------
-        samples: np.ndarray
-             The samples on which hypervolume improvement is calculated
-        num_evals: `int`
-            The number of points to return (with top hypervolume improvement)
-
-        Returns
-        -------
-        hv_imp, index
-            Returns a tuple with lists of the best hypervolume improvement
-            and the indices of the corresponding points in samples
-
-        """
-        yhat = yhat.copy()
-        y = y.copy()
-
-        # Set up maximization and minimization
-        for v in self.domain.output_variables:
-            if v.maximize:
-                y[v.name] = -1 * y[v.name]
-                yhat[v.name] = -1 * yhat[v.name]
-
-        # samples, mean, std = samples.standardize(return_mean=True, return_std=True)
-        yhat = yhat.data_to_numpy()
-        Ynew = y.data_to_numpy()
-
-        # Reference
-        Yfront, _ = pareto_efficient(Ynew, maximize=False)
-        r = np.max(Yfront, axis=0) + 0.01 * (
-            np.max(Yfront, axis=0) - np.min(Yfront, axis=0)
-        )
-
-        indices = []
-        n = yhat.shape[1]
-        mask = np.ones(yhat.shape[0], dtype=bool)
-        samples_indices = np.arange(0, yhat.shape[0])
-
-        for i in range(num_evals):
-            masked_samples = yhat[mask, :]
-            Yfront, _ = pareto_efficient(Ynew, maximize=False)
-            if len(Yfront) == 0:
-                raise ValueError("Pareto front length too short")
-
-            hv_improvement = []
-            hvY = hypervolume(Yfront, r)
-            # Determine hypervolume improvement by including
-            # each point from samples (masking previously selected poonts)
-            for sample in masked_samples:
-                sample = sample.reshape(1, n)
-                A = np.append(Ynew, sample, axis=0)
-                Afront, _ = pareto_efficient(A, maximize=False)
-                hv = hypervolume(Afront, r)
-                hv_improvement.append(hv - hvY)
-
-            hvY0 = hvY if i == 0 else hvY0
-            hv_improvement = np.array(hv_improvement)
-            masked_index = np.argmax(hv_improvement)
-
-            # Housekeeping: find the max HvI point and mask out for next round
-            original_index = samples_indices[mask][masked_index]
-            new_point = yhat[original_index, :].reshape(1, n)
-            Ynew = np.append(Ynew, new_point, axis=0)
-            mask[original_index] = False
-            indices.append(original_index)
-
-        if len(hv_improvement) == 0:
-            hv_imp = 0
-        elif len(indices) == 0:
-            indices = []
-            hv_imp = 0
-        else:
-            # Total hypervolume improvement
-            Yfront, _ = pareto_efficient(Ynew, maximize=False)
-            hv_imp =  hypervolume(Yfront, r) - hvY0
-        return hv_imp, indices
-
-
-def rmse(Y_pred, Y_true, mean, std):
-    Y_pred = Y_pred * std + mean
-    Y_true = Y_true * std + mean
-    square_error = (Y_pred[:, 0] - Y_true[:, 0]) ** 2
-    return np.sqrt(np.mean(square_error))
-
-
-class ThompsonSampledModel:
-    def __init__(self, model_name=None):
-        self.model_name = model_name
-        self.input_columns_ordered = None
-        self.output_columns_ordered = None
-        self.logger = logging.getLogger(__name__)
-
-    def fit(self, X: DataSet, y: DataSet, **kwargs):
-        """Train model and take spectral samples"""
-        from botorch.models import SingleTaskGP
-        from botorch.fit import fit_gpytorch_model
-        from gpytorch.mlls.exact_marginal_log_likelihood import (
-            ExactMarginalLogLikelihood,
-        )
-        import pyrff
-        import torch
-
-        self.input_columns_ordered = X.columns
-
-        # Convert to tensors
-        X_np = X.to_numpy().astype(float)
-        y_np = y.to_numpy().astype(float)
-        X = torch.from_numpy(X_np)
-        y = torch.from_numpy(y_np)
-
-        # Train the GP model
-        self.model = SingleTaskGP(X, y)
-        mll = ExactMarginalLogLikelihood(self.model.likelihood, self.model)
-        fit_gpytorch_model(mll)
-
-        # self.logger.info model hyperparameters
-        if self.model_name is None:
-            self.model_name = self.output_columns_ordered[0]
-        self.lengthscales_ = self.model.covar_module.base_kernel.lengthscale.detach()[
-            0
-        ].numpy()
-        self.outputscale_ = self.model.covar_module.outputscale.detach().numpy()
-        self.noise_ = self.model.likelihood.noise_covar.noise.detach().numpy()[0]
-        self.logger.debug(f"Model {self.model_name} lengthscales: {self.lengthscales_}")
-        self.logger.debug(f"Model {self.model_name} variance: {self.outputscale_}")
-        self.logger.debug(f"Model {self.model_name} noise: {self.noise_}")
-
-        # Spectral sampling
-        n_spectral_points = kwargs.get("n_spectral_points", 1500)
-        n_retries = kwargs.get("n_retries", 10)
-        self.logger.debug(
-            f"Spectral sampling {self.model_name} with {n_spectral_points} spectral points."
-        )
-        self.rff = None
-        nu = self.model.covar_module.base_kernel.nu
-        for _ in range(n_retries):
+# ---------------- HPLC processing & updates ----------------
+def process_hplc_and_fill(filename: str, data_np: np.ndarray):
+    """
+    Compute response vector using stored hplc params and write into next_row.
+    Handles phases: 'lhs' -> fill initial LHS rows; after they finish, append SOR suggestions and switch to 'sor';
+    then fill sor rows.
+    """
+    with store_lock:
+        lhs = store.get("lhs_table")
+        if lhs is None:
+            raise RuntimeError("No LHS uploaded.")
+        objectives = store.get("objectives") or []
+        nobj = len(objectives) or 1
+        hplc_params = store.get("hplc_params") or {}
+        phase = store.get("phase")
+        next_row = store.get("next_row", 0)
+        expected = store.get("expected_files", 0)
+    # compute response
+    resp = response_HPLC_csv(
+        data_np,
+        hplc_params.get("YminRT", 2.0),
+        hplc_params.get("YmaxRT", 4.0),
+        hplc_params.get("IminRT_list", [0.5]),
+        hplc_params.get("ImaxRT_list", [1.0]),
+        hplc_params.get("minRTISO", 10.0),
+        hplc_params.get("maxRTISO", 12.0),
+        nobj
+    )
+    # ensure objective columns exist
+    obj_names = [o["name"] for o in objectives]
+    with store_lock:
+        for name in obj_names:
+            if name not in lhs.columns:
+                lhs[name] = np.nan
+        # if next_row >= lhs rows, append blank rows until index exists
+        while next_row >= lhs.shape[0]:
+            lhs = pd.concat([lhs, pd.DataFrame([{c: np.nan for c in lhs.columns}])], ignore_index=True)
+        # fill responses into objective columns at next_row
+        for j, name in enumerate(obj_names):
+            if j < len(resp):
+                lhs.at[next_row, name] = resp[j]
+        # register hplc response
+        store["hplc_responses"][filename] = resp
+        # increment next_row
+        store["next_row"] = next_row + 1
+        store["lhs_table"] = lhs
+    # run optimization after each file (non-fatal)
+    try:
+        with store_lock:
+            cur_lhs = store.get("lhs_table")
+            objectives_local = store.get("objectives") or []
+            nobj_local = max(1, len(objectives_local))
+        domain = build_domain_from_df(cur_lhs, objectives_local)
+        out = run_summit_optimization(domain, cur_lhs, nobj_local)
+        with store_lock:
             try:
-                self.rff = pyrff.sample_rff(
-                    lengthscales=self.lengthscales_,
-                    scaling=np.sqrt(self.outputscale_),
-                    noise=self.noise_,
-                    kernel_nu=nu,
-                    X=X_np,
-                    Y=y_np[:, 0],
-                    M=n_spectral_points,
-                )
-                break
-            except np.linalg.LinAlgError as e:
-                self.logger.error(e)
-            except ValueError as e:
-                self.logger.error(e)
-        if self.rff is None:
-            raise RuntimeError(f"Spectral sampling failed after {n_retries} retries.")
+                store["optimization_result"] = pd.DataFrame(out)
+            except Exception:
+                store["optimization_result"] = out
+    except Exception as e:
+        with store_lock:
+            store["optimization_result"] = {"error": str(e)}
+    # after update, check phase completion
+    with store_lock:
+        phase = store.get("phase")
+        next_row = store.get("next_row", 0)
+        expected = store.get("expected_files", 0)
+        # if in 'lhs' and initial LHS files are done => append SOR suggestions (if any)
+        if phase == "lhs" and next_row >= expected:
+            # move to suggestion stage: append sor_iterations suggested rows
+            sor_it = store.get("sor_iterations", 0)
+            if sor_it > 0:
+                try:
+                    start_idx = suggest_experiments_and_append(sor_it, store.get("objectives") or [])
+                    # set new expected_files and phase to 'sor'
+                    store["phase"] = "sor"
+                    store["expected_files"] = sor_it
+                    store["appended_start_index"] = start_idx
+                    # reset next_row to first appended index (so next HPLC fills appended rows)
+                    store["next_row"] = start_idx
+                except Exception as e:
+                    store["optimization_result"] = {"error": f"Suggestion append failed: {e}"}
+            else:
+                # no SOR iterations requested -> done
+                store["phase"] = "done"
+    return resp
 
-        return dict(
-            name=self.model_name,
-            rff=self.rff,
-            lengthscales=self.lengthscales_,
-            outputscale=self.outputscale_,
-            noise=self.noise_,
-        )
+# ---------------- Watcher ----------------
+class HPLCHandler(FileSystemEventHandler):
+    def __init__(self):
+        super().__init__()
+    def on_created(self, event):
+        if event.is_directory: return
+        filepath = event.src_path
+        if not filepath.lower().endswith(".csv"): return
+        filename = os.path.basename(filepath)
+        try:
+            data_np = HPLC_data_read_csv(filepath)
+            resp = process_hplc_and_fill(filename, data_np)
+            print(f"[watcher] processed {filename} -> {resp} next_row={store.get('next_row')}")
+        except Exception as e:
+            print("[watcher] error:", e)
 
-    def predict(self, X: DataSet, **kwargs):
-        """Predict the values of a"""
-        X = X[self.input_columns_ordered].to_numpy()
-        return self.rff(X)
+# ---------------- Pydantic models ----------------
+class UploadLHSResp(BaseModel):
+    status: str
+    n: int
+    columns: List[str]
+    warning: Optional[str] = None
 
-    def save(self, filepath=None):
-        import pyrff
-        if filepath is None:
-            filepath = get_summit_config_path() / "tsemo" / str(self.uuid_val)
-            os.makedirs(filepath, exist_ok=True)
-            filepath = filepath / "models.h5"
-        pyrff.save_rffs([self.rff], filepath)
+class ObjectiveItem(BaseModel):
+    name: str
+    maximize: Optional[bool] = False
 
-    def load(self, filepath=None):
-        import pyrff
-        if filepath is None:
-            filepath = get_summit_config_path() / "tsemo" / str(self.uuid_val)
-            os.makedirs(filepath, exist_ok=True)
-            filepath = filepath / "models.h5"
-        self.rff = pyrff.load_rffs(filepath)[0]
+class StartRunRequest(BaseModel):
+    objectives: List[ObjectiveItem]
+    hplc_params: Optional[Dict[str, Any]] = None
+    watch_path: Optional[str] = None     # optional; you can still upload files via /upload_hplc
+    sor_iterations: int = 0
 
-
-class TSEMOInternalWrapper(Problem):
-    """Wrapper for NSGAII internal optimisation
-
-    Parameters
-    ----------
-    models : list of :class:`ThompsonSampledModel`
-        The models to optimize
-    domain : :class:`~summit.domain.Domain`
-        Domain used for optimisation.
-    fixed_variable_names : list, optional
-        A list of variables which should take on fixed values.
-    Notes
-    -----
-    It is assumed that the inputs are scaled between 0 and 1.
-
+# ---------------- Endpoints ----------------
+@app.post("/upload_lhs")
+async def upload_lhs(file: UploadFile = File(...)):
     """
+    Upload LHS Excel (first sheet used). Stores first sheet dataframe.
+    """
+    try:
+        content = await file.read()
+        df = pd.read_excel(io.BytesIO(content), sheet_name=0)
+        df.columns = [str(c).strip() for c in df.columns]
+        with store_lock:
+            store["lhs_table"] = df
+            store["optimization_result"] = None
+            store["hplc_responses"] = {}
+            store["objectives"] = None
+            store["hplc_params"] = None
+            store["phase"] = None
+            store["expected_files"] = 0
+            store["next_row"] = 0
+            store["sor_iterations"] = 0
+            store["appended_start_index"] = None
+        expected_any = {"Equiv1","Equiv2","Equiv3","ResidenceTime3","ReactionTemperature"}
+        has_expected = bool(expected_any.intersection(set(df.columns)))
+        resp = {"status": "ok", "n": df.shape[0], "columns": df.columns.tolist()}
+        if not has_expected:
+            resp["warning"] = "Uploaded sheet does not contain typical SOR column names; stored anyway."
+        return resp
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to parse Excel: {e}"}
 
-    def __init__(self, models, domain, fixed_variables: dict = None):
-        import pyrff
+@app.post("/start_run")
+async def start_run(req: StartRunRequest = Body(...)):
+    """
+    Configure run:
+    - objectives (list)
+    - hplc_params: {YminRT,YmaxRT,IminRT_list,ImaxRT_list,minRTISO,maxRTISO}
+    - watch_path (optional)
+    - sor_iterations (int)
+    After start: server will expect initial files = n_rows (LHS). Phase = 'lhs'.
+    """
+    with store_lock:
+        lhs = store.get("lhs_table")
+        if lhs is None:
+            return {"status": "error", "message": "Please upload LHS first via /upload_lhs"}
+        # store objectives and create columns
+        objectives = [{"name": o.name, "maximize": bool(o.maximize)} for o in req.objectives]
+        for obj in objectives:
+            if obj["name"] not in lhs.columns:
+                lhs[obj["name"]] = np.nan
+        store["lhs_table"] = lhs
+        store["objectives"] = objectives
+        # store hplc params
+        default_hplc = {"YminRT": 2.0, "YmaxRT": 4.0, "IminRT_list":[0.5], "ImaxRT_list":[1.0], "minRTISO":10.0, "maxRTISO":12.0}
+        params = default_hplc.copy()
+        if req.hplc_params:
+            params.update(req.hplc_params)
+        store["hplc_params"] = params
+        # set run phase and expected files to number of LHS rows first
+        n_rows = int(lhs.shape[0])
+        store["phase"] = "lhs"
+        store["expected_files"] = n_rows
+        store["next_row"] = 0
+        store["sor_iterations"] = int(req.sor_iterations or 0)
+        store["appended_start_index"] = None
+    # if a watch_path was provided, start watch
+    if req.watch_path:
+        global observer
+        if store.get("watching"):
+            return {"status": "error", "message": "Already watching a folder. Stop it first."}
+        if not os.path.isdir(req.watch_path):
+            return {"status": "error", "message": "Provided path is not a directory."}
+        handler = HPLCHandler()
+        observer = Observer()
+        observer.schedule(handler, path=req.watch_path, recursive=False)
+        observer.daemon = True
+        observer.start()
+        with store_lock:
+            store["watching"] = True
+            store["watch_path"] = req.watch_path
+    return {"status": "running", "phase": "lhs", "expected_files": n_rows, "sor_iterations": store.get("sor_iterations"), "objectives": store.get("objectives")}
 
-        self.models = models
-        self.domain = domain
-        self.fixed_variables = fixed_variables
+@app.post("/upload_hplc")
+async def upload_hplc(file: UploadFile = File(...),
+                      YminRT: float = Query(None),
+                      YmaxRT: float = Query(None),
+                      IminRT_list: Optional[str] = Query(None),
+                      ImaxRT_list: Optional[str] = Query(None),
+                      minRTISO: float = Query(None),
+                      maxRTISO: float = Query(None)):
+    """
+    Upload a single HPLC CSV and process (fills the next row).
+    Optional query params override stored hplc_params for this file.
+    IminRT_list and ImaxRT_list as comma-separated strings (e.g. "0.7,1.2").
+    """
+    try:
+        content = await file.read()
+        df = pd.read_csv(io.BytesIO(content))
+        # try to find Area/RT
+        if 'Area' in df.columns and 'RT' in df.columns:
+            data_np = df[['Area','RT']].to_numpy()
+        else:
+            cols_lower = {c.lower(): c for c in df.columns}
+            if 'area' in cols_lower and 'rt' in cols_lower:
+                data_np = df[[cols_lower['area'], cols_lower['rt']]].to_numpy()
+            else:
+                return {"status": "error", "message": "CSV missing Area/RT columns"}
+        # override hplc params if query provided
+        with store_lock:
+            params = store.get("hplc_params", {})
+        if YminRT is not None: params['YminRT'] = YminRT
+        if YmaxRT is not None: params['YmaxRT'] = YmaxRT
+        if IminRT_list is not None:
+            params['IminRT_list'] = [float(x.strip()) for x in IminRT_list.split(",") if x.strip()!='']
+        if ImaxRT_list is not None:
+            params['ImaxRT_list'] = [float(x.strip()) for x in ImaxRT_list.split(",") if x.strip()!='']
+        if minRTISO is not None: params['minRTISO'] = float(minRTISO)
+        if maxRTISO is not None: params['maxRTISO'] = float(maxRTISO)
+        with store_lock:
+            store['hplc_params'] = params
+        resp = process_hplc_and_fill(file.filename, data_np)
+        return {"status": "ok", "filename": file.filename, "response": resp, "next_row": store.get("next_row")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-        # Number of decision variables
-        # Categoricals are not optimized by NSGA, hence no descriptors
-        n_var = domain.num_continuous_dimensions(include_descriptors=False)
-        self.X_columns = [
-            v.name
-            for v in self.domain.input_variables
-            if v.variable_type == "continuous"
-        ]
+@app.post("/stop_watch")
+async def stop_watch():
+    global observer
+    if observer:
+        observer.stop()
+        observer.join(timeout=2)
+    with store_lock:
+        store["watching"] = False
+        store["watch_path"] = None
+    return {"status": "stopped"}
 
-        # Number of objectives
-        n_obj = len(domain.output_variables)
+@app.get("/results")
+async def get_results():
+    with store_lock:
+        lhs = store.get("lhs_table")
+        opt = store.get("optimization_result")
+        hplc = store.get("hplc_responses", {})
+        watching = store.get("watching", False)
+        watch_path = store.get("watch_path", None)
+        phase = store.get("phase")
+        expected = store.get("expected_files", 0)
+        next_row = store.get("next_row", 0)
+        objectives = store.get("objectives")
+        sor_iterations = store.get("sor_iterations", 0)
+    return {
+        "lhs_table": lhs.to_dict(orient="records") if lhs is not None else None,
+        "optimization_result": opt.to_dict(orient="records") if isinstance(opt, pd.DataFrame) else opt,
+        "hplc_responses": hplc,
+        "watching": watching,
+        "watch_path": watch_path,
+        "phase": phase,
+        "expected_files": expected,
+        "next_row": next_row,
+        "objectives": objectives,
+        "sor_iterations": sor_iterations
+    }
 
-        # Number of constraints
-        n_constr = len(domain.constraints)
+@app.on_event("shutdown")
+def shutdown_event():
+    global observer
+    if observer:
+        try:
+            observer.stop()
+            observer.join(timeout=2)
+            print("Observer stopped")
+        except Exception:
+            pass
 
-        super().__init__(n_var=n_var, n_obj=n_obj, n_constr=n_constr, xl=0, xu=1)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+#############################################
+// src/App.jsx
+import React, { useEffect, useState } from "react";
+import axios from "axios";
 
-    def _evaluate(self, X, out, *args, **kwargs):
-        # Convert X to a DataSet
-        X = DataSet(np.atleast_2d(X), columns=self.X_columns)
+const API_BASE = ""; // "" for Vite proxy; or "http://localhost:8000"
 
-        # Add in any fixed columns (i.e., values for cateogricals)
-        if self.fixed_variables is not None:
-            for key, value in self.fixed_variables.items():
-                X[key] = value
+export default function App() {
+  const [lhsFile, setLhsFile] = useState(null);
+  const [lhs, setLhs] = useState(null);
+  const [objectivesText, setObjectivesText] = useState("Yield:Maximize,Purity:Minimize");
+  const [sorIter, setSorIter] = useState(3);
+  const [watchPath, setWatchPath] = useState("");
+  const [hplcFile, setHplcFile] = useState(null);
+  const [results, setResults] = useState(null);
+  const [polling, setPolling] = useState(true);
 
-        F = np.zeros([X.shape[0], self.n_obj])
-        for i in range(self.n_obj):
-            F[:, i] = self.models[i].predict(X)
+  // HPLC params
+  const [YminRT, setYminRT] = useState(2.0);
+  const [YmaxRT, setYmaxRT] = useState(4.0);
+  const [IminRT, setIminRT] = useState("0.7");
+  const [ImaxRT, setImaxRT] = useState("1.3");
+  const [minRTISO, setMinRTISO] = useState(10.0);
+  const [maxRTISO, setMaxRTISO] = useState(12.0);
 
-        # Negate objectives that are need to be maximized
-        for i, v in enumerate(self.domain.output_variables):
-            if v.maximize:
-                F[:, i] *= -1
-        out["F"] = F
+  useEffect(() => {
+    let id = null;
+    if (polling) {
+      fetchResults();
+      id = setInterval(fetchResults, 2500);
+    }
+    return () => clearInterval(id);
+  }, [polling]);
 
-        # Add constraints if necessary
-        if self.domain.constraints:
-            constraint_res = [
-                X.eval(c.lhs, resolvers=[X]) for c in self.domain.constraints
-            ]
-            out["G"] = [c.tolist()[0] for c in constraint_res]
+  async function fetchResults() {
+    try {
+      const res = await axios.get(`${API_BASE}/results`);
+      setResults(res.data);
+      if (res.data && res.data.lhs_table) setLhs(res.data.lhs_table);
+    } catch (err) {
+      // ignore
+    }
+  }
 
-    tsemo_exp = strat_TSEMO.suggest_experiments(1,lhs_exp,use_spectral_sample=True,
-  File "C:\Users\T00009590\AppData\Local\miniconda3\envs\sorOldEnv\lib\site-packages\summit\strategies\tsemo.py", line 243, in suggest_experiments
-    if X.shape[0] == 0 and yhat.shape[0] == 0:
-UnboundLocalError: local variable 'X' referenced before assignment
-<summit.domain.Domain object at 0x0000019BF2A1BD90>
+  function parseObjectives(text) {
+    return text.split(",").map(p => p.trim()).filter(Boolean).map(entry => {
+      const [nameRaw, modeRaw] = entry.split(":").map(x => x && x.trim());
+      return { name: nameRaw || "obj", maximize: (modeRaw || "Maximize").toLowerCase().startsWith("max") };
+    });
+  }
 
-Invalid optimization domain configuration.
+  async function uploadLHS() {
+    if (!lhsFile) { alert("Select an LHS Excel file (.xlsx)"); return; }
+    try {
+      const form = new FormData();
+      form.append("file", lhsFile);
+      const res = await axios.post(`${API_BASE}/upload_lhs`, form, { headers: { "Content-Type": "multipart/form-data" }});
+      if (res.data.status === "ok") {
+        alert(`Uploaded LHS: ${res.data.n} rows`);
+        await fetchResults();
+      } else {
+        alert("Upload error: " + JSON.stringify(res.data));
+      }
+    } catch (err) { alert("Upload failed: " + (err.response?.data?.message || err.message)); }
+  }
 
-No suggestions found.
+  async function startRun() {
+    const objectives = parseObjectives(objectivesText);
+    if (!objectives.length) { alert("Enter objectives"); return; }
+    if (!lhs) { alert("Upload LHS first"); return; }
+    const payload = {
+      objectives: objectives,
+      hplc_params: {
+        YminRT: Number(YminRT),
+        YmaxRT: Number(YmaxRT),
+        IminRT_list: IminRT.split(",").map(x=>Number(x.trim())).filter(x=>!Number.isNaN(x)),
+        ImaxRT_list: ImaxRT.split(",").map(x=>Number(x.trim())).filter(x=>!Number.isNaN(x)),
+        minRTISO: Number(minRTISO),
+        maxRTISO: Number(maxRTISO)
+      },
+      watch_path: watchPath || NoneIfEmpty(watchPath),
+      sor_iterations: Number(sorIter) || 0
+    };
+    try {
+      const res = await axios.post(`${API_BASE}/start_run`, payload, { headers: { "Content-Type": "application/json" }});
+      if (res.data && res.data.status === "running") {
+        alert("Run started: initial phase = lhs; expected files = " + res.data.expected_files);
+        fetchResults();
+      } else {
+        alert("Start run response: " + JSON.stringify(res.data));
+      }
+    } catch (err) { alert("Start run failed: " + JSON.stringify(err.response?.data || err.message)); }
+  }
 
-None EXP
+  function NoneIfEmpty(s) { return (typeof s === "string" && s.trim() === "") ? null : s; }
 
-None
- 
-Processing ..
+  async function uploadHplc() {
+    if (!hplcFile) { alert("Select CSV file first"); return; }
+    try {
+      const form = new FormData();
+      form.append("file", hplcFile);
+      const params = {
+        YminRT: Number(YminRT),
+        YmaxRT: Number(YmaxRT),
+        IminRT_list: IminRT,
+        ImaxRT_list: ImaxRT,
+        minRTISO: Number(minRTISO),
+        maxRTISO: Number(maxRTISO)
+      };
+      const res = await axios.post(`${API_BASE}/upload_hplc`, form, { params, headers: { "Content-Type": "multipart/form-data" }});
+      if (res.data && res.data.status === "ok") {
+        alert(`Processed ${res.data.filename} -> response ${JSON.stringify(res.data.response)}; next_row=${res.data.next_row}`);
+        fetchResults();
+      } else {
+        alert("Upload HPLC error: " + JSON.stringify(res.data));
+      }
+    } catch (err) { alert("Upload HPLC failed: " + JSON.stringify(err.response?.data || err.message)); }
+  }
 
-C:\Users\T00009590\Documents\Current Applications\cloud_sor\Report03.csv
+  return (
+    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 1100, margin: "0 auto" }}>
+      <h1>SOR AI — LHS-first then SOR iterations</h1>
 
-              0             1             2              3   ...                9              10      11        12
+      <section style={card}>
+        <h3>1) Upload LHS Excel (.xlsx)</h3>
+        <input type="file" accept=".xlsx,.xls" onChange={e => setLhsFile(e.target.files?.[0] || null)} />
+        <button style={btn} onClick={uploadLHS}>Upload LHS</button>
+        <div style={{ marginTop: 8 }}>
+          <small>After upload, the server stores the first sheet as the LHS table.</small>
+        </div>
+      </section>
 
-0   Equivalence1  Equivalence2  Equivalence3  Residencetime  ...  FlowratesofPump4  TotalFlowrate  Purity  Impurity
+      <section style={card}>
+        <h3>2) Configure run (objectives + HPLC params) & provide watch path + SOR iterations</h3>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div style={{ minWidth: 420 }}>
+            <label>Objectives (comma separated, Name:Maximize or Minimize)</label><br />
+            <input style={input} value={objectivesText} onChange={e => setObjectivesText(e.target.value)} />
+          </div>
+          <div>
+            <label>Watch path (server absolute path) — optional</label><br />
+            <input style={{ ...input, width: 360 }} value={watchPath} onChange={e => setWatchPath(e.target.value)} />
+          </div>
+          <div>
+            <label>SOR iterations (after LHS fill)</label><br />
+            <input style={{ width: 80, padding: 8 }} type="number" value={sorIter} onChange={e => setSorIter(Number(e.target.value))} />
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button style={btn} onClick={startRun}>Start Run</button>
+          </div>
+        </div>
 
-1         1.9646       11.4115        2.4006         2.9272  ...            1.1949         3.4162
+        <div style={{ marginTop: 12 }}>
+          <details>
+            <summary>HPLC parsing params (optional)</summary>
+            <div style={{ display: "flex", gap: 8, marginTop: 6, alignItems: "center" }}>
+              <div>
+                <small>YminRT</small><br />
+                <input style={small} value={YminRT} onChange={e => setYminRT(e.target.value)} />
+              </div>
+              <div>
+                <small>YmaxRT</small><br />
+                <input style={small} value={YmaxRT} onChange={e => setYmaxRT(e.target.value)} />
+              </div>
+              <div>
+                <small>IminRT list</small><br />
+                <input style={small} value={IminRT} onChange={e => setIminRT(e.target.value)} />
+              </div>
+              <div>
+                <small>ImaxRT list</small><br />
+                <input style={small} value={ImaxRT} onChange={e => setImaxRT(e.target.value)} />
+              </div>
+              <div>
+                <small>ISO min</small><br />
+                <input style={small} value={minRTISO} onChange={e => setMinRTISO(e.target.value)} />
+              </div>
+              <div>
+                <small>ISO max</small><br />
+                <input style={small} value={maxRTISO} onChange={e => setMaxRTISO(e.target.value)} />
+              </div>
+            </div>
+          </details>
+        </div>
+      </section>
 
-2         2.8601        8.1717        2.8734         1.5045  ...            2.2151         6.6466
+      <section style={card}>
+        <h3>3) Upload HPLC CSV files (one-by-one) — they will fill rows in order</h3>
+        <input type="file" accept=".csv" onChange={e => setHplcFile(e.target.files?.[0] || null)} />
+        <button style={btn} onClick={uploadHplc}>Upload HPLC (fill next row)</button>
+        <div style={{ marginTop: 8 }}>
+          <small>Alternatively, if you supplied a watch path when starting run, drop CSVs into that folder on the server.</small>
+        </div>
+      </section>
 
-3         1.5916        6.5775        1.6922         1.7305  ...            2.5461         5.7786
+      <section style={card}>
+        <h3>Live LHS table (server-stored)</h3>
+        {lhs ? (
+          <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", padding: 8 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead>
+                <tr>{Object.keys(lhs[0]).map(k => <th key={k} style={{ textAlign: "left", padding: 6 }}>{k}</th>)}</tr>
+              </thead>
+              <tbody>
+                {lhs.map((row, i) => (
+                  <tr key={i}>
+                    {Object.keys(lhs[0]).map(k => <td key={k} style={{ padding: 6 }}>{String(row[k] ?? "").slice(0, 20)}</td>)}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <div>No LHS uploaded yet.</div>}
+      </section>
 
-4         1.6966        7.1659        1.5961         1.9995  ...            2.1612         5.0013
+      <section style={card}>
+        <h3>Optimization result</h3>
+        <div style={{ maxHeight: 300, overflow: "auto", background: "#0b1220", color: "#cff", padding: 8, borderRadius: 6 }}>
+          <pre>{results && results.optimization_result ? JSON.stringify(results.optimization_result, null, 2) : "No optimization result yet."}</pre>
+        </div>
+      </section>
 
-5         1.8131        9.9565        2.1887         2.8246  ...            1.3253         3.5403
+      <footer style={{ marginTop: 12 }}>
+        <label><input type="checkbox" checked={polling} onChange={e => setPolling(e.target.checked)} /> Poll server every 2.5s</label>
+      </footer>
+    </div>
+  );
+}
 
-6         2.1564        6.4752        2.6818         2.1537  ...            1.7508         4.6432
-
-7         2.8836        9.7536        1.9831          2.341  ...            1.4734         4.2718
-
-8         2.6049        8.6833        2.1729         2.4555  ...            1.4554         4.0725
-
-9         2.4092       10.4674        1.7921         2.1943  ...             1.644         4.5574
-
-10        2.2403        9.2496        2.5873         2.6725  ...            1.3196         3.7419
-
-11        2.5297       11.8903         2.802         1.8722  ...            1.7012         5.3412
- 
-[12 rows x 13 columns] in Multi Tsemo
-<summit.domain.Domain object at 0x0000019BF2A1BD90>
-
-Invalid optimization domain configuration.
-
-No suggestions found.
-
-None EXP
-
-None
-
-Exception in thread Thread-1:
-
-Traceback (most recent call last):
-
-  File "C:\Users\T00009590\AppData\Local\miniconda3\envs\sorOldEnv\lib\threading.py", line 973, in _bootstrap_inner
-
-    self.run()
-
-  File "C:\Users\T00009590\AppData\Local\miniconda3\envs\sorOldEnv\lib\site-packages\watchdog\observers\api.py", line 213, in run   
-
-    self.dispatch_events(self.event_queue)
-
-  File "C:\Users\T00009590\AppData\Local\miniconda3\envs\sorOldEnv\lib\site-packages\watchdog\observers\api.py", line 391, in dispatch_events
-
-    handler.dispatch(event)
-
-  File "C:\Users\T00009590\AppData\Local\miniconda3\envs\sorOldEnv\lib\site-packages\watchdog\events.py", line 217, in dispatch     
-
-    getattr(self, f"on_{event.event_type}")(event)
-
-  File "C:\Users\T00009590\Documents\Current Applications\cloud_sor\self_optimization_reactions\server\main.py", line 255, in on_created
-
-    response = utils.process_lhs_iteration(df_userinput_lhs,nobj,lhs_exp = final_result)
-
-  File "C:\Users\T00009590\Documents\Current Applications\cloud_sor\self_optimization_reactions\server\utils.py", line 216, in process_lhs_iteration
-
-    response = run_optimization(domain,nobj,lhs_exp)
-
-  File "C:\Users\T00009590\Documents\Current Applications\cloud_sor\self_optimization_reactions\server\utils.py", line 197, in run_optimization
-
-    sor_out.columns = [col[0] for col in sor_out.columns]
-
-AttributeError: 'NoneType' object has no attribute 'columns'
- 
+const card = { background: "#fff", padding: 12, borderRadius: 8, marginBottom: 12, boxShadow: "0 6px 18px rgba(15,20,50,0.06)" };
+const btn = { background: "#0b5fff", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6 };
+const input = { width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ddd" };
+const small = { width: 84, padding: 6, borderRadius: 6, border: "1px solid #ddd" };
