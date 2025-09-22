@@ -1,175 +1,3 @@
-import React, { useEffect, useState } from "react";
-import axios from "axios";
-
-export default function App() {
-  const [lhs, setLhs] = useState(null);
-  const [opt, setOpt] = useState(null);
-  const [hplc, setHplc] = useState({});
-  const [objectivesText, setObjectivesText] = useState("Yield:Maximize,Imp1:Minimize");
-  const [sorIter, setSorIter] = useState(10);
-  const [watchPath, setWatchPath] = useState("");
-  const [watchStatus, setWatchStatus] = useState(null);
-  const [lhsFile, setLhsFile] = useState(null); // uploaded file object
-  const [polling, setPolling] = useState(true);
-
-  // Upload LHS Excel
-  async function uploadLHS() {
-    if (!lhsFile) {
-      alert("Select an Excel file first (xlsx/xls).");
-      return;
-    }
-    try {
-      const form = new FormData();
-      form.append("file", lhsFile);
-      const res = await axios.post("/upload_lhs", form, {
-        headers: { "Content-Type": "multipart/form-data" }
-      });
-      if (res.data.status === "ok") {
-        // request server to refresh results
-        await pollResults();
-        alert(`LHS uploaded: ${res.data.n} rows. Columns: ${res.data.columns.join(", ")}`);
-      } else {
-        alert("Upload failed: " + JSON.stringify(res.data));
-      }
-    } catch (err) {
-      console.error(err);
-      alert("Upload error: " + (err.response?.data?.message || err.message));
-    }
-  }
-
-  // Run optimization (uses whatever is in store['lhs_table'])
-  async function runOptimize() {
-    try {
-      const parts = objectivesText.split(",").map(p => p.trim()).filter(Boolean);
-      const objs = parts.map(p => {
-        const [name, mode] = p.split(":").map(x => x.trim());
-        return { name, maximize: (mode || "Maximize").toLowerCase().startsWith("max") };
-      });
-      const payload = { objectives: objs, sor_iterations: Number(sorIter), nobj: Math.max(1, objs.length) };
-      const res = await axios.post("/optimize", payload);
-      if (res.data && res.data.result) {
-        setOpt(res.data.result);
-        alert("Optimization completed (result returned).");
-      } else {
-        alert("Optimize response: " + JSON.stringify(res.data));
-      }
-    } catch (err) {
-      console.error(err);
-      alert("Optimize error: " + (err.response?.data?.message || err.message));
-    }
-  }
-
-  // Poll results
-  async function pollResults() {
-    try {
-      const res = await axios.get("/results");
-      if (res.data) {
-        if (res.data.lhs_table) setLhs(res.data.lhs_table);
-        if (res.data.optimization_result) setOpt(res.data.optimization_result);
-        if (res.data.hplc_responses) setHplc(res.data.hplc_responses);
-      }
-    } catch (err) {
-      console.warn("Poll results error:", err.message);
-    }
-  }
-
-  useEffect(() => {
-    let id = null;
-    if (polling) {
-      pollResults();
-      id = setInterval(() => pollResults(), 3000);
-    }
-    return () => clearInterval(id);
-  }, [polling]);
-
-  return (
-    <div style={{ padding: 20 }}>
-      <h1>SOR AI — Upload LHS & Optimize</h1>
-
-      <section style={{ marginBottom: 16 }}>
-        <h3>Step 1 — Upload your generated LHS Excel</h3>
-        <input
-          type="file"
-          accept=".xlsx,.xls"
-          onChange={(e) => {
-            setLhsFile(e.target.files?.[0] || null);
-          }}
-        />
-        <button onClick={uploadLHS} style={{ marginLeft: 8 }}>Upload LHS</button>
-        <div style={{ marginTop: 8 }}>
-          <strong>Uploaded LHS preview (server-stored):</strong>
-          {lhs ? (
-            <div style={{ maxHeight: 220, overflow: "auto", border: "1px solid #eee", padding: 8 }}>
-              <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead>
-                  <tr>
-                    {Object.keys(lhs[0]).slice(0, 10).map(k => <th key={k} style={{ textAlign: "left", padding: 6 }}>{k}</th>)}
-                  </tr>
-                </thead>
-                <tbody>
-                  {lhs.map((r, idx) => (
-                    <tr key={idx}>
-                      {Object.keys(lhs[0]).slice(0, 10).map(k => <td key={k} style={{ padding: 6 }}>{String(r[k]).slice(0, 14)}</td>)}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : <div>No LHS stored on server yet.</div>}
-        </div>
-      </section>
-
-      <section style={{ marginBottom: 16 }}>
-        <h3>Step 2 — Set objectives & run optimization</h3>
-        <div style={{ marginBottom: 8 }}>
-          <label>Objectives (comma-separated, name:Maximize or Minimize):</label><br />
-          <input style={{ width: "80%", padding: 6 }} value={objectivesText} onChange={e => setObjectivesText(e.target.value)} />
-        </div>
-        <div style={{ marginBottom: 8 }}>
-          <label>SOR iterations:</label>
-          <input type="number" value={sorIter} onChange={e => setSorIter(Number(e.target.value))} style={{ width: 120, marginLeft: 6 }} />
-          <button onClick={runOptimize} style={{ marginLeft: 12 }}>Run Optimize</button>
-        </div>
-        <div>
-          <h4>Optimization Result</h4>
-          {opt ? <pre style={{ maxHeight: 260, overflow: "auto", background: "#111", color: "#dff", padding: 8 }}>{JSON.stringify(opt, null, 2)}</pre> : <div>No optimization result yet.</div>}
-        </div>
-      </section>
-
-      <section>
-        <h3>Watcher & HPLC</h3>
-        <div>
-          <label>Server folder path to watch:</label>
-          <input style={{ width: 420, marginLeft: 8 }} value={watchPath} onChange={e => setWatchPath(e.target.value)} />
-          <button onClick={async () => {
-            try {
-              const params = new URLSearchParams({ path: watchPath, nobj: "2" });
-              const res = await axios.post(`/start_watch?${params.toString()}`);
-              setWatchStatus(res.data);
-              alert("Watcher started: " + JSON.stringify(res.data));
-            } catch (err) { alert("Start watch error: " + (err.response?.data?.message || err.message)); }
-          }} style={{ marginLeft: 8 }}>Start Watch</button>
-          <button onClick={async () => {
-            try {
-              const res = await axios.post("/stop_watch");
-              setWatchStatus(res.data);
-              alert("Watcher stopped.");
-            } catch (err) { alert("Stop watch error: " + (err.response?.data?.message || err.message)); }
-          }} style={{ marginLeft: 8 }}>Stop Watch</button>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <strong>Watcher:</strong> <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(watchStatus)}</pre>
-          <strong>HPLC responses:</strong> <pre style={{ whiteSpace: "pre-wrap" }}>{JSON.stringify(hplc, null, 2)}</pre>
-        </div>
-      </section>
-
-      <div style={{ marginTop: 12 }}>
-        <label><input type="checkbox" checked={polling} onChange={e => setPolling(e.target.checked)} /> Poll server every 3s</label>
-      </div>
-    </div>
-  );
-}
-###########################################
 # main.py
 import io
 import os
@@ -178,46 +6,51 @@ from typing import List, Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form, Query
+from fastapi import FastAPI, UploadFile, File, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# Summit (your optimization library)
-# Make sure 'summit' is installed in your environment
+# Attempt to import summit (optional)
 try:
     from summit.domain import Domain, ContinuousVariable
     from summit.strategies import TSEMO, SNOBFIT
     from summit.utils.dataset import DataSet
 except Exception as e:
-    # If summit isn't installed, optimization endpoints will return error messages
     Domain = None
     ContinuousVariable = None
     TSEMO = None
     SNOBFIT = None
     DataSet = None
-    print("Warning: summit import failed. Install summit for optimization endpoints to work.", e)
+    print("Warning: summit import failed. Install summit for optimization to work:", e)
 
-
-app = FastAPI(title="SOR AI Backend")
+app = FastAPI(title="SOR AI Backend (updated workflow)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change in prod
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# ---------------- In-memory store ----------------
+# ---------------- In-memory store & lock ----------------
 store: Dict[str, Any] = {
-    "lhs_table": None,               # pandas DataFrame
+    "lhs_table": None,               # pandas DataFrame with experiments
     "optimization_result": None,     # pandas DataFrame
-    "hplc_responses": {},            # filename -> response list
+    "hplc_responses": {},            # filename -> response vector
     "watching": False,
     "watch_path": None,
+    # workflow control
+    "objectives": None,              # list of {"name":..., "maximize":bool}
+    "expected_files": 0,             # number of HPLC files expected (sor iterations)
+    "next_row": 0,                   # next row index in lhs_table to fill with HPLC data
+    "nobj": 0,                       # number of objectives (length of objectives list)
 }
+store_lock = threading.Lock()
+
+observer: Optional[Observer] = None
 
 # ---------------- Utilities ----------------
 def latin_hypercube_sampling(bounds: List[List[float]], n_samples: int, random_state: Optional[int] = None):
@@ -243,7 +76,6 @@ def compute_sor_table(
     molecular_weights=[90.05, 101.19, 318.18, 532.09],
     densities=[1.00, 0.726, 1.08, 0.90]
 ):
-    """Compute the full SOR table as per your formulas."""
     n = len(eq1_vals)
     rows = []
     coil1 = 5.00
@@ -271,10 +103,6 @@ def compute_sor_table(
         mass2 = E2 * moles4 * mw2
         mass3 = E3 * moles4 * mw3
         mass4 = mass4
-
-        moles1 = mass1 / mw1
-        moles2 = mass2 / mw2
-        moles3 = mass3 / mw3
 
         vol1 = mass1 / d1
         vol2 = vol_g_1 * mass4
@@ -310,7 +138,6 @@ def compute_sor_table(
             "Flowrate1": round(f1, 8), "Flowrate2": round(f2, 8),
             "Flowrate3": round(f3, 8), "Flowrate4": round(f4, 8),
             "TotalFlowrate": round(total_flowrate, 8),
-            # intermediate diagnostic columns
             "Obs1": round(obs1, 8), "Obs2": round(obs2, 8), "Obs3": round(obs3, 8), "Obs4": round(obs4, 8),
             "Vol1": round(vol1, 8), "Vol2": round(vol2, 8), "Vol3": round(vol3, 8), "Vol4": round(vol4, 8),
             "Vol5": round(vol5, 8), "Vol6": round(vol6, 8), "Vol7": round(vol7, 8), "Vol8": round(vol8, 8),
@@ -319,35 +146,29 @@ def compute_sor_table(
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    # preferred column order
     cols_order = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature",
                   "ReactionTime", "Flowrate1", "Flowrate2", "Flowrate3", "Flowrate4", "TotalFlowrate"]
     remaining = [c for c in df.columns if c not in cols_order]
     df = df[cols_order + remaining]
     return df
 
-# ---------------- HPLC parsing and response ----------------
+# ---------------- HPLC parsing & response ----------------
 def HPLC_data_read_csv(file_path: str) -> np.ndarray:
     try:
         data = pd.read_csv(file_path)
-        data_final = pd.DataFrame()
-        # expect 'Area' and 'RT' columns
-        if 'Area' not in data.columns or 'RT' not in data.columns:
-            # try alternative names (case-insensitive)
-            cols_lower = {c.lower(): c for c in data.columns}
-            area_col = cols_lower.get('area')
-            rt_col = cols_lower.get('rt')
-            if area_col and rt_col:
-                data_final['Peak_Area'] = data[area_col]
-                data_final['RT'] = data[rt_col]
-            else:
-                raise ValueError("CSV missing 'Area' or 'RT' columns")
+        # accept variations of column names
+        if 'Area' in data.columns and 'RT' in data.columns:
+            df = pd.DataFrame({"Area": data['Area'], "RT": data['RT']})
         else:
-            data_final['Peak_Area'] = data['Area']
-            data_final['RT'] = data['RT']
-        return data_final.to_numpy()
+            cols_lower = {c.lower(): c for c in data.columns}
+            if 'area' in cols_lower and 'rt' in cols_lower:
+                df = pd.DataFrame({"Area": data[cols_lower['area']], "RT": data[cols_lower['rt']]})
+            else:
+                # try to guess columns if small dataset
+                raise ValueError("CSV missing 'Area' and 'RT' columns")
+        return df.to_numpy()
     except Exception as e:
-        print(f"Error reading HPLC CSV file {file_path}: {e}")
+        print("HPLC read error:", e)
         return np.array([])
 
 def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
@@ -390,11 +211,148 @@ def response_HPLC_csv(
 
     return response
 
-# ---------------- Folder watcher ----------------
+# ---------------- Domain builder & optimization ----------------
+def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
+    if Domain is None or ContinuousVariable is None:
+        raise RuntimeError("Summit is not installed. Install summit for optimization.")
+
+    required_names = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]
+    found = {}
+    for name in required_names:
+        for col in df.columns:
+            if col.lower().replace(" ", "") == name.lower().replace(" ", ""):
+                found[name] = col
+                break
+
+    domain = Domain()
+    if len(found) >= 4:
+        for canonical in ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]:
+            if canonical in found:
+                col = found[canonical]
+                lb = float(df[col].min())
+                ub = float(df[col].max())
+                if lb == ub:
+                    lb -= 1e-6; ub += 1e-6
+                domain += ContinuousVariable(name=canonical, description=canonical, bounds=[lb, ub])
+    else:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) == 0:
+            raise ValueError("No numeric columns in LHS to build domain.")
+        for col in numeric_cols[:5]:
+            lb = float(df[col].min()); ub = float(df[col].max())
+            if lb == ub: lb -= 1e-6; ub += 1e-6
+            domain += ContinuousVariable(name=str(col), description=str(col), bounds=[lb, ub])
+
+    # Add objectives as ContinuousVariables (0-100)
+    for obj in objectives:
+        obj_name = obj.get("name", "objective")
+        maximize = bool(obj.get("maximize", False))
+        domain += ContinuousVariable(name=obj_name, description=obj_name, bounds=[0, 100], is_objective=True, maximize=maximize)
+
+    return domain
+
+def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
+    if TSEMO is None or SNOBFIT is None or DataSet is None:
+        raise RuntimeError("Summit is not installed or failed to import.")
+
+    if nobj > 1:
+        strat = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
+        lhs_ds = DataSet.from_df(lhs_df)
+        out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
+    else:
+        strat = SNOBFIT(domain)
+        lhs_ds = DataSet.from_df(lhs_df)
+        out = strat.suggest_experiments(1, lhs_ds)
+
+    try:
+        out.columns = [col[0] for col in out.columns]
+    except Exception:
+        pass
+    if "strategy" in out.columns:
+        out = out.drop(columns={"strategy"})
+    common = [c for c in lhs_df.columns if c in out.columns]
+    if len(common) > 0:
+        out = out[common]
+    return out
+
+# ---------------- HPLC processing & update helper ----------------
+def process_hplc_and_update_table(filename: str, data_np: np.ndarray,
+                                  YminRT: float, YmaxRT: float,
+                                  IminRT_list: List[float], ImaxRT_list: List[float],
+                                  minRTISO: float, maxRTISO: float):
+    """
+    Compute HPLC response vector and write into the next empty row of lhs_table,
+    filling objective columns in order.
+    """
+    with store_lock:
+        lhs = store.get("lhs_table")
+        objectives = store.get("objectives") or []
+        nobj = store.get("nobj", len(objectives))
+
+        if lhs is None:
+            raise RuntimeError("No LHS table stored on server.")
+
+        # compute response
+        resp = response_HPLC_csv(data_np, YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO, nobj)
+
+        # determine which row to fill
+        next_row = store.get("next_row", 0)
+        total_rows = lhs.shape[0]
+        if next_row >= total_rows:
+            # nothing to fill, ignore or append? we will append a new row with NaNs and then fill
+            new_row = {c: np.nan for c in lhs.columns}
+            lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+            store["lhs_table"] = lhs
+            total_rows = lhs.shape[0]
+
+        # ensure objective columns exist
+        obj_names = [o["name"] for o in objectives]
+        for name in obj_names:
+            if name not in lhs.columns:
+                lhs[name] = np.nan
+
+        # fill responses into objective columns for the next_row
+        for j, name in enumerate(obj_names):
+            if j < len(resp):
+                try:
+                    lhs.at[next_row, name] = resp[j]
+                except Exception as e:
+                    lhs.loc[next_row, name] = resp[j]
+
+        # store hplc response mapping
+        store["hplc_responses"][filename] = resp
+
+        # increment next_row
+        store["next_row"] = next_row + 1
+        store["lhs_table"] = lhs
+
+    # After updating table, run optimization (best-effort)
+    try:
+        with store_lock:
+            current_lhs = store.get("lhs_table")
+            objectives = store.get("objectives") or []
+            nobj = store.get("nobj", len(objectives))
+
+        domain = build_domain_from_df(current_lhs, objectives)
+        out = run_summit_optimization(domain, current_lhs, nobj)
+        with store_lock:
+            # store optimization output as DataFrame
+            try:
+                out_df = pd.DataFrame(out)
+            except Exception:
+                out_df = out
+            store["optimization_result"] = out_df
+    except Exception as e:
+        # keep optimization failures non-fatal; store error message
+        with store_lock:
+            store["optimization_result"] = {"error": str(e)}
+
+    return resp
+
+# ---------------- Watcher handler ----------------
 class HPLCHandler(FileSystemEventHandler):
-    def __init__(self, nobj, YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO):
+    def __init__(self, YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO):
         super().__init__()
-        self.nobj = nobj
         self.YminRT = YminRT
         self.YmaxRT = YmaxRT
         self.IminRT_list = IminRT_list
@@ -406,167 +364,85 @@ class HPLCHandler(FileSystemEventHandler):
         if event.is_directory:
             return
         filepath = event.src_path
-        if filepath.lower().endswith(".csv"):
-            try:
-                data = HPLC_data_read_csv(filepath)
-                response = response_HPLC_csv(data, self.YminRT, self.YmaxRT,
-                                             self.IminRT_list, self.ImaxRT_list,
-                                             self.minRTISO, self.maxRTISO, self.nobj)
-                store["hplc_responses"][os.path.basename(filepath)] = response
-                print(f"[watcher] processed {filepath} -> response={response}")
-            except Exception as e:
-                print(f"[watcher] error processing {filepath}: {e}")
+        if not filepath.lower().endswith(".csv"):
+            return
+        filename = os.path.basename(filepath)
+        try:
+            data_np = HPLC_data_read_csv(filepath)
+            resp = process_hplc_and_update_table(filename, data_np,
+                                                self.YminRT, self.YmaxRT,
+                                                self.IminRT_list, self.ImaxRT_list,
+                                                self.minRTISO, self.maxRTISO)
+            print(f"[watcher] processed {filename} -> resp={resp} next_row={store.get('next_row')}")
+        except Exception as e:
+            print(f"[watcher] error processing {filename}: {e}")
 
-observer: Optional[Observer] = None
-
-# ---------------- Domain creation helpers ----------------
-def _find_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Return first column in df whose lower name matches any candidate lower-case variants."""
-    cols_lower = {c.lower(): c for c in df.columns}
-    for c in candidates:
-        key = c.lower().replace(" ", "")
-        # check various normalized forms
-        for existing_lower, original in cols_lower.items():
-            if existing_lower.replace(" ", "") == key:
-                return original
-    # fallback: try direct presence
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
-def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
-    """
-    Try to create a Summit Domain using standard column names.
-    If the expected columns don't exist, fall back to selecting first numeric columns.
-    """
-    if Domain is None or ContinuousVariable is None:
-        raise RuntimeError("Summit not installed - cannot build domain.")
-
-    required_names = ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]
-    found = {}
-    for name in required_names:
-        col = _find_column(df, [name, name.lower(), name.upper(), name.replace(" ", "")])
-        if col:
-            found[name] = col
-
-    domain = Domain()
-    # if we found the canonical columns, use their min/max
-    if len(found) >= 4:
-        for canonical in ["Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"]:
-            if canonical in found:
-                col = found[canonical]
-                lb = float(df[col].min())
-                ub = float(df[col].max())
-                if lb == ub:
-                    # small jitter to avoid zero-width domain
-                    lb = lb - 1e-6
-                    ub = ub + 1e-6
-                domain += ContinuousVariable(name=canonical, description=canonical, bounds=[lb, ub])
-    else:
-        # fallback: use first up to 5 numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric columns found in LHS to build domain.")
-        use_cols = numeric_cols[:5]
-        for col in use_cols:
-            lb = float(df[col].min())
-            ub = float(df[col].max())
-            if lb == ub:
-                lb -= 1e-6
-                ub += 1e-6
-            # name variables as original column names
-            domain += ContinuousVariable(name=str(col), description=str(col), bounds=[lb, ub])
-    # add objectives as ContinuousVariables (0-100 bounds by default)
-    for obj in objectives:
-        obj_name = obj.get("name", "objective")
-        maximize = bool(obj.get("maximize", False))
-        domain += ContinuousVariable(name=obj_name, description=obj_name, bounds=[0, 100], is_objective=True, maximize=maximize)
-
-    return domain
-
-# ---------------- Optimization wrappers ----------------
-def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    if TSEMO is None or SNOBFIT is None or DataSet is None:
-        raise RuntimeError("Summit not installed or failed to import.")
-
-    # choose method based on number of objectives
-    if nobj > 1:
-        strat = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
-        lhs_ds = DataSet.from_df(lhs_df)
-        out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
-    else:
-        strat = SNOBFIT(domain)
-        lhs_ds = DataSet.from_df(lhs_df)
-        out = strat.suggest_experiments(1, lhs_ds)
-
-    # transform output to readable DataFrame
-    try:
-        out.columns = [col[0] for col in out.columns]
-    except Exception:
-        pass
-    if "strategy" in out.columns:
-        out = out.drop(columns={"strategy"})
-    # try to keep columns that exist in lhs_df
-    common = [c for c in lhs_df.columns if c in out.columns]
-    if len(common) > 0:
-        out = out[common]
-    return out
-
-# ---------------- Pydantic models for endpoints ----------------
+# ---------------- Pydantic models ----------------
 class GenerateRequest(BaseModel):
     n_experiments: int = 11
     random_seed: Optional[int] = None
 
+class ObjectiveItem(BaseModel):
+    name: str
+    maximize: Optional[bool] = False
+
+class StartWatchRequest(BaseModel):
+    path: str
+    objectives: List[ObjectiveItem]
+    sor_iterations: int
+    # HPLC parsing params with defaults
+    YminRT: float = 2.0
+    YmaxRT: float = 4.0
+    IminRT_list: List[float] = [0.5]
+    ImaxRT_list: List[float] = [1.0]
+    minRTISO: float = 10.0
+    maxRTISO: float = 12.0
+
 class OptimizeRequest(BaseModel):
-    objectives: List[Dict[str, Any]]   # e.g. [{"name":"Yield","maximize":True}, {"name":"Impurity1","maximize":False}]
+    objectives: List[Dict[str, Any]]
     sor_iterations: int = 10
     nobj: int = 2
 
-# ---------------- FastAPI endpoints ----------------
+# ---------------- Endpoints ----------------
 @app.post("/generate_lhs")
 async def generate_lhs(req: GenerateRequest):
-    """
-    Generate LHS table and store in memory.
-    Input: JSON { "n_experiments": 11, "random_seed": 42 }
-    """
     n = max(1, int(req.n_experiments))
     seed = int(req.random_seed) if req.random_seed is not None else None
-
-    # default bounds (your request)
     bounds = [
-        [1.5, 3.0],   # Equiv1
-        [6.0, 12.0],  # Equiv2
-        [1.5, 3.0],   # Equiv3
-        [1.5, 3.0],   # ResidenceTime3
-        [35.0, 65.0]  # ReactionTemperature
+        [1.5, 3.0],
+        [6.0, 12.0],
+        [1.5, 3.0],
+        [1.5, 3.0],
+        [35.0, 65.0]
     ]
     samples = latin_hypercube_sampling(bounds, n, random_state=seed)
-    eq1_vals = samples[:, 0]
-    eq2_vals = samples[:, 1]
-    eq3_vals = samples[:, 2]
-    rt3_vals = samples[:, 3]
-    temp_vals = samples[:, 4]
-
+    eq1_vals = samples[:, 0]; eq2_vals = samples[:, 1]; eq3_vals = samples[:, 2]
+    rt3_vals = samples[:, 3]; temp_vals = samples[:, 4]
     df = compute_sor_table(eq1_vals, eq2_vals, eq3_vals, rt3_vals, temp_vals)
-    store["lhs_table"] = df
-    # clear previous optimization result
-    store["optimization_result"] = None
-
+    with store_lock:
+        store["lhs_table"] = df
+        store["optimization_result"] = None
+        store["hplc_responses"] = {}
+        store["objectives"] = None
+        store["expected_files"] = 0
+        store["next_row"] = 0
+        store["nobj"] = 0
     return {"status": "ok", "n": n, "table": df.to_dict(orient="records")}
 
 @app.post("/upload_lhs")
 async def upload_lhs(file: UploadFile = File(...)):
-    """
-    Upload an Excel file (first sheet used) and store as LHS table.
-    """
     try:
         content = await file.read()
         df = pd.read_excel(io.BytesIO(content), sheet_name=0)
         df.columns = [str(c).strip() for c in df.columns]
-        store["lhs_table"] = df
-        store["optimization_result"] = None
-        # return summary
+        with store_lock:
+            store["lhs_table"] = df
+            store["optimization_result"] = None
+            store["hplc_responses"] = {}
+            store["objectives"] = None
+            store["expected_files"] = 0
+            store["next_row"] = 0
+            store["nobj"] = 0
         expected_any = {"Equiv1", "Equiv2", "Equiv3", "ResidenceTime3", "ReactionTemperature"}
         has_expected = bool(expected_any.intersection(set(df.columns)))
         resp = {"status": "ok", "n": df.shape[0], "columns": df.columns.tolist()}
@@ -577,44 +453,47 @@ async def upload_lhs(file: UploadFile = File(...)):
         return {"status": "error", "message": f"Failed to parse Excel: {str(e)}"}
 
 @app.post("/start_watch")
-async def start_watch(
-    path: str = Query(..., description="Absolute path on server to watch for new CSV files"),
-    nobj: int = Query(2),
-    YminRT: float = Query(2.0),
-    YmaxRT: float = Query(4.0),
-    IminRT_list: List[float] = Query([0.5]),
-    ImaxRT_list: List[float] = Query([1.0]),
-    minRTISO: float = Query(10.0),
-    maxRTISO: float = Query(12.0),
-):
+async def start_watch(req: StartWatchRequest = Body(...)):
     """
-    Start folder watcher for CSVs. Example:
-    /start_watch?path=/data/hplc&nobj=2&YminRT=2.0&YmaxRT=4.0
+    Configure the run (objectives + sor_iterations) and start watching path.
     """
     global observer
-    if store["watching"]:
-        return {"status": "already_watching", "path": store["watch_path"]}
+    path = req.path
+    objectives_in = [{"name": o.name, "maximize": bool(o.maximize)} for o in req.objectives]
+    sor_iterations = int(req.sor_iterations)
+    nobj = len(objectives_in)
+
+    with store_lock:
+        if store.get("lhs_table") is None:
+            return {"status": "error", "message": "Upload LHS first via /upload_lhs before starting the watch."}
+        # Add objective columns (if absent) to lhs_table
+        lhs = store["lhs_table"]
+        for obj in objectives_in:
+            if obj["name"] not in lhs.columns:
+                lhs[obj["name"]] = np.nan
+        store["lhs_table"] = lhs
+        store["objectives"] = objectives_in
+        store["expected_files"] = sor_iterations
+        store["next_row"] = 0
+        store["nobj"] = nobj
 
     if not os.path.isdir(path):
         return {"status": "error", "message": "Path does not exist or is not a directory"}
 
-    handler = HPLCHandler(
-        nobj=nobj,
-        YminRT=YminRT,
-        YmaxRT=YmaxRT,
-        IminRT_list=IminRT_list,
-        ImaxRT_list=ImaxRT_list,
-        minRTISO=minRTISO,
-        maxRTISO=maxRTISO,
-    )
+    if store.get("watching"):
+        return {"status": "already_watching", "path": store.get("watch_path")}
+
+    handler = HPLCHandler(req.YminRT, req.YmaxRT, req.IminRT_list, req.ImaxRT_list, req.minRTISO, req.maxRTISO)
     observer = Observer()
     observer.schedule(handler, path=path, recursive=False)
     observer.daemon = True
     observer.start()
 
-    store["watching"] = True
-    store["watch_path"] = path
-    return {"status": "watching", "path": path}
+    with store_lock:
+        store["watching"] = True
+        store["watch_path"] = path
+
+    return {"status": "watching", "path": path, "expected_files": sor_iterations, "objectives": objectives_in}
 
 @app.post("/stop_watch")
 async def stop_watch():
@@ -622,54 +501,90 @@ async def stop_watch():
     if observer:
         observer.stop()
         observer.join(timeout=2)
-    store["watching"] = False
-    store["watch_path"] = None
+    with store_lock:
+        store["watching"] = False
+        store["watch_path"] = None
     return {"status": "stopped"}
+
+@app.post("/upload_hplc")
+async def upload_hplc(file: UploadFile = File(...),
+                      YminRT: float = Query(2.0),
+                      YmaxRT: float = Query(4.0),
+                      IminRT_list: List[float] = Query([0.5]),
+                      ImaxRT_list: List[float] = Query([1.0]),
+                      minRTISO: float = Query(10.0),
+                      maxRTISO: float = Query(12.0)):
+    """
+    Upload a single HPLC CSV via HTTP and process it in the same row-wise manner.
+    """
+    try:
+        filename = file.filename
+        content = await file.read()
+        tmp = io.BytesIO(content)
+        # read CSV bytes into pandas and then into numpy for processing
+        df = pd.read_csv(tmp)
+        # convert to numpy format expected by response_HPLC_csv
+        if 'Area' in df.columns and 'RT' in df.columns:
+            data_np = df[['Area', 'RT']].to_numpy()
+        else:
+            cols_lower = {c.lower(): c for c in df.columns}
+            if 'area' in cols_lower and 'rt' in cols_lower:
+                data_np = df[[cols_lower['area'], cols_lower['rt']]].to_numpy()
+            else:
+                return {"status": "error", "message": "CSV missing Area/RT columns"}
+        resp = process_hplc_and_update_table(filename, data_np, YminRT, YmaxRT, IminRT_list, ImaxRT_list, minRTISO, maxRTISO)
+        return {"status": "ok", "filename": filename, "response": resp, "next_row": store.get("next_row")}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.post("/optimize")
 async def optimize(req: OptimizeRequest):
-    """
-    Run optimization using current LHS table as starting experiments.
-    Body: { "objectives": [{"name":"Yield","maximize":true}, ...], "sor_iterations":10, "nobj":2 }
-    """
-    lhs_df: Optional[pd.DataFrame] = store.get("lhs_table")
+    with store_lock:
+        lhs_df = store.get("lhs_table")
     if lhs_df is None:
-        return {"status": "error", "message": "No LHS table present. Upload one with /upload_lhs or generate via /generate_lhs"}
+        return {"status": "error", "message": "No LHS table present. Upload one first via /upload_lhs."}
 
-    # attempt to build domain
     try:
         domain = build_domain_from_df(lhs_df, req.objectives)
     except Exception as e:
         return {"status": "error", "message": f"Failed to build domain from LHS: {e}"}
 
-    # run optimization
     try:
         out = run_summit_optimization(domain, lhs_df, req.nobj)
     except Exception as e:
         return {"status": "error", "message": f"Optimization failed: {e}"}
 
-    # store and return result
     try:
         out_df = pd.DataFrame(out)
     except Exception:
-        out_df = out  # could already be DataFrame-like
+        out_df = out
 
-    store["optimization_result"] = out_df
-    return {"status": "ok", "result": out_df.to_dict(orient="records")}
+    with store_lock:
+        store["optimization_result"] = out_df
+    return {"status": "ok", "result": out_df.to_dict(orient='records')}
 
 @app.get("/results")
 async def get_results():
-    lhs = store.get("lhs_table")
-    opt = store.get("optimization_result")
+    with store_lock:
+        lhs = store.get("lhs_table")
+        opt = store.get("optimization_result")
+        hplc = store.get("hplc_responses", {})
+        watching = store.get("watching", False)
+        watch_path = store.get("watch_path", None)
+        objectives = store.get("objectives", None)
+        expected_files = store.get("expected_files", 0)
+        next_row = store.get("next_row", 0)
     return {
         "lhs_table": lhs.to_dict(orient="records") if lhs is not None else None,
-        "optimization_result": opt.to_dict(orient="records") if opt is not None else None,
-        "hplc_responses": store.get("hplc_responses", {}),
-        "watching": store.get("watching", False),
-        "watch_path": store.get("watch_path", None),
+        "optimization_result": opt.to_dict(orient="records") if isinstance(opt, pd.DataFrame) else opt,
+        "hplc_responses": hplc,
+        "watching": watching,
+        "watch_path": watch_path,
+        "objectives": objectives,
+        "expected_files": expected_files,
+        "next_row": next_row
     }
 
-# ---------------- Shutdown handler ----------------
 @app.on_event("shutdown")
 def shutdown_event():
     global observer
@@ -681,8 +596,6 @@ def shutdown_event():
         except Exception:
             pass
 
-# ---------------- If run as script ----------------
 if __name__ == "__main__":
-    # For local debug only: run with `python main.py` (not recommended for production)
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
