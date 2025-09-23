@@ -1,705 +1,64 @@
-# main.py - Reaction Database AI (fixed: direct LLM for general queries + hardened Bing)
-import os
-import re
-import glob
-import io
-import json
-import time
-import requests
-import traceback
-from typing import Union, List, Optional, Dict, Any, Tuple
-from jose import jwt
-import threading
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
-from pydantic import BaseModel
-import fitz  # PyMuPDF
-import pandas as pd
-from PIL import Image
-from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA, LLMChain
-from langchain.prompts import PromptTemplate
-import mimetypes
-from difflib import SequenceMatcher
-from pptx import Presentation
-from pptx.util import Pt
-from pydantic import BaseModel as PydanticBaseModel
-
-# Optional libs
-try:
-    import docx
-except Exception:
-    docx = None
-try:
-    import pptx as pptx_lib
-except Exception:
-    pptx_lib = None
-try:
-    import pytesseract
-except Exception:
-    pytesseract = None
-
-# ---------------------------
-# Config (fill / override via env)
-# ---------------------------
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL", "")
-AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2025-01-01-preview")
-AZURE_API_KEY = os.environ.get("AZURE_API_KEY", "")
-AZURE_DEPLOYMENT = os.environ.get("AZURE_DEPLOYMENT", "api-ai4o")
-AZURE_MODEL = os.environ.get("AZURE_MODEL", "gpt-4o")
-
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-3-large",
-    api_version="2025-01-01-preview",
-    azure_endpoint=os.environ.get("AZURE_EMBEDDING_ENDPOINT", ""),
-    api_key=os.environ.get("AZURE_API_KEY", ""),
-    azure_deployment=os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "api-ai-3l")
-)
-chat_model = AzureChatOpenAI(
-    azure_deployment=AZURE_DEPLOYMENT,
-    model=AZURE_MODEL,
-    api_version=AZURE_API_VERSION,
-    api_key=os.environ.get("AZURE_API_KEY", ""),
-    azure_endpoint=os.environ.get("AZURE_BASE_URL", "")
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
-
-BING_SEARCH_ENDPOINT = os.environ.get("BING_SEARCH_ENDPOINT", "")
-BING_SEARCH_KEY = os.environ.get("BING_SEARCH_KEY", "")
-USE_BING_DEFAULT = True
-
-SECRET_KEY = os.environ.get("RDB_SECRET_KEY", "myFAVsecretKEY")
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
-
-BASE_DIR = os.environ.get("RDB_BASE_DIR", r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database")
-PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
-SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
-UPLOADS_DIR = os.path.join(BASE_DIR, "User_Uploads")
-
-os.makedirs(PRODUCTS_DIR, exist_ok=True)
-os.makedirs(SCHEMES_DIR, exist_ok=True)
-os.makedirs(UPLOADS_DIR, exist_ok=True)
-
-REACTION_TYPES = [
-    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
-    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
-    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
-]
-
-# Prompts
-EXTRACTION_PROMPT_TEMPLATE = """
-You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
-1. **API Name**: The active pharmaceutical ingredient
-2. **Reaction Chemistry**: Type and description
-3. **Yield**: Exact yield percentages or values mentioned in the source
-4. **Procedure**: Summarize the complete procedure into clear, concise numbered bullet points, preserving the key steps and important details. Do NOT omit any steps or essential content.
-5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
-
-Structure your response as follows (literal headers must appear exactly like below):
-
-### API Name
-[API name here]
-### Reaction Chemistry
-[Reaction chemistry description here]
-### Yield
-[Yield value here]
-### Procedure
-[Complete procedure here]
-### Tabular Data
-[Markdown table here]
-
-Document Content:
-{context}
-Question: {question}
-Answer:
-"""
-EXTRACTION_PROMPT = PromptTemplate(template=EXTRACTION_PROMPT_TEMPLATE, input_variables=["context", "question"])
-
-QA_PROMPT_TEMPLATE = """
-You are a concise pharmaceutical chemistry expert. Use the provided document context to answer the user's question directly and concisely.
-
-Rules (follow exactly):
-- Use only the information present in the context. Do NOT hallucinate.
-- Answer in one short paragraph (2-6 sentences) unless the user explicitly asks for step-by-step procedure.
-- Do NOT reproduce the full document content. Do NOT provide unrequested long verbatim passages.
-- If multiple documents were used, identify only those documents that were actually the sources of the answer.
-- If the answer is not present in the context, say "I could not find an answer in the provided documents." (do not guess).
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:
-"""
-QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
-
-# ------------------------------
-# Helpers: file handling & extraction
-# ------------------------------
-def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
-    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
-        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
-        if os.path.exists(scheme_path):
-            return scheme_path
-    return None
-
-def list_products() -> List[Dict[str, Any]]:
-    products = []
-    for reaction_type in REACTION_TYPES:
-        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
-        if not os.path.exists(reaction_dir):
-            continue
-        files = glob.glob(os.path.join(reaction_dir, "*.*"))
-        for path in files:
-            filename = os.path.basename(path)
-            product_name = os.path.splitext(filename)[0]
-            scheme_image = find_scheme_image(reaction_type, product_name)
-            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
-            product_id = f"{reaction_type}_{product_name}"
-            products.append({
-                "id": product_id,
-                "name": product_name,
-                "reaction_type": reaction_type,
-                "pdf_path": path,
-                "scheme_image": scheme_image if scheme_image else None,
-                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
-            })
-    # user uploads
-    uploads = glob.glob(os.path.join(UPLOADS_DIR, "*"))
-    for path in uploads:
-        if os.path.isdir(path):
-            for fpath in glob.glob(os.path.join(path, "*.*")):
-                filename = os.path.basename(fpath)
-                pname = os.path.splitext(filename)[0]
-                pid = f"UserUpload_{os.path.basename(path)}_{pname}"
-                products.append({
-                    "id": pid,
-                    "name": pname,
-                    "reaction_type": "User_Uploads",
-                    "pdf_path": fpath,
-                    "scheme_image": None,
-                    "scheme_cdx": None
-                })
-    return products
-
-def extract_pdf_text(pdf_path: str) -> str:
-    doc = fitz.open(pdf_path)
-    text = ""
-    for page in doc:
-        text += page.get_text() + "\n"
-    return text
-
-def extract_docx_text(path: str) -> str:
-    if docx is None:
-        raise RuntimeError("python-docx not installed")
-    d = docx.Document(path)
-    texts = [p.text for p in d.paragraphs if p.text and p.text.strip()]
-    return "\n".join(texts)
-
-def extract_pptx_text(path: str) -> str:
-    if pptx_lib is None:
-        raise RuntimeError("python-pptx not installed for extraction")
-    prs = pptx_lib.Presentation(path)
-    texts = []
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            try:
-                if hasattr(shape, "text") and shape.text:
-                    texts.append(shape.text)
-            except Exception:
-                continue
-    return "\n".join(texts)
-
-def extract_xls_text(path: str) -> str:
-    xls = pd.read_excel(path, sheet_name=None)
-    parts = []
-    for sheet_name, df in xls.items():
-        parts.append(f"### Sheet: {sheet_name}")
-        parts.append(df.to_csv(index=False))
-    return "\n\n".join(parts)
-
-def extract_csv_text(path: str) -> str:
-    df = pd.read_csv(path)
-    return df.to_csv(index=False)
-
-def extract_image_text(path: str) -> Tuple[str, bool]:
-    if pytesseract is None:
-        return ("", False)
-    img = Image.open(path)
-    txt = pytesseract.image_to_string(img)
-    return (txt or "", True)
-
-# ------------------------------
-# Caches & locks
-_vectorstore_cache: Dict[str, FAISS] = {}
-_product_details_cache: Dict[str, Dict[str, Any]] = {}
-_vectorstore_lock = threading.Lock()
-
-def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
-    pid = product["id"]
-    with _vectorstore_lock:
-        if pid in _vectorstore_cache:
-            return _vectorstore_cache[pid]
-        path = product.get("pdf_path")
-        if not path or not os.path.exists(path):
-            return None
-        ext = os.path.splitext(path)[1].lower()
-        text = ""
-        try:
-            if ext == ".pdf":
-                text = extract_pdf_text(path)
-            elif ext in [".docx", ".doc"]:
-                text = extract_docx_text(path)
-            elif ext == ".pptx":
-                text = extract_pptx_text(path)
-            elif ext in [".xlsx", ".xls"]:
-                text = extract_xls_text(path)
-            elif ext == ".csv":
-                text = extract_csv_text(path)
-            elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
-                txt, did = extract_image_text(path)
-                if did and txt.strip():
-                    text = txt
-                else:
-                    text = f"[image file: {os.path.basename(path)}]"
-            else:
-                try:
-                    text = extract_pdf_text(path)
-                except Exception:
-                    text = f"[file: {os.path.basename(path)}]"
-        except Exception as e:
-            print(f"Extraction error for {path}: {e}")
-            return None
-
-        if not text or len(text.strip()) < 20:
-            return None
-
-        doc = Document(page_content=text, metadata={
-            "product_id": pid,
-            "product_name": product["name"],
-            "reaction_type": product.get("reaction_type", "User_Uploads"),
-            "source": path
-        })
-        try:
-            vs = FAISS.from_documents([doc], cached_embeddings)
-        except Exception as e:
-            print(f"FAISS build error for {pid}: {e}")
-            return None
-        _vectorstore_cache[pid] = vs
-        return vs
-
-def parse_structured_response(text: str) -> Dict[str, Any]:
-    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
-    def grab(section):
-        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else None
-    result["api_name"] = grab("API Name")
-    result["reaction_chemistry"] = grab("Reaction Chemistry")
-    result["yield"] = grab("Yield")
-    result["procedure"] = grab("Procedure")
-    tab_raw = grab("Tabular Data")
-    if tab_raw:
-        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
-        if table_patterns:
-            for tbl_md in table_patterns:
-                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
-                if len(lines) >= 2:
-                    header = [h.strip() for h in lines[0].split("|")]
-                    rows = []
-                    for rowline in lines[2:]:
-                        cols = [c.strip() for c in rowline.split("|")]
-                        rows.append(cols)
-                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
-        else:
-            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
-    return result
-
-# ------------------------------
-# Conversation memory (in-memory)
-_CHAT_MEMORY: Dict[str, List[Dict[str,str]]] = {}
-MEMORY_LOCK = threading.Lock()
-MEMORY_MAX_MESSAGES = 40
-
-def memory_append(conversation_id: str, role: str, content: str):
-    if not conversation_id:
-        return
-    with MEMORY_LOCK:
-        arr = _CHAT_MEMORY.setdefault(conversation_id, [])
-        arr.append({"role": role, "content": content})
-        if len(arr) > MEMORY_MAX_MESSAGES:
-            _CHAT_MEMORY[conversation_id] = arr[-MEMORY_MAX_MESSAGES:]
-
-def memory_get(conversation_id: str) -> List[Dict[str,str]]:
-    if not conversation_id:
-        return []
-    with MEMORY_LOCK:
-        return list(_CHAT_MEMORY.get(conversation_id, []))
-
-def memory_clear(conversation_id: str):
-    if not conversation_id:
-        return
-    with MEMORY_LOCK:
-        _CHAT_MEMORY.pop(conversation_id, None)
-
-# ------------------------------
-# Bing search helper (hardened)
-def bing_search(query: str, top_k: int = 5) -> Dict[str, Any]:
-    if not BING_SEARCH_ENDPOINT or not BING_SEARCH_KEY:
-        return {"web_pages": [], "raw": None, "error": "Bing not configured"}
-    headers_variants = [
-        {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY},
-        {"Ocp-Apim-SubscriptionKey": BING_SEARCH_KEY},
-        {"Subscription-Key": BING_SEARCH_KEY},
-        {"Api-Key": BING_SEARCH_KEY},
-        {"X-Api-Key": BING_SEARCH_KEY},
-    ]
-    params = {"q": query, "count": top_k, "textDecorations": True, "textFormat": "Plain"}
-    last_err = None
-    for headers in headers_variants:
-        try:
-            resp = requests.get(BING_SEARCH_ENDPOINT, headers=headers, params=params, timeout=20)
-            if resp.status_code == 401 or resp.status_code == 403:
-                # unauthorized - try next header variant
-                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                continue
-            resp.raise_for_status()
-            j = resp.json()
-            web_pages = []
-            # two common shapes: j["webPages"]["value"] or j["value"]
-            values = j.get("webPages", {}).get("value") or j.get("value") or []
-            for v in values[:top_k]:
-                web_pages.append({
-                    "name": v.get("name") or v.get("title") or "",
-                    "url": v.get("url") or v.get("displayUrl") or v.get("id") or "",
-                    "snippet": v.get("snippet") or v.get("excerpt") or v.get("description") or ""
-                })
-            return {"web_pages": web_pages, "raw": j}
-        except Exception as e:
-            last_err = str(e)
-            continue
-    return {"web_pages": [], "raw": None, "error": last_err}
-
-# ------------------------------
-# FastAPI app
-app = FastAPI(title="Reaction Database AI (FastAPI)")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-# ------------------------------
-# Pydantic models
-class ProductOut(PydanticBaseModel):
-    id: str
-    name: str
-    reaction_type: str
-    has_scheme_image: bool
-    has_scheme_cdx: bool
-
-class QARequest(PydanticBaseModel):
-    product_id: Optional[str] = None
-    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-    use_bing: Optional[bool] = None
-    conversation_id: Optional[str] = None
-
-class QueryRequest(PydanticBaseModel):
-    product_ids: List[str]
-    question: str
-    conversation_id: Optional[str] = None
-
-# Sample prompts for frontend
-SAMPLE_PROMPTS = [
-    {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
-    {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
-    {"id": "procedure_steps", "title": "Procedure steps", "text": "List the procedure as numbered steps exactly as in the document."},
-    {"id": "conditions", "title": "Reaction conditions", "text": "List solvents, catalysts, and temperatures used in the synthesis."}
-]
-
-# ------------------------------
-# Basic endpoints
-@app.get("/reactions", response_model=List[str])
-def get_reactions():
-    return REACTION_TYPES + ["User_Uploads"]
-
-@app.get("/prompts")
-def get_prompts():
-    return SAMPLE_PROMPTS
-
-@app.get("/products", response_model=List[ProductOut])
-def get_products(reaction_type: Optional[str] = None):
-    allp = list_products()
-    if reaction_type:
-        allp = [p for p in allp if p["reaction_type"] == reaction_type]
-    out = []
-    for p in allp:
-        out.append(ProductOut(
-            id=p["id"],
-            name=p["name"],
-            reaction_type=p["reaction_type"],
-            has_scheme_image=bool(p["scheme_image"]),
-            has_scheme_cdx=bool(p["scheme_cdx"])
-        ))
-    return out
-
-@app.get("/product/{product_id}/meta")
-def product_meta(product_id: str):
-    products = list_products()
-    for p in products:
-        if p["id"] == product_id:
-            return {
-                "id": p["id"],
-                "name": p["name"],
-                "reaction_type": p["reaction_type"],
-                "pdf_path": p["pdf_path"],
-                "scheme_image": p["scheme_image"],
-                "scheme_cdx": p["scheme_cdx"]
-            }
-    raise HTTPException(status_code=404, detail="Product not found")
-
-@app.get("/product/{product_id}/pdf")
-def product_pdf(product_id: str):
-    meta = product_meta(product_id)
-    pdf_path = meta["pdf_path"]
-    if os.path.exists(pdf_path):
-        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
-    raise HTTPException(status_code=404, detail="PDF not found")
-
-@app.get("/product/{product_id}/scheme-image")
-def product_scheme_image(product_id: str):
-    meta = product_meta(product_id)
-    path = meta.get("scheme_image")
-    if path and os.path.exists(path):
-        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
-    raise HTTPException(status_code=404, detail="Scheme image not found")
-
-# ------------------------------
-# Upload endpoint
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str] = Form("User_Uploads"), filename: Optional[str] = Form(None)):
-    try:
-        safe_rt = re.sub(r'[^a-zA-Z0-9_\- ]', '', (reaction_type or "User_Uploads"))
-    except Exception:
-        safe_rt = "User_Uploads"
-    ts = int(time.time())
-    folder_name = f"{safe_rt}_{ts}"
-    out_dir = os.path.join(UPLOADS_DIR, folder_name)
-    os.makedirs(out_dir, exist_ok=True)
-
-    orig_filename = filename or file.filename or f"uploaded_{ts}"
-    save_path = os.path.join(out_dir, orig_filename)
-    with open(save_path, "wb") as f:
-        contents = await file.read()
-        f.write(contents)
-
-    ext = os.path.splitext(save_path)[1].lower()
-    text = ""
-    ocr_performed = False
-    extract_error = None
-    try:
-        if ext == ".pdf":
-            text = extract_pdf_text(save_path)
-        elif ext in [".docx", ".doc"]:
-            text = extract_docx_text(save_path)
-        elif ext == ".pptx":
-            text = extract_pptx_text(save_path)
-        elif ext in [".xlsx", ".xls"]:
-            text = extract_xls_text(save_path)
-        elif ext == ".csv":
-            text = extract_csv_text(save_path)
-        elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
-            text, ocr_performed = extract_image_text(save_path)
-        else:
-            try:
-                text = extract_pdf_text(save_path)
-            except Exception:
-                text = f"[uploaded file: {orig_filename}]"
-    except Exception as e:
-        extract_error = str(e)
-        print("Upload extraction error:", e)
-
-    product_name = os.path.splitext(orig_filename)[0]
-    product_id = f"UserUpload_{folder_name}_{product_name}"
-    meta = {
-        "id": product_id,
-        "name": product_name,
-        "reaction_type": "User_Uploads",
-        "pdf_path": save_path,
-        "scheme_image": None,
-        "scheme_cdx": None,
-        "ocr_performed": ocr_performed,
-        "extract_error": extract_error
-    }
-
-    try:
-        doc = Document(page_content=(text or f"[uploaded file: {orig_filename}]"), metadata={
-            "product_id": product_id,
-            "product_name": product_name,
-            "reaction_type": "User_Uploads",
-            "source": save_path
-        })
-        vs = FAISS.from_documents([doc], cached_embeddings)
-        with _vectorstore_lock:
-            _vectorstore_cache[product_id] = vs
-    except Exception as e:
-        print(f"Warning: indexing uploaded file failed: {e}")
-
-    return {"meta": meta, "message": "Uploaded and indexed (if supported).", "product_id": product_id}
-
-# ------------------------------
-# Product detection helpers
-def _normalize_alnum(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-def _tokens(s: str):
-    return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
-
-def detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
-    products = list_products()
-    if not products:
-        return None
-    q_norm = _normalize_alnum(question)
-    q_tokens = set(_tokens(question))
-    sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
-
-    for p in sorted_products:
-        name_norm = _normalize_alnum(p["name"])
-        if name_norm and name_norm in q_norm:
-            return p
-
-    token_matches = []
-    for p in sorted_products:
-        pname_tokens = set(_tokens(p["name"]))
-        if not pname_tokens:
-            continue
-        overlap = pname_tokens.intersection(q_tokens)
-        if overlap:
-            token_matches.append((p, len(overlap), len(pname_tokens), overlap))
-    if token_matches:
-        token_matches.sort(key=lambda x: (-(x[1]/x[2]), -x[1]))
-        p_best, match_count, token_count, overlap = token_matches[0]
-        ratio = match_count / token_count
-        if ratio >= 0.5:
-            return p_best
-
-    best = None
-    best_ratio = 0.0
-    for p in products:
-        pname = (p["name"] or "").lower()
-        if not pname.strip():
-            continue
-        r1 = SequenceMatcher(None, pname, question.lower()).ratio()
-        r2 = SequenceMatcher(None, _normalize_alnum(pname), _normalize_alnum(question)).ratio()
-        ratio = (r1 + r2) / 2.0
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best = (p, ratio, r1, r2)
-    if best:
-        p_best, ratio, _, _ = best
-        if ratio >= 0.60:
-            return p_best
-    return None
-
-# ------------------------------
-# product/details (NEW behavior: direct LLM for general queries)
 @app.post("/product/details")
 def product_details(req: QARequest):
+    """
+    Robust product/details endpoint.
+
+    Behavior summary:
+      - If req.product_id is provided:
+          * If question == canonical extraction -> run structured extraction (parsing and caching).
+          * Else -> run retrieval QA on that specific product; return {"answer":..., "sources":[...]}.
+      - If req.product_id not provided:
+          * Try to detect a product name inside the question (exact normalized substring -> token-overlap -> similarity).
+          * If detected -> run retrieval QA on that product and return {"answer":..., "sources":[...]}.
+          * If NOT detected -> call the LLM directly (no document retrieval) and return {"response": ...}.
+    """
     try:
         q_text = (req.question or "").strip()
         if not q_text:
             return JSONResponse(status_code=400, content={"error": "question is required"})
 
-        conversation_id = req.conversation_id
-        if conversation_id:
-            memory_append(conversation_id, "user", q_text)
-
+        # canonical extraction text (case-insensitive)
         CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
-        use_bing = req.use_bing if req.use_bing is not None else USE_BING_DEFAULT
 
-        # 1) explicit product_id path => document retrieval/extraction
-        if req.product_id:
-            prod = next((p for p in list_products() if p["id"] == req.product_id), None)
-            if not prod:
-                return JSONResponse(status_code=404, content={"error": "Product not found"})
-            is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
-            if not is_extraction:
-                with _vectorstore_lock:
-                    vs = _vectorstore_cache.get(prod["id"])
-                if not vs:
-                    vs = build_product_vector_store(prod)
-                    if not vs:
-                        return JSONResponse(status_code=500, content={"error":"Failed to build vector store for product"})
-                retriever = vs.as_retriever(search_kwargs={"k": 3})
-                qa_chain = RetrievalQA.from_chain_type(
-                    llm=chat_model,
-                    chain_type="stuff",
-                    retriever=retriever,
-                    chain_type_kwargs={"prompt": QA_PROMPT},
-                    return_source_documents=True
-                )
-                out = qa_chain({"query": q_text})
-                answer_text = out.get("result") or out.get("output_text") or ""
-                source_docs = out.get("source_documents", []) or []
-                seen = set()
-                sources = []
-                for sd in source_docs:
-                    pid = sd.metadata.get("product_id")
-                    pname = sd.metadata.get("product_name")
-                    if pid and pid not in seen:
-                        seen.add(pid)
-                        sources.append({"product_id": pid, "product_name": pname})
-                if conversation_id:
-                    memory_append(conversation_id, "assistant", answer_text)
-                return {"answer": answer_text, "sources": sources}
-            # structured extraction path
-            if req.product_id in _product_details_cache:
-                return _product_details_cache[req.product_id]
-            vs = build_product_vector_store(prod)
-            if not vs:
-                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid file)"})
-            retriever = vs.as_retriever(search_kwargs={"k": 1})
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": EXTRACTION_PROMPT},
-                return_source_documents=False,
-            )
-            raw_response = qa_chain.run(q_text)
-            parsed = parse_structured_response(raw_response)
-            _product_details_cache[req.product_id] = parsed
-            if conversation_id:
-                memory_append(conversation_id, "assistant", raw_response)
-            return parsed
+        # DEBUG
+        print("=== /product/details called ===")
+        print("Question:", q_text)
+        print("product_id:", getattr(req, "product_id", None))
 
-        # 2) Attempt detect product by name in the free-text query
-        detected = detect_product_by_name(q_text)
-        if detected:
+        # Helper: run retrieval QA on a product and return answer + sources
+        def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
+            print(f"DEBUG: Running retrieval for product: {product['name']} (id: {product['id']})")
+            pdf_path = product.get("pdf_path")
+            if not pdf_path or not os.path.exists(pdf_path):
+                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}: {pdf_path}")
+
+            # Build/reuse vectorstore for product
             with _vectorstore_lock:
-                vs = _vectorstore_cache.get(detected["id"])
+                vs = _vectorstore_cache.get(product["id"])
             if not vs:
-                vs = build_product_vector_store(detected)
+                vs = build_product_vector_store(product)
                 if not vs:
-                    return JSONResponse(status_code=500, content={"error":"Failed to build vector store for detected product"})
-            retriever = vs.as_retriever(search_kwargs={"k": 3})
+                    raise HTTPException(status_code=500, detail="Failed to build vector store for product")
+
+            retriever = vs.as_retriever(search_kwargs={"k": k})
+
+            # Use QA_PROMPT as configured in module (must exist)
+            prompt_to_use = globals().get("QA_PROMPT") or globals().get("PROMPT") or EXTRACTION_PROMPT
+
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
                 chain_type="stuff",
                 retriever=retriever,
-                chain_type_kwargs={"prompt": QA_PROMPT},
-                return_source_documents=True
+                chain_type_kwargs={"prompt": prompt_to_use},
+                return_source_documents=True,
             )
-            out = qa_chain({"query": q_text})
-            answer_text = out.get("result") or out.get("output_text") or ""
+
+            out = qa_chain({"query": question})
+            # langchain sometimes returns different keys; support common variants
+            answer_text = out.get("result") or out.get("output_text") or out.get("answer") or ""
             source_docs = out.get("source_documents", []) or []
+
+            # Build unique ordered sources list
             seen = set()
             sources = []
             for sd in source_docs:
@@ -708,45 +67,170 @@ def product_details(req: QARequest):
                 if pid and pid not in seen:
                     seen.add(pid)
                     sources.append({"product_id": pid, "product_name": pname})
-            if conversation_id:
-                memory_append(conversation_id, "assistant", answer_text)
+            print(f"DEBUG: Retrieval produced answer length={len(answer_text)} and {len(sources)} source(s)")
             return {"answer": answer_text, "sources": sources}
 
-        # 3) No product detected -> general query: DO NOT chunk docs.
-        # Option A: If use_bing and configured, fetch search snippets and synthesize
-        mem_msgs = memory_get(conversation_id) if conversation_id else []
-        memory_context = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in mem_msgs[-10:]]) if mem_msgs else ""
+        # Helper: detect product name inside question (reuse your detection logic)
+        def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
+            products = list_products()
+            if not products:
+                print("DEBUG: No products to match.")
+                return None
 
-        if use_bing and BING_SEARCH_ENDPOINT and BING_SEARCH_KEY:
-            bing_res = bing_search(q_text, top_k=5)
-            web_pages = bing_res.get("web_pages", [])
-            # Build snippets context
-            snippets = "\n\n".join([f"{i+1}. {wp['name']}\nURL: {wp['url']}\nSnippet: {wp['snippet']}" for i, wp in enumerate(web_pages)])
-            context_for_llm = f"{memory_context}\n\nSearch results:\n{snippets}"
-            synth_prompt = PromptTemplate(template="""You are a concise expert. Use ONLY the provided search snippets and conversation memory to answer the question. If the answer is not present, say 'I could not find an answer in the provided documents.' Context: {context}\nQuestion: {question}\nAnswer:""", input_variables=["context", "question"])
-            chain = LLMChain(llm=chat_model, prompt=synth_prompt)
+            def _normalize_alnum(s: str) -> str:
+                return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+            def _tokens(s: str):
+                return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
+
+            q_norm_alnum = _normalize_alnum(question)
+            q_tokens = set(_tokens(question))
+
+            # 1) Exact normalized substring match (prefer longer product names)
+            sorted_products = sorted(products, key=lambda p: len(p["name"] or ""), reverse=True)
+            for p in sorted_products:
+                name_norm = _normalize_alnum(p["name"])
+                if name_norm and name_norm in q_norm_alnum:
+                    print(f"DEBUG: Exact normalized substring match -> '{p['name']}' (id: {p['id']})")
+                    return p
+
+            # 2) Token overlap heuristic
+            token_matches = []
+            for p in sorted_products:
+                pname_tokens = set(_tokens(p["name"]))
+                if not pname_tokens:
+                    continue
+                overlap = pname_tokens.intersection(q_tokens)
+                if overlap:
+                    token_matches.append((p, len(overlap), len(pname_tokens), overlap))
+            if token_matches:
+                token_matches.sort(key=lambda x: (-(x[1] / x[2]), -x[1]))
+                p_best, match_count, token_count, overlap = token_matches[0]
+                ratio = match_count / token_count
+                print(f"DEBUG: Token-overlap candidate -> '{p_best['name']}' overlap {match_count}/{token_count} ratio={ratio:.2f}")
+                if ratio >= 0.5:
+                    return p_best
+
+            # 3) Similarity fallback
+            best = None
+            best_ratio = 0.0
+            for p in products:
+                pname = (p["name"] or "").lower()
+                if not pname.strip():
+                    continue
+                r1 = SequenceMatcher(None, pname, question.lower()).ratio()
+                r2 = SequenceMatcher(None, _normalize_alnum(pname), _normalize_alnum(question)).ratio()
+                ratio = (r1 + r2) / 2.0
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best = (p, ratio, r1, r2)
+            if best:
+                p_best, ratio, r1, r2 = best
+                print(f"DEBUG: Best similarity candidate -> '{p_best['name']}' ratio_avg={ratio:.3f}")
+                if ratio >= 0.60:
+                    return p_best
+
+            return None
+
+        # -------------------------
+        # Main branching logic
+        # -------------------------
+        # 1) If explicit product_id provided -> handle product-specific retrieval or extraction
+        if getattr(req, "product_id", None):
+            products = list_products()
+            product = next((p for p in products if p["id"] == req.product_id), None)
+            if not product:
+                return JSONResponse(status_code=404, content={"error": "Product not found"})
+
+            is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
+
+            if not is_extraction:
+                # retrieval QA for this product
+                try:
+                    return _run_retrieval_for_product(product, q_text, k=3)
+                except HTTPException as he:
+                    raise he
+                except Exception as e:
+                    print("ERROR in product retrieval:", e)
+                    tb = traceback.format_exc()
+                    print(tb)
+                    raise HTTPException(status_code=500, detail=str(e))
+
+            # structured extraction path (cached)
+            if req.product_id in _product_details_cache:
+                print("DEBUG: returning cached parsed details for", req.product_id)
+                return _product_details_cache[req.product_id]
+
+            # build vector store and run extraction prompt
+            vs = build_product_vector_store(product)
+            if not vs:
+                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
+
+            retriever = vs.as_retriever(search_kwargs={"k": 1})
+            prompt_for_extraction = globals().get("EXTRACTION_PROMPT") or globals().get("PROMPT")
+            if not prompt_for_extraction:
+                return JSONResponse(status_code=500, content={"error": "No extraction prompt configured."})
+
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt_for_extraction},
+                return_source_documents=False,
+            )
+
             try:
-                ans = chain.run({"context": context_for_llm, "question": q_text})
+                raw_response = qa_chain.run(q_text)
             except Exception as e:
-                print("LLM synth from bing failed:", e)
-                ans = "I could not synthesize an answer from web results."
-            if conversation_id:
-                memory_append(conversation_id, "assistant", ans)
-            return {"answer": ans, "web_results": web_pages, "source": "bing+llm"}
+                print("ERROR running extraction chain:", e)
+                raise HTTPException(status_code=500, detail=f"LLM extraction error: {e}")
 
-        # 4) No bing or not using bing -> direct LLM call with memory context
-        direct_prompt = PromptTemplate(template="""You are a concise pharmaceutical chemistry expert. Use the conversation memory (if any) and answer directly and succinctly. Conversation Memory:\n{mem}\n\nQuestion: {question}\nAnswer:""", input_variables=["mem", "question"])
-        chain = LLMChain(llm=chat_model, prompt=direct_prompt)
+            parsed = parse_structured_response(raw_response)
+            _product_details_cache[req.product_id] = parsed
+            print("DEBUG: structured extraction completed and cached")
+            return parsed
+
+        # 2) No explicit product_id -> attempt to detect a product name in the question
+        detected = _detect_product_by_name(q_text)
+        if detected:
+            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
+            try:
+                return _run_retrieval_for_product(detected, q_text, k=3)
+            except HTTPException as he:
+                raise he
+            except Exception as e:
+                print("ERROR in detected-product retrieval:", e)
+                tb = traceback.format_exc()
+                print(tb)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # 3) No product detected -> direct LLM call (fallback to generative)
+        print("DEBUG: No product detected -> calling LLM directly (generative path)")
+
+        # Use the QA_PROMPT to get a concise answer (this will call LLM directly)
+        prompt_for_gen = globals().get("QA_PROMPT") or globals().get("PROMPT") or EXTRACTION_PROMPT
+
+        # Build a simple chain that uses the prompt template and the question
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=None,  # no retriever -> direct LLM
+            chain_type_kwargs={"prompt": prompt_for_gen},
+            return_source_documents=False,
+        )
+
         try:
-            ans = chain.run({"mem": memory_context, "question": q_text})
+            raw_response = qa_chain.run(q_text)
         except Exception as e:
-            print("LLM direct call failed:", e)
+            print("ERROR running direct LLM chain:", e)
+            tb = traceback.format_exc()
+            print(tb)
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
-        if conversation_id:
-            memory_append(conversation_id, "assistant", ans)
-        return {"answer": ans, "source": "llm"}
+
+        return {"response": raw_response}
 
     except HTTPException as he:
+        # re-raise HTTP exceptions so FastAPI handles them
         raise he
     except Exception as e:
         tb = traceback.format_exc()
@@ -758,262 +242,3 @@ def product_details(req: QARequest):
             "message": str(e),
             "trace": trace_lines
         })
-
-# ------------------------------
-# Query multiple documents (unchanged)
-@app.post("/query")
-def query_documents(req: QueryRequest):
-    if not req.product_ids:
-        raise HTTPException(status_code=400, detail="product_ids must be a non-empty list")
-    if not req.question or not req.question.strip():
-        raise HTTPException(status_code=400, detail="question required")
-
-    docs = []
-    for pid in req.product_ids:
-        try:
-            meta = product_meta(pid)
-        except HTTPException:
-            continue
-        pdf_path = meta.get("pdf_path")
-        if not pdf_path or not os.path.exists(pdf_path):
-            continue
-        try:
-            ext = os.path.splitext(pdf_path)[1].lower()
-            if ext == ".pdf":
-                text = extract_pdf_text(pdf_path)
-            elif ext in [".docx", ".doc"]:
-                text = extract_docx_text(pdf_path)
-            elif ext == ".pptx":
-                text = extract_pptx_text(pdf_path)
-            elif ext in [".xlsx", ".xls"]:
-                text = extract_xls_text(pdf_path)
-            elif ext == ".csv":
-                text = extract_csv_text(pdf_path)
-            else:
-                try:
-                    text = extract_pdf_text(pdf_path)
-                except:
-                    text = f"[file: {os.path.basename(pdf_path)}]"
-            if not text or len(text.strip()) < 50:
-                continue
-            doc = Document(page_content=text, metadata={
-                "product_id": pid,
-                "product_name": meta.get("name", ""),
-                "reaction_type": meta.get("reaction_type", "")
-            })
-            docs.append(doc)
-        except Exception:
-            continue
-
-    if len(docs) == 0:
-        raise HTTPException(status_code=404, detail="No documents available for the provided product_ids")
-
-    try:
-        vector_store = FAISS.from_documents(docs, cached_embeddings)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
-
-    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
-
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=chat_model,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": QA_PROMPT},
-        return_source_documents=True
-    )
-
-    try:
-        out = qa_chain({"query": req.question})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
-
-    answer_text = out.get("result") or out.get("output_text") or str(out)
-    source_docs = out.get("source_documents", [])
-    seen = set()
-    sources = []
-    for sd in source_docs:
-        pid = sd.metadata.get("product_id")
-        pname = sd.metadata.get("product_name")
-        if pid and pid not in seen:
-            seen.add(pid)
-            sources.append({"product_id": pid, "product_name": pname})
-    if req.conversation_id:
-        memory_append(req.conversation_id, "assistant", answer_text)
-    return {"answer": answer_text, "sources": sources}
-
-# ------------------------------
-# Search (autocomplete)
-@app.get("/products/search")
-def search_products(q: str = "", limit: int = 10):
-    if q is None:
-        q = ""
-    q_norm = re.sub(r'[^a-z0-9]', '', q.lower())
-    if q_norm == "":
-        prods = list_products()[:limit]
-        return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in prods]
-    products = list_products()
-    prefix_matches = []
-    substring_matches = []
-    for p in products:
-        name_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
-        if name_norm.startswith(q_norm):
-            prefix_matches.append(p)
-        elif q_norm in name_norm:
-            substring_matches.append(p)
-    prefix_matches = sorted(prefix_matches, key=lambda x: -len(x["name"]))
-    substring_matches = sorted(substring_matches, key=lambda x: -len(x["name"]))
-    combined = prefix_matches + substring_matches
-    combined = combined[:limit]
-    return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
-
-# ------------------------------
-# PPT generation endpoint
-@app.post("/generate_ppt")
-def generate_ppt(body: dict):
-    topic = (body.get("topic") or "").strip()
-    n_slides = int(body.get("n_slides") or 5)
-    if not topic:
-        raise HTTPException(status_code=400, detail="topic required")
-    if n_slides < 1 or n_slides > 30:
-        raise HTTPException(status_code=400, detail="n_slides must be between 1 and 30")
-
-    prompt_template = PromptTemplate(
-        template="""
-You are an expert slide-writer. Produce a JSON array of exactly {n} slide objects for the topic: "{topic}".
-Each slide object must have this structure:
-{{"title": "Slide title", "bullets": ["first bullet", "second bullet", ...]}}
-Bullets should be concise (3-6 items per slide maximum). The entire response must be valid JSON (an array of objects). No extra commentary.
-""",
-        input_variables=["topic", "n"]
-    )
-    llm_chain = LLMChain(llm=chat_model, prompt=prompt_template)
-    try:
-        raw = llm_chain.run({"topic": topic, "n": n_slides})
-    except Exception as e:
-        print("LLM error generating slide JSON:", e)
-        raise HTTPException(status_code=500, detail="LLM error while generating slides")
-
-    slides = []
-    try:
-        start = raw.find('[')
-        end = raw.rfind(']')
-        if start != -1 and end != -1 and end > start:
-            json_text = raw[start:end+1]
-            slides = json.loads(json_text)
-        else:
-            slides = json.loads(raw)
-    except Exception:
-        try:
-            m = re.search(r'(\[.*\])', raw, re.DOTALL)
-            if m:
-                slides = json.loads(m.group(1))
-            else:
-                raise
-        except Exception as e2:
-            print("Failed to parse JSON from LLM output:", e2)
-            raise HTTPException(status_code=500, detail="Failed to parse slide JSON from LLM output")
-
-    prs = Presentation()
-    for s in slides:
-        title = s.get("title", "")[:200]
-        bullets = s.get("bullets", [])[:8]
-        layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
-        slide = prs.slides.add_slide(layout)
-        try:
-            slide.shapes.title.text = title
-        except Exception:
-            pass
-        try:
-            body = slide.shapes.placeholders[1].text_frame
-            body.clear()
-            for b in bullets:
-                p = body.add_paragraph()
-                p.text = b
-                p.level = 0
-                p.font.size = Pt(18)
-        except Exception:
-            txBox = slide.shapes.add_textbox(Pt(72), Pt(108), Pt(600), Pt(320))
-            tf = txBox.text_frame
-            tf.text = "\n".join(bullets)
-
-    fobj = io.BytesIO()
-    prs.save(fobj)
-    fobj.seek(0)
-    filename = f"slides_{re.sub(r'[^0-9a-zA-Z]+','_', topic)[:60]}_{int(time.time())}.pptx"
-    return StreamingResponse(fobj, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", headers={
-        "Content-Disposition": f'attachment; filename="{filename}"'
-    })
-
-# ------------------------------
-# Transcribe (unchanged guidance)
-GOOGLE_CREDENTIALS_JSON = ""
-
-@app.post("/transcribe")
-async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
-    content = await file.read()
-    if not use_google:
-        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
-    if not GOOGLE_CREDENTIALS_JSON:
-        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
-    try:
-        from google.cloud import speech_v1p1beta1 as speech
-        from google.oauth2 import service_account
-    except Exception as e:
-        return {"error": f"google-cloud-speech library not installed: {e}"}
-    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    credentials = service_account.Credentials.from_service_account_info(creds_info)
-    client = speech.SpeechClient(credentials=credentials)
-    audio = speech.RecognitionAudio(content=content)
-    config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=16000,
-        language_code="en-US",
-        enable_automatic_punctuation=True,
-    )
-    response = client.recognize(config=config, audio=audio)
-    transcripts = [r.alternatives[0].transcript for r in response.results]
-    return {"transcript": " ".join(transcripts)}
-
-# ------------------------------
-# Memory endpoints
-@app.post("/memory")
-def add_memory_item(conversation_id: str = Form(...), role: str = Form(...), content: str = Form(...)):
-    memory_append(conversation_id, role, content)
-    return {"status": "ok", "conversation_id": conversation_id}
-
-@app.get("/memory/{conversation_id}")
-def get_memory(conversation_id: str):
-    return {"conversation_id": conversation_id, "messages": memory_get(conversation_id)}
-
-@app.delete("/memory/{conversation_id}")
-def clear_memory(conversation_id: str):
-    memory_clear(conversation_id)
-    return {"status": "cleared", "conversation_id": conversation_id}
-
-# ------------------------------
-# Health & auth
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-def create_access_token(data: dict, expires_delta: Union[timedelta , None] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-@app.post("/login")
-async def login():
-    user_info = {"first_name":"Demo","last_name":"User"}
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user_info["first_name"]},
-        expires_delta=access_token_expires
-    )
-    return {
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "firstname": user_info["first_name"],
-        "lastname": user_info["last_name"],
-    }
