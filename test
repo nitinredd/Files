@@ -1,352 +1,1489 @@
-// src/App.jsx
-import React, { useEffect, useState } from "react";
-import axios from "axios";
+# main.py (FULL)
+import os
+import re
+import glob
+import base64
+import io
+import json
+import time
+from typing import Union, List, Optional, Dict, Any, Tuple
+from jose import jwt
+import threading
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBasic
+from datetime import datetime, timedelta
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+import pandas as pd
+from PIL import Image
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+import mimetypes
+from difflib import SequenceMatcher
+import traceback
 
-const API_BASE = ""; // leave empty for Vite proxy; set to "http://localhost:8000" if you prefer direct calls
+# Optional libraries (not mandatory unless you enable OCR)
+try:
+    import docx  # python-docx
+except Exception:
+    docx = None
 
-export default function App() {
-  const [lhsFile, setLhsFile] = useState(null);
-  const [lhs, setLhs] = useState(null);
-  const [results, setResults] = useState(null);
+try:
+    import pptx  # python-pptx
+except Exception:
+    pptx = None
 
-  const [objectivesText, setObjectivesText] = useState("Yield:Maximize,Purity:Minimize");
-  const [sorIter, setSorIter] = useState(3);
-  const [watchPath, setWatchPath] = useState("");
+try:
+    import pytesseract  # optional OCR
+except Exception:
+    pytesseract = None
 
-  const [YminRT, setYminRT] = useState(2.0);
-  const [YmaxRT, setYmaxRT] = useState(4.0);
-  const [IminRT_list, setIminRT_list] = useState("0.7");
-  const [ImaxRT_list, setImaxRT_list] = useState("1.3");
-  const [minRTISO, setMinRTISO] = useState(10.0);
-  const [maxRTISO, setMaxRTISO] = useState(12.0);
+# ---------------------------
+# Configuration
+# ---------------------------
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-  const [hplcFile, setHplcFile] = useState(null);
-  const [polling, setPolling] = useState(true);
+# Azure Configuration (left as provided)
+base_url = ""
+api_version = "2025-01-01-preview"
 
-  useEffect(() => {
-    let id = null;
-    if (polling) {
-      fetchResults();
-      id = setInterval(fetchResults, 2500);
+api_key = ""
+deployment_name = "api-ai4o"
+model_name = "gpt-4o"
+
+# Initialize Azure services (unchanged)
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-3-large",
+    api_version="2025-01-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment=""
+)
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+# JWT Config
+SECRET_KEY = "myFAVsecretKEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# Reaction types
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
+PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
+SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
+UPLOADS_DIR = os.path.join(BASE_DIR, "User_Uploads")
+
+os.makedirs(PRODUCTS_DIR, exist_ok=True)
+os.makedirs(SCHEMES_DIR, exist_ok=True)
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+# Prompts
+EXTRACTION_PROMPT_TEMPLATE = """
+You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
+1. **API Name**: The active pharmaceutical ingredient
+2. **Reaction Chemistry**: Type and description
+3. **Yield**: Exact yield percentages or values mentioned in the source
+4. **Procedure**: Summarize the complete procedure into clear, concise numbered bullet points, preserving the key steps and important details. Do NOT omit any steps or essential content.
+5. **Tabular Data**: Provide COMPLETE tabular data in markdown table format. Do NOT omit, summarize, or transform any content.
+
+Structure your response as follows (literal headers must appear exactly like below):
+
+### API Name
+[API name here]
+### Reaction Chemistry
+[Reaction chemistry description here]
+### Yield
+[Yield value here]
+### Procedure
+[Complete procedure here]
+### Tabular Data
+[Markdown table here]
+
+Document Content:
+{context}
+Question: {question}
+Answer:
+"""
+EXTRACTION_PROMPT = PromptTemplate(template=EXTRACTION_PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+QA_PROMPT_TEMPLATE = """
+You are a concise pharmaceutical chemistry expert. Use the provided document context to answer the user's question directly and concisely.
+
+Rules (follow exactly):
+- Use only the information present in the context. Do NOT hallucinate.
+- Answer in one short paragraph (2-6 sentences) unless the user explicitly asks for step-by-step procedure.
+- Do NOT reproduce the full document content. Do NOT provide unrequested long verbatim passages.
+- If multiple documents were used, identify only those documents that were actually the sources of the answer.
+- If the answer is not present in the context, say "I could not find an answer in the provided documents." (do not guess).
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:
+"""
+QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
+
+# ------------------------------
+# Helpers
+# ------------------------------
+def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
+    for ext in ['.jpeg', '.jpg', '.png', '.gif']:
+        scheme_path = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}{ext}")
+        if os.path.exists(scheme_path):
+            return scheme_path
+    return None
+
+def list_products() -> List[Dict[str, Any]]:
+    """List both on-disk Products and user uploads (User_Uploads)."""
+    products = []
+    # from Products dir
+    for reaction_type in REACTION_TYPES:
+        reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
+        if not os.path.exists(reaction_dir):
+            continue
+        pdf_files = glob.glob(os.path.join(reaction_dir, "*.*"))
+        for pdf_path in pdf_files:
+            filename = os.path.basename(pdf_path)
+            product_name = os.path.splitext(filename)[0]
+            scheme_image = find_scheme_image(reaction_type, product_name)
+            scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
+            product_id = f"{reaction_type}_{product_name}"
+            products.append({
+                "id": product_id,
+                "name": product_name,
+                "reaction_type": reaction_type,
+                "pdf_path": pdf_path,
+                "scheme_image": scheme_image if scheme_image else None,
+                "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
+            })
+    # from user uploads
+    uploads = glob.glob(os.path.join(UPLOADS_DIR, "*"))
+    for path in uploads:
+        if os.path.isdir(path):
+            files = glob.glob(os.path.join(path, "*.*"))
+            for fpath in files:
+                filename = os.path.basename(fpath)
+                product_name = os.path.splitext(filename)[0]
+                product_id = f"UserUpload_{os.path.basename(path)}_{product_name}"
+                # reaction_type for uploads is stored as folder name prefix; allow "User" tag
+                products.append({
+                    "id": product_id,
+                    "name": product_name,
+                    "reaction_type": "User_Uploads",
+                    "pdf_path": fpath,
+                    "scheme_image": None,
+                    "scheme_cdx": None
+                })
+    return products
+
+def extract_pdf_text(pdf_path: str) -> str:
+    try:
+        doc = fitz.open(pdf_path)
+        text = ""
+        for page in doc:
+            text += page.get_text() + "\n"
+        return text
+    except Exception as e:
+        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
+
+# simple extractors for other formats
+def extract_docx_text(path: str) -> str:
+    if docx is None:
+        raise RuntimeError("python-docx not installed")
+    doc = docx.Document(path)
+    paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    return "\n".join(paragraphs)
+
+def extract_pptx_text(path: str) -> str:
+    if pptx is None:
+        raise RuntimeError("python-pptx not installed")
+    prs = pptx.Presentation(path)
+    texts = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            try:
+                if hasattr(shape, "text") and shape.text:
+                    texts.append(shape.text)
+            except Exception:
+                continue
+    return "\n".join(texts)
+
+def extract_xls_text(path: str) -> str:
+    try:
+        # read all sheets and convert to tabular markdown style
+        xls = pd.read_excel(path, sheet_name=None)
+        parts = []
+        for sheet_name, df in xls.items():
+            parts.append(f"### Sheet: {sheet_name}")
+            parts.append(df.to_csv(index=False))
+        return "\n\n".join(parts)
+    except Exception as e:
+        raise RuntimeError(f"Failed reading xlsx: {e}")
+
+def extract_csv_text(path: str) -> str:
+    try:
+        df = pd.read_csv(path)
+        return df.to_csv(index=False)
+    except Exception as e:
+        raise RuntimeError(f"Failed reading csv: {e}")
+
+def extract_image_text(path: str) -> Tuple[str,bool]:
+    """
+    Try OCR using pytesseract (if available). Returns (text, ocr_performed_bool).
+    If pytesseract missing or fails, returns ("", False).
+    """
+    if pytesseract is None:
+        return ("", False)
+    try:
+        img = Image.open(path)
+        txt = pytesseract.image_to_string(img)
+        return (txt or "", True)
+    except Exception as e:
+        print(f"OCR error: {e}")
+        return ("", False)
+
+# Cache for vectorstores and product details
+_vectorstore_cache: Dict[str, FAISS] = {}
+_product_details_cache: Dict[str, Dict[str, Any]] = {}
+_vectorstore_lock = threading.Lock()
+
+def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
+    pid = product["id"]
+    with _vectorstore_lock:
+        if pid in _vectorstore_cache:
+            return _vectorstore_cache[pid]
+        if not os.path.exists(product["pdf_path"]):
+            return None
+        # attempt to extract text according to extension
+        path = product["pdf_path"]
+        ext = os.path.splitext(path)[1].lower()
+        text = ""
+        try:
+            if ext in [".pdf"]:
+                text = extract_pdf_text(path)
+            elif ext in [".docx", ".doc"]:
+                text = extract_docx_text(path)
+            elif ext in [".pptx"]:
+                text = extract_pptx_text(path)
+            elif ext in [".xlsx", ".xls"]:
+                text = extract_xls_text(path)
+            elif ext in [".csv"]:
+                text = extract_csv_text(path)
+            elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
+                # try OCR if available
+                txt, did = extract_image_text(path)
+                if did:
+                    text = txt
+                else:
+                    # store a short placeholder so it's findable
+                    text = f"[image file: {os.path.basename(path)}]"
+            else:
+                # default: try fitz for other file types
+                try:
+                    text = extract_pdf_text(path)
+                except Exception:
+                    text = f"[file: {os.path.basename(path)}]"
+        except Exception as e:
+            print(f"Text extraction failed for {path}: {e}")
+            return None
+
+        if not text or len(text.strip()) < 20:
+            # for small files, still allow short content but do not build
+            return None
+
+        doc = Document(page_content=text, metadata={
+            "product_id": pid,
+            "product_name": product["name"],
+            "reaction_type": product.get("reaction_type", "User_Uploads"),
+            "source": path
+        })
+        vs = FAISS.from_documents([doc], cached_embeddings)
+        _vectorstore_cache[pid] = vs
+        return vs
+
+def parse_structured_response(text: str) -> Dict[str, Any]:
+    result = {"raw": text, "api_name": None, "reaction_chemistry": None, "yield": None, "procedure": None, "tables": []}
+    def grab(section):
+        m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else None
+
+    result["api_name"] = grab("API Name")
+    result["reaction_chemistry"] = grab("Reaction Chemistry")
+    result["yield"] = grab("Yield")
+    result["procedure"] = grab("Procedure")
+    tab_raw = grab("Tabular Data")
+    if tab_raw:
+        table_patterns = re.findall(r"(\|[^\n]*\|\s*\n\|[-:\s|]*\|\s*\n(?:\|[^\n]*\|\s*\n?)*)", tab_raw, re.DOTALL)
+        if table_patterns:
+            for tbl_md in table_patterns:
+                lines = [ln.strip().strip("|").strip() for ln in tbl_md.splitlines() if ln.strip()]
+                if len(lines) >= 2:
+                    header = [h.strip() for h in lines[0].split("|")]
+                    rows = []
+                    for rowline in lines[2:]:
+                        cols = [c.strip() for c in rowline.split("|")]
+                        rows.append(cols)
+                    result["tables"].append({"headers": header, "rows": rows, "raw_md": tbl_md})
+        else:
+            result["tables"].append({"headers": [], "rows": [], "raw_md": tab_raw})
+    return result
+
+# ------------------------------
+# FastAPI app
+# ------------------------------
+app = FastAPI(title="Reaction Database AI (FastAPI)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ------------------------------
+# Pydantic models
+# ------------------------------
+class ProductOut(BaseModel):
+    id: str
+    name: str
+    reaction_type: str
+    has_scheme_image: bool
+    has_scheme_cdx: bool
+
+class QARequest(BaseModel):
+    product_id: Optional[str] = None
+    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+
+class QueryRequest(BaseModel):
+    product_ids: List[str]
+    question: str
+
+# ------------------------------
+# Small sample prompt gallery (frontend can fetch)
+SAMPLE_PROMPTS = [
+    {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
+    {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
+    {"id": "procedure_steps", "title": "Procedure steps", "text": "List the procedure as numbered steps exactly as in the document."},
+    {"id": "conditions", "title": "Reaction conditions", "text": "List solvents, catalysts, and temperatures used in the synthesis."}
+]
+# ------------------------------
+
+# ------------------------------
+# Endpoints (existing + new)
+# ------------------------------
+@app.get("/reactions", response_model=List[str])
+def get_reactions():
+    # Return the reaction tiles plus a 'User Uploads' tile
+    return REACTION_TYPES + ["User_Uploads"]
+
+@app.get("/prompts")
+def get_prompts():
+    return SAMPLE_PROMPTS
+
+@app.get("/products", response_model=List[ProductOut])
+def get_products(reaction_type: Optional[str] = None):
+    allp = list_products()
+    if reaction_type:
+        allp = [p for p in allp if p["reaction_type"] == reaction_type or reaction_type == "User_Uploads" and p["reaction_type"] == "User_Uploads"]
+    out = []
+    for p in allp:
+        out.append(ProductOut(
+            id=p["id"],
+            name=p["name"],
+            reaction_type=p["reaction_type"],
+            has_scheme_image=bool(p["scheme_image"]),
+            has_scheme_cdx=bool(p["scheme_cdx"])
+        ))
+    return out
+
+@app.get("/product/{product_id}/meta")
+def product_meta(product_id: str):
+    products = list_products()
+    for p in products:
+        if p["id"] == product_id:
+            return {
+                "id": p["id"],
+                "name": p["name"],
+                "reaction_type": p["reaction_type"],
+                "pdf_path": p["pdf_path"],
+                "scheme_image": p["scheme_image"],
+                "scheme_cdx": p["scheme_cdx"]
+            }
+    raise HTTPException(status_code=404, detail="Product not found")
+
+@app.get("/product/{product_id}/pdf")
+def product_pdf(product_id: str):
+    meta = product_meta(product_id)
+    pdf_path = meta["pdf_path"]
+    if os.path.exists(pdf_path):
+        return FileResponse(pdf_path, media_type="application/pdf", filename=os.path.basename(pdf_path))
+    raise HTTPException(status_code=404, detail="PDF not found")
+
+@app.get("/product/{product_id}/scheme-image")
+def product_scheme_image(product_id: str):
+    meta = product_meta(product_id)
+    path = meta.get("scheme_image")
+    if path and os.path.exists(path):
+        return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
+    raise HTTPException(status_code=404, detail="Scheme image not found")
+
+# ------------------------------
+# Upload endpoint: save, extract, index
+# ------------------------------
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str] = Form("User_Uploads"), filename: Optional[str] = Form(None)):
+    """
+    Accept a file upload (pdf, docx, pptx, xlsx, csv, images).
+    Saves to UPLOADS_DIR/<timestamp>_<uploader>/<filename>, extracts text, builds vectorstore, and returns meta.
+    """
+    # sanitize reaction_type
+    try:
+        rt = re.sub(r'[^a-zA-Z0-9_\- ]', '', (reaction_type or "User_Uploads"))
+    except Exception:
+        rt = "User_Uploads"
+    # create a unique folder for the upload batch
+    ts = int(time.time())
+    folder_name = f"{rt}_{ts}"
+    out_dir = os.path.join(UPLOADS_DIR, folder_name)
+    os.makedirs(out_dir, exist_ok=True)
+
+    orig_filename = filename or file.filename or f"uploaded_{ts}"
+    save_path = os.path.join(out_dir, orig_filename)
+    # write file
+    with open(save_path, "wb") as f:
+        contents = await file.read()
+        f.write(contents)
+
+    # attempt extraction based on extension
+    ext = os.path.splitext(save_path)[1].lower()
+    text = ""
+    ocr_performed = False
+    extract_error = None
+    try:
+        if ext == ".pdf":
+            text = extract_pdf_text(save_path)
+        elif ext in [".docx", ".doc"]:
+            text = extract_docx_text(save_path)
+        elif ext == ".pptx":
+            text = extract_pptx_text(save_path)
+        elif ext in [".xlsx", ".xls"]:
+            text = extract_xls_text(save_path)
+        elif ext == ".csv":
+            text = extract_csv_text(save_path)
+        elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
+            text, ocr_performed = extract_image_text(save_path)
+        else:
+            # try PDF extraction, else fallback to binary placeholder
+            try:
+                text = extract_pdf_text(save_path)
+            except Exception:
+                text = f"[uploaded file: {orig_filename}]"
+    except Exception as e:
+        extract_error = str(e)
+        print(f"Upload extraction error: {e}")
+
+    # create product metadata and id
+    product_name = os.path.splitext(orig_filename)[0]
+    product_id = f"UserUpload_{folder_name}_{product_name}"
+    product_meta_info = {
+        "id": product_id,
+        "name": product_name,
+        "reaction_type": "User_Uploads",
+        "pdf_path": save_path,
+        "scheme_image": None,
+        "scheme_cdx": None,
+        "ocr_performed": ocr_performed,
+        "extract_error": extract_error
     }
-    return () => clearInterval(id);
-  }, [polling]);
 
-  async function fetchResults() {
-    try {
-      // Since there's no /results endpoint, we'll try to get current state from various endpoints
-      // For now, we'll just log that polling is happening but not set any state
-      // since the backend doesn't have a dedicated results endpoint
-      console.log("Polling... (no /results endpoint available)");
-    } catch (err) {
-      // silent
-      console.log("Polling error (expected):", err.message);
-    }
-  }
+    # attempt to create vectorstore so queries will use it immediately
+    try:
+        doc = Document(page_content=(text or f"[uploaded file: {orig_filename}]"), metadata={
+            "product_id": product_id,
+            "product_name": product_name,
+            "reaction_type": "User_Uploads",
+            "source": save_path
+        })
+        vs = FAISS.from_documents([doc], cached_embeddings)
+        with _vectorstore_lock:
+            _vectorstore_cache[product_id] = vs
+    except Exception as e:
+        print(f"Warning: Failed to index uploaded file {save_path}: {e}")
+        # proceed — user can still query and we will try on-demand build later
 
-  function parseObjectives(text) {
-    return text
-      .split(",")
-      .map((p) => p.trim())
-      .filter(Boolean)
-      .map((entry) => {
-        const [nameRaw, modeRaw] = entry.split(":").map((x) => x && x.trim());
-        return { name: nameRaw || "Objective", maximize: (modeRaw || "Maximize").toLowerCase().startsWith("max") };
-      });
-  }
+    return {"meta": product_meta_info, "message": "File uploaded and indexed (if supported).", "product_id": product_id}
 
-  // Upload LHS Excel
-  async function uploadLHS() {
-    if (!lhsFile) {
-      alert("Select an LHS Excel (.xlsx/.xls) file first.");
-      return;
-    }
-    try {
-      const form = new FormData();
-      form.append("file", lhsFile);
-      const url = `${API_BASE}/upload_lhs`;
-      const res = await axios.post(url, form, { headers: { "Content-Type": "multipart/form-data" } });
-      
-      if (res.data) {
-        if (res.data.status === "ok") {
-          alert(`Upload success: server stored ${res.data.n} rows with columns: ${res.data.columns.join(', ')}`);
-          
-          // Set local state based on successful response
-          setLhs({ 
-            columns: res.data.columns,
-            rows: Array(res.data.n).fill({}).map((_, i) => 
-              res.data.columns.reduce((acc, col) => ({ ...acc, [col]: `Row ${i+1}` }), {})
+# ------------------------------
+# product/details endpoint (kept robust - uses QA_PROMPT/EXTRACTION_PROMPT)
+@app.post("/product/details")
+def product_details(req: QARequest):
+    try:
+        q_text = (req.question or "").strip()
+        if not q_text:
+            return JSONResponse(status_code=400, content={"error": "question is required"})
+        CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
+
+        def _normalize_alnum(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+        def _tokens(s: str):
+            return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
+
+        print("=== /product/details called ===")
+        print("Question:", q_text)
+
+        def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
+            products = list_products()
+            if not products:
+                return None
+            q_norm_alnum = _normalize_alnum(question)
+            q_tokens = set(_tokens(question))
+            sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
+            exact_matches = []
+            for p in sorted_products:
+                name_norm = _normalize_alnum(p["name"])
+                if not name_norm:
+                    continue
+                if name_norm in q_norm_alnum:
+                    exact_matches.append((p, name_norm))
+            if exact_matches:
+                chosen = exact_matches[0][0]
+                print(f"DEBUG: Exact normalized substring match -> '{chosen['name']}' (id: {chosen['id']})")
+                return chosen
+            token_matches = []
+            for p in sorted_products:
+                pname_tokens = set(_tokens(p["name"]))
+                if not pname_tokens:
+                    continue
+                overlap = pname_tokens.intersection(q_tokens)
+                if overlap:
+                    token_matches.append((p, len(overlap), len(pname_tokens), overlap))
+            if token_matches:
+                token_matches.sort(key=lambda x: (-(x[1] / x[2]), -x[1]))
+                best = token_matches[0]
+                p_best, match_count, token_count, overlap = best
+                ratio = match_count / token_count
+                print(f"DEBUG: Token-overlap candidate -> '{p_best['name']}' (id: {p_best['id']}) overlap {match_count}/{token_count} tokens {overlap} ratio={ratio:.2f}")
+                if ratio >= 0.5:
+                    return p_best
+            best = None
+            best_ratio = 0.0
+            for p in products:
+                pname = (p["name"] or "").lower()
+                if not pname.strip():
+                    continue
+                r1 = SequenceMatcher(None, pname, question.lower()).ratio()
+                r2 = SequenceMatcher(None, _normalize_alnum(pname), _normalize_alnum(question)).ratio()
+                ratio = (r1 + r2) / 2.0
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best = (p, ratio, r1, r2)
+            if best:
+                p_best, ratio, r1, r2 = best
+                print(f"DEBUG: Best similarity candidate -> '{p_best['name']}' (id: {p_best['id']}) ratio_avg={ratio:.3f} r1={r1:.3f} r2={r2:.3f}")
+                if ratio >= 0.60:
+                    return p_best
+                else:
+                    print(f"DEBUG: Best similarity below threshold (0.60): {ratio:.3f} -> will NOT auto-select")
+            return None
+
+        def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
+            print(f"DEBUG: Running retrieval for product: {product['name']} (id: {product['id']})")
+            pdf_path = product.get("pdf_path")
+            if not pdf_path or not os.path.exists(pdf_path):
+                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}: {pdf_path}")
+            try:
+                # attempt to reuse cached vs, else build
+                pid = product["id"]
+                with _vectorstore_lock:
+                    vs = _vectorstore_cache.get(pid)
+                if not vs:
+                    # create a temporary product dict for build
+                    temp_product = {"id": pid, "name": product["name"], "reaction_type": product.get("reaction_type", "User_Uploads"), "pdf_path": pdf_path}
+                    vs = build_product_vector_store(temp_product)
+                    if not vs:
+                        raise HTTPException(status_code=500, detail="Failed to build vectorstore for product")
+                retriever = vs.as_retriever(search_kwargs={"k": k})
+            except HTTPException:
+                raise
+            except Exception as e:
+                print(f"ERROR building/retrieving VS: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+
+            prompt_to_use = QA_PROMPT
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt_to_use},
+                return_source_documents=True,
             )
-          });
-          
-          if (res.data.warning) {
-            alert("Warning: " + res.data.warning);
-          }
-        } else {
-          alert("Upload returned: " + JSON.stringify(res.data));
-        }
-      }
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("Upload LHS failed: " + JSON.stringify(msg));
-      console.error(err);
-    }
-  }
+            out = qa_chain({"query": question})
+            answer_text = out.get("result") or out.get("output_text") or ""
+            source_docs = out.get("source_documents", []) or []
+            seen = set()
+            sources = []
+            for sd in source_docs:
+                pid = sd.metadata.get("product_id")
+                pname = sd.metadata.get("product_name")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    sources.append({"product_id": pid, "product_name": pname})
+            print(f"DEBUG: Retrieval produced answer length={len(answer_text)} and {len(sources)} source(s)")
+            return {"answer": answer_text, "sources": sources}
 
-  // Start run (creates objective columns and sets expected_files = n_rows)
-  async function startRun() {
-    try {
-      const objectives = parseObjectives(objectivesText);
-      if (!objectives.length) {
-        alert("Enter at least one objective (e.g. Yield:Maximize).");
-        return;
-      }
+        # main logic
+        if req.product_id:
+            products = list_products()
+            product = next((p for p in products if p["id"] == req.product_id), None)
+            if not product:
+                return JSONResponse(status_code=404, content={"error": "Product not found"})
+            is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
+            if not is_extraction:
+                return _run_retrieval_for_product(product, q_text, k=3)
+            if req.product_id in _product_details_cache:
+                return _product_details_cache[req.product_id]
+            vs = build_product_vector_store(product)
+            if not vs:
+                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
+            retriever = vs.as_retriever(search_kwargs={"k": 1})
+            prompt_for_extraction = EXTRACTION_PROMPT
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": prompt_for_extraction},
+                return_source_documents=False,
+            )
+            raw_response = qa_chain.run(q_text)
+            parsed = parse_structured_response(raw_response)
+            _product_details_cache[req.product_id] = parsed
+            return parsed
 
-      const payload = {
-        objectives: objectives,
-        hplc_params: {
-          YminRT: Number(YminRT),
-          YmaxRT: Number(YmaxRT),
-          IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
-          ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
-          minRTISO: Number(minRTISO),
-          maxRTISO: Number(maxRTISO),
-        },
-        watch_path: watchPath && watchPath.trim() !== "" ? watchPath.trim() : null,
-        sor_iterations: Number(sorIter) || 0,
-      };
+        detected = _detect_product_by_name(q_text)
+        if detected:
+            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
+            return _run_retrieval_for_product(detected, q_text, k=3)
 
-      const url = `${API_BASE}/start_run`;
-      const res = await axios.post(url, payload, { headers: { "Content-Type": "application/json" } });
-      
-      if (res.data) {
-        if (res.data.status === "running") {
-          alert(`Run started: phase=${res.data.phase}, expected_files=${res.data.expected_files}, sor_iterations=${res.data.sor_iterations}`);
-        } else {
-          alert("Start run response: " + JSON.stringify(res.data));
-        }
-      }
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("Start run failed: " + JSON.stringify(msg));
-      console.error(err);
-    }
-  }
+        # fallback generative
+        prompt_for_gen = QA_PROMPT
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=chat_model,
+            chain_type="stuff",
+            retriever=None,
+            chain_type_kwargs={"prompt": prompt_for_gen},
+            return_source_documents=False,
+        )
+        raw_response = qa_chain.run(q_text)
+        return {"response": raw_response}
 
-  // Upload single HPLC CSV (fills next row)
-  async function uploadHplc() {
-    if (!hplcFile) {
-      alert("Select an HPLC CSV file first.");
-      return;
-    }
-    try {
-      const form = new FormData();
-      form.append("file", hplcFile);
-      const params = {
-        YminRT: Number(YminRT),
-        YmaxRT: Number(YmaxRT),
-        IminRT_list: IminRT_list,
-        ImaxRT_list: ImaxRT_list,
-        minRTISO: Number(minRTISO),
-        maxRTISO: Number(maxRTISO),
-      };
-      const url = `${API_BASE}/upload_hplc`;
-      const res = await axios.post(url, form, { params, headers: { "Content-Type": "multipart/form-data" } });
-      
-      if (res.data) {
-        if (res.data.status === "ok") {
-          alert(`HPLC processed: ${res.data.filename} response=${JSON.stringify(res.data.response)} next_row=${res.data.next_row}`);
-        } else {
-          alert("Upload HPLC returned: " + JSON.stringify(res.data));
-        }
-      }
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("Upload HPLC failed: " + JSON.stringify(msg));
-      console.error(err);
-    }
-  }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        tb = traceback.format_exc()
+        print("=== /product/details ERROR ===")
+        print(tb)
+        trace_lines = tb.splitlines()[-30:]
+        return JSONResponse(status_code=500, content={
+            "error": "Internal server error in /product/details",
+            "message": str(e),
+            "trace": trace_lines
+        })
 
-  async function startWatchFolder() {
-    if (!watchPath || watchPath.trim() === "") {
-      alert("Enter server watch path first.");
-      return;
-    }
-    try {
-      const objectives = parseObjectives(objectivesText);
-      const payload = {
-        path: watchPath,
-        objectives: objectives,
-        sor_iterations: Number(sorIter) || 0,
-        YminRT: Number(YminRT),
-        YmaxRT: Number(YmaxRT),
-        IminRT_list: IminRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
-        ImaxRT_list: ImaxRT_list.split(",").map((x) => Number(x.trim())).filter((n) => !Number.isNaN(n)),
-        minRTISO: Number(minRTISO),
-        maxRTISO: Number(maxRTISO),
-      };
-      const res = await axios.post(`${API_BASE}/start_watch`, payload, { headers: { "Content-Type": "application/json" } });
-      
-      if (res.data) {
-        alert("start_watch response: " + JSON.stringify(res.data));
-      }
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("start_watch failed: " + JSON.stringify(msg));
-      console.error(err);
-    }
-  }
+# ------------------------------
+# Multi-doc query (existing)
+@app.post("/query")
+def query_documents(req: QueryRequest):
+    if not req.product_ids:
+        raise HTTPException(status_code=400, detail="product_ids must be a non-empty list")
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="question required")
+    docs = []
+    for pid in req.product_ids:
+        try:
+            meta = product_meta(pid)
+        except HTTPException:
+            continue
+        pdf_path = meta.get("pdf_path")
+        if not pdf_path or not os.path.exists(pdf_path):
+            continue
+        text = None
+        try:
+            # reuse build_product_vector_store for text extraction
+            temp_product = {"id": pid, "name": meta.get("name"), "reaction_type": meta.get("reaction_type"), "pdf_path": pdf_path}
+            vs = build_product_vector_store(temp_product)
+            if vs:
+                # we still need the Document; build from extracted text
+                # extract text manually to include here
+                ext = os.path.splitext(pdf_path)[1].lower()
+                if ext == ".pdf":
+                    text = extract_pdf_text(pdf_path)
+                elif ext in [".docx", ".doc"]:
+                    text = extract_docx_text(pdf_path)
+                elif ext == ".pptx":
+                    text = extract_pptx_text(pdf_path)
+                elif ext in [".xlsx", ".xls"]:
+                    text = extract_xls_text(pdf_path)
+                elif ext == ".csv":
+                    text = extract_csv_text(pdf_path)
+                else:
+                    try:
+                        text = extract_pdf_text(pdf_path)
+                    except:
+                        text = f"[file: {os.path.basename(pdf_path)}]"
+            else:
+                continue
+        except Exception:
+            continue
+        if not text or len(text.strip()) < 50:
+            continue
+        doc = Document(page_content=text, metadata={
+            "product_id": pid,
+            "product_name": meta.get("name", ""),
+            "reaction_type": meta.get("reaction_type", "")
+        })
+        docs.append(doc)
+    if len(docs) == 0:
+        raise HTTPException(status_code=404, detail="No documents available for the provided product_ids")
+    try:
+        vector_store = FAISS.from_documents(docs, cached_embeddings)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=chat_model,
+        chain_type="stuff",
+        retriever=retriever,
+        chain_type_kwargs={"prompt": QA_PROMPT},
+        return_source_documents=True
+    )
+    try:
+        out = qa_chain({"query": req.question})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
+    answer_text = out.get("result") or out.get("output_text") or str(out)
+    source_docs = out.get("source_documents", [])
+    seen = set()
+    sources = []
+    for sd in source_docs:
+        pid = sd.metadata.get("product_id")
+        pname = sd.metadata.get("product_name")
+        if pid and pid not in seen:
+            seen.add(pid)
+            sources.append({"product_id": pid, "product_name": pname})
+    return {"answer": answer_text, "sources": sources}
 
-  async function stopWatchFolder() {
-    try {
-      const res = await axios.post(`${API_BASE}/stop_watch`);
-      alert("stop_watch response: " + JSON.stringify(res.data));
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("stop_watch failed: " + JSON.stringify(msg));
-    }
-  }
+# ------------------------------
+# Search endpoint (autocomplete friendly)
+@app.get("/products/search")
+def search_products(q: str = "", limit: int = 10):
+    if q is None:
+        q = ""
+    q_norm = re.sub(r'[^a-z0-9]', '', q.lower())
+    if q_norm == "":
+        prods = list_products()[:limit]
+        return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in prods]
+    products = list_products()
+    prefix_matches = []
+    substring_matches = []
+    for p in products:
+        name_norm = re.sub(r'[^a-z0-9]', '', p["name"].lower())
+        if name_norm.startswith(q_norm):
+            prefix_matches.append(p)
+        elif q_norm in name_norm:
+            substring_matches.append(p)
+    prefix_matches = sorted(prefix_matches, key=lambda x: -len(x["name"]))
+    substring_matches = sorted(substring_matches, key=lambda x: -len(x["name"]))
+    combined = prefix_matches + substring_matches
+    combined = combined[:limit]
+    return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
 
-  // Manual optimize (if needed)
-  async function runOptimizeManually() {
-    try {
-      const objectives = parseObjectives(objectivesText);
-      const payload = { 
-        objectives: objectives, 
-        nobj: Math.max(1, objectives.length) 
-      };
-      const res = await axios.post(`${API_BASE}/optimize`, payload, { headers: { "Content-Type": "application/json" } });
-      alert("optimize response: " + JSON.stringify(res.data));
-    } catch (err) {
-      const msg = err.response?.data || err.message || String(err);
-      alert("optimize failed: " + JSON.stringify(msg));
-    }
-  }
+# ------------------------------
+# Transcription (unchanged)
+GOOGLE_CREDENTIALS_JSON = ""
 
-  // UI
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bool] = Form(False)):
+    content = await file.read()
+    if not use_google:
+        return {"error": "Server-side transcription disabled. Use browser Web Speech API for demo, or set use_google=True and provide GOOGLE_CREDENTIALS_JSON in main.py."}
+    if not GOOGLE_CREDENTIALS_JSON:
+        return {"error": "GOOGLE_CREDENTIALS_JSON not configured in main.py. Paste credentials JSON string into file to enable."}
+    try:
+        from google.cloud import speech_v1p1beta1 as speech
+        from google.oauth2 import service_account
+    except Exception as e:
+        return {"error": f"google-cloud-speech library not installed: {e}"}
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    credentials = service_account.Credentials.from_service_account_info(creds_info)
+    client = speech.SpeechClient(credentials=credentials)
+    audio = speech.RecognitionAudio(content=content)
+    config = speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+    )
+    response = client.recognize(config=config, audio=audio)
+    transcripts = [r.alternatives[0].transcript for r in response.results]
+    return {"transcript": " ".join(transcripts)}
+
+# ------------------------------
+# Health & auth (unchanged)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+def create_access_token(data: dict, expires_delta: Union[timedelta , None] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+@app.post("/login")
+async def login(user_info: dict = Depends(lambda: {"first_name":"demo","last_name":"user"} if True else None)):
+    # (temporary demo auth - replace with config.check_ldap_auth in production)
+    user_info = {"first_name":"Demo","last_name":"User"}
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_info["first_name"]},
+        expires_delta=access_token_expires
+    )
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "firstname": user_info["first_name"],
+        "lastname": user_info["last_name"],
+    }
+###############################################
+// src/api.js
+import axios from 'axios';
+const api = axios.create({
+  baseURL: 'http://localhost:8000', // change if backend hosted elsewhere
+  timeout: 60000,
+});
+
+export default api;
+
+export const fetchReactions = async () => {
+  const res = await api.get('/reactions');
+  return res.data;
+};
+
+export const fetchProducts = async (reaction_type) => {
+  const res = await api.get('/products', { params: { reaction_type }});
+  return res.data;
+};
+
+export const fetchPrompts = async () => {
+  const res = await api.get('/prompts');
+  return res.data;
+};
+
+export const searchProducts = async (q) => {
+  const res = await api.get('/products/search', { params: { q }});
+  return res.data;
+};
+
+export const fetchProductMeta = async (productId) => {
+  const res = await api.get(`/product/${encodeURIComponent(productId)}/meta`);
+  return res.data;
+};
+
+export const fetchProductDetails = (productId = undefined, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data") => {
+  return api.post('/product/details', { product_id: productId, question });
+};
+
+export const fetchSchemeImageUrl = async (productId) => {
+  // return absolute backend URL for image
+  return `http://localhost:8000/product/${encodeURIComponent(productId)}/scheme-image`;
+};
+
+export const queryWithCitations = (productIds = [], question = "") => {
+  return api.post('/query', { product_ids: productIds, question });
+};
+
+export const uploadFile = async (file, reaction_type="User_Uploads", filename=null) => {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('reaction_type', reaction_type);
+  if (filename) fd.append('filename', filename);
+  const res = await api.post('/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' }});
+  return res.data;
+};
+###################################
+// src/components/ReactionTiles.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
+
+export default function ReactionTiles({ reactions = [], onSelect }) {
   return (
-    <div style={{ padding: 20, fontFamily: "Inter, Arial, sans-serif", maxWidth: 1100, margin: "0 auto" }}>
-      <h1>SOR AI — LHS → HPLC → Optimization</h1>
-
-      <section style={card}>
-        <h3>1) Upload LHS Excel (.xlsx)</h3>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input type="file" accept=".xlsx,.xls" onChange={(e) => setLhsFile(e.target.files?.[0] || null)} />
-          <button style={btn} onClick={uploadLHS}>Upload LHS</button>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <small>Server will store the first sheet of your uploaded Excel as the LHS table.</small>
-        </div>
-      </section>
-
-      <section style={card}>
-        <h3>2) Configure objectives, HPLC params, watch path & SOR iterations → Start Run</h3>
-        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <div style={{ minWidth: 420 }}>
-            <label>Objectives (comma-separated, name:Maximize or Minimize):</label><br />
-            <input style={input} value={objectivesText} onChange={(e) => setObjectivesText(e.target.value)} />
-          </div>
-
-          <div>
-            <label>Server watch path (optional)</label><br />
-            <input style={{ ...input, width: 360 }} value={watchPath} onChange={(e) => setWatchPath(e.target.value)} />
-          </div>
-
-          <div>
-            <label>SOR iterations (after initial LHS files)</label><br />
-            <input style={{ width: 100, padding: 8 }} type="number" value={sorIter} onChange={(e) => setSorIter(Number(e.target.value))} />
-          </div>
-
-          <div style={{ display: "flex", gap: 8 }}>
-            <button style={btn} onClick={startRun}>Start Run</button>
-            <button style={btnAlt} onClick={startWatchFolder}>Start Watch (optional)</button>
-            <button style={btnAlt} onClick={stopWatchFolder}>Stop Watch</button>
-            <button style={btnAlt} onClick={runOptimizeManually}>Run Optimize (manual)</button>
-          </div>
-        </div>
-
-        <details style={{ marginTop: 8 }}>
-          <summary>HPLC parsing params (optional)</summary>
-          <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
-            <div>
-              <small>YminRT</small><br />
-              <input style={small} value={YminRT} onChange={(e) => setYminRT(e.target.value)} />
-            </div>
-            <div>
-              <small>YmaxRT</small><br />
-              <input style={small} value={YmaxRT} onChange={(e) => setYmaxRT(e.target.value)} />
-            </div>
-            <div>
-              <small>IminRT list</small><br />
-              <input style={small} value={IminRT_list} onChange={(e) => setIminRT_list(e.target.value)} />
-            </div>
-            <div>
-              <small>ImaxRT list</small><br />
-              <input style={small} value={ImaxRT_list} onChange={(e) => setImaxRT_list(e.target.value)} />
-            </div>
-            <div>
-              <small>ISO min</small><br />
-              <input style={small} value={minRTISO} onChange={(e) => setMinRTISO(Number(e.target.value))} />
-            </div>
-            <div>
-              <small>ISO max</small><br />
-              <input style={small} value={maxRTISO} onChange={(e) => setMaxRTISO(Number(e.target.value))} />
-            </div>
-          </div>
-        </details>
-      </section>
-
-      <section style={card}>
-        <h3>3) Upload HPLC CSV (fills next row)</h3>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input type="file" accept=".csv" onChange={(e) => setHplcFile(e.target.files?.[0] || null)} />
-          <button style={btn} onClick={uploadHplc}>Upload HPLC (fills next row)</button>
-        </div>
-        <div style={{ marginTop: 8 }}>
-          <small>If you supplied a watch path when starting the run, dropping CSVs into that server folder will also process them automatically.</small>
-        </div>
-      </section>
-
-      <section style={card}>
-        <h3>Live LHS (server-stored)</h3>
-        {lhs ? (
-          <div style={{ maxHeight: 360, overflow: "auto", border: "1px solid #eee", padding: 8 }}>
-            <table style={{ width: "100%", borderCollapse: "collapse" }}>
-              <thead>
-                <tr>{lhs.columns.map((k) => <th key={k} style={{ textAlign: "left", padding: 6, borderBottom: "1px solid #eee" }}>{k}</th>)}</tr>
-              </thead>
-              <tbody>
-                {lhs.rows.map((row, i) => (
-                  <tr key={i}>
-                    {lhs.columns.map((k) => <td key={k} style={{ padding: 6, borderBottom: "1px solid #fafafa" }}>{String(row[k] ?? "").slice(0, 20)}</td>)}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            <div style={{ marginTop: 8, fontStyle: 'italic', color: '#666' }}>
-              Note: This is a placeholder display. Actual data will be stored on the server.
-            </div>
-          </div>
-        ) : <div>No LHS stored on server yet. Upload an LHS file above.</div>}
-      </section>
-
-      <section style={card}>
-        <h3>Optimization result</h3>
-        <div style={{ maxHeight: 300, overflow: "auto", background: "#0b1220", color: "#cff", padding: 8, borderRadius: 6 }}>
-          <pre>{results ? JSON.stringify(results, null, 2) : "No optimization result yet. Optimization results will appear here after HPLC processing."}</pre>
-        </div>
-      </section>
-
-      <footer style={{ marginTop: 12, color: "#666" }}>
-        <label><input type="checkbox" checked={polling} onChange={(e) => setPolling(e.target.checked)} /> Poll server every 2.5s (currently disabled - no /results endpoint)</label>
-      </footer>
+    <div className="py-3">
+      <div className="flex flex-wrap gap-3">
+        {reactions.map((r) => (
+          <motion.button
+            key={r}
+            whileHover={{ scale: 1.03 }}
+            whileTap={{ scale: 0.98 }}
+            onClick={() => onSelect(r)}
+            className="px-4 py-2 bg-gradient-to-r from-purple-100 via-purple-200 to-indigo-100 text-purple-800 rounded-2xl shadow-sm border border-purple-200 hover:shadow-md"
+          >
+            {r.replace(/_/g, " ")}
+          </motion.button>
+        ))}
+      </div>
     </div>
   );
 }
+################################
+// src/components/PromptGallery.jsx
+import React from 'react';
+import { motion } from 'framer-motion';
 
-// styles
-const card = { background: "#fff", padding: 12, borderRadius: 8, boxShadow: "0 6px 18px rgba(15,20,50,0.06)", marginBottom: 12 };
-const btn = { background: "#0b5fff", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
-const btnAlt = { background: "#222", color: "#fff", padding: "8px 12px", border: "none", borderRadius: 6, cursor: "pointer" };
-const input = { width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ddd" };
-const small = { width: 84, padding: 6, borderRadius: 6, border: "1px solid #ddd" };
+export default function PromptGallery({ prompts = [], onPick }) {
+  return (
+    <div className="mt-3">
+      <h4 className="text-sm font-semibold text-gray-600 mb-2">Prompt gallery</h4>
+      <div className="flex gap-3 flex-wrap">
+        {prompts.map(p => (
+          <motion.button
+            key={p.id}
+            onClick={() => onPick(p.text)}
+            whileHover={{ y: -4 }}
+            className="px-3 py-2 bg-white border rounded-lg shadow-sm text-sm text-gray-700 hover:bg-purple-50"
+            title={p.title}
+          >
+            {p.title}
+          </motion.button>
+        ))}
+      </div>
+    </div>
+  );
+}
+##############################
+// src/components/UploadPanel.jsx
+import React, { useState } from 'react';
+import { uploadFile, fetchProducts } from '../api';
+
+export default function UploadPanel({ onUploaded }) {
+  const [file, setFile] = useState(null);
+  const [reactionType, setReactionType] = useState("User_Uploads");
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!file) return setMessage("Select a file first");
+    setLoading(true);
+    try {
+      const res = await uploadFile(file, reactionType, file.name);
+      setMessage("Uploaded: " + (res.meta?.name || res.product_id));
+      setFile(null);
+      if (onUploaded) onUploaded(res);
+    } catch (err) {
+      console.error(err);
+      setMessage("Upload failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit} className="p-4 bg-white rounded-xl shadow-sm">
+      <div className="flex gap-2 items-center">
+        <input type="file" onChange={(e) => setFile(e.target.files?.[0])} />
+        <select value={reactionType} onChange={(e) => setReactionType(e.target.value)} className="px-2 py-1 border rounded">
+          <option value="User_Uploads">User Uploads</option>
+          <option value="C-C_Bond_Formation">C-C Bond Formation</option>
+          <option value="C-N_Bond_Formation">C-N Bond Formation</option>
+          {/* add others or fetch from backend */}
+        </select>
+        <button disabled={loading} type="submit" className="px-3 py-1 bg-primary text-white rounded">Upload</button>
+      </div>
+      {message && <div className="mt-2 text-sm text-gray-600">{message}</div>}
+    </form>
+  );
+}
+#############################
+// src/App.jsx
+import React, { useEffect, useState, useRef } from "react";
+import { motion } from "framer-motion";
+
+import ChatWindow from "./components/ChatWindow";
+import ProductTabs from "./components/ProductTabs";
+import ProductDetailModal from "./components/ProductDetailModal";
+import SidebarHistory from "./components/SidebarHistory";
+import ReactionTiles from "./components/ReactionTiles";
+import PromptGallery from "./components/PromptGallery";
+import UploadPanel from "./components/UploadPanel";
+
+import {
+  fetchReactions,
+  fetchProducts,
+  fetchProductMeta,
+  fetchProductDetails,
+  fetchSchemeImageUrl,
+  fetchPrompts,
+  queryWithCitations,
+  searchProducts,
+} from "./api";
+
+import Navbar from "./Navbar/Navbar";
+import Footer from "./Footer/Footer";
+
+import chem_logo from "../assets/Chemhub_Logo_Colored.png"; // update path if needed
+
+export default function App() {
+  // Global app state
+  const [reactions, setReactions] = useState([]);
+  const [prompts, setPrompts] = useState([]);
+
+  const [products, setProducts] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
+
+  const [selectedProduct, setSelectedProduct] = useState(null); // meta
+  const [productDetails, setProductDetails] = useState(null);
+  const [productListVisible, setProductListVisible] = useState(false);
+
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
+
+  const [messages, setMessages] = useState([]); // chat messages
+  const [history, setHistory] = useState([]); // conversation history list
+
+  // Loading state flags
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [queryLoading, setQueryLoading] = useState(false);
+
+  // Selected citations (right-click / multi-select)
+  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
+
+  // For scheme preview in chat
+  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
+
+  // Typeahead search state
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const searchTimeoutRef = useRef(null);
+
+  // Refs
+  const chatWindowRef = useRef(null);
+
+  // Initialize reactions and prompts
+  useEffect(() => {
+    fetchReactions().then((r) => {
+      setReactions(r || []);
+    }).catch((e) => {
+      console.error("fetchReactions error:", e);
+    });
+
+    fetchPrompts().then((p) => {
+      setPrompts(p || []);
+    }).catch((e) => {
+      console.warn("fetchPrompts failed:", e);
+    });
+
+    // minimal onboarding message
+    setMessages([{
+      role: "assistant",
+      content: "Welcome — type a reaction or product name to find documents, or ask a question directly."
+    }]);
+  }, []);
+
+  // Utility to push a message
+  const pushMessage = (m) => setMessages(prev => [...prev, m]);
+
+  // Normalize helper
+  const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
+
+  // Product selection flow (opens modal, preloads scheme, fetches details)
+  const handleSelectProduct = async (productId) => {
+    try {
+      setLoadingDetails(true);
+      const meta = await fetchProductMeta(productId);
+      setSelectedProduct(meta);
+      setProductDetails(null);
+      setSelectedSchemeUrl(null);
+      setDetailModalOpen(true);
+
+      // preload scheme image url for quicker preview
+      try {
+        const schemeUrl = fetchSchemeImageUrl(productId);
+        setSelectedSchemeUrl(schemeUrl);
+      } catch (e) {
+        // ignore
+      }
+
+      // fetch full extraction (canonical extraction)
+      const res = await fetchProductDetails(productId); // default extraction
+      const payload = (res && res.data) ? res.data : res;
+      setProductDetails(payload);
+
+      // add to history
+      setHistory(h => [{ title: meta.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
+
+    } catch (err) {
+      console.error("handleSelectProduct error:", err);
+      pushMessage({ role: "assistant", content: "Failed to load product details." });
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  // When user right-clicks or context-adds a product to citations
+  const handleToggleCite = (product) => {
+    const exists = selectedCitedDocs.find(p => p.id === product.id);
+    if (exists) {
+      setSelectedCitedDocs(prev => prev.filter(p => p.id !== product.id));
+      pushMessage({ role: "assistant", content: `Removed citation: ${product.name}` });
+    } else {
+      setSelectedCitedDocs(prev => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
+      pushMessage({ role: "assistant", content: `Added citation: ${product.name}` });
+    }
+  };
+
+  // Remove citation helper (used by UI)
+  const removeCitation = (id) => {
+    const found = selectedCitedDocs.find(d => d.id === id);
+    setSelectedCitedDocs(prev => prev.filter(d => d.id !== id));
+    if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
+  };
+
+  // Search products for autocomplete (debounced)
+  useEffect(() => {
+    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    if (!searchQuery || searchQuery.trim().length < 1) {
+      setSearchResults([]);
+      return;
+    }
+    searchTimeoutRef.current = setTimeout(async () => {
+      try {
+        const results = await searchProducts(searchQuery);
+        setSearchResults(results || []);
+      } catch (e) {
+        console.error("searchProducts error:", e);
+        setSearchResults([]);
+      }
+    }, 240); // small debounce
+    return () => {
+      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
+    };
+  }, [searchQuery]);
+
+  // Main user-send handler
+  const handleUserSend = async (text) => {
+    // push user message
+    pushMessage({ role: "user", content: text });
+
+    // Reaction detection: if text is a reaction name, list products
+    const norm = normalize(text);
+    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, '_')));
+    if (match) {
+      setSelectedReaction(match);
+      try {
+        const prods = await fetchProducts(match);
+        setProducts(prods || []);
+        setProductListVisible(true);
+        pushMessage({ role: "assistant", content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
+      } catch (e) {
+        console.error(e);
+        pushMessage({ role: "assistant", content: "Error loading products for that reaction."});
+      }
+      return;
+    }
+
+    // If user has selected citations, query across them
+    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
+      setQueryLoading(true);
+      // show intermediate loading in chat
+      pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
+      try {
+        const ids = selectedCitedDocs.map(d => d.id);
+        const res = await queryWithCitations(ids, text);
+        const payload = (res && res.data) ? res.data : res;
+        // remove loading placeholder
+        setMessages(prev => {
+          const idx = prev.map(m => m.loading).lastIndexOf(true);
+          if (idx >= 0) {
+            const copy = [...prev];
+            copy.splice(idx, 1);
+            return copy;
+          }
+          return prev;
+        });
+        const answer = payload?.answer || payload?.response || "No relevant answer found.";
+        const sources = (payload?.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
+        pushMessage({ role: "assistant", content: answer, sources });
+      } catch (err) {
+        console.error("queryWithCitations error:", err);
+        pushMessage({ role: "assistant", content: "Error querying selected documents."});
+      } finally {
+        setQueryLoading(false);
+      }
+      return;
+    }
+
+    // If no selected product, let backend attempt to detect product name inside question
+    if (!selectedProduct) {
+      setQueryLoading(true);
+      pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
+      try {
+        const res = await fetchProductDetails(undefined, text);
+        const payload = (res && res.data) ? res.data : res;
+
+        // remove loading placeholder
+        setMessages(prev => {
+          const idx = prev.map(m => m.loading).lastIndexOf(true);
+          if (idx >= 0) {
+            const copy = [...prev];
+            copy.splice(idx, 1);
+            return copy;
+          }
+          return prev;
+        });
+
+        if (payload && payload.api_name) {
+          // structured data returned
+          let summary = "";
+          if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
+          if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
+          if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
+          if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || '').slice(0, 400)}\n\n`;
+          pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
+        } else if (payload && (payload.answer || payload.response)) {
+          const answer = payload.answer || payload.response || "No answer.";
+          const sources = (payload.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
+          pushMessage({ role: "assistant", content: answer, sources });
+        } else {
+          pushMessage({ role: "assistant", content: "No structured data found. Try selecting a product or ask for specific extraction." });
+        }
+      } catch (err) {
+        console.error("fetchProductDetails error (no product):", err);
+        pushMessage({ role: "assistant", content: "Error querying documents." });
+      } finally {
+        setQueryLoading(false);
+      }
+      return;
+    }
+
+    // If a product is already selected, query it directly
+    setQueryLoading(true);
+    pushMessage({ role: "assistant", content: "Fetching answer from selected document...", loading: true });
+    try {
+      const res = await fetchProductDetails(selectedProduct.id, text);
+      const payload = (res && res.data) ? res.data : res;
+
+      // remove loading placeholder
+      setMessages(prev => {
+        const idx = prev.map(m => m.loading).lastIndexOf(true);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy.splice(idx, 1);
+          return copy;
+        }
+        return prev;
+      });
+
+      if (payload && payload.api_name) {
+        let summary = "";
+        if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
+        if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
+        if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
+        if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || '').slice(0, 400)}\n\n`;
+        pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
+        setProductDetails(payload);
+        setDetailModalOpen(true);
+        setHistory(h => [{ title: selectedProduct.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: selectedProduct.id }, ...h]);
+      } else if (payload && (payload.answer || payload.response)) {
+        const answer = payload.answer || payload.response || "No answer.";
+        const sources = (payload.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
+        pushMessage({ role: "assistant", content: answer, sources });
+      } else {
+        pushMessage({ role: "assistant", content: "No answer found from document." });
+      }
+    } catch (err) {
+      console.error("fetchProductDetails (selected) error:", err);
+      pushMessage({ role: "assistant", content: "Error querying backend." });
+    } finally {
+      setQueryLoading(false);
+    }
+  };
+
+  // When user selects a reaction tile, fetch products for that reaction
+  const handleReactionClick = async (reactionName) => {
+    setSelectedReaction(reactionName);
+    try {
+      const prods = await fetchProducts(reactionName);
+      setProducts(prods || []);
+      setProductListVisible(true);
+      pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
+    } catch (e) {
+      console.error(e);
+      pushMessage({ role: "assistant", content: "Error loading products for that reaction."});
+    }
+  };
+
+  // When user picks a sample prompt from the gallery: send it immediately to the chat as if user typed it
+  const handlePromptPick = async (promptText) => {
+    // you could also prefer to populate the input field; we send immediately for convenience
+    await handleUserSend(promptText);
+  };
+
+  // Upload callback to refresh user uploads list
+  const handleUploadComplete = async (uploadResp) => {
+    // refresh user uploads in product list
+    try {
+      const prods = await fetchProducts("User_Uploads");
+      setProducts(prods || []);
+      setProductListVisible(true);
+      pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
+    } catch (e) {
+      console.warn("refresh uploads after upload failed:", e);
+    }
+  };
+
+  // When user clicks search result item
+  const handleSearchSelect = async (item) => {
+    setSearchQuery("");
+    setSearchResults([]);
+    // item shape: {id, name, reaction_type}
+    await handleSelectProduct(item.id);
+  };
+
+  return (
+    <>
+      <Navbar />
+
+      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex justify-center">
+        <div className="w-full max-w-7xl py-8 px-4">
+
+          {/* Header / Branding */}
+          <div className="flex items-center justify-between mb-6 gap-4">
+            <div className="flex items-center gap-4">
+              <img src={chem_logo} alt="logo" className="h-14 w-auto" />
+              <div>
+                <h1 className="text-2xl font-extrabold text-gray-900">Reaction Database AI</h1>
+                <div className="text-sm text-gray-500">Search, extract and explore reaction documents</div>
+              </div>
+            </div>
+
+            {/* Upload panel sits in header area */}
+            <div className="w-1/3 min-w-[260px]">
+              <UploadPanel onUploaded={handleUploadComplete} />
+            </div>
+          </div>
+
+          {/* Reaction tiles */}
+          <div className="mb-4">
+            <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Left column: chat + prompt gallery */}
+            <div className="lg:col-span-2">
+              {/* Chat window */}
+              <ChatWindow
+                ref={chatWindowRef}
+                messages={messages}
+                onSend={handleUserSend}
+                centeredWidth="w-full"
+                loading={queryLoading || loadingDetails}
+                selectedCitedDocs={selectedCitedDocs}
+                removeCitation={removeCitation}
+              />
+
+              {/* Prompt gallery */}
+              <div className="mt-4">
+                <PromptGallery prompts={prompts} onPick={handlePromptPick} />
+              </div>
+
+              {/* Product search (typeahead) */}
+              <div className="mt-4">
+                <label className="text-sm text-gray-600">Search products (type to autocomplete)</label>
+                <div className="relative mt-2">
+                  <input
+                    className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-secondary"
+                    placeholder="Type a product name..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchResults && searchResults.length > 0 && (
+                    <div className="absolute z-50 left-0 right-0 mt-1 bg-white border rounded-lg shadow max-h-56 overflow-auto">
+                      {searchResults.map((s) => (
+                        <div
+                          key={s.id}
+                          onClick={() => handleSearchSelect(s)}
+                          className="px-3 py-2 hover:bg-gray-50 cursor-pointer"
+                          title={s.name}
+                        >
+                          <div className="text-sm font-medium truncate">{s.name}</div>
+                          <div className="text-xs text-gray-400 truncate">{s.reaction_type}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Right column: products list + history */}
+            <div className="lg:col-span-1">
+              {/* Matched products */}
+              {productListVisible && (
+                <div className="mb-4">
+                  <h3 className="text-lg font-semibold mb-2">Matched Products</h3>
+                  <ProductTabs
+                    products={products}
+                    onSelect={handleSelectProduct}
+                    onContext={handleToggleCite} // expects ProductTabs handles onContext (right-click)
+                    citedIds={new Set(selectedCitedDocs.map(d => d.id))}
+                  />
+                </div>
+              )}
+
+              {/* Chat history / conversations */}
+              <div className="mb-4">
+                <SidebarHistory history={history} onSelect={(h) => { if (h && h.productId) handleSelectProduct(h.productId); }} />
+              </div>
+            </div>
+          </div>
+
+          {/* Product detail modal */}
+          <ProductDetailModal
+            open={detailModalOpen}
+            onClose={() => setDetailModalOpen(false)}
+            meta={selectedProduct}
+            details={productDetails}
+            loading={loadingDetails}
+          />
+
+        </div>
+      </div>
+
+      <Footer />
+    </>
+  );
+}
