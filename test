@@ -1,4 +1,4 @@
-# main.py (FULL)
+# main.py - Reaction Database AI (updated)
 import os
 import re
 import glob
@@ -6,6 +6,8 @@ import base64
 import io
 import json
 import time
+import requests
+import traceback
 from typing import Union, List, Optional, Dict, Any, Tuple
 from jose import jwt
 import threading
@@ -24,42 +26,41 @@ from langchain.storage.file_system import LocalFileStore
 from langchain_openai import AzureOpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
+from langchain.chains import RetrievalQA, LLMChain
 from langchain.prompts import PromptTemplate
 import mimetypes
 from difflib import SequenceMatcher
-import traceback
+from pydantic import BaseModel
+from pptx import Presentation
+from pptx.util import Inches, Pt
 
-# Optional libraries (not mandatory unless you enable OCR)
+# Optional libraries (safe-guarded)
 try:
     import docx  # python-docx
 except Exception:
     docx = None
-
 try:
-    import pptx  # python-pptx
+    import pptx as pptx_lib  # python-pptx used for extraction (optional)
 except Exception:
-    pptx = None
-
+    pptx_lib = None
 try:
-    import pytesseract  # optional OCR
+    import pytesseract
 except Exception:
     pytesseract = None
 
 # ---------------------------
-# Configuration
+# Config - adapt as needed
 # ---------------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Azure Configuration (left as provided)
-base_url = ""
+# Azure LLM config (kept as you requested)
+base_url = ""  # set your azure endpoint if needed
 api_version = "2025-01-01-preview"
-
 api_key = ""
 deployment_name = "api-ai4o"
 model_name = "gpt-4o"
 
-# Initialize Azure services (unchanged)
+# Initialize Azure services
 file_store = LocalFileStore('langchain-embeddings')
 base = AzureOpenAIEmbeddings(
     model="text-embedding-3-large",
@@ -77,12 +78,17 @@ chat_model = AzureChatOpenAI(
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
+# Bing / Web Search (optional - provide keys)
+BING_SEARCH_ENDPOINT = os.environ.get("BING_SEARCH_ENDPOINT", "")  # e.g. https://api.bing.microsoft.com/v7.0/search or your azure bing endpoint
+BING_SEARCH_KEY = os.environ.get("BING_SEARCH_KEY", "")
+USE_BING_IF_NO_DOCS = True  # toggle this to disable web fallback
+
 # JWT Config
 SECRET_KEY = "myFAVsecretKEY"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# Reaction types
+# Reaction types & file layout
 REACTION_TYPES = [
     "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
     "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
@@ -147,7 +153,7 @@ Answer:
 QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
 
 # ------------------------------
-# Helpers
+# Helpers: file listing, extraction, indexing, parsing
 # ------------------------------
 def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
     for ext in ['.jpeg', '.jpg', '.png', '.gif']:
@@ -157,16 +163,14 @@ def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
     return None
 
 def list_products() -> List[Dict[str, Any]]:
-    """List both on-disk Products and user uploads (User_Uploads)."""
     products = []
-    # from Products dir
     for reaction_type in REACTION_TYPES:
         reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
         if not os.path.exists(reaction_dir):
             continue
-        pdf_files = glob.glob(os.path.join(reaction_dir, "*.*"))
-        for pdf_path in pdf_files:
-            filename = os.path.basename(pdf_path)
+        files = glob.glob(os.path.join(reaction_dir, "*.*"))
+        for path in files:
+            filename = os.path.basename(path)
             product_name = os.path.splitext(filename)[0]
             scheme_image = find_scheme_image(reaction_type, product_name)
             scheme_cdx = os.path.join(SCHEMES_DIR, reaction_type, f"{product_name}.cdx")
@@ -175,20 +179,18 @@ def list_products() -> List[Dict[str, Any]]:
                 "id": product_id,
                 "name": product_name,
                 "reaction_type": reaction_type,
-                "pdf_path": pdf_path,
+                "pdf_path": path,
                 "scheme_image": scheme_image if scheme_image else None,
                 "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
             })
-    # from user uploads
+    # user uploads (flat)
     uploads = glob.glob(os.path.join(UPLOADS_DIR, "*"))
     for path in uploads:
         if os.path.isdir(path):
-            files = glob.glob(os.path.join(path, "*.*"))
-            for fpath in files:
+            for fpath in glob.glob(os.path.join(path, "*.*")):
                 filename = os.path.basename(fpath)
                 product_name = os.path.splitext(filename)[0]
                 product_id = f"UserUpload_{os.path.basename(path)}_{product_name}"
-                # reaction_type for uploads is stored as folder name prefix; allow "User" tag
                 products.append({
                     "id": product_id,
                     "name": product_name,
@@ -209,18 +211,18 @@ def extract_pdf_text(pdf_path: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
 
-# simple extractors for other formats
+# minimal extractors for other formats (safe guarded)
 def extract_docx_text(path: str) -> str:
     if docx is None:
         raise RuntimeError("python-docx not installed")
-    doc = docx.Document(path)
-    paragraphs = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-    return "\n".join(paragraphs)
+    d = docx.Document(path)
+    texts = [p.text for p in d.paragraphs if p.text and p.text.strip()]
+    return "\n".join(texts)
 
 def extract_pptx_text(path: str) -> str:
-    if pptx is None:
-        raise RuntimeError("python-pptx not installed")
-    prs = pptx.Presentation(path)
+    if pptx_lib is None:
+        raise RuntimeError("python-pptx not installed for extraction")
+    prs = pptx_lib.Presentation(path)
     texts = []
     for slide in prs.slides:
         for shape in slide.shapes:
@@ -233,7 +235,6 @@ def extract_pptx_text(path: str) -> str:
 
 def extract_xls_text(path: str) -> str:
     try:
-        # read all sheets and convert to tabular markdown style
         xls = pd.read_excel(path, sheet_name=None)
         parts = []
         for sheet_name, df in xls.items():
@@ -241,7 +242,7 @@ def extract_xls_text(path: str) -> str:
             parts.append(df.to_csv(index=False))
         return "\n\n".join(parts)
     except Exception as e:
-        raise RuntimeError(f"Failed reading xlsx: {e}")
+        raise RuntimeError(f"Failed reading excel: {e}")
 
 def extract_csv_text(path: str) -> str:
     try:
@@ -251,10 +252,6 @@ def extract_csv_text(path: str) -> str:
         raise RuntimeError(f"Failed reading csv: {e}")
 
 def extract_image_text(path: str) -> Tuple[str,bool]:
-    """
-    Try OCR using pytesseract (if available). Returns (text, ocr_performed_bool).
-    If pytesseract missing or fails, returns ("", False).
-    """
     if pytesseract is None:
         return ("", False)
     try:
@@ -265,7 +262,8 @@ def extract_image_text(path: str) -> Tuple[str,bool]:
         print(f"OCR error: {e}")
         return ("", False)
 
-# Cache for vectorstores and product details
+# ------------------------------
+# Caches & locks
 _vectorstore_cache: Dict[str, FAISS] = {}
 _product_details_cache: Dict[str, Dict[str, Any]] = {}
 _vectorstore_lock = threading.Lock()
@@ -275,43 +273,39 @@ def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
     with _vectorstore_lock:
         if pid in _vectorstore_cache:
             return _vectorstore_cache[pid]
-        if not os.path.exists(product["pdf_path"]):
+        path = product.get("pdf_path")
+        if not path or not os.path.exists(path):
             return None
-        # attempt to extract text according to extension
-        path = product["pdf_path"]
         ext = os.path.splitext(path)[1].lower()
         text = ""
         try:
-            if ext in [".pdf"]:
+            if ext == ".pdf":
                 text = extract_pdf_text(path)
             elif ext in [".docx", ".doc"]:
                 text = extract_docx_text(path)
-            elif ext in [".pptx"]:
+            elif ext == ".pptx":
                 text = extract_pptx_text(path)
             elif ext in [".xlsx", ".xls"]:
                 text = extract_xls_text(path)
-            elif ext in [".csv"]:
+            elif ext == ".csv":
                 text = extract_csv_text(path)
             elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
-                # try OCR if available
                 txt, did = extract_image_text(path)
-                if did:
+                if did and txt.strip():
                     text = txt
                 else:
-                    # store a short placeholder so it's findable
                     text = f"[image file: {os.path.basename(path)}]"
             else:
-                # default: try fitz for other file types
+                # fallback try pdf extraction then placeholder
                 try:
                     text = extract_pdf_text(path)
                 except Exception:
                     text = f"[file: {os.path.basename(path)}]"
         except Exception as e:
-            print(f"Text extraction failed for {path}: {e}")
+            print(f"Extraction error for {path}: {e}")
             return None
 
         if not text or len(text.strip()) < 20:
-            # for small files, still allow short content but do not build
             return None
 
         doc = Document(page_content=text, metadata={
@@ -320,7 +314,11 @@ def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
             "reaction_type": product.get("reaction_type", "User_Uploads"),
             "source": path
         })
-        vs = FAISS.from_documents([doc], cached_embeddings)
+        try:
+            vs = FAISS.from_documents([doc], cached_embeddings)
+        except Exception as e:
+            print(f"FAISS build error for {pid}: {e}")
+            return None
         _vectorstore_cache[pid] = vs
         return vs
 
@@ -329,7 +327,6 @@ def parse_structured_response(text: str) -> Dict[str, Any]:
     def grab(section):
         m = re.search(rf"###\s*{re.escape(section)}\s*(.*?)\s*(?=###\s*\w+|\Z)", text, re.DOTALL | re.IGNORECASE)
         return m.group(1).strip() if m else None
-
     result["api_name"] = grab("API Name")
     result["reaction_chemistry"] = grab("Reaction Chemistry")
     result["yield"] = grab("Yield")
@@ -365,7 +362,7 @@ app.add_middleware(
 )
 
 # ------------------------------
-# Pydantic models
+# Models
 # ------------------------------
 class ProductOut(BaseModel):
     id: str
@@ -383,7 +380,7 @@ class QueryRequest(BaseModel):
     question: str
 
 # ------------------------------
-# Small sample prompt gallery (frontend can fetch)
+# Sample prompts (frontend)
 SAMPLE_PROMPTS = [
     {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
     {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
@@ -393,11 +390,35 @@ SAMPLE_PROMPTS = [
 # ------------------------------
 
 # ------------------------------
-# Endpoints (existing + new)
+# Utility: Bing / web search helper
+# ------------------------------
+def bing_search(query: str, top_k: int = 5) -> Dict[str, Any]:
+    """
+    Use Bing Web Search (Azure or classic) with endpoint and key.
+    Returns { 'web_pages': [ { name, url, snippet } ], 'raw': <response dict> }
+    """
+    if not BING_SEARCH_ENDPOINT or not BING_SEARCH_KEY:
+        return {"web_pages": [], "raw": None, "error": "Bing endpoint/key not configured."}
+    headers = {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY}
+    params = {"q": query, "count": top_k, "textDecorations": True, "textFormat": "Plain"}
+    try:
+        resp = requests.get(BING_SEARCH_ENDPOINT, headers=headers, params=params, timeout=20)
+        resp.raise_for_status()
+        j = resp.json()
+        web_pages = []
+        # Bing returns webPages.value typically
+        for v in (j.get("webPages", {}).get("value", [])[:top_k]):
+            web_pages.append({"name": v.get("name"), "url": v.get("url"), "snippet": v.get("snippet")})
+        return {"web_pages": web_pages, "raw": j}
+    except Exception as e:
+        print(f"Bing search error: {e}")
+        return {"web_pages": [], "raw": None, "error": str(e)}
+
+# ------------------------------
+# Endpoints
 # ------------------------------
 @app.get("/reactions", response_model=List[str])
 def get_reactions():
-    # Return the reaction tiles plus a 'User Uploads' tile
     return REACTION_TYPES + ["User_Uploads"]
 
 @app.get("/prompts")
@@ -408,7 +429,10 @@ def get_prompts():
 def get_products(reaction_type: Optional[str] = None):
     allp = list_products()
     if reaction_type:
-        allp = [p for p in allp if p["reaction_type"] == reaction_type or reaction_type == "User_Uploads" and p["reaction_type"] == "User_Uploads"]
+        if reaction_type == "User_Uploads":
+            allp = [p for p in allp if p["reaction_type"] == "User_Uploads"]
+        else:
+            allp = [p for p in allp if p["reaction_type"] == reaction_type]
     out = []
     for p in allp:
         out.append(ProductOut(
@@ -448,24 +472,18 @@ def product_scheme_image(product_id: str):
     meta = product_meta(product_id)
     path = meta.get("scheme_image")
     if path and os.path.exists(path):
+        # let the browser handle caching / CORS (we allow_origins="*")
         return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
     raise HTTPException(status_code=404, detail="Scheme image not found")
 
 # ------------------------------
-# Upload endpoint: save, extract, index
-# ------------------------------
+# Upload endpoint
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str] = Form("User_Uploads"), filename: Optional[str] = Form(None)):
-    """
-    Accept a file upload (pdf, docx, pptx, xlsx, csv, images).
-    Saves to UPLOADS_DIR/<timestamp>_<uploader>/<filename>, extracts text, builds vectorstore, and returns meta.
-    """
-    # sanitize reaction_type
     try:
         rt = re.sub(r'[^a-zA-Z0-9_\- ]', '', (reaction_type or "User_Uploads"))
     except Exception:
         rt = "User_Uploads"
-    # create a unique folder for the upload batch
     ts = int(time.time())
     folder_name = f"{rt}_{ts}"
     out_dir = os.path.join(UPLOADS_DIR, folder_name)
@@ -473,12 +491,10 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
 
     orig_filename = filename or file.filename or f"uploaded_{ts}"
     save_path = os.path.join(out_dir, orig_filename)
-    # write file
     with open(save_path, "wb") as f:
         contents = await file.read()
         f.write(contents)
 
-    # attempt extraction based on extension
     ext = os.path.splitext(save_path)[1].lower()
     text = ""
     ocr_performed = False
@@ -497,19 +513,17 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
         elif ext in [".png", ".jpg", ".jpeg", ".gif"]:
             text, ocr_performed = extract_image_text(save_path)
         else:
-            # try PDF extraction, else fallback to binary placeholder
             try:
                 text = extract_pdf_text(save_path)
             except Exception:
                 text = f"[uploaded file: {orig_filename}]"
     except Exception as e:
         extract_error = str(e)
-        print(f"Upload extraction error: {e}")
+        print("Upload extraction error:", e)
 
-    # create product metadata and id
     product_name = os.path.splitext(orig_filename)[0]
     product_id = f"UserUpload_{folder_name}_{product_name}"
-    product_meta_info = {
+    meta = {
         "id": product_id,
         "name": product_name,
         "reaction_type": "User_Uploads",
@@ -520,7 +534,7 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
         "extract_error": extract_error
     }
 
-    # attempt to create vectorstore so queries will use it immediately
+    # attempt immediate indexing
     try:
         doc = Document(page_content=(text or f"[uploaded file: {orig_filename}]"), metadata={
             "product_id": product_id,
@@ -532,19 +546,19 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
         with _vectorstore_lock:
             _vectorstore_cache[product_id] = vs
     except Exception as e:
-        print(f"Warning: Failed to index uploaded file {save_path}: {e}")
-        # proceed — user can still query and we will try on-demand build later
+        print(f"Warning: indexing uploaded file failed: {e}")
 
-    return {"meta": product_meta_info, "message": "File uploaded and indexed (if supported).", "product_id": product_id}
+    return {"meta": meta, "message": "Uploaded and indexed (if supported).", "product_id": product_id}
 
 # ------------------------------
-# product/details endpoint (kept robust - uses QA_PROMPT/EXTRACTION_PROMPT)
+# product/details (robust with detection, bing fallback, etc.)
 @app.post("/product/details")
 def product_details(req: QARequest):
     try:
         q_text = (req.question or "").strip()
         if not q_text:
             return JSONResponse(status_code=400, content={"error": "question is required"})
+
         CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
 
         def _normalize_alnum(s: str) -> str:
@@ -556,6 +570,7 @@ def product_details(req: QARequest):
         print("=== /product/details called ===")
         print("Question:", q_text)
 
+        # detection by product name (3 strategies)
         def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
             products = list_products()
             if not products:
@@ -563,17 +578,15 @@ def product_details(req: QARequest):
             q_norm_alnum = _normalize_alnum(question)
             q_tokens = set(_tokens(question))
             sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
-            exact_matches = []
+
+            # exact normalized substring
             for p in sorted_products:
                 name_norm = _normalize_alnum(p["name"])
-                if not name_norm:
-                    continue
-                if name_norm in q_norm_alnum:
-                    exact_matches.append((p, name_norm))
-            if exact_matches:
-                chosen = exact_matches[0][0]
-                print(f"DEBUG: Exact normalized substring match -> '{chosen['name']}' (id: {chosen['id']})")
-                return chosen
+                if name_norm and name_norm in q_norm_alnum:
+                    print(f"DEBUG: Exact normalized substring -> {p['name']}")
+                    return p
+
+            # token overlap
             token_matches = []
             for p in sorted_products:
                 pname_tokens = set(_tokens(p["name"]))
@@ -583,13 +596,14 @@ def product_details(req: QARequest):
                 if overlap:
                     token_matches.append((p, len(overlap), len(pname_tokens), overlap))
             if token_matches:
-                token_matches.sort(key=lambda x: (-(x[1] / x[2]), -x[1]))
-                best = token_matches[0]
-                p_best, match_count, token_count, overlap = best
+                token_matches.sort(key=lambda x: (-(x[1]/x[2]), -x[1]))
+                p_best, match_count, token_count, overlap = token_matches[0]
                 ratio = match_count / token_count
-                print(f"DEBUG: Token-overlap candidate -> '{p_best['name']}' (id: {p_best['id']}) overlap {match_count}/{token_count} tokens {overlap} ratio={ratio:.2f}")
+                print(f"DEBUG: token overlap candidate {p_best['name']} ratio={ratio:.2f}")
                 if ratio >= 0.5:
                     return p_best
+
+            # similarity fallback
             best = None
             best_ratio = 0.0
             for p in products:
@@ -604,59 +618,50 @@ def product_details(req: QARequest):
                     best = (p, ratio, r1, r2)
             if best:
                 p_best, ratio, r1, r2 = best
-                print(f"DEBUG: Best similarity candidate -> '{p_best['name']}' (id: {p_best['id']}) ratio_avg={ratio:.3f} r1={r1:.3f} r2={r2:.3f}")
+                print(f"DEBUG: similarity best -> {p_best['name']} ratio={ratio:.3f}")
                 if ratio >= 0.60:
                     return p_best
                 else:
-                    print(f"DEBUG: Best similarity below threshold (0.60): {ratio:.3f} -> will NOT auto-select")
+                    print("DEBUG: best similarity below threshold")
             return None
 
+        # run retrieval for a given product
         def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
-            print(f"DEBUG: Running retrieval for product: {product['name']} (id: {product['id']})")
+            print(f"DEBUG: Running retrieval for product {product['id']}")
             pdf_path = product.get("pdf_path")
             if not pdf_path or not os.path.exists(pdf_path):
-                raise HTTPException(status_code=404, detail=f"PDF not found for product {product.get('id')}: {pdf_path}")
-            try:
-                # attempt to reuse cached vs, else build
-                pid = product["id"]
-                with _vectorstore_lock:
-                    vs = _vectorstore_cache.get(pid)
+                raise HTTPException(status_code=404, detail="Product file not found")
+            pid = product["id"]
+            # try cached vectorstore, else build
+            with _vectorstore_lock:
+                vs = _vectorstore_cache.get(pid)
+            if not vs:
+                vs = build_product_vector_store(product)
                 if not vs:
-                    # create a temporary product dict for build
-                    temp_product = {"id": pid, "name": product["name"], "reaction_type": product.get("reaction_type", "User_Uploads"), "pdf_path": pdf_path}
-                    vs = build_product_vector_store(temp_product)
-                    if not vs:
-                        raise HTTPException(status_code=500, detail="Failed to build vectorstore for product")
-                retriever = vs.as_retriever(search_kwargs={"k": k})
-            except HTTPException:
-                raise
-            except Exception as e:
-                print(f"ERROR building/retrieving VS: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
-
-            prompt_to_use = QA_PROMPT
+                    raise HTTPException(status_code=500, detail="Failed to build vectorstore for product")
+            retriever = vs.as_retriever(search_kwargs={"k": k})
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
                 chain_type="stuff",
                 retriever=retriever,
-                chain_type_kwargs={"prompt": prompt_to_use},
-                return_source_documents=True,
+                chain_type_kwargs={"prompt": QA_PROMPT},
+                return_source_documents=True
             )
             out = qa_chain({"query": question})
             answer_text = out.get("result") or out.get("output_text") or ""
             source_docs = out.get("source_documents", []) or []
+            # unique sources
             seen = set()
             sources = []
             for sd in source_docs:
-                pid = sd.metadata.get("product_id")
+                pid2 = sd.metadata.get("product_id")
                 pname = sd.metadata.get("product_name")
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    sources.append({"product_id": pid, "product_name": pname})
-            print(f"DEBUG: Retrieval produced answer length={len(answer_text)} and {len(sources)} source(s)")
+                if pid2 and pid2 not in seen:
+                    seen.add(pid2)
+                    sources.append({"product_id": pid2, "product_name": pname})
             return {"answer": answer_text, "sources": sources}
 
-        # main logic
+        # 1) if explicit product_id provided
         if req.product_id:
             products = list_products()
             product = next((p for p in products if p["id"] == req.product_id), None)
@@ -665,18 +670,18 @@ def product_details(req: QARequest):
             is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
             if not is_extraction:
                 return _run_retrieval_for_product(product, q_text, k=3)
+            # extraction path (structured)
             if req.product_id in _product_details_cache:
                 return _product_details_cache[req.product_id]
             vs = build_product_vector_store(product)
             if not vs:
-                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid PDF)"})
+                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid file)"})
             retriever = vs.as_retriever(search_kwargs={"k": 1})
-            prompt_for_extraction = EXTRACTION_PROMPT
             qa_chain = RetrievalQA.from_chain_type(
                 llm=chat_model,
                 chain_type="stuff",
                 retriever=retriever,
-                chain_type_kwargs={"prompt": prompt_for_extraction},
+                chain_type_kwargs={"prompt": EXTRACTION_PROMPT},
                 return_source_documents=False,
             )
             raw_response = qa_chain.run(q_text)
@@ -684,22 +689,100 @@ def product_details(req: QARequest):
             _product_details_cache[req.product_id] = parsed
             return parsed
 
+        # 2) no explicit product_id: attempt detect in free text
         detected = _detect_product_by_name(q_text)
         if detected:
-            print(f"DEBUG: Detected product by name: {detected['name']} (id: {detected['id']}) -> running retrieval")
+            print(f"DEBUG: Detected product: {detected['name']} -> running retrieval")
             return _run_retrieval_for_product(detected, q_text, k=3)
 
-        # fallback generative
-        prompt_for_gen = QA_PROMPT
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=None,
-            chain_type_kwargs={"prompt": prompt_for_gen},
-            return_source_documents=False,
-        )
-        raw_response = qa_chain.run(q_text)
-        return {"response": raw_response}
+        # 3) no product found -> do a multi-document retrieval across available docs (bounded)
+        print("DEBUG: No product detected - attempting multi-doc retrieval")
+        products_all = list_products()
+        docs = []
+        # limit number of docs to avoid heavy indexing (e.g., 50)
+        MAX_DOCS = 50
+        count = 0
+        for p in products_all:
+            if count >= MAX_DOCS:
+                break
+            path = p.get("pdf_path")
+            if not path or not os.path.exists(path):
+                continue
+            # Build or reuse vector store but collect Document objects to build combined index
+            try:
+                # reuse extraction logic
+                ext = os.path.splitext(path)[1].lower()
+                text = ""
+                if ext == ".pdf":
+                    text = extract_pdf_text(path)
+                elif ext in [".docx", ".doc"]:
+                    text = extract_docx_text(path)
+                elif ext == ".pptx":
+                    text = extract_pptx_text(path)
+                elif ext in [".xlsx", ".xls"]:
+                    text = extract_xls_text(path)
+                elif ext == ".csv":
+                    text = extract_csv_text(path)
+                else:
+                    try:
+                        text = extract_pdf_text(path)
+                    except Exception:
+                        text = f"[file: {os.path.basename(path)}]"
+                if not text or len(text.strip()) < 50:
+                    continue
+                doc = Document(page_content=text, metadata={"product_id": p["id"], "product_name": p["name"], "reaction_type": p["reaction_type"]})
+                docs.append(doc)
+                count += 1
+            except Exception:
+                continue
+
+        if docs:
+            try:
+                vector_store = FAISS.from_documents(docs, cached_embeddings)
+                retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+                qa_chain = RetrievalQA.from_chain_type(
+                    llm=chat_model,
+                    chain_type="stuff",
+                    retriever=retriever,
+                    chain_type_kwargs={"prompt": QA_PROMPT},
+                    return_source_documents=True
+                )
+                out = qa_chain({"query": q_text})
+                answer_text = out.get("result") or out.get("output_text") or ""
+                source_docs = out.get("source_documents", []) or []
+                seen = set()
+                sources = []
+                for sd in source_docs:
+                    pid2 = sd.metadata.get("product_id")
+                    pname = sd.metadata.get("product_name")
+                    if pid2 and pid2 not in seen:
+                        seen.add(pid2)
+                        sources.append({"product_id": pid2, "product_name": pname})
+                return {"answer": answer_text, "sources": sources}
+            except Exception as e:
+                print("Multi-doc retrieval error:", e)
+                # fall through to web search if enabled
+
+        # 4) fallback to Bing web search (if enabled)
+        if USE_BING_IF_NO_DOCS and BING_SEARCH_ENDPOINT and BING_SEARCH_KEY:
+            print("DEBUG: Falling back to Bing web search for query")
+            bing_result = bing_search(q_text, top_k=5)
+            web_pages = bing_result.get("web_pages", [])
+            # build a short context string (snippets) for LLM to synthesize an answer
+            snippets = "\n\n".join([f"{i+1}. {wp['name']}\nURL: {wp['url']}\nSnippet: {wp['snippet']}" for i, wp in enumerate(web_pages)])
+            combined_context = f"Search results for: {q_text}\n\n{snippets}"
+            # create a simple LLMChain to synthesize a concise answer from snippets
+            slide_prompt = PromptTemplate(template="""You are a concise helpful assistant. Use ONLY the following search result snippets to answer the question. If the answer cannot be found, say "I could not find an answer in the provided documents." Context: {context}\nQuestion: {question}\nAnswer:""", input_variables=["context", "question"])
+            llm_chain = LLMChain(llm=chat_model, prompt=slide_prompt)
+            try:
+                ans = llm_chain.run({"context": combined_context, "question": q_text})
+            except Exception as e:
+                print("LLM synthesis from Bing snippets failed:", e)
+                ans = "I could not synthesize an answer from web results."
+            return {"answer": ans, "web_results": web_pages}
+        else:
+            # No docs and no bing -> respond politely
+            return {"response": "I could not find any matching documents. Try selecting a product, uploading a relevant document, or enable web search."}
 
     except HTTPException as he:
         raise he
@@ -715,13 +798,14 @@ def product_details(req: QARequest):
         })
 
 # ------------------------------
-# Multi-doc query (existing)
+# Query multiple documents
 @app.post("/query")
 def query_documents(req: QueryRequest):
     if not req.product_ids:
         raise HTTPException(status_code=400, detail="product_ids must be a non-empty list")
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question required")
+
     docs = []
     for pid in req.product_ids:
         try:
@@ -731,49 +815,44 @@ def query_documents(req: QueryRequest):
         pdf_path = meta.get("pdf_path")
         if not pdf_path or not os.path.exists(pdf_path):
             continue
-        text = None
         try:
-            # reuse build_product_vector_store for text extraction
-            temp_product = {"id": pid, "name": meta.get("name"), "reaction_type": meta.get("reaction_type"), "pdf_path": pdf_path}
-            vs = build_product_vector_store(temp_product)
-            if vs:
-                # we still need the Document; build from extracted text
-                # extract text manually to include here
-                ext = os.path.splitext(pdf_path)[1].lower()
-                if ext == ".pdf":
-                    text = extract_pdf_text(pdf_path)
-                elif ext in [".docx", ".doc"]:
-                    text = extract_docx_text(pdf_path)
-                elif ext == ".pptx":
-                    text = extract_pptx_text(pdf_path)
-                elif ext in [".xlsx", ".xls"]:
-                    text = extract_xls_text(pdf_path)
-                elif ext == ".csv":
-                    text = extract_csv_text(pdf_path)
-                else:
-                    try:
-                        text = extract_pdf_text(pdf_path)
-                    except:
-                        text = f"[file: {os.path.basename(pdf_path)}]"
+            ext = os.path.splitext(pdf_path)[1].lower()
+            if ext == ".pdf":
+                text = extract_pdf_text(pdf_path)
+            elif ext in [".docx", ".doc"]:
+                text = extract_docx_text(pdf_path)
+            elif ext == ".pptx":
+                text = extract_pptx_text(pdf_path)
+            elif ext in [".xlsx", ".xls"]:
+                text = extract_xls_text(pdf_path)
+            elif ext == ".csv":
+                text = extract_csv_text(pdf_path)
             else:
+                try:
+                    text = extract_pdf_text(pdf_path)
+                except:
+                    text = f"[file: {os.path.basename(pdf_path)}]"
+            if not text or len(text.strip()) < 50:
                 continue
+            doc = Document(page_content=text, metadata={
+                "product_id": pid,
+                "product_name": meta.get("name", ""),
+                "reaction_type": meta.get("reaction_type", "")
+            })
+            docs.append(doc)
         except Exception:
             continue
-        if not text or len(text.strip()) < 50:
-            continue
-        doc = Document(page_content=text, metadata={
-            "product_id": pid,
-            "product_name": meta.get("name", ""),
-            "reaction_type": meta.get("reaction_type", "")
-        })
-        docs.append(doc)
+
     if len(docs) == 0:
         raise HTTPException(status_code=404, detail="No documents available for the provided product_ids")
+
     try:
         vector_store = FAISS.from_documents(docs, cached_embeddings)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed building vector index: {e}")
+
     retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+
     qa_chain = RetrievalQA.from_chain_type(
         llm=chat_model,
         chain_type="stuff",
@@ -781,10 +860,12 @@ def query_documents(req: QueryRequest):
         chain_type_kwargs={"prompt": QA_PROMPT},
         return_source_documents=True
     )
+
     try:
         out = qa_chain({"query": req.question})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"QA execution failed: {e}")
+
     answer_text = out.get("result") or out.get("output_text") or str(out)
     source_docs = out.get("source_documents", [])
     seen = set()
@@ -798,7 +879,7 @@ def query_documents(req: QueryRequest):
     return {"answer": answer_text, "sources": sources}
 
 # ------------------------------
-# Search endpoint (autocomplete friendly)
+# Search endpoint (autocomplete)
 @app.get("/products/search")
 def search_products(q: str = "", limit: int = 10):
     if q is None:
@@ -823,7 +904,98 @@ def search_products(q: str = "", limit: int = 10):
     return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
 
 # ------------------------------
-# Transcription (unchanged)
+# PPT generation endpoint
+@app.post("/generate_ppt")
+def generate_ppt(body: dict):
+    """
+    body: { "topic": "...", "n_slides": 5 }
+    Returns a FileResponse with a generated PPTX.
+    """
+    topic = (body.get("topic") or "").strip()
+    n_slides = int(body.get("n_slides") or 5)
+    if not topic:
+        raise HTTPException(status_code=400, detail="topic required")
+    if n_slides < 1 or n_slides > 30:
+        raise HTTPException(status_code=400, detail="n_slides must be between 1 and 30")
+
+    prompt_template = PromptTemplate(
+        template="""
+You are an expert slide-writer. Produce a JSON array of exactly {n} slide objects for the topic: "{topic}".
+Each slide object must have this structure:
+{{"title": "Slide title", "bullets": ["first bullet", "second bullet", ...]}}
+Bullets should be concise (3-6 items per slide maximum). The entire response must be valid JSON (an array of objects). No extra commentary.
+""",
+        input_variables=["topic", "n"]
+    )
+    llm_chain = LLMChain(llm=chat_model, prompt=prompt_template)
+    try:
+        raw = llm_chain.run({"topic": topic, "n": n_slides})
+    except Exception as e:
+        print("LLM error generating slide JSON:", e)
+        raise HTTPException(status_code=500, detail="LLM error while generating slides")
+
+    # Try to extract JSON array substring if the model added backticks or text
+    json_text = None
+    try:
+        # look for first '[' and last ']'
+        start = raw.find('[')
+        end = raw.rfind(']')
+        if start != -1 and end != -1 and end > start:
+            json_text = raw[start:end+1]
+            slides = json.loads(json_text)
+        else:
+            slides = json.loads(raw)
+    except Exception as e:
+        # try a looser extraction using regex for JSON array
+        try:
+            m = re.search(r'(\[.*\])', raw, re.DOTALL)
+            if m:
+                json_text = m.group(1)
+                slides = json.loads(json_text)
+            else:
+                raise
+        except Exception as e2:
+            print("Failed to parse JSON from LLM output:", e2)
+            raise HTTPException(status_code=500, detail="Failed to parse slide JSON from LLM output")
+
+    # Build PPTX
+    prs = Presentation()
+    # set slide layout 1 (title + content)
+    for s in slides:
+        title = s.get("title", "")[:200]
+        bullets = s.get("bullets", [])[:8]
+        slide_layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
+        slide = prs.slides.add_slide(slide_layout)
+        # set title
+        try:
+            slide.shapes.title.text = title
+        except Exception:
+            pass
+        # body placeholder
+        try:
+            body = slide.shapes.placeholders[1].text_frame
+            body.clear()
+            for b in bullets:
+                p = body.add_paragraph()
+                p.text = b
+                p.level = 0
+                p.font.size = Pt(18)
+        except Exception:
+            # fallback: create a textbox
+            txBox = slide.shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(4))
+            tf = txBox.text_frame
+            tf.text = "\n".join(bullets)
+    # Save to bytes
+    fobj = io.BytesIO()
+    prs.save(fobj)
+    fobj.seek(0)
+    filename = f"slides_{re.sub(r'[^0-9a-zA-Z]+','_', topic)[:60]}_{int(time.time())}.pptx"
+    return StreamingResponse(fobj, media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    })
+
+# ------------------------------
+# Transcribe endpoint (unchanged guidance)
 GOOGLE_CREDENTIALS_JSON = ""
 
 @app.post("/transcribe")
@@ -853,7 +1025,7 @@ async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bo
     return {"transcript": " ".join(transcripts)}
 
 # ------------------------------
-# Health & auth (unchanged)
+# Health and auth
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -865,8 +1037,7 @@ def create_access_token(data: dict, expires_delta: Union[timedelta , None] = Non
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 @app.post("/login")
-async def login(user_info: dict = Depends(lambda: {"first_name":"demo","last_name":"user"} if True else None)):
-    # (temporary demo auth - replace with config.check_ldap_auth in production)
+async def login(user_info: dict = Depends(lambda: {"first_name":"demo","last_name":"user"})):
     user_info = {"first_name":"Demo","last_name":"User"}
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -879,611 +1050,3 @@ async def login(user_info: dict = Depends(lambda: {"first_name":"demo","last_nam
         "firstname": user_info["first_name"],
         "lastname": user_info["last_name"],
     }
-###############################################
-// src/api.js
-import axios from 'axios';
-const api = axios.create({
-  baseURL: 'http://localhost:8000', // change if backend hosted elsewhere
-  timeout: 60000,
-});
-
-export default api;
-
-export const fetchReactions = async () => {
-  const res = await api.get('/reactions');
-  return res.data;
-};
-
-export const fetchProducts = async (reaction_type) => {
-  const res = await api.get('/products', { params: { reaction_type }});
-  return res.data;
-};
-
-export const fetchPrompts = async () => {
-  const res = await api.get('/prompts');
-  return res.data;
-};
-
-export const searchProducts = async (q) => {
-  const res = await api.get('/products/search', { params: { q }});
-  return res.data;
-};
-
-export const fetchProductMeta = async (productId) => {
-  const res = await api.get(`/product/${encodeURIComponent(productId)}/meta`);
-  return res.data;
-};
-
-export const fetchProductDetails = (productId = undefined, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data") => {
-  return api.post('/product/details', { product_id: productId, question });
-};
-
-export const fetchSchemeImageUrl = async (productId) => {
-  // return absolute backend URL for image
-  return `http://localhost:8000/product/${encodeURIComponent(productId)}/scheme-image`;
-};
-
-export const queryWithCitations = (productIds = [], question = "") => {
-  return api.post('/query', { product_ids: productIds, question });
-};
-
-export const uploadFile = async (file, reaction_type="User_Uploads", filename=null) => {
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('reaction_type', reaction_type);
-  if (filename) fd.append('filename', filename);
-  const res = await api.post('/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' }});
-  return res.data;
-};
-###################################
-// src/components/ReactionTiles.jsx
-import React from 'react';
-import { motion } from 'framer-motion';
-
-export default function ReactionTiles({ reactions = [], onSelect }) {
-  return (
-    <div className="py-3">
-      <div className="flex flex-wrap gap-3">
-        {reactions.map((r) => (
-          <motion.button
-            key={r}
-            whileHover={{ scale: 1.03 }}
-            whileTap={{ scale: 0.98 }}
-            onClick={() => onSelect(r)}
-            className="px-4 py-2 bg-gradient-to-r from-purple-100 via-purple-200 to-indigo-100 text-purple-800 rounded-2xl shadow-sm border border-purple-200 hover:shadow-md"
-          >
-            {r.replace(/_/g, " ")}
-          </motion.button>
-        ))}
-      </div>
-    </div>
-  );
-}
-################################
-// src/components/PromptGallery.jsx
-import React from 'react';
-import { motion } from 'framer-motion';
-
-export default function PromptGallery({ prompts = [], onPick }) {
-  return (
-    <div className="mt-3">
-      <h4 className="text-sm font-semibold text-gray-600 mb-2">Prompt gallery</h4>
-      <div className="flex gap-3 flex-wrap">
-        {prompts.map(p => (
-          <motion.button
-            key={p.id}
-            onClick={() => onPick(p.text)}
-            whileHover={{ y: -4 }}
-            className="px-3 py-2 bg-white border rounded-lg shadow-sm text-sm text-gray-700 hover:bg-purple-50"
-            title={p.title}
-          >
-            {p.title}
-          </motion.button>
-        ))}
-      </div>
-    </div>
-  );
-}
-##############################
-// src/components/UploadPanel.jsx
-import React, { useState } from 'react';
-import { uploadFile, fetchProducts } from '../api';
-
-export default function UploadPanel({ onUploaded }) {
-  const [file, setFile] = useState(null);
-  const [reactionType, setReactionType] = useState("User_Uploads");
-  const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState(null);
-
-  const submit = async (e) => {
-    e.preventDefault();
-    if (!file) return setMessage("Select a file first");
-    setLoading(true);
-    try {
-      const res = await uploadFile(file, reactionType, file.name);
-      setMessage("Uploaded: " + (res.meta?.name || res.product_id));
-      setFile(null);
-      if (onUploaded) onUploaded(res);
-    } catch (err) {
-      console.error(err);
-      setMessage("Upload failed");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <form onSubmit={submit} className="p-4 bg-white rounded-xl shadow-sm">
-      <div className="flex gap-2 items-center">
-        <input type="file" onChange={(e) => setFile(e.target.files?.[0])} />
-        <select value={reactionType} onChange={(e) => setReactionType(e.target.value)} className="px-2 py-1 border rounded">
-          <option value="User_Uploads">User Uploads</option>
-          <option value="C-C_Bond_Formation">C-C Bond Formation</option>
-          <option value="C-N_Bond_Formation">C-N Bond Formation</option>
-          {/* add others or fetch from backend */}
-        </select>
-        <button disabled={loading} type="submit" className="px-3 py-1 bg-primary text-white rounded">Upload</button>
-      </div>
-      {message && <div className="mt-2 text-sm text-gray-600">{message}</div>}
-    </form>
-  );
-}
-#############################
-// src/App.jsx
-import React, { useEffect, useState, useRef } from "react";
-import { motion } from "framer-motion";
-
-import ChatWindow from "./components/ChatWindow";
-import ProductTabs from "./components/ProductTabs";
-import ProductDetailModal from "./components/ProductDetailModal";
-import SidebarHistory from "./components/SidebarHistory";
-import ReactionTiles from "./components/ReactionTiles";
-import PromptGallery from "./components/PromptGallery";
-import UploadPanel from "./components/UploadPanel";
-
-import {
-  fetchReactions,
-  fetchProducts,
-  fetchProductMeta,
-  fetchProductDetails,
-  fetchSchemeImageUrl,
-  fetchPrompts,
-  queryWithCitations,
-  searchProducts,
-} from "./api";
-
-import Navbar from "./Navbar/Navbar";
-import Footer from "./Footer/Footer";
-
-import chem_logo from "../assets/Chemhub_Logo_Colored.png"; // update path if needed
-
-export default function App() {
-  // Global app state
-  const [reactions, setReactions] = useState([]);
-  const [prompts, setPrompts] = useState([]);
-
-  const [products, setProducts] = useState([]);
-  const [selectedReaction, setSelectedReaction] = useState(null);
-
-  const [selectedProduct, setSelectedProduct] = useState(null); // meta
-  const [productDetails, setProductDetails] = useState(null);
-  const [productListVisible, setProductListVisible] = useState(false);
-
-  const [detailModalOpen, setDetailModalOpen] = useState(false);
-
-  const [messages, setMessages] = useState([]); // chat messages
-  const [history, setHistory] = useState([]); // conversation history list
-
-  // Loading state flags
-  const [loadingDetails, setLoadingDetails] = useState(false);
-  const [queryLoading, setQueryLoading] = useState(false);
-
-  // Selected citations (right-click / multi-select)
-  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
-
-  // For scheme preview in chat
-  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
-
-  // Typeahead search state
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState([]);
-  const searchTimeoutRef = useRef(null);
-
-  // Refs
-  const chatWindowRef = useRef(null);
-
-  // Initialize reactions and prompts
-  useEffect(() => {
-    fetchReactions().then((r) => {
-      setReactions(r || []);
-    }).catch((e) => {
-      console.error("fetchReactions error:", e);
-    });
-
-    fetchPrompts().then((p) => {
-      setPrompts(p || []);
-    }).catch((e) => {
-      console.warn("fetchPrompts failed:", e);
-    });
-
-    // minimal onboarding message
-    setMessages([{
-      role: "assistant",
-      content: "Welcome — type a reaction or product name to find documents, or ask a question directly."
-    }]);
-  }, []);
-
-  // Utility to push a message
-  const pushMessage = (m) => setMessages(prev => [...prev, m]);
-
-  // Normalize helper
-  const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
-
-  // Product selection flow (opens modal, preloads scheme, fetches details)
-  const handleSelectProduct = async (productId) => {
-    try {
-      setLoadingDetails(true);
-      const meta = await fetchProductMeta(productId);
-      setSelectedProduct(meta);
-      setProductDetails(null);
-      setSelectedSchemeUrl(null);
-      setDetailModalOpen(true);
-
-      // preload scheme image url for quicker preview
-      try {
-        const schemeUrl = fetchSchemeImageUrl(productId);
-        setSelectedSchemeUrl(schemeUrl);
-      } catch (e) {
-        // ignore
-      }
-
-      // fetch full extraction (canonical extraction)
-      const res = await fetchProductDetails(productId); // default extraction
-      const payload = (res && res.data) ? res.data : res;
-      setProductDetails(payload);
-
-      // add to history
-      setHistory(h => [{ title: meta.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: meta.id }, ...h]);
-
-    } catch (err) {
-      console.error("handleSelectProduct error:", err);
-      pushMessage({ role: "assistant", content: "Failed to load product details." });
-    } finally {
-      setLoadingDetails(false);
-    }
-  };
-
-  // When user right-clicks or context-adds a product to citations
-  const handleToggleCite = (product) => {
-    const exists = selectedCitedDocs.find(p => p.id === product.id);
-    if (exists) {
-      setSelectedCitedDocs(prev => prev.filter(p => p.id !== product.id));
-      pushMessage({ role: "assistant", content: `Removed citation: ${product.name}` });
-    } else {
-      setSelectedCitedDocs(prev => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
-      pushMessage({ role: "assistant", content: `Added citation: ${product.name}` });
-    }
-  };
-
-  // Remove citation helper (used by UI)
-  const removeCitation = (id) => {
-    const found = selectedCitedDocs.find(d => d.id === id);
-    setSelectedCitedDocs(prev => prev.filter(d => d.id !== id));
-    if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
-  };
-
-  // Search products for autocomplete (debounced)
-  useEffect(() => {
-    if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    if (!searchQuery || searchQuery.trim().length < 1) {
-      setSearchResults([]);
-      return;
-    }
-    searchTimeoutRef.current = setTimeout(async () => {
-      try {
-        const results = await searchProducts(searchQuery);
-        setSearchResults(results || []);
-      } catch (e) {
-        console.error("searchProducts error:", e);
-        setSearchResults([]);
-      }
-    }, 240); // small debounce
-    return () => {
-      if (searchTimeoutRef.current) clearTimeout(searchTimeoutRef.current);
-    };
-  }, [searchQuery]);
-
-  // Main user-send handler
-  const handleUserSend = async (text) => {
-    // push user message
-    pushMessage({ role: "user", content: text });
-
-    // Reaction detection: if text is a reaction name, list products
-    const norm = normalize(text);
-    const match = reactions.find(r => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, '_')));
-    if (match) {
-      setSelectedReaction(match);
-      try {
-        const prods = await fetchProducts(match);
-        setProducts(prods || []);
-        setProductListVisible(true);
-        pushMessage({ role: "assistant", content: `Found ${prods.length} product${(prods.length === 1 ? '' : 's')} — pick one below.`});
-      } catch (e) {
-        console.error(e);
-        pushMessage({ role: "assistant", content: "Error loading products for that reaction."});
-      }
-      return;
-    }
-
-    // If user has selected citations, query across them
-    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
-      setQueryLoading(true);
-      // show intermediate loading in chat
-      pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
-      try {
-        const ids = selectedCitedDocs.map(d => d.id);
-        const res = await queryWithCitations(ids, text);
-        const payload = (res && res.data) ? res.data : res;
-        // remove loading placeholder
-        setMessages(prev => {
-          const idx = prev.map(m => m.loading).lastIndexOf(true);
-          if (idx >= 0) {
-            const copy = [...prev];
-            copy.splice(idx, 1);
-            return copy;
-          }
-          return prev;
-        });
-        const answer = payload?.answer || payload?.response || "No relevant answer found.";
-        const sources = (payload?.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
-        pushMessage({ role: "assistant", content: answer, sources });
-      } catch (err) {
-        console.error("queryWithCitations error:", err);
-        pushMessage({ role: "assistant", content: "Error querying selected documents."});
-      } finally {
-        setQueryLoading(false);
-      }
-      return;
-    }
-
-    // If no selected product, let backend attempt to detect product name inside question
-    if (!selectedProduct) {
-      setQueryLoading(true);
-      pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
-      try {
-        const res = await fetchProductDetails(undefined, text);
-        const payload = (res && res.data) ? res.data : res;
-
-        // remove loading placeholder
-        setMessages(prev => {
-          const idx = prev.map(m => m.loading).lastIndexOf(true);
-          if (idx >= 0) {
-            const copy = [...prev];
-            copy.splice(idx, 1);
-            return copy;
-          }
-          return prev;
-        });
-
-        if (payload && payload.api_name) {
-          // structured data returned
-          let summary = "";
-          if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
-          if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
-          if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
-          if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || '').slice(0, 400)}\n\n`;
-          pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
-        } else if (payload && (payload.answer || payload.response)) {
-          const answer = payload.answer || payload.response || "No answer.";
-          const sources = (payload.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
-          pushMessage({ role: "assistant", content: answer, sources });
-        } else {
-          pushMessage({ role: "assistant", content: "No structured data found. Try selecting a product or ask for specific extraction." });
-        }
-      } catch (err) {
-        console.error("fetchProductDetails error (no product):", err);
-        pushMessage({ role: "assistant", content: "Error querying documents." });
-      } finally {
-        setQueryLoading(false);
-      }
-      return;
-    }
-
-    // If a product is already selected, query it directly
-    setQueryLoading(true);
-    pushMessage({ role: "assistant", content: "Fetching answer from selected document...", loading: true });
-    try {
-      const res = await fetchProductDetails(selectedProduct.id, text);
-      const payload = (res && res.data) ? res.data : res;
-
-      // remove loading placeholder
-      setMessages(prev => {
-        const idx = prev.map(m => m.loading).lastIndexOf(true);
-        if (idx >= 0) {
-          const copy = [...prev];
-          copy.splice(idx, 1);
-          return copy;
-        }
-        return prev;
-      });
-
-      if (payload && payload.api_name) {
-        let summary = "";
-        if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
-        if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
-        if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
-        if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || '').slice(0, 400)}\n\n`;
-        pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
-        setProductDetails(payload);
-        setDetailModalOpen(true);
-        setHistory(h => [{ title: selectedProduct.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: selectedProduct.id }, ...h]);
-      } else if (payload && (payload.answer || payload.response)) {
-        const answer = payload.answer || payload.response || "No answer.";
-        const sources = (payload.sources || []).map(s => ({ product_id: s.product_id, product_name: s.product_name }));
-        pushMessage({ role: "assistant", content: answer, sources });
-      } else {
-        pushMessage({ role: "assistant", content: "No answer found from document." });
-      }
-    } catch (err) {
-      console.error("fetchProductDetails (selected) error:", err);
-      pushMessage({ role: "assistant", content: "Error querying backend." });
-    } finally {
-      setQueryLoading(false);
-    }
-  };
-
-  // When user selects a reaction tile, fetch products for that reaction
-  const handleReactionClick = async (reactionName) => {
-    setSelectedReaction(reactionName);
-    try {
-      const prods = await fetchProducts(reactionName);
-      setProducts(prods || []);
-      setProductListVisible(true);
-      pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
-    } catch (e) {
-      console.error(e);
-      pushMessage({ role: "assistant", content: "Error loading products for that reaction."});
-    }
-  };
-
-  // When user picks a sample prompt from the gallery: send it immediately to the chat as if user typed it
-  const handlePromptPick = async (promptText) => {
-    // you could also prefer to populate the input field; we send immediately for convenience
-    await handleUserSend(promptText);
-  };
-
-  // Upload callback to refresh user uploads list
-  const handleUploadComplete = async (uploadResp) => {
-    // refresh user uploads in product list
-    try {
-      const prods = await fetchProducts("User_Uploads");
-      setProducts(prods || []);
-      setProductListVisible(true);
-      pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
-    } catch (e) {
-      console.warn("refresh uploads after upload failed:", e);
-    }
-  };
-
-  // When user clicks search result item
-  const handleSearchSelect = async (item) => {
-    setSearchQuery("");
-    setSearchResults([]);
-    // item shape: {id, name, reaction_type}
-    await handleSelectProduct(item.id);
-  };
-
-  return (
-    <>
-      <Navbar />
-
-      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex justify-center">
-        <div className="w-full max-w-7xl py-8 px-4">
-
-          {/* Header / Branding */}
-          <div className="flex items-center justify-between mb-6 gap-4">
-            <div className="flex items-center gap-4">
-              <img src={chem_logo} alt="logo" className="h-14 w-auto" />
-              <div>
-                <h1 className="text-2xl font-extrabold text-gray-900">Reaction Database AI</h1>
-                <div className="text-sm text-gray-500">Search, extract and explore reaction documents</div>
-              </div>
-            </div>
-
-            {/* Upload panel sits in header area */}
-            <div className="w-1/3 min-w-[260px]">
-              <UploadPanel onUploaded={handleUploadComplete} />
-            </div>
-          </div>
-
-          {/* Reaction tiles */}
-          <div className="mb-4">
-            <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Left column: chat + prompt gallery */}
-            <div className="lg:col-span-2">
-              {/* Chat window */}
-              <ChatWindow
-                ref={chatWindowRef}
-                messages={messages}
-                onSend={handleUserSend}
-                centeredWidth="w-full"
-                loading={queryLoading || loadingDetails}
-                selectedCitedDocs={selectedCitedDocs}
-                removeCitation={removeCitation}
-              />
-
-              {/* Prompt gallery */}
-              <div className="mt-4">
-                <PromptGallery prompts={prompts} onPick={handlePromptPick} />
-              </div>
-
-              {/* Product search (typeahead) */}
-              <div className="mt-4">
-                <label className="text-sm text-gray-600">Search products (type to autocomplete)</label>
-                <div className="relative mt-2">
-                  <input
-                    className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-secondary"
-                    placeholder="Type a product name..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
-                  {searchResults && searchResults.length > 0 && (
-                    <div className="absolute z-50 left-0 right-0 mt-1 bg-white border rounded-lg shadow max-h-56 overflow-auto">
-                      {searchResults.map((s) => (
-                        <div
-                          key={s.id}
-                          onClick={() => handleSearchSelect(s)}
-                          className="px-3 py-2 hover:bg-gray-50 cursor-pointer"
-                          title={s.name}
-                        >
-                          <div className="text-sm font-medium truncate">{s.name}</div>
-                          <div className="text-xs text-gray-400 truncate">{s.reaction_type}</div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Right column: products list + history */}
-            <div className="lg:col-span-1">
-              {/* Matched products */}
-              {productListVisible && (
-                <div className="mb-4">
-                  <h3 className="text-lg font-semibold mb-2">Matched Products</h3>
-                  <ProductTabs
-                    products={products}
-                    onSelect={handleSelectProduct}
-                    onContext={handleToggleCite} // expects ProductTabs handles onContext (right-click)
-                    citedIds={new Set(selectedCitedDocs.map(d => d.id))}
-                  />
-                </div>
-              )}
-
-              {/* Chat history / conversations */}
-              <div className="mb-4">
-                <SidebarHistory history={history} onSelect={(h) => { if (h && h.productId) handleSelectProduct(h.productId); }} />
-              </div>
-            </div>
-          </div>
-
-          {/* Product detail modal */}
-          <ProductDetailModal
-            open={detailModalOpen}
-            onClose={() => setDetailModalOpen(false)}
-            meta={selectedProduct}
-            details={productDetails}
-            loading={loadingDetails}
-          />
-
-        </div>
-      </div>
-
-      <Footer />
-    </>
-  );
-}
