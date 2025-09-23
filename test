@@ -1,4 +1,4 @@
-# main.py
+# main.py - Reaction Database AI (fixed: direct LLM for general queries + hardened Bing)
 import os
 import re
 import glob
@@ -32,13 +32,13 @@ from pptx import Presentation
 from pptx.util import Pt
 from pydantic import BaseModel as PydanticBaseModel
 
-# Optional libraries (safe-guarded)
+# Optional libs
 try:
-    import docx  # python-docx
+    import docx
 except Exception:
     docx = None
 try:
-    import pptx as pptx_lib  # python-pptx (extraction)
+    import pptx as pptx_lib
 except Exception:
     pptx_lib = None
 try:
@@ -47,18 +47,16 @@ except Exception:
     pytesseract = None
 
 # ---------------------------
-# Basic config - adapt as needed
+# Config (fill / override via env)
 # ---------------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Azure LLM config (left as you requested - fill values or set env vars if needed)
-AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL", "")  # e.g. https://your-azure-endpoint
+AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL", "")
 AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2025-01-01-preview")
 AZURE_API_KEY = os.environ.get("AZURE_API_KEY", "")
 AZURE_DEPLOYMENT = os.environ.get("AZURE_DEPLOYMENT", "api-ai4o")
 AZURE_MODEL = os.environ.get("AZURE_MODEL", "gpt-4o")
 
-# Initialize Azure services (kept per your request)
 file_store = LocalFileStore('langchain-embeddings')
 base = AzureOpenAIEmbeddings(
     model="text-embedding-3-large",
@@ -76,17 +74,14 @@ chat_model = AzureChatOpenAI(
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-# Bing / Web Search (optional)
 BING_SEARCH_ENDPOINT = os.environ.get("BING_SEARCH_ENDPOINT", "")
 BING_SEARCH_KEY = os.environ.get("BING_SEARCH_KEY", "")
-USE_BING_DEFAULT = True  # default behavior: allow Bing for general queries
+USE_BING_DEFAULT = True
 
-# JWT / Auth (simple demo secret - replace in production)
 SECRET_KEY = os.environ.get("RDB_SECRET_KEY", "myFAVsecretKEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# File locations (adjust to your environment)
 BASE_DIR = os.environ.get("RDB_BASE_DIR", r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database")
 PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
 SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
@@ -96,14 +91,13 @@ os.makedirs(PRODUCTS_DIR, exist_ok=True)
 os.makedirs(SCHEMES_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# Reaction categories
 REACTION_TYPES = [
     "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
     "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
     "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
 ]
 
-# Prompt templates
+# Prompts
 EXTRACTION_PROMPT_TEMPLATE = """
 You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
 1. **API Name**: The active pharmaceutical ingredient
@@ -152,7 +146,7 @@ Answer:
 QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
 
 # ------------------------------
-# Helpers: listing, extracting, parsing
+# Helpers: file handling & extraction
 # ------------------------------
 def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
     for ext in ['.jpeg', '.jpg', '.png', '.gif']:
@@ -163,7 +157,6 @@ def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
 
 def list_products() -> List[Dict[str, Any]]:
     products = []
-    # product folders per reaction type
     for reaction_type in REACTION_TYPES:
         reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
         if not os.path.exists(reaction_dir):
@@ -183,7 +176,7 @@ def list_products() -> List[Dict[str, Any]]:
                 "scheme_image": scheme_image if scheme_image else None,
                 "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
             })
-    # include user uploads
+    # user uploads
     uploads = glob.glob(os.path.join(UPLOADS_DIR, "*"))
     for path in uploads:
         if os.path.isdir(path):
@@ -334,11 +327,10 @@ def parse_structured_response(text: str) -> Dict[str, Any]:
     return result
 
 # ------------------------------
-# Simple in-memory conversation memory (per conversation_id)
-# For production, persist to DB.
+# Conversation memory (in-memory)
 _CHAT_MEMORY: Dict[str, List[Dict[str,str]]] = {}
 MEMORY_LOCK = threading.Lock()
-MEMORY_MAX_MESSAGES = 40  # keep last N messages in memory to include in context
+MEMORY_MAX_MESSAGES = 40
 
 def memory_append(conversation_id: str, role: str, content: str):
     if not conversation_id:
@@ -346,7 +338,6 @@ def memory_append(conversation_id: str, role: str, content: str):
     with MEMORY_LOCK:
         arr = _CHAT_MEMORY.setdefault(conversation_id, [])
         arr.append({"role": role, "content": content})
-        # trim
         if len(arr) > MEMORY_MAX_MESSAGES:
             _CHAT_MEMORY[conversation_id] = arr[-MEMORY_MAX_MESSAGES:]
 
@@ -363,35 +354,47 @@ def memory_clear(conversation_id: str):
         _CHAT_MEMORY.pop(conversation_id, None)
 
 # ------------------------------
-# Web / Bing helper
+# Bing search helper (hardened)
 def bing_search(query: str, top_k: int = 5) -> Dict[str, Any]:
     if not BING_SEARCH_ENDPOINT or not BING_SEARCH_KEY:
         return {"web_pages": [], "raw": None, "error": "Bing not configured"}
-    headers = {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY}
+    headers_variants = [
+        {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY},
+        {"Ocp-Apim-SubscriptionKey": BING_SEARCH_KEY},
+        {"Subscription-Key": BING_SEARCH_KEY},
+        {"Api-Key": BING_SEARCH_KEY},
+        {"X-Api-Key": BING_SEARCH_KEY},
+    ]
     params = {"q": query, "count": top_k, "textDecorations": True, "textFormat": "Plain"}
-    try:
-        resp = requests.get(BING_SEARCH_ENDPOINT, headers=headers, params=params, timeout=20)
-        resp.raise_for_status()
-        j = resp.json()
-        web_pages = []
-        for v in (j.get("webPages", {}).get("value", [])[:top_k]):
-            web_pages.append({"name": v.get("name"), "url": v.get("url"), "snippet": v.get("snippet")})
-        return {"web_pages": web_pages, "raw": j}
-    except Exception as e:
-        print("Bing search error:", e)
-        return {"web_pages": [], "raw": None, "error": str(e)}
+    last_err = None
+    for headers in headers_variants:
+        try:
+            resp = requests.get(BING_SEARCH_ENDPOINT, headers=headers, params=params, timeout=20)
+            if resp.status_code == 401 or resp.status_code == 403:
+                # unauthorized - try next header variant
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                continue
+            resp.raise_for_status()
+            j = resp.json()
+            web_pages = []
+            # two common shapes: j["webPages"]["value"] or j["value"]
+            values = j.get("webPages", {}).get("value") or j.get("value") or []
+            for v in values[:top_k]:
+                web_pages.append({
+                    "name": v.get("name") or v.get("title") or "",
+                    "url": v.get("url") or v.get("displayUrl") or v.get("id") or "",
+                    "snippet": v.get("snippet") or v.get("excerpt") or v.get("description") or ""
+                })
+            return {"web_pages": web_pages, "raw": j}
+        except Exception as e:
+            last_err = str(e)
+            continue
+    return {"web_pages": [], "raw": None, "error": last_err}
 
 # ------------------------------
 # FastAPI app
 app = FastAPI(title="Reaction Database AI (FastAPI)")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ------------------------------
 # Pydantic models
@@ -405,15 +408,15 @@ class ProductOut(PydanticBaseModel):
 class QARequest(PydanticBaseModel):
     product_id: Optional[str] = None
     question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-    use_bing: Optional[bool] = None  # allow client to request bing usage
-    conversation_id: Optional[str] = None  # for memory
+    use_bing: Optional[bool] = None
+    conversation_id: Optional[str] = None
 
 class QueryRequest(PydanticBaseModel):
     product_ids: List[str]
     question: str
     conversation_id: Optional[str] = None
 
-# Sample prompts (frontend)
+# Sample prompts for frontend
 SAMPLE_PROMPTS = [
     {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
     {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
@@ -422,7 +425,7 @@ SAMPLE_PROMPTS = [
 ]
 
 # ------------------------------
-# Endpoints: simple ones first
+# Basic endpoints
 @app.get("/reactions", response_model=List[str])
 def get_reactions():
     return REACTION_TYPES + ["User_Uploads"]
@@ -479,7 +482,7 @@ def product_scheme_image(product_id: str):
     raise HTTPException(status_code=404, detail="Scheme image not found")
 
 # ------------------------------
-# Upload endpoint (keep as before)
+# Upload endpoint
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str] = Form("User_Uploads"), filename: Optional[str] = Form(None)):
     try:
@@ -536,7 +539,6 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
         "extract_error": extract_error
     }
 
-    # attempt immediate indexing
     try:
         doc = Document(page_content=(text or f"[uploaded file: {orig_filename}]"), metadata={
             "product_id": product_id,
@@ -553,7 +555,7 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
     return {"meta": meta, "message": "Uploaded and indexed (if supported).", "product_id": product_id}
 
 # ------------------------------
-# Helper: product name detection (exact/overlap/similarity)
+# Product detection helpers
 def _normalize_alnum(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
@@ -568,13 +570,11 @@ def detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
     q_tokens = set(_tokens(question))
     sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
 
-    # 1) exact normalized substring
     for p in sorted_products:
         name_norm = _normalize_alnum(p["name"])
         if name_norm and name_norm in q_norm:
             return p
 
-    # 2) token overlap
     token_matches = []
     for p in sorted_products:
         pname_tokens = set(_tokens(p["name"]))
@@ -590,7 +590,6 @@ def detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
         if ratio >= 0.5:
             return p_best
 
-    # 3) similarity fallback
     best = None
     best_ratio = 0.0
     for p in products:
@@ -610,42 +609,28 @@ def detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
     return None
 
 # ------------------------------
-# product/details endpoint
+# product/details (NEW behavior: direct LLM for general queries)
 @app.post("/product/details")
 def product_details(req: QARequest):
-    """
-    Behavior:
-    - If req.product_id is provided:
-        * If canonical extraction -> run EXTRACTION_PROMPT extraction (cached)
-        * Else -> run retrieval QA on that product and return {"answer", "sources"}
-    - Else:
-        * Try to detect product by name inside the question -> retrieval for that product
-        * If no product detected:
-            - If use_bing True or default and Bing configured -> run bing_search and synthesize via LLM
-            - Else -> direct LLM call (LLMChain) using conversation memory if conversation_id provided
-    """
     try:
         q_text = (req.question or "").strip()
         if not q_text:
             return JSONResponse(status_code=400, content={"error": "question is required"})
 
         conversation_id = req.conversation_id
-        # append to memory user message
         if conversation_id:
             memory_append(conversation_id, "user", q_text)
 
         CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
         use_bing = req.use_bing if req.use_bing is not None else USE_BING_DEFAULT
 
-        # 1) explicit product_id path
+        # 1) explicit product_id path => document retrieval/extraction
         if req.product_id:
-            # find product
             prod = next((p for p in list_products() if p["id"] == req.product_id), None)
             if not prod:
                 return JSONResponse(status_code=404, content={"error": "Product not found"})
             is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
             if not is_extraction:
-                # retrieval QA
                 with _vectorstore_lock:
                     vs = _vectorstore_cache.get(prod["id"])
                 if not vs:
@@ -671,11 +656,10 @@ def product_details(req: QARequest):
                     if pid and pid not in seen:
                         seen.add(pid)
                         sources.append({"product_id": pid, "product_name": pname})
-                # append assistant message to memory
                 if conversation_id:
                     memory_append(conversation_id, "assistant", answer_text)
                 return {"answer": answer_text, "sources": sources}
-            # extraction path
+            # structured extraction path
             if req.product_id in _product_details_cache:
                 return _product_details_cache[req.product_id]
             vs = build_product_vector_store(prod)
@@ -696,10 +680,9 @@ def product_details(req: QARequest):
                 memory_append(conversation_id, "assistant", raw_response)
             return parsed
 
-        # 2) no explicit product_id => attempt detect by product name in the question
+        # 2) Attempt detect product by name in the free-text query
         detected = detect_product_by_name(q_text)
         if detected:
-            # perform retrieval for detected product
             with _vectorstore_lock:
                 vs = _vectorstore_cache.get(detected["id"])
             if not vs:
@@ -729,18 +712,15 @@ def product_details(req: QARequest):
                 memory_append(conversation_id, "assistant", answer_text)
             return {"answer": answer_text, "sources": sources}
 
-        # 3) no product detected: general query => do NOT chunk docs. Use LLM directly (optionally Bing)
-        # Build context from conversation memory (last N messages)
+        # 3) No product detected -> general query: DO NOT chunk docs.
+        # Option A: If use_bing and configured, fetch search snippets and synthesize
         mem_msgs = memory_get(conversation_id) if conversation_id else []
-        # Build memory context string
-        memory_context = ""
-        if mem_msgs:
-            memory_context = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in mem_msgs[-10:]])
+        memory_context = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in mem_msgs[-10:]]) if mem_msgs else ""
 
-        # If bing usage requested & configured -> call bing and synthesize
         if use_bing and BING_SEARCH_ENDPOINT and BING_SEARCH_KEY:
             bing_res = bing_search(q_text, top_k=5)
             web_pages = bing_res.get("web_pages", [])
+            # Build snippets context
             snippets = "\n\n".join([f"{i+1}. {wp['name']}\nURL: {wp['url']}\nSnippet: {wp['snippet']}" for i, wp in enumerate(web_pages)])
             context_for_llm = f"{memory_context}\n\nSearch results:\n{snippets}"
             synth_prompt = PromptTemplate(template="""You are a concise expert. Use ONLY the provided search snippets and conversation memory to answer the question. If the answer is not present, say 'I could not find an answer in the provided documents.' Context: {context}\nQuestion: {question}\nAnswer:""", input_variables=["context", "question"])
@@ -752,20 +732,19 @@ def product_details(req: QARequest):
                 ans = "I could not synthesize an answer from web results."
             if conversation_id:
                 memory_append(conversation_id, "assistant", ans)
-            return {"answer": ans, "web_results": web_pages}
+            return {"answer": ans, "web_results": web_pages, "source": "bing+llm"}
 
-        # 4) No bing -> direct LLM call with memory_context (if any)
-        direct_context = memory_context if memory_context else ""
-        prompt_for_direct = PromptTemplate(template="""You are a concise pharmaceutical chemistry expert. Use the conversation memory (if any) and answer directly and succinctly. Conversation Memory:\n{mem}\n\nQuestion: {question}\nAnswer:""", input_variables=["mem", "question"])
-        chain = LLMChain(llm=chat_model, prompt=prompt_for_direct)
+        # 4) No bing or not using bing -> direct LLM call with memory context
+        direct_prompt = PromptTemplate(template="""You are a concise pharmaceutical chemistry expert. Use the conversation memory (if any) and answer directly and succinctly. Conversation Memory:\n{mem}\n\nQuestion: {question}\nAnswer:""", input_variables=["mem", "question"])
+        chain = LLMChain(llm=chat_model, prompt=direct_prompt)
         try:
-            ans = chain.run({"mem": direct_context, "question": q_text})
+            ans = chain.run({"mem": memory_context, "question": q_text})
         except Exception as e:
             print("LLM direct call failed:", e)
             raise HTTPException(status_code=500, detail=f"LLM error: {e}")
         if conversation_id:
             memory_append(conversation_id, "assistant", ans)
-        return {"answer": ans}
+        return {"answer": ans, "source": "llm"}
 
     except HTTPException as he:
         raise he
@@ -781,7 +760,7 @@ def product_details(req: QARequest):
         })
 
 # ------------------------------
-# Query multiple documents endpoint (unchanged behavior)
+# Query multiple documents (unchanged)
 @app.post("/query")
 def query_documents(req: QueryRequest):
     if not req.product_ids:
@@ -859,13 +838,12 @@ def query_documents(req: QueryRequest):
         if pid and pid not in seen:
             seen.add(pid)
             sources.append({"product_id": pid, "product_name": pname})
-    # append to memory if conversation_id provided
     if req.conversation_id:
         memory_append(req.conversation_id, "assistant", answer_text)
     return {"answer": answer_text, "sources": sources}
 
 # ------------------------------
-# Search endpoint (autocomplete)
+# Search (autocomplete)
 @app.get("/products/search")
 def search_products(q: str = "", limit: int = 10):
     if q is None:
@@ -890,7 +868,7 @@ def search_products(q: str = "", limit: int = 10):
     return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
 
 # ------------------------------
-# PPT generation endpoint (keeps same behavior)
+# PPT generation endpoint
 @app.post("/generate_ppt")
 def generate_ppt(body: dict):
     topic = (body.get("topic") or "").strip()
@@ -916,7 +894,6 @@ Bullets should be concise (3-6 items per slide maximum). The entire response mus
         print("LLM error generating slide JSON:", e)
         raise HTTPException(status_code=500, detail="LLM error while generating slides")
 
-    # parse JSON robustly
     slides = []
     try:
         start = raw.find('[')
@@ -969,7 +946,7 @@ Bullets should be concise (3-6 items per slide maximum). The entire response mus
     })
 
 # ------------------------------
-# Transcribe endpoint (unchanged guidance)
+# Transcribe (unchanged guidance)
 GOOGLE_CREDENTIALS_JSON = ""
 
 @app.post("/transcribe")
@@ -999,7 +976,7 @@ async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bo
     return {"transcript": " ".join(transcripts)}
 
 # ------------------------------
-# Chat memory endpoints
+# Memory endpoints
 @app.post("/memory")
 def add_memory_item(conversation_id: str = Form(...), role: str = Form(...), content: str = Form(...)):
     memory_append(conversation_id, role, content)
@@ -1015,7 +992,7 @@ def clear_memory(conversation_id: str):
     return {"status": "cleared", "conversation_id": conversation_id}
 
 # ------------------------------
-# Health & simple auth helper
+# Health & auth
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -1028,7 +1005,6 @@ def create_access_token(data: dict, expires_delta: Union[timedelta , None] = Non
 
 @app.post("/login")
 async def login():
-    # placeholder demo login - integrate your LDAP if required
     user_info = {"first_name":"Demo","last_name":"User"}
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
