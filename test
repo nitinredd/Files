@@ -1,8 +1,7 @@
-# main.py - Reaction Database AI (updated)
+# main.py
 import os
 import re
 import glob
-import base64
 import io
 import json
 import time
@@ -14,7 +13,6 @@ import threading
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBasic
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import fitz  # PyMuPDF
@@ -30,9 +28,9 @@ from langchain.chains import RetrievalQA, LLMChain
 from langchain.prompts import PromptTemplate
 import mimetypes
 from difflib import SequenceMatcher
-from pydantic import BaseModel
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.util import Pt
+from pydantic import BaseModel as PydanticBaseModel
 
 # Optional libraries (safe-guarded)
 try:
@@ -40,7 +38,7 @@ try:
 except Exception:
     docx = None
 try:
-    import pptx as pptx_lib  # python-pptx used for extraction (optional)
+    import pptx as pptx_lib  # python-pptx (extraction)
 except Exception:
     pptx_lib = None
 try:
@@ -49,53 +47,47 @@ except Exception:
     pytesseract = None
 
 # ---------------------------
-# Config - adapt as needed
+# Basic config - adapt as needed
 # ---------------------------
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Azure LLM config (kept as you requested)
-base_url = ""  # set your azure endpoint if needed
-api_version = "2025-01-01-preview"
-api_key = ""
-deployment_name = "api-ai4o"
-model_name = "gpt-4o"
+# Azure LLM config (left as you requested - fill values or set env vars if needed)
+AZURE_BASE_URL = os.environ.get("AZURE_BASE_URL", "")  # e.g. https://your-azure-endpoint
+AZURE_API_VERSION = os.environ.get("AZURE_API_VERSION", "2025-01-01-preview")
+AZURE_API_KEY = os.environ.get("AZURE_API_KEY", "")
+AZURE_DEPLOYMENT = os.environ.get("AZURE_DEPLOYMENT", "api-ai4o")
+AZURE_MODEL = os.environ.get("AZURE_MODEL", "gpt-4o")
 
-# Initialize Azure services
+# Initialize Azure services (kept per your request)
 file_store = LocalFileStore('langchain-embeddings')
 base = AzureOpenAIEmbeddings(
     model="text-embedding-3-large",
     api_version="2025-01-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment=""
+    azure_endpoint=os.environ.get("AZURE_EMBEDDING_ENDPOINT", ""),
+    api_key=os.environ.get("AZURE_API_KEY", ""),
+    azure_deployment=os.environ.get("AZURE_EMBEDDING_DEPLOYMENT", "api-ai-3l")
 )
 chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url
+    azure_deployment=AZURE_DEPLOYMENT,
+    model=AZURE_MODEL,
+    api_version=AZURE_API_VERSION,
+    api_key=os.environ.get("AZURE_API_KEY", ""),
+    azure_endpoint=os.environ.get("AZURE_BASE_URL", "")
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-# Bing / Web Search (optional - provide keys)
-BING_SEARCH_ENDPOINT = os.environ.get("BING_SEARCH_ENDPOINT", "")  # e.g. https://api.bing.microsoft.com/v7.0/search or your azure bing endpoint
+# Bing / Web Search (optional)
+BING_SEARCH_ENDPOINT = os.environ.get("BING_SEARCH_ENDPOINT", "")
 BING_SEARCH_KEY = os.environ.get("BING_SEARCH_KEY", "")
-USE_BING_IF_NO_DOCS = True  # toggle this to disable web fallback
+USE_BING_DEFAULT = True  # default behavior: allow Bing for general queries
 
-# JWT Config
-SECRET_KEY = "myFAVsecretKEY"
+# JWT / Auth (simple demo secret - replace in production)
+SECRET_KEY = os.environ.get("RDB_SECRET_KEY", "myFAVsecretKEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# Reaction types & file layout
-REACTION_TYPES = [
-    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
-    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
-    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
-]
-
-BASE_DIR = r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database"
+# File locations (adjust to your environment)
+BASE_DIR = os.environ.get("RDB_BASE_DIR", r"C:\Users\Desktop\WORK\API\Reaction_Database\Datasets_O\Reaction_Database")
 PRODUCTS_DIR = os.path.join(BASE_DIR, "Products")
 SCHEMES_DIR = os.path.join(BASE_DIR, "Synthetic_Schemes")
 UPLOADS_DIR = os.path.join(BASE_DIR, "User_Uploads")
@@ -104,7 +96,14 @@ os.makedirs(PRODUCTS_DIR, exist_ok=True)
 os.makedirs(SCHEMES_DIR, exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-# Prompts
+# Reaction categories
+REACTION_TYPES = [
+    "C-C_Bond_Formation", "C-N_Bond_Formation", "Salt_Formation", "Hydrolysis",
+    "Amidation", "Reduction", "Oxidation", "Cyclization", "Purification",
+    "Metal_mediated_catalyzed", "C-halogen Bond Formation", "Miscellaneous"
+]
+
+# Prompt templates
 EXTRACTION_PROMPT_TEMPLATE = """
 You are a pharmaceutical chemistry expert specializing in reaction chemistry. Extract the following information from the document in a structured format Mandatorily:
 1. **API Name**: The active pharmaceutical ingredient
@@ -153,7 +152,7 @@ Answer:
 QA_PROMPT = PromptTemplate(template=QA_PROMPT_TEMPLATE, input_variables=["context", "question"])
 
 # ------------------------------
-# Helpers: file listing, extraction, indexing, parsing
+# Helpers: listing, extracting, parsing
 # ------------------------------
 def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
     for ext in ['.jpeg', '.jpg', '.png', '.gif']:
@@ -164,6 +163,7 @@ def find_scheme_image(reaction_type: str, product_name: str) -> Optional[str]:
 
 def list_products() -> List[Dict[str, Any]]:
     products = []
+    # product folders per reaction type
     for reaction_type in REACTION_TYPES:
         reaction_dir = os.path.join(PRODUCTS_DIR, reaction_type)
         if not os.path.exists(reaction_dir):
@@ -183,17 +183,17 @@ def list_products() -> List[Dict[str, Any]]:
                 "scheme_image": scheme_image if scheme_image else None,
                 "scheme_cdx": scheme_cdx if os.path.exists(scheme_cdx) else None
             })
-    # user uploads (flat)
+    # include user uploads
     uploads = glob.glob(os.path.join(UPLOADS_DIR, "*"))
     for path in uploads:
         if os.path.isdir(path):
             for fpath in glob.glob(os.path.join(path, "*.*")):
                 filename = os.path.basename(fpath)
-                product_name = os.path.splitext(filename)[0]
-                product_id = f"UserUpload_{os.path.basename(path)}_{product_name}"
+                pname = os.path.splitext(filename)[0]
+                pid = f"UserUpload_{os.path.basename(path)}_{pname}"
                 products.append({
-                    "id": product_id,
-                    "name": product_name,
+                    "id": pid,
+                    "name": pname,
                     "reaction_type": "User_Uploads",
                     "pdf_path": fpath,
                     "scheme_image": None,
@@ -202,16 +202,12 @@ def list_products() -> List[Dict[str, Any]]:
     return products
 
 def extract_pdf_text(pdf_path: str) -> str:
-    try:
-        doc = fitz.open(pdf_path)
-        text = ""
-        for page in doc:
-            text += page.get_text() + "\n"
-        return text
-    except Exception as e:
-        raise RuntimeError(f"Error reading PDF {pdf_path}: {e}")
+    doc = fitz.open(pdf_path)
+    text = ""
+    for page in doc:
+        text += page.get_text() + "\n"
+    return text
 
-# minimal extractors for other formats (safe guarded)
 def extract_docx_text(path: str) -> str:
     if docx is None:
         raise RuntimeError("python-docx not installed")
@@ -234,33 +230,23 @@ def extract_pptx_text(path: str) -> str:
     return "\n".join(texts)
 
 def extract_xls_text(path: str) -> str:
-    try:
-        xls = pd.read_excel(path, sheet_name=None)
-        parts = []
-        for sheet_name, df in xls.items():
-            parts.append(f"### Sheet: {sheet_name}")
-            parts.append(df.to_csv(index=False))
-        return "\n\n".join(parts)
-    except Exception as e:
-        raise RuntimeError(f"Failed reading excel: {e}")
+    xls = pd.read_excel(path, sheet_name=None)
+    parts = []
+    for sheet_name, df in xls.items():
+        parts.append(f"### Sheet: {sheet_name}")
+        parts.append(df.to_csv(index=False))
+    return "\n\n".join(parts)
 
 def extract_csv_text(path: str) -> str:
-    try:
-        df = pd.read_csv(path)
-        return df.to_csv(index=False)
-    except Exception as e:
-        raise RuntimeError(f"Failed reading csv: {e}")
+    df = pd.read_csv(path)
+    return df.to_csv(index=False)
 
-def extract_image_text(path: str) -> Tuple[str,bool]:
+def extract_image_text(path: str) -> Tuple[str, bool]:
     if pytesseract is None:
         return ("", False)
-    try:
-        img = Image.open(path)
-        txt = pytesseract.image_to_string(img)
-        return (txt or "", True)
-    except Exception as e:
-        print(f"OCR error: {e}")
-        return ("", False)
+    img = Image.open(path)
+    txt = pytesseract.image_to_string(img)
+    return (txt or "", True)
 
 # ------------------------------
 # Caches & locks
@@ -296,7 +282,6 @@ def build_product_vector_store(product: Dict[str, Any]) -> Optional[FAISS]:
                 else:
                     text = f"[image file: {os.path.basename(path)}]"
             else:
-                # fallback try pdf extraction then placeholder
                 try:
                     text = extract_pdf_text(path)
                 except Exception:
@@ -349,56 +334,39 @@ def parse_structured_response(text: str) -> Dict[str, Any]:
     return result
 
 # ------------------------------
-# FastAPI app
-# ------------------------------
-app = FastAPI(title="Reaction Database AI (FastAPI)")
+# Simple in-memory conversation memory (per conversation_id)
+# For production, persist to DB.
+_CHAT_MEMORY: Dict[str, List[Dict[str,str]]] = {}
+MEMORY_LOCK = threading.Lock()
+MEMORY_MAX_MESSAGES = 40  # keep last N messages in memory to include in context
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def memory_append(conversation_id: str, role: str, content: str):
+    if not conversation_id:
+        return
+    with MEMORY_LOCK:
+        arr = _CHAT_MEMORY.setdefault(conversation_id, [])
+        arr.append({"role": role, "content": content})
+        # trim
+        if len(arr) > MEMORY_MAX_MESSAGES:
+            _CHAT_MEMORY[conversation_id] = arr[-MEMORY_MAX_MESSAGES:]
 
-# ------------------------------
-# Models
-# ------------------------------
-class ProductOut(BaseModel):
-    id: str
-    name: str
-    reaction_type: str
-    has_scheme_image: bool
-    has_scheme_cdx: bool
+def memory_get(conversation_id: str) -> List[Dict[str,str]]:
+    if not conversation_id:
+        return []
+    with MEMORY_LOCK:
+        return list(_CHAT_MEMORY.get(conversation_id, []))
 
-class QARequest(BaseModel):
-    product_id: Optional[str] = None
-    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
-
-class QueryRequest(BaseModel):
-    product_ids: List[str]
-    question: str
+def memory_clear(conversation_id: str):
+    if not conversation_id:
+        return
+    with MEMORY_LOCK:
+        _CHAT_MEMORY.pop(conversation_id, None)
 
 # ------------------------------
-# Sample prompts (frontend)
-SAMPLE_PROMPTS = [
-    {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
-    {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
-    {"id": "procedure_steps", "title": "Procedure steps", "text": "List the procedure as numbered steps exactly as in the document."},
-    {"id": "conditions", "title": "Reaction conditions", "text": "List solvents, catalysts, and temperatures used in the synthesis."}
-]
-# ------------------------------
-
-# ------------------------------
-# Utility: Bing / web search helper
-# ------------------------------
+# Web / Bing helper
 def bing_search(query: str, top_k: int = 5) -> Dict[str, Any]:
-    """
-    Use Bing Web Search (Azure or classic) with endpoint and key.
-    Returns { 'web_pages': [ { name, url, snippet } ], 'raw': <response dict> }
-    """
     if not BING_SEARCH_ENDPOINT or not BING_SEARCH_KEY:
-        return {"web_pages": [], "raw": None, "error": "Bing endpoint/key not configured."}
+        return {"web_pages": [], "raw": None, "error": "Bing not configured"}
     headers = {"Ocp-Apim-Subscription-Key": BING_SEARCH_KEY}
     params = {"q": query, "count": top_k, "textDecorations": True, "textFormat": "Plain"}
     try:
@@ -406,17 +374,55 @@ def bing_search(query: str, top_k: int = 5) -> Dict[str, Any]:
         resp.raise_for_status()
         j = resp.json()
         web_pages = []
-        # Bing returns webPages.value typically
         for v in (j.get("webPages", {}).get("value", [])[:top_k]):
             web_pages.append({"name": v.get("name"), "url": v.get("url"), "snippet": v.get("snippet")})
         return {"web_pages": web_pages, "raw": j}
     except Exception as e:
-        print(f"Bing search error: {e}")
+        print("Bing search error:", e)
         return {"web_pages": [], "raw": None, "error": str(e)}
 
 # ------------------------------
-# Endpoints
+# FastAPI app
+app = FastAPI(title="Reaction Database AI (FastAPI)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ------------------------------
+# Pydantic models
+class ProductOut(PydanticBaseModel):
+    id: str
+    name: str
+    reaction_type: str
+    has_scheme_image: bool
+    has_scheme_cdx: bool
+
+class QARequest(PydanticBaseModel):
+    product_id: Optional[str] = None
+    question: str = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"
+    use_bing: Optional[bool] = None  # allow client to request bing usage
+    conversation_id: Optional[str] = None  # for memory
+
+class QueryRequest(PydanticBaseModel):
+    product_ids: List[str]
+    question: str
+    conversation_id: Optional[str] = None
+
+# Sample prompts (frontend)
+SAMPLE_PROMPTS = [
+    {"id": "extract_all", "title": "Extract structured reaction data", "text": "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data"},
+    {"id": "yield_only", "title": "Yield details", "text": "What is the yield reported for the final step? Provide percent if available."},
+    {"id": "procedure_steps", "title": "Procedure steps", "text": "List the procedure as numbered steps exactly as in the document."},
+    {"id": "conditions", "title": "Reaction conditions", "text": "List solvents, catalysts, and temperatures used in the synthesis."}
+]
+
+# ------------------------------
+# Endpoints: simple ones first
 @app.get("/reactions", response_model=List[str])
 def get_reactions():
     return REACTION_TYPES + ["User_Uploads"]
@@ -429,10 +435,7 @@ def get_prompts():
 def get_products(reaction_type: Optional[str] = None):
     allp = list_products()
     if reaction_type:
-        if reaction_type == "User_Uploads":
-            allp = [p for p in allp if p["reaction_type"] == "User_Uploads"]
-        else:
-            allp = [p for p in allp if p["reaction_type"] == reaction_type]
+        allp = [p for p in allp if p["reaction_type"] == reaction_type]
     out = []
     for p in allp:
         out.append(ProductOut(
@@ -472,20 +475,19 @@ def product_scheme_image(product_id: str):
     meta = product_meta(product_id)
     path = meta.get("scheme_image")
     if path and os.path.exists(path):
-        # let the browser handle caching / CORS (we allow_origins="*")
         return FileResponse(path, media_type="image/png", filename=os.path.basename(path))
     raise HTTPException(status_code=404, detail="Scheme image not found")
 
 # ------------------------------
-# Upload endpoint
+# Upload endpoint (keep as before)
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str] = Form("User_Uploads"), filename: Optional[str] = Form(None)):
     try:
-        rt = re.sub(r'[^a-zA-Z0-9_\- ]', '', (reaction_type or "User_Uploads"))
+        safe_rt = re.sub(r'[^a-zA-Z0-9_\- ]', '', (reaction_type or "User_Uploads"))
     except Exception:
-        rt = "User_Uploads"
+        safe_rt = "User_Uploads"
     ts = int(time.time())
-    folder_name = f"{rt}_{ts}"
+    folder_name = f"{safe_rt}_{ts}"
     out_dir = os.path.join(UPLOADS_DIR, folder_name)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -551,195 +553,106 @@ async def upload_file(file: UploadFile = File(...), reaction_type: Optional[str]
     return {"meta": meta, "message": "Uploaded and indexed (if supported).", "product_id": product_id}
 
 # ------------------------------
-# product/details (robust with detection, bing fallback, etc.)
+# Helper: product name detection (exact/overlap/similarity)
+def _normalize_alnum(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+def _tokens(s: str):
+    return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
+
+def detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
+    products = list_products()
+    if not products:
+        return None
+    q_norm = _normalize_alnum(question)
+    q_tokens = set(_tokens(question))
+    sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
+
+    # 1) exact normalized substring
+    for p in sorted_products:
+        name_norm = _normalize_alnum(p["name"])
+        if name_norm and name_norm in q_norm:
+            return p
+
+    # 2) token overlap
+    token_matches = []
+    for p in sorted_products:
+        pname_tokens = set(_tokens(p["name"]))
+        if not pname_tokens:
+            continue
+        overlap = pname_tokens.intersection(q_tokens)
+        if overlap:
+            token_matches.append((p, len(overlap), len(pname_tokens), overlap))
+    if token_matches:
+        token_matches.sort(key=lambda x: (-(x[1]/x[2]), -x[1]))
+        p_best, match_count, token_count, overlap = token_matches[0]
+        ratio = match_count / token_count
+        if ratio >= 0.5:
+            return p_best
+
+    # 3) similarity fallback
+    best = None
+    best_ratio = 0.0
+    for p in products:
+        pname = (p["name"] or "").lower()
+        if not pname.strip():
+            continue
+        r1 = SequenceMatcher(None, pname, question.lower()).ratio()
+        r2 = SequenceMatcher(None, _normalize_alnum(pname), _normalize_alnum(question)).ratio()
+        ratio = (r1 + r2) / 2.0
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best = (p, ratio, r1, r2)
+    if best:
+        p_best, ratio, _, _ = best
+        if ratio >= 0.60:
+            return p_best
+    return None
+
+# ------------------------------
+# product/details endpoint
 @app.post("/product/details")
 def product_details(req: QARequest):
+    """
+    Behavior:
+    - If req.product_id is provided:
+        * If canonical extraction -> run EXTRACTION_PROMPT extraction (cached)
+        * Else -> run retrieval QA on that product and return {"answer", "sources"}
+    - Else:
+        * Try to detect product by name inside the question -> retrieval for that product
+        * If no product detected:
+            - If use_bing True or default and Bing configured -> run bing_search and synthesize via LLM
+            - Else -> direct LLM call (LLMChain) using conversation memory if conversation_id provided
+    """
     try:
         q_text = (req.question or "").strip()
         if not q_text:
             return JSONResponse(status_code=400, content={"error": "question is required"})
 
+        conversation_id = req.conversation_id
+        # append to memory user message
+        if conversation_id:
+            memory_append(conversation_id, "user", q_text)
+
         CANONICAL_EXTRACTION = "extract api name, reaction chemistry, yield, procedure, and tabular data"
+        use_bing = req.use_bing if req.use_bing is not None else USE_BING_DEFAULT
 
-        def _normalize_alnum(s: str) -> str:
-            return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-        def _tokens(s: str):
-            return [t for t in re.split(r'[^a-z0-9]+', (s or "").lower()) if t]
-
-        print("=== /product/details called ===")
-        print("Question:", q_text)
-
-        # detection by product name (3 strategies)
-        def _detect_product_by_name(question: str) -> Optional[Dict[str, Any]]:
-            products = list_products()
-            if not products:
-                return None
-            q_norm_alnum = _normalize_alnum(question)
-            q_tokens = set(_tokens(question))
-            sorted_products = sorted(products, key=lambda p: len(p["name"]), reverse=True)
-
-            # exact normalized substring
-            for p in sorted_products:
-                name_norm = _normalize_alnum(p["name"])
-                if name_norm and name_norm in q_norm_alnum:
-                    print(f"DEBUG: Exact normalized substring -> {p['name']}")
-                    return p
-
-            # token overlap
-            token_matches = []
-            for p in sorted_products:
-                pname_tokens = set(_tokens(p["name"]))
-                if not pname_tokens:
-                    continue
-                overlap = pname_tokens.intersection(q_tokens)
-                if overlap:
-                    token_matches.append((p, len(overlap), len(pname_tokens), overlap))
-            if token_matches:
-                token_matches.sort(key=lambda x: (-(x[1]/x[2]), -x[1]))
-                p_best, match_count, token_count, overlap = token_matches[0]
-                ratio = match_count / token_count
-                print(f"DEBUG: token overlap candidate {p_best['name']} ratio={ratio:.2f}")
-                if ratio >= 0.5:
-                    return p_best
-
-            # similarity fallback
-            best = None
-            best_ratio = 0.0
-            for p in products:
-                pname = (p["name"] or "").lower()
-                if not pname.strip():
-                    continue
-                r1 = SequenceMatcher(None, pname, question.lower()).ratio()
-                r2 = SequenceMatcher(None, _normalize_alnum(pname), _normalize_alnum(question)).ratio()
-                ratio = (r1 + r2) / 2.0
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best = (p, ratio, r1, r2)
-            if best:
-                p_best, ratio, r1, r2 = best
-                print(f"DEBUG: similarity best -> {p_best['name']} ratio={ratio:.3f}")
-                if ratio >= 0.60:
-                    return p_best
-                else:
-                    print("DEBUG: best similarity below threshold")
-            return None
-
-        # run retrieval for a given product
-        def _run_retrieval_for_product(product: Dict[str, Any], question: str, k: int = 3) -> Dict[str, Any]:
-            print(f"DEBUG: Running retrieval for product {product['id']}")
-            pdf_path = product.get("pdf_path")
-            if not pdf_path or not os.path.exists(pdf_path):
-                raise HTTPException(status_code=404, detail="Product file not found")
-            pid = product["id"]
-            # try cached vectorstore, else build
-            with _vectorstore_lock:
-                vs = _vectorstore_cache.get(pid)
-            if not vs:
-                vs = build_product_vector_store(product)
-                if not vs:
-                    raise HTTPException(status_code=500, detail="Failed to build vectorstore for product")
-            retriever = vs.as_retriever(search_kwargs={"k": k})
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": QA_PROMPT},
-                return_source_documents=True
-            )
-            out = qa_chain({"query": question})
-            answer_text = out.get("result") or out.get("output_text") or ""
-            source_docs = out.get("source_documents", []) or []
-            # unique sources
-            seen = set()
-            sources = []
-            for sd in source_docs:
-                pid2 = sd.metadata.get("product_id")
-                pname = sd.metadata.get("product_name")
-                if pid2 and pid2 not in seen:
-                    seen.add(pid2)
-                    sources.append({"product_id": pid2, "product_name": pname})
-            return {"answer": answer_text, "sources": sources}
-
-        # 1) if explicit product_id provided
+        # 1) explicit product_id path
         if req.product_id:
-            products = list_products()
-            product = next((p for p in products if p["id"] == req.product_id), None)
-            if not product:
+            # find product
+            prod = next((p for p in list_products() if p["id"] == req.product_id), None)
+            if not prod:
                 return JSONResponse(status_code=404, content={"error": "Product not found"})
             is_extraction = q_text.strip().lower() == CANONICAL_EXTRACTION
             if not is_extraction:
-                return _run_retrieval_for_product(product, q_text, k=3)
-            # extraction path (structured)
-            if req.product_id in _product_details_cache:
-                return _product_details_cache[req.product_id]
-            vs = build_product_vector_store(product)
-            if not vs:
-                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid file)"})
-            retriever = vs.as_retriever(search_kwargs={"k": 1})
-            qa_chain = RetrievalQA.from_chain_type(
-                llm=chat_model,
-                chain_type="stuff",
-                retriever=retriever,
-                chain_type_kwargs={"prompt": EXTRACTION_PROMPT},
-                return_source_documents=False,
-            )
-            raw_response = qa_chain.run(q_text)
-            parsed = parse_structured_response(raw_response)
-            _product_details_cache[req.product_id] = parsed
-            return parsed
-
-        # 2) no explicit product_id: attempt detect in free text
-        detected = _detect_product_by_name(q_text)
-        if detected:
-            print(f"DEBUG: Detected product: {detected['name']} -> running retrieval")
-            return _run_retrieval_for_product(detected, q_text, k=3)
-
-        # 3) no product found -> do a multi-document retrieval across available docs (bounded)
-        print("DEBUG: No product detected - attempting multi-doc retrieval")
-        products_all = list_products()
-        docs = []
-        # limit number of docs to avoid heavy indexing (e.g., 50)
-        MAX_DOCS = 50
-        count = 0
-        for p in products_all:
-            if count >= MAX_DOCS:
-                break
-            path = p.get("pdf_path")
-            if not path or not os.path.exists(path):
-                continue
-            # Build or reuse vector store but collect Document objects to build combined index
-            try:
-                # reuse extraction logic
-                ext = os.path.splitext(path)[1].lower()
-                text = ""
-                if ext == ".pdf":
-                    text = extract_pdf_text(path)
-                elif ext in [".docx", ".doc"]:
-                    text = extract_docx_text(path)
-                elif ext == ".pptx":
-                    text = extract_pptx_text(path)
-                elif ext in [".xlsx", ".xls"]:
-                    text = extract_xls_text(path)
-                elif ext == ".csv":
-                    text = extract_csv_text(path)
-                else:
-                    try:
-                        text = extract_pdf_text(path)
-                    except Exception:
-                        text = f"[file: {os.path.basename(path)}]"
-                if not text or len(text.strip()) < 50:
-                    continue
-                doc = Document(page_content=text, metadata={"product_id": p["id"], "product_name": p["name"], "reaction_type": p["reaction_type"]})
-                docs.append(doc)
-                count += 1
-            except Exception:
-                continue
-
-        if docs:
-            try:
-                vector_store = FAISS.from_documents(docs, cached_embeddings)
-                retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+                # retrieval QA
+                with _vectorstore_lock:
+                    vs = _vectorstore_cache.get(prod["id"])
+                if not vs:
+                    vs = build_product_vector_store(prod)
+                    if not vs:
+                        return JSONResponse(status_code=500, content={"error":"Failed to build vector store for product"})
+                retriever = vs.as_retriever(search_kwargs={"k": 3})
                 qa_chain = RetrievalQA.from_chain_type(
                     llm=chat_model,
                     chain_type="stuff",
@@ -753,36 +666,106 @@ def product_details(req: QARequest):
                 seen = set()
                 sources = []
                 for sd in source_docs:
-                    pid2 = sd.metadata.get("product_id")
+                    pid = sd.metadata.get("product_id")
                     pname = sd.metadata.get("product_name")
-                    if pid2 and pid2 not in seen:
-                        seen.add(pid2)
-                        sources.append({"product_id": pid2, "product_name": pname})
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        sources.append({"product_id": pid, "product_name": pname})
+                # append assistant message to memory
+                if conversation_id:
+                    memory_append(conversation_id, "assistant", answer_text)
                 return {"answer": answer_text, "sources": sources}
-            except Exception as e:
-                print("Multi-doc retrieval error:", e)
-                # fall through to web search if enabled
+            # extraction path
+            if req.product_id in _product_details_cache:
+                return _product_details_cache[req.product_id]
+            vs = build_product_vector_store(prod)
+            if not vs:
+                return JSONResponse(status_code=500, content={"error": "Failed to build vector store (empty/invalid file)"})
+            retriever = vs.as_retriever(search_kwargs={"k": 1})
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": EXTRACTION_PROMPT},
+                return_source_documents=False,
+            )
+            raw_response = qa_chain.run(q_text)
+            parsed = parse_structured_response(raw_response)
+            _product_details_cache[req.product_id] = parsed
+            if conversation_id:
+                memory_append(conversation_id, "assistant", raw_response)
+            return parsed
 
-        # 4) fallback to Bing web search (if enabled)
-        if USE_BING_IF_NO_DOCS and BING_SEARCH_ENDPOINT and BING_SEARCH_KEY:
-            print("DEBUG: Falling back to Bing web search for query")
-            bing_result = bing_search(q_text, top_k=5)
-            web_pages = bing_result.get("web_pages", [])
-            # build a short context string (snippets) for LLM to synthesize an answer
+        # 2) no explicit product_id => attempt detect by product name in the question
+        detected = detect_product_by_name(q_text)
+        if detected:
+            # perform retrieval for detected product
+            with _vectorstore_lock:
+                vs = _vectorstore_cache.get(detected["id"])
+            if not vs:
+                vs = build_product_vector_store(detected)
+                if not vs:
+                    return JSONResponse(status_code=500, content={"error":"Failed to build vector store for detected product"})
+            retriever = vs.as_retriever(search_kwargs={"k": 3})
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=chat_model,
+                chain_type="stuff",
+                retriever=retriever,
+                chain_type_kwargs={"prompt": QA_PROMPT},
+                return_source_documents=True
+            )
+            out = qa_chain({"query": q_text})
+            answer_text = out.get("result") or out.get("output_text") or ""
+            source_docs = out.get("source_documents", []) or []
+            seen = set()
+            sources = []
+            for sd in source_docs:
+                pid = sd.metadata.get("product_id")
+                pname = sd.metadata.get("product_name")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    sources.append({"product_id": pid, "product_name": pname})
+            if conversation_id:
+                memory_append(conversation_id, "assistant", answer_text)
+            return {"answer": answer_text, "sources": sources}
+
+        # 3) no product detected: general query => do NOT chunk docs. Use LLM directly (optionally Bing)
+        # Build context from conversation memory (last N messages)
+        mem_msgs = memory_get(conversation_id) if conversation_id else []
+        # Build memory context string
+        memory_context = ""
+        if mem_msgs:
+            memory_context = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in mem_msgs[-10:]])
+
+        # If bing usage requested & configured -> call bing and synthesize
+        if use_bing and BING_SEARCH_ENDPOINT and BING_SEARCH_KEY:
+            bing_res = bing_search(q_text, top_k=5)
+            web_pages = bing_res.get("web_pages", [])
             snippets = "\n\n".join([f"{i+1}. {wp['name']}\nURL: {wp['url']}\nSnippet: {wp['snippet']}" for i, wp in enumerate(web_pages)])
-            combined_context = f"Search results for: {q_text}\n\n{snippets}"
-            # create a simple LLMChain to synthesize a concise answer from snippets
-            slide_prompt = PromptTemplate(template="""You are a concise helpful assistant. Use ONLY the following search result snippets to answer the question. If the answer cannot be found, say "I could not find an answer in the provided documents." Context: {context}\nQuestion: {question}\nAnswer:""", input_variables=["context", "question"])
-            llm_chain = LLMChain(llm=chat_model, prompt=slide_prompt)
+            context_for_llm = f"{memory_context}\n\nSearch results:\n{snippets}"
+            synth_prompt = PromptTemplate(template="""You are a concise expert. Use ONLY the provided search snippets and conversation memory to answer the question. If the answer is not present, say 'I could not find an answer in the provided documents.' Context: {context}\nQuestion: {question}\nAnswer:""", input_variables=["context", "question"])
+            chain = LLMChain(llm=chat_model, prompt=synth_prompt)
             try:
-                ans = llm_chain.run({"context": combined_context, "question": q_text})
+                ans = chain.run({"context": context_for_llm, "question": q_text})
             except Exception as e:
-                print("LLM synthesis from Bing snippets failed:", e)
+                print("LLM synth from bing failed:", e)
                 ans = "I could not synthesize an answer from web results."
+            if conversation_id:
+                memory_append(conversation_id, "assistant", ans)
             return {"answer": ans, "web_results": web_pages}
-        else:
-            # No docs and no bing -> respond politely
-            return {"response": "I could not find any matching documents. Try selecting a product, uploading a relevant document, or enable web search."}
+
+        # 4) No bing -> direct LLM call with memory_context (if any)
+        direct_context = memory_context if memory_context else ""
+        prompt_for_direct = PromptTemplate(template="""You are a concise pharmaceutical chemistry expert. Use the conversation memory (if any) and answer directly and succinctly. Conversation Memory:\n{mem}\n\nQuestion: {question}\nAnswer:""", input_variables=["mem", "question"])
+        chain = LLMChain(llm=chat_model, prompt=prompt_for_direct)
+        try:
+            ans = chain.run({"mem": direct_context, "question": q_text})
+        except Exception as e:
+            print("LLM direct call failed:", e)
+            raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+        if conversation_id:
+            memory_append(conversation_id, "assistant", ans)
+        return {"answer": ans}
 
     except HTTPException as he:
         raise he
@@ -798,7 +781,7 @@ def product_details(req: QARequest):
         })
 
 # ------------------------------
-# Query multiple documents
+# Query multiple documents endpoint (unchanged behavior)
 @app.post("/query")
 def query_documents(req: QueryRequest):
     if not req.product_ids:
@@ -876,6 +859,9 @@ def query_documents(req: QueryRequest):
         if pid and pid not in seen:
             seen.add(pid)
             sources.append({"product_id": pid, "product_name": pname})
+    # append to memory if conversation_id provided
+    if req.conversation_id:
+        memory_append(req.conversation_id, "assistant", answer_text)
     return {"answer": answer_text, "sources": sources}
 
 # ------------------------------
@@ -904,13 +890,9 @@ def search_products(q: str = "", limit: int = 10):
     return [{"id": p["id"], "name": p["name"], "reaction_type": p["reaction_type"]} for p in combined]
 
 # ------------------------------
-# PPT generation endpoint
+# PPT generation endpoint (keeps same behavior)
 @app.post("/generate_ppt")
 def generate_ppt(body: dict):
-    """
-    body: { "topic": "...", "n_slides": 5 }
-    Returns a FileResponse with a generated PPTX.
-    """
     topic = (body.get("topic") or "").strip()
     n_slides = int(body.get("n_slides") or 5)
     if not topic:
@@ -934,10 +916,9 @@ Bullets should be concise (3-6 items per slide maximum). The entire response mus
         print("LLM error generating slide JSON:", e)
         raise HTTPException(status_code=500, detail="LLM error while generating slides")
 
-    # Try to extract JSON array substring if the model added backticks or text
-    json_text = None
+    # parse JSON robustly
+    slides = []
     try:
-        # look for first '[' and last ']'
         start = raw.find('[')
         end = raw.rfind(']')
         if start != -1 and end != -1 and end > start:
@@ -945,33 +926,27 @@ Bullets should be concise (3-6 items per slide maximum). The entire response mus
             slides = json.loads(json_text)
         else:
             slides = json.loads(raw)
-    except Exception as e:
-        # try a looser extraction using regex for JSON array
+    except Exception:
         try:
             m = re.search(r'(\[.*\])', raw, re.DOTALL)
             if m:
-                json_text = m.group(1)
-                slides = json.loads(json_text)
+                slides = json.loads(m.group(1))
             else:
                 raise
         except Exception as e2:
             print("Failed to parse JSON from LLM output:", e2)
             raise HTTPException(status_code=500, detail="Failed to parse slide JSON from LLM output")
 
-    # Build PPTX
     prs = Presentation()
-    # set slide layout 1 (title + content)
     for s in slides:
         title = s.get("title", "")[:200]
         bullets = s.get("bullets", [])[:8]
-        slide_layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
-        slide = prs.slides.add_slide(slide_layout)
-        # set title
+        layout = prs.slide_layouts[1] if len(prs.slide_layouts) > 1 else prs.slide_layouts[0]
+        slide = prs.slides.add_slide(layout)
         try:
             slide.shapes.title.text = title
         except Exception:
             pass
-        # body placeholder
         try:
             body = slide.shapes.placeholders[1].text_frame
             body.clear()
@@ -981,11 +956,10 @@ Bullets should be concise (3-6 items per slide maximum). The entire response mus
                 p.level = 0
                 p.font.size = Pt(18)
         except Exception:
-            # fallback: create a textbox
-            txBox = slide.shapes.add_textbox(Inches(1), Inches(1.5), Inches(8), Inches(4))
+            txBox = slide.shapes.add_textbox(Pt(72), Pt(108), Pt(600), Pt(320))
             tf = txBox.text_frame
             tf.text = "\n".join(bullets)
-    # Save to bytes
+
     fobj = io.BytesIO()
     prs.save(fobj)
     fobj.seek(0)
@@ -1025,7 +999,23 @@ async def transcribe_audio(file: UploadFile = File(...), use_google: Optional[bo
     return {"transcript": " ".join(transcripts)}
 
 # ------------------------------
-# Health and auth
+# Chat memory endpoints
+@app.post("/memory")
+def add_memory_item(conversation_id: str = Form(...), role: str = Form(...), content: str = Form(...)):
+    memory_append(conversation_id, role, content)
+    return {"status": "ok", "conversation_id": conversation_id}
+
+@app.get("/memory/{conversation_id}")
+def get_memory(conversation_id: str):
+    return {"conversation_id": conversation_id, "messages": memory_get(conversation_id)}
+
+@app.delete("/memory/{conversation_id}")
+def clear_memory(conversation_id: str):
+    memory_clear(conversation_id)
+    return {"status": "cleared", "conversation_id": conversation_id}
+
+# ------------------------------
+# Health & simple auth helper
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -1037,7 +1027,8 @@ def create_access_token(data: dict, expires_delta: Union[timedelta , None] = Non
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 @app.post("/login")
-async def login(user_info: dict = Depends(lambda: {"first_name":"demo","last_name":"user"})):
+async def login():
+    # placeholder demo login - integrate your LDAP if required
     user_info = {"first_name":"Demo","last_name":"User"}
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
