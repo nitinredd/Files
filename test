@@ -243,9 +243,16 @@ def clean_dataframe_for_summit(df: pd.DataFrame) -> pd.DataFrame:
 def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
     """Run Summit optimization."""
     
+    print(f"Starting optimization with {len(lhs_df)} existing rows")
+    print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input vars, {len([v for v in domain.variables if v.is_objective])} objectives")
+    
     # Prepare DataFrame for Summit - ensure proper column alignment
     domain_var_names = [var.name for var in domain.variables if not var.is_objective]
     domain_obj_names = [var.name for var in domain.variables if var.is_objective]
+    
+    print(f"Domain input variables: {domain_var_names}")
+    print(f"Domain objectives: {domain_obj_names}")
+    print(f"Original DataFrame columns: {list(lhs_df.columns)}")
     
     # Create a clean DataFrame with only the columns that match domain variables
     lhs_clean = pd.DataFrame()
@@ -259,9 +266,11 @@ def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
             if col_clean == var_name or str(col) == var_name:
                 lhs_clean[var_name] = lhs_df[col]
                 found = True
+                print(f"Mapped {col} -> {var_name}")
                 break
         
         if not found:
+            print(f"WARNING: Could not find column for variable {var_name}")
             # If no matching column found, fill with NaN (this shouldn't happen with proper domain building)
             lhs_clean[var_name] = np.nan
     
@@ -273,127 +282,173 @@ def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
             if col_clean == obj_name or str(col) == obj_name:
                 lhs_clean[obj_name] = lhs_df[col]
                 found = True
+                print(f"Mapped objective {col} -> {obj_name}")
                 break
         
         if not found:
             # For objectives, we might not have data yet
             lhs_clean[obj_name] = np.nan
+            print(f"No data for objective {obj_name}, using NaN")
+    
+    print(f"Clean DataFrame shape: {lhs_clean.shape}")
+    print(f"Clean DataFrame columns: {list(lhs_clean.columns)}")
     
     # Remove rows where ALL input variables are NaN (these can't be used for optimization)
     input_vars_df = lhs_clean[domain_var_names]
     valid_rows = ~input_vars_df.isna().all(axis=1)
     lhs_clean_valid = lhs_clean[valid_rows].copy()
     
+    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
+    
     # Ensure we have some valid data
     if len(lhs_clean_valid) == 0:
-        print("Warning: No valid data rows found for optimization")
+        print("WARNING: No valid data rows found for optimization - generating random suggestion")
         # Return a random suggestion based on domain bounds
         out = pd.DataFrame()
         for var in domain.variables:
             if not var.is_objective:
                 # Generate random value within bounds
                 low, high = var.bounds
-                out[var.name] = [np.random.uniform(low, high)]
+                random_val = np.random.uniform(low, high)
+                out[var.name] = [random_val]
+                print(f"Random suggestion for {var.name}: {random_val} (bounds: {low}-{high})")
+        print(f"Generated random suggestion: {out.to_dict('records')[0]}")
         return out
     
     # Create DataSet for Summit
     try:
+        print("Creating DataSet...")
         lhs_ds = DataSet.from_df(lhs_clean_valid)
+        print(f"DataSet created successfully with {len(lhs_ds)} rows")
     except Exception as e:
         print(f"Failed to create DataSet: {e}")
+        print("Generating random fallback...")
         # Fallback to random suggestion
         out = pd.DataFrame()
         for var in domain.variables:
             if not var.is_objective:
                 low, high = var.bounds
-                out[var.name] = [np.random.uniform(low, high)]
+                random_val = np.random.uniform(low, high)
+                out[var.name] = [random_val]
         return out
     
     # Run optimization
     if nobj > 1:
         try:
+            print("Trying TSEMO optimization...")
             strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
             out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
+            print("TSEMO optimization successful")
         except Exception as e:
             print(f"TSEMO failed with error: {e}")
             print("Falling back to SNOBFIT...")
             try:
                 strat = SNOBFIT(domain)
                 out = strat.suggest_experiments(1, lhs_ds)
+                print("SNOBFIT optimization successful")
             except Exception as e2:
                 print(f"SNOBFIT also failed: {e2}")
+                print("Using random fallback...")
                 # Final fallback to random
                 out = pd.DataFrame()
                 for var in domain.variables:
                     if not var.is_objective:
                         low, high = var.bounds
-                        out[var.name] = [np.random.uniform(low, high)]
+                        random_val = np.random.uniform(low, high)
+                        out[var.name] = [random_val]
+                print(f"Random fallback generated: {out.to_dict('records')[0] if len(out) > 0 else 'EMPTY'}")
                 return out
     else:
         try:
+            print("Using SNOBFIT optimization...")
             strat = SNOBFIT(domain)
             out = strat.suggest_experiments(1, lhs_ds)
+            print("SNOBFIT optimization successful")
         except Exception as e:
             print(f"SNOBFIT failed: {e}")
+            print("Using random fallback...")
             # Fallback to random
             out = pd.DataFrame()
             for var in domain.variables:
                 if not var.is_objective:
                     low, high = var.bounds
-                    out[var.name] = [np.random.uniform(low, high)]
+                    random_val = np.random.uniform(low, high)
+                    out[var.name] = [random_val]
             return out
     
     # Clean up output
     if "strategy" in out.columns:
         out = out.drop(columns=["strategy"])
     
+    print(f"Final optimization output shape: {out.shape}")
+    print(f"Final optimization output: {out.to_dict('records')[0] if len(out) > 0 else 'EMPTY'}")
+    
     return out
 
 def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
     try:
-        print("In Domain")
+        print("Building domain...")
         domain = build_domain_from_df(lhs, objectives)
-        print("Out Domain")
+        print(f"Domain created successfully")
         print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input variables and {len([v for v in domain.variables if v.is_objective])} objectives")
+        
+        # Print domain details
+        input_vars = [v.name for v in domain.variables if not v.is_objective]
+        obj_vars = [v.name for v in domain.variables if v.is_objective]
+        print(f"Input variables: {input_vars}")
+        print(f"Objective variables: {obj_vars}")
+        
     except Exception as e:
         raise RuntimeError(f"Domain build failed: {e}")
     
     suggestions = []
     for i in range(num_suggestions):
-        print(f"Generating suggestion {i+1}/{num_suggestions}")
+        print(f"\n=== Generating suggestion {i+1}/{num_suggestions} ===")
         try:
             out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-            print("Optimization completed successfully")
+            print(f"Optimization returned: {type(out)}, shape: {out.shape if hasattr(out, 'shape') else 'N/A'}")
             
             if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
                 suggested = out.iloc[0].to_dict()
+                print(f"Raw suggestions from optimization: {suggested}")
             else:
                 suggested = {}
-                print("Warning: No suggestions returned from optimization")
+                print("WARNING: No suggestions returned from optimization, using empty dict")
 
             # Create new row with proper column mapping
             new_row = {}
+            print("Mapping suggestions to original columns:")
+            
             for col in lhs.columns:
                 # Check if we have a suggestion for this column
                 col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
                 
                 if col_clean in suggested:
                     new_row[col] = suggested[col_clean]
+                    print(f"  {col} <- {col_clean} = {suggested[col_clean]}")
                 elif col in suggested:
                     new_row[col] = suggested[col]
+                    print(f"  {col} = {suggested[col]}")
                 else:
                     # For objective columns or unmapped columns, use NaN
                     new_row[col] = np.nan
+                    print(f"  {col} = NaN (no suggestion)")
             
+            print(f"Final new row: {new_row}")
             suggestions.append(new_row)
             lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-            print(f"Added suggestion {i+1}, total rows: {len(lhs)}")
+            print(f"Successfully added suggestion {i+1}, total rows: {len(lhs)}")
             
         except Exception as e:
-            print(f"Error generating suggestion {i+1}: {e}")
+            print(f"ERROR generating suggestion {i+1}: {e}")
+            import traceback
+            traceback.print_exc()
+            
             # Create a row with all NaN values as fallback
             new_row = {c: np.nan for c in lhs.columns}
+            print(f"Using fallback row with all NaN: {new_row}")
             suggestions.append(new_row)
             lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
     
+    print(f"\n=== Final result: {len(suggestions)} suggestions added ===")
     return lhs
