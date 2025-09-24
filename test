@@ -1,484 +1,385 @@
-import pandas as pd
-import numpy as np
-from summit.domain import Domain, ContinuousVariable
-from typing import List, Dict , Any
-from summit.strategies import TSEMO,Random, SNOBFIT
-from summit.utils.dataset import DataSet
+// src/App.jsx
+import React, { useEffect, useState, useRef } from "react";
+import { motion } from "framer-motion";
 
-def HPLC_data_read_csv(file_path: str) -> np.ndarray:
-    """
-    Reads HPLC data from a CSV file.
-    Assumes the CSV has 'Area' and 'RT' columns.
-    Returns a NumPy array with [Area, RT].
-    """
-    try:
-        data = pd.read_csv(file_path)
-        data_final = pd.DataFrame()
-        data_final['Peak_Area'] = data['Area']
-        data_final['RT'] = data['RT']
-        return data_final.to_numpy()
-    except Exception as e:
-        print(f"Error reading HPLC CSV file {file_path}: {e}")
-        return np.array([]) # Return empty array on error
+import ChatWindow from "./components/ChatWindow";
+import ProductTabs from "./components/ProductTabs";
+import ProductDetailModal from "./components/ProductDetailModal";
+import SidebarHistory from "./components/SidebarHistory";
+import ReactionTiles from "./components/ReactionTiles";
+import PromptGallery from "./components/PromptGallery";
 
-def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
-    """
-    Calculates impurity response based on peak area within a given RT range.
-    data_np: NumPy array with [Area, RT]
-    IminRT, ImaxRT: Retention time range for the impurity
-    areaISO: Isocratic peak area for normalization
-    """
-    areaB = 0
-    for i in range(data_np.shape[0]):
-        if IminRT <= data_np[i, 1] <= ImaxRT:
-            areaB += data_np[i, 0]
-    return areaB / areaISO if areaISO != 0 else 0.0
+import {
+  fetchReactions,
+  fetchPrompts,
+  fetchProducts,
+  fetchProductMeta,
+  fetchProductDetails,
+  fetchSchemeImageUrl,
+  queryWithCitations,
+  uploadFile,
+} from "./api";
 
-def response_HPLC_csv(
-    data_np: np.ndarray,
-    YminRT: float, YmaxRT: float,
-    IminRT_list: List[float], ImaxRT_list: List[float],
-    minRTISO: float, maxRTISO: float,
-    nobj: int
-) -> List[float]:
-    """
-    Computes yield and impurity responses from HPLC data.
-    data_np: NumPy array with [Area, RT]
-    YminRT, YmaxRT: RT range for the main product (yield)
-    IminRT_list, ImaxRT_list: Lists of RT ranges for multiple impurities
-    minRTISO, maxRTISO: RT range for the internal standard (isocratic)
-    nobj: Number of objectives (including yield and impurities)
-    """
-    if data_np.size == 0:
-        # Return default values if data is empty
-        return [float('inf')] * nobj
+import Navbar from "./Navbar/Navbar";
+import Footer from "./Footer/Footer";
 
-    areaA = 0
-    for i in range(data_np.shape[0]):
-        if YminRT <= data_np[i, 1] <= YmaxRT:
-            areaA += data_np[i, 0]
+import chem_logo from "../assets/Chemhub_Logo_Colored.png";
 
-    areaISO = 0
-    for i in range(data_np.shape[0]):
-        if minRTISO <= data_np[i, 1] <= maxRTISO:
-            areaISO += data_np[i, 0]
+export default function App() {
+  // Global app state
+  const [reactions, setReactions] = useState([]);
+  const [prompts, setPrompts] = useState([]);
 
-    response = []
-    # Yield calculation (negative log for minimization)
-    yield_result = areaA / areaISO if areaISO != 0 else 0.0
-    response.append(-np.log(yield_result) if yield_result > 0 else float('inf')) # Handle log(0)
+  const [products, setProducts] = useState([]);
+  const [selectedReaction, setSelectedReaction] = useState(null);
 
-    # Impurities calculation
-    # nobj includes yield, so iterate for nobj-1 impurities
-    for i in range(nobj - 1):
-        if i < len(IminRT_list) and i < len(ImaxRT_list):
-            impurities_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
-            response.append(impurities_result)
-        else:
-            response.append(0.0) # Default if impurity range is missing
+  const [selectedProduct, setSelectedProduct] = useState(null); // meta
+  const [productDetails, setProductDetails] = useState(null);
+  const [productListVisible, setProductListVisible] = useState(false);
 
-    return response
+  const [detailModalOpen, setDetailModalOpen] = useState(false);
 
-def monitor_folder_creation1_csv(
-    file_path: str,
-    nobj: List,
-    YminRT: float, YmaxRT: float,
-    IminRT: float, ImaxRT: float,
-    minRTISO: float, maxRTISO: float
-) -> Dict[str, Dict[str, List[float]]]:
-    """
-    Processes a single HPLC CSV file and returns the calculated responses.
-    This function wraps the HPLC data reading and response calculation.
-    filepath = new file path (excel file path)
-    nobj = Objective data objectives names 
-    """
-    data = HPLC_data_read_csv(file_path)
-    response = response_HPLC_csv(data,YminRT,YmaxRT,IminRT,ImaxRT,minRTISO,maxRTISO,nobj)
-    return response
+  const [messages, setMessages] = useState([]); // chat messages
+  const [history, setHistory] = useState([]); // conversation history list
 
-def process_hplc_and_fill(filename: str, data_np: np.ndarray,lhs: pd.DataFrame,objectives: list,nobj,hplc_params: dict):
-    """Process HPLC data and update results."""
-    nobj = max(1, len(objectives))
-    # Calculate response
-    resp = response_HPLC_csv(
-        data_np,
-        hplc_params.get("YminRT", 2.0),
-        hplc_params.get("YmaxRT", 4.0),
-        hplc_params.get("IminRT_list", [0.5]),
-        hplc_params.get("ImaxRT_list", [1.0]),
-        hplc_params.get("minRTISO", 10.0),
-        hplc_params.get("maxRTISO", 12.0),
-        nobj
-    )
+  // Loading state flags
+  const [loadingDetails, setLoadingDetails] = useState(false);
+  const [queryLoading, setQueryLoading] = useState(false);
 
-    return resp
+  // Selected citations (right-click / multi-select)
+  const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
 
-def process_uploaded_csv_file(full_path_uploaded_csv,
-                              df,
-                              minRTISO,
-                              maxRTISO,
-                              YminRT,
-                              YmaxRT,
-                              IminRT_list,
-                              ImaxRT_list,
-                              transformed_objectives,
-                              lhs ):
-    if 'Area' in df.columns and 'RT' in df.columns:
-            data_np = df[['Area', 'RT']].to_numpy()
-    else:
-        cols_lower = {c.lower(): c for c in df.columns}
-        if 'area' in cols_lower and 'rt' in cols_lower:
-            data_np = df[[cols_lower['area'], cols_lower['rt']]].to_numpy()
-    hplc_params = {}
-    if YminRT is not None: hplc_params['YminRT'] = YminRT
-    if YmaxRT is not None: hplc_params['YmaxRT'] = YmaxRT
-    if IminRT_list is not None:
-        hplc_params['IminRT_list'] = [float(x) for x in IminRT_list if str(x).strip() != '']
+  // For scheme preview in chat
+  const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
 
-    if ImaxRT_list is not None:
-        hplc_params['ImaxRT_list'] = [float(x) for x in ImaxRT_list if str(x).strip() != '']
+  // Prompt Gallery modal state
+  const [promptGalleryOpen, setPromptGalleryOpen] = useState(false);
 
-    if minRTISO is not None: hplc_params['minRTISO'] = float(minRTISO)
-    if maxRTISO is not None: hplc_params['maxRTISO'] = float(maxRTISO)
+  // Refs
+  const chatWindowRef = useRef(null);
 
-    resp = process_hplc_and_fill(filename = full_path_uploaded_csv, 
-                                 data_np = data_np,
-                                 lhs = lhs,
-                                 objectives = transformed_objectives,
-                                 nobj = len(transformed_objectives),
-                                 hplc_params = hplc_params)
-    return resp
+  // Initialize reactions and prompts on mount
+  useEffect(() => {
+    fetchReactions()
+      .then((r) => setReactions(r || []))
+      .catch((e) => console.error("fetchReactions error:", e));
 
-def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
-    """Build optimization domain from DataFrame."""
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    domain = Domain()
-    if len(numeric_cols) == 0:
-        raise ValueError("No numeric columns to build domain.")
+    fetchPrompts()
+      .then((p) => setPrompts(p?.prompts || p || []))
+      .catch((e) => console.warn("fetchPrompts failed:", e));
 
-    # Get objective column names to exclude them from input variables
-    objective_names = [obj.get("name", "").replace(" ", "_") for obj in objectives]
-    
-    # Add ALL numeric columns as input variables (except objectives)
-    for col in numeric_cols:
-        sanitized_name = str(col).replace(" ", "_")  # Replace spaces with underscores
-        
-        # Skip if this column is an objective
-        if sanitized_name in objective_names:
-            continue
-            
-        # Calculate bounds from existing data
-        col_data = df[col].dropna()  # Remove NaN values for bound calculation
-        if len(col_data) > 0:
-            lb = float(col_data.min())
-            ub = float(col_data.max())
-            if lb == ub:
-                lb -= 1e-6
-                ub += 1e-6
-        else:
-            # Default bounds if no data available
-            lb, ub = 0.0, 1.0
-            
-        domain += ContinuousVariable(name=sanitized_name, description=str(col), bounds=[lb, ub])
+    // onboarding message
+    setMessages([
+      {
+        role: "assistant",
+        content:
+          "Welcome — type a reaction or product name to find documents, or ask a question directly. Use the Prompt Gallery for ready-made prompts.",
+      },
+    ]);
+  }, []);
 
-    # Add objectives
-    for obj in objectives:
-        obj_name = obj.get("name", "obj").replace(" ", "_")  # Sanitize objective name
-        maximize = bool(obj.get("maximize", False))
-        domain += ContinuousVariable(
-            name=obj_name,
-            description=obj_name,
-            bounds=[0, 100],
-            is_objective=True,
-            maximize=maximize
-        )
-    return domain
+  // message utilities
+  const pushMessage = (m) => setMessages((prev) => [...prev, m]);
 
-def clean_dataframe_for_summit(df: pd.DataFrame) -> pd.DataFrame:
-    """Clean DataFrame to avoid Summit/TSEMO column overlap issues."""
-    df_clean = df.copy()
-    
-    # Handle MultiIndex columns
-    if isinstance(df_clean.columns, pd.MultiIndex):
-        new_columns = []
-        for col in df_clean.columns:
-            if isinstance(col, tuple):
-                # Join tuple elements, filter out 'DATA' and empty strings
-                parts = [str(x) for x in col if str(x).upper() != 'DATA' and str(x).strip()]
-                if parts:
-                    col_name = "_".join(parts)
-                else:
-                    col_name = f"col_{len(new_columns)}"
-            else:
-                col_name = str(col)
-            
-            # Remove special characters that might cause issues
-            col_name = col_name.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
-            
-            # Ensure uniqueness
-            counter = 1
-            original_name = col_name
-            while col_name in new_columns:
-                col_name = f"{original_name}_{counter}"
-                counter += 1
-            new_columns.append(col_name)
-        
-        df_clean.columns = new_columns
-    else:
-        # Clean regular column names
-        new_columns = []
-        for col in df_clean.columns:
-            col_name = str(col).replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
-            # Ensure uniqueness
-            counter = 1
-            original_name = col_name
-            while col_name in new_columns:
-                col_name = f"{original_name}_{counter}"
-                counter += 1
-            new_columns.append(col_name)
-        df_clean.columns = new_columns
-    
-    return df_clean
+  // normalize helper
+  const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
 
-def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    """Run Summit optimization."""
-    
-    print(f"Starting optimization with {len(lhs_df)} existing rows")
-    print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input vars, {len([v for v in domain.variables if v.is_objective])} objectives")
-    
-    # Prepare DataFrame for Summit - ensure proper column alignment
-    domain_var_names = [var.name for var in domain.variables if not var.is_objective]
-    domain_obj_names = [var.name for var in domain.variables if var.is_objective]
-    
-    print(f"Domain input variables: {domain_var_names}")
-    print(f"Domain objectives: {domain_obj_names}")
-    print(f"Original DataFrame columns: {list(lhs_df.columns)}")
-    
-    # Create a clean DataFrame with only the columns that match domain variables
-    lhs_clean = pd.DataFrame()
-    
-    # Map input variables
-    for var_name in domain_var_names:
-        # Try to find matching column in original DataFrame
-        found = False
-        for col in lhs_df.columns:
-            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-            if col_clean == var_name or str(col) == var_name:
-                lhs_clean[var_name] = lhs_df[col]
-                found = True
-                print(f"Mapped {col} -> {var_name}")
-                break
-        
-        if not found:
-            print(f"WARNING: Could not find column for variable {var_name}")
-            # If no matching column found, fill with NaN (this shouldn't happen with proper domain building)
-            lhs_clean[var_name] = np.nan
-    
-    # Map objective variables  
-    for obj_name in domain_obj_names:
-        found = False
-        for col in lhs_df.columns:
-            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-            if col_clean == obj_name or str(col) == obj_name:
-                lhs_clean[obj_name] = lhs_df[col]
-                found = True
-                print(f"Mapped objective {col} -> {obj_name}")
-                break
-        
-        if not found:
-            # For objectives, we might not have data yet
-            lhs_clean[obj_name] = np.nan
-            print(f"No data for objective {obj_name}, using NaN")
-    
-    print(f"Clean DataFrame shape: {lhs_clean.shape}")
-    print(f"Clean DataFrame columns: {list(lhs_clean.columns)}")
-    
-    # Remove rows where ALL input variables are NaN (these can't be used for optimization)
-    input_vars_df = lhs_clean[domain_var_names]
-    valid_rows = ~input_vars_df.isna().all(axis=1)
-    lhs_clean_valid = lhs_clean[valid_rows].copy()
-    
-    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
-    
-    # Ensure we have some valid data
-    if len(lhs_clean_valid) == 0:
-        print("WARNING: No valid data rows found for optimization - generating random suggestion")
-        # Return a random suggestion based on domain bounds
-        out = pd.DataFrame()
-        for var in domain.variables:
-            if not var.is_objective:
-                # Generate random value within bounds
-                low, high = var.bounds
-                random_val = np.random.uniform(low, high)
-                out[var.name] = [random_val]
-                print(f"Random suggestion for {var.name}: {random_val} (bounds: {low}-{high})")
-        print(f"Generated random DataFrame shape: {out.shape}")
-        return out
-    
-    # Create DataSet for Summit
-    try:
-        print("Creating DataSet...")
-        lhs_ds = DataSet.from_df(lhs_clean_valid)
-        print(f"DataSet created successfully with {len(lhs_ds)} rows")
-    except Exception as e:
-        print(f"Failed to create DataSet: {e}")
-        print("Generating random fallback...")
-        # Fallback to random suggestion
-        out = pd.DataFrame()
-        for var in domain.variables:
-            if not var.is_objective:
-                low, high = var.bounds
-                random_val = np.random.uniform(low, high)
-                out[var.name] = [random_val]
-        return out
-    
-    # Run optimization
-    if nobj > 1:
-        try:
-            print("Trying TSEMO optimization...")
-            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
-            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
-            print("TSEMO optimization successful")
-        except Exception as e:
-            print(f"TSEMO failed with error: {e}")
-            print("Falling back to SNOBFIT...")
-            try:
-                strat = SNOBFIT(domain)
-                out = strat.suggest_experiments(1, lhs_ds)
-                print("SNOBFIT optimization successful")
-            except Exception as e2:
-                print(f"SNOBFIT also failed: {e2}")
-                print("Using random fallback...")
-                # Final fallback to random
-                out = pd.DataFrame()
-                for var in domain.variables:
-                    if not var.is_objective:
-                        low, high = var.bounds
-                        random_val = np.random.uniform(low, high)
-                        out[var.name] = [random_val]
-                print(f"Random fallback generated: {out.to_dict('records')[0] if len(out) > 0 else 'EMPTY'}")
-                return out
-    else:
-        try:
-            print("Using SNOBFIT optimization...")
-            strat = SNOBFIT(domain)
-            out = strat.suggest_experiments(1, lhs_ds)
-            print("SNOBFIT optimization successful")
-        except Exception as e:
-            print(f"SNOBFIT failed: {e}")
-            print("Using random fallback...")
-            # Fallback to random
-            out = pd.DataFrame()
-            for var in domain.variables:
-                if not var.is_objective:
-                    low, high = var.bounds
-                    random_val = np.random.uniform(low, high)
-                    out[var.name] = [random_val]
-            return out
-    
-    # Clean up output
-    if "strategy" in out.columns:
-        out = out.drop(columns=["strategy"])
-    
-    print(f"Final optimization output shape: {out.shape}")
-    print(f"Final optimization output columns: {list(out.columns)}")
-    
-    # Handle MultiIndex columns if present
-    if isinstance(out.columns, pd.MultiIndex):
-        print("MultiIndex columns detected, flattening...")
-        # Flatten MultiIndex columns by taking the first level or combining levels
-        new_columns = []
-        for col in out.columns:
-            if isinstance(col, tuple):
-                # Take the first non-empty element from the tuple
-                name = next((str(x) for x in col if str(x).strip() and str(x) != 'nan'), str(col[0]))
-                new_columns.append(name)
-            else:
-                new_columns.append(str(col))
-        out.columns = new_columns
-        print(f"Flattened columns: {list(out.columns)}")
-    
-    # Show a sample of the actual data
-    if len(out) > 0:
-        sample_dict = {}
-        for col in out.columns[:5]:  # Show first 5 columns as sample
-            sample_dict[col] = out[col].iloc[0]
-        print(f"Sample output data: {sample_dict}")
-    
-    return out
+  // === Product selection flow ===
+  const handleSelectProduct = async (productId) => {
+    try {
+      setLoadingDetails(true);
+      const meta = await fetchProductMeta(productId);
+      setSelectedProduct(meta);
+      setProductDetails(null);
+      setSelectedSchemeUrl(null);
+      setDetailModalOpen(true);
 
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
-    try:
-        print("Building domain...")
-        domain = build_domain_from_df(lhs, objectives)
-        print(f"Domain created successfully")
-        print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input variables and {len([v for v in domain.variables if v.is_objective])} objectives")
-        
-        # Print domain details
-        input_vars = [v.name for v in domain.variables if not v.is_objective]
-        obj_vars = [v.name for v in domain.variables if v.is_objective]
-        print(f"Input variables: {input_vars}")
-        print(f"Objective variables: {obj_vars}")
-        
-    except Exception as e:
-        raise RuntimeError(f"Domain build failed: {e}")
-    
-    suggestions = []
-    for i in range(num_suggestions):
-        print(f"\n=== Generating suggestion {i+1}/{num_suggestions} ===")
-        try:
-            out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-            print(f"Optimization returned: {type(out)}, shape: {out.shape if hasattr(out, 'shape') else 'N/A'}")
-            
-            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
-                print(f"Optimization output shape: {out.shape}")
-                print(f"Optimization output columns: {list(out.columns)}")
-                
-                # Convert to dictionary - handle potential MultiIndex columns
-                try:
-                    suggested = out.iloc[0].to_dict()
-                    print(f"Raw suggestions from optimization: {dict(list(suggested.items())[:5])}...")  # Show first 5
-                except Exception as e:
-                    print(f"Error converting output to dict: {e}")
-                    suggested = {}
-            else:
-                suggested = {}
-                print("WARNING: No suggestions returned from optimization, using empty dict")
+      // preload scheme image
+      try {
+        const schemeUrl = await fetchSchemeImageUrl(productId);
+        setSelectedSchemeUrl(schemeUrl);
+      } catch (e) {
+        // ignore if not available
+      }
 
-            # Create new row with proper column mapping
-            new_row = {}
-            print("Mapping suggestions to original columns:")
-            
-            for col in lhs.columns:
-                # Check if we have a suggestion for this column
-                col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-                
-                if col_clean in suggested:
-                    new_row[col] = suggested[col_clean]
-                    print(f"  {col} <- {col_clean} = {suggested[col_clean]}")
-                elif col in suggested:
-                    new_row[col] = suggested[col]
-                    print(f"  {col} = {suggested[col]}")
-                else:
-                    # For objective columns or unmapped columns, use NaN
-                    new_row[col] = np.nan
-                    print(f"  {col} = NaN (no suggestion)")
-            
-            print(f"Final new row: {new_row}")
-            suggestions.append(new_row)
-            lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-            print(f"Successfully added suggestion {i+1}, total rows: {len(lhs)}")
-            
-        except Exception as e:
-            print(f"ERROR generating suggestion {i+1}: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Create a row with all NaN values as fallback
-            new_row = {c: np.nan for c in lhs.columns}
-            print(f"Using fallback row with all NaN: {new_row}")
-            suggestions.append(new_row)
-            lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-    
-    print(f"\n=== Final result: {len(suggestions)} suggestions added ===")
-    return lhs
+      // fetch canonical extraction for the product (no question arg -> extraction)
+      const res = await fetchProductDetails(productId);
+      const payload = res?.data ?? res;
+      setProductDetails(payload);
+
+      // add to history
+      setHistory((h) => [
+        { title: meta.name, content: payload?.procedure ? payload.procedure.slice(0, 120) : "", productId: meta.id },
+        ...h,
+      ]);
+    } catch (err) {
+      console.error("handleSelectProduct error:", err);
+      pushMessage({ role: "assistant", content: "Failed to load product details." });
+    } finally {
+      setLoadingDetails(false);
+    }
+  };
+
+  // toggle citation (right-click)
+  const handleToggleCite = (product) => {
+    const exists = selectedCitedDocs.find((p) => p.id === product.id);
+    if (exists) {
+      setSelectedCitedDocs((prev) => prev.filter((p) => p.id !== product.id));
+      pushMessage({ role: "assistant", content: `Removed citation: ${product.name}` });
+    } else {
+      setSelectedCitedDocs((prev) => [{ id: product.id, name: product.name, reaction_type: product.reaction_type }, ...prev]);
+      pushMessage({ role: "assistant", content: `Added citation: ${product.name}` });
+    }
+  };
+
+  const removeCitation = (id) => {
+    const found = selectedCitedDocs.find((d) => d.id === id);
+    setSelectedCitedDocs((prev) => prev.filter((d) => d.id !== id));
+    if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
+  };
+
+  // === Upload (file) ===
+  // The ChatWindow component provides the "+" file input and will call this onUploadFile(file)
+  const handleUploadFile = async (file) => {
+    if (!file) return;
+    try {
+      pushMessage({ role: "assistant", content: `Uploading ${file.name}...` });
+      const form = new FormData();
+      form.append("file", file);
+      // You can optionally allow the UI to pick reaction_type; default to "Miscellaneous"
+      form.append("reaction_type", "Miscellaneous");
+      const resp = await uploadFile(form); // expects backend /upload
+      pushMessage({ role: "assistant", content: `Upload complete: ${file.name}` });
+      // Optionally refresh product list if user wants
+      // If your upload endpoint stored file under Products/<reaction>, it will show in fetchProducts for that reaction
+    } catch (err) {
+      console.error("uploadFile error:", err);
+      pushMessage({ role: "assistant", content: "File upload failed." });
+    }
+  };
+
+  // === Prompt gallery handlers ===
+  const openPromptGallery = () => setPromptGalleryOpen(true);
+  const closePromptGallery = () => setPromptGalleryOpen(false);
+
+  const handlePromptPick = async (promptText, sendImmediately = true) => {
+    // By default send immediately. If you'd prefer to populate the input instead,
+    // you can change sendImmediately=false and use chatWindowRef to set input.
+    closePromptGallery();
+    if (sendImmediately) {
+      await handleUserSend(promptText);
+    } else {
+      // populate chat input if ChatWindow exposes a method via ref
+      if (chatWindowRef.current && typeof chatWindowRef.current.setInput === "function") {
+        chatWindowRef.current.setInput(promptText);
+      }
+    }
+  };
+
+  // === Main user-send handler ===
+  const handleUserSend = async (text) => {
+    pushMessage({ role: "user", content: text });
+
+    // 1) If text is exactly a reaction name, list products
+    const norm = normalize(text);
+    const match = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
+    if (match) {
+      setSelectedReaction(match);
+      try {
+        const prods = await fetchProducts(match);
+        setProducts(prods || []);
+        setProductListVisible(true);
+        pushMessage({ role: "assistant", content: `Found ${prods.length} product${prods.length === 1 ? "" : "s"} — pick one below.` });
+      } catch (e) {
+        console.error("fetchProducts error:", e);
+        pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
+      }
+      return;
+    }
+
+    // 2) If user has selected citations, query across them via /query
+    if (selectedCitedDocs && selectedCitedDocs.length > 0) {
+      setQueryLoading(true);
+      // show temporary loading message (we'll add final message after)
+      pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
+      try {
+        const ids = selectedCitedDocs.map((d) => d.id);
+        const res = await queryWithCitations(ids, text);
+        const payload = res?.data ?? res;
+        // remove the loading placeholder (the last message with loading:true)
+        setMessages((prev) => {
+          const idx = [...prev].reverse().findIndex((m) => m.loading);
+          if (idx >= 0) {
+            const realIdx = prev.length - 1 - idx;
+            const copy = [...prev];
+            copy.splice(realIdx, 1);
+            return copy;
+          }
+          return prev;
+        });
+        const answer = payload?.answer || payload?.response || "No relevant answer found.";
+        const sources = payload?.sources || [];
+        pushMessage({ role: "assistant", content: answer, sources });
+      } catch (err) {
+        console.error("queryWithCitations error:", err);
+        pushMessage({ role: "assistant", content: "Error querying selected documents." });
+      } finally {
+        setQueryLoading(false);
+      }
+      return;
+    }
+
+    // 3) If no selected product, call backend /product/details WITHOUT product_id
+    // backend will try to detect a product name in free-text; if short greeting -> generative LLM
+    setQueryLoading(true);
+    pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
+    try {
+      const res = await fetchProductDetails(undefined, text); // backend handles detection/generative
+      const payload = res?.data ?? res;
+
+      // remove loading placeholder
+      setMessages((prev) => {
+        const idx = [...prev].reverse().findIndex((m) => m.loading);
+        if (idx >= 0) {
+          const realIdx = prev.length - 1 - idx;
+          const copy = [...prev];
+          copy.splice(realIdx, 1);
+          return copy;
+        }
+        return prev;
+      });
+
+      // Handle different payload shapes:
+      if (payload && payload.api_name) {
+        // structured extraction result
+        let summary = "";
+        if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
+        if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
+        if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
+        if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || "").slice(0, 400)}\n\n`;
+        pushMessage({ role: "assistant", content: summary, tables: payload.tables || [] });
+      } else if (payload && (payload.answer || payload.response || payload.response_text)) {
+        // retrieval or generative response
+        const answer = payload.answer || payload.response || payload.response_text;
+        const sources = payload.sources || [];
+        pushMessage({ role: "assistant", content: answer, sources });
+      } else {
+        // fallback
+        pushMessage({ role: "assistant", content: payload?.response || payload?.answer || "No answer found." });
+      }
+    } catch (err) {
+      console.error("fetchProductDetails (no product) error:", err);
+      pushMessage({ role: "assistant", content: "Error querying documents." });
+    } finally {
+      setQueryLoading(false);
+    }
+  };
+
+  // Reaction tile click -> fetch products
+  const handleReactionClick = async (reactionName) => {
+    setSelectedReaction(reactionName);
+    try {
+      const prods = await fetchProducts(reactionName);
+      setProducts(prods || []);
+      setProductListVisible(true);
+      pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
+    } catch (e) {
+      console.error("fetchProducts error:", e);
+      pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
+    }
+  };
+
+  // === UI: render ===
+  return (
+    <>
+      <Navbar />
+
+      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex justify-center">
+        <div className="w-full max-w-7xl py-8 px-4">
+          {/* Header */}
+          <div className="flex items-center justify-between mb-6 gap-4">
+            <div className="flex items-center gap-4">
+              <img src={chem_logo} alt="logo" className="h-14 w-auto" />
+              <div>
+                <h1 className="text-2xl font-extrabold text-gray-900">Reaction Database AI</h1>
+                <div className="text-sm text-gray-500">Search, extract and explore reaction documents</div>
+              </div>
+            </div>
+
+            {/* intentionally removed top-right upload — file upload is inside chat bar as "+" */}
+            <div className="text-sm text-gray-400">Signed in as Demo</div>
+          </div>
+
+          {/* Reaction tiles (visual, clickable) */}
+          <div className="mb-6">
+            <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Left and center: chat + prompt gallery */}
+            <div className="lg:col-span-2">
+              <ChatWindow
+                ref={chatWindowRef}
+                messages={messages}
+                onSend={handleUserSend}
+                centeredWidth="w-full"
+                loading={queryLoading || loadingDetails}
+                selectedSchemeUrl={selectedSchemeUrl}
+                selectedProduct={selectedProduct}
+                onUploadFile={handleUploadFile}       /* upload plus button inside chat */
+                openPromptGallery={() => setPromptGalleryOpen(true)} /* opens gallery modal */
+                selectedCitedDocs={selectedCitedDocs}
+                removeCitation={removeCitation}
+              />
+
+              {/* NOTE: Prompt gallery button is also inside ChatWindow; we also show a modal here */}
+              <PromptGallery
+                open={promptGalleryOpen}
+                onClose={() => setPromptGalleryOpen(false)}
+                prompts={prompts}
+                onPick={(p) => handlePromptPick(p.prompt || p)}
+                // prompts are objects like {title,prompt} from /prompt-gallery
+              />
+            </div>
+
+            {/* Right column: matched products and history */}
+            <div className="lg:col-span-1 space-y-4">
+              {productListVisible && (
+                <div className="bg-white p-4 rounded-2xl shadow">
+                  <h3 className="text-lg font-semibold mb-2">Matched Products</h3>
+                  <ProductTabs
+                    products={products}
+                    onSelect={(id) => handleSelectProduct(id)}
+                    onContext={(product) => handleToggleCite(product)} // right-click handler
+                    citedIds={new Set(selectedCitedDocs.map((d) => d.id))}
+                  />
+                </div>
+              )}
+
+              <div className="bg-white p-4 rounded-2xl shadow">
+                <h3 className="text-lg font-semibold mb-2">Recent & Saved</h3>
+                <SidebarHistory
+                  history={history}
+                  onSelect={(h) => {
+                    if (h && h.productId) handleSelectProduct(h.productId);
+                  }}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Detail modal */}
+          <ProductDetailModal
+            open={detailModalOpen}
+            onClose={() => setDetailModalOpen(false)}
+            meta={selectedProduct}
+            details={productDetails}
+            loading={loadingDetails}
+          />
+        </div>
+      </div>
+
+      <Footer />
+    </>
+  );
+}
