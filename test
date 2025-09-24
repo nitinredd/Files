@@ -5,7 +5,6 @@ import { motion } from "framer-motion";
 import ChatWindow from "./components/ChatWindow";
 import ProductTabs from "./components/ProductTabs";
 import ProductDetailModal from "./components/ProductDetailModal";
-import SidebarHistory from "./components/SidebarHistory";
 import ReactionTiles from "./components/ReactionTiles";
 import PromptGallery from "./components/PromptGallery";
 
@@ -40,7 +39,7 @@ export default function App() {
   const [detailModalOpen, setDetailModalOpen] = useState(false);
 
   const [messages, setMessages] = useState([]); // chat messages
-  const [history, setHistory] = useState([]); // conversation history list
+  const [history, setHistory] = useState([]); // still kept for product-history entries (not rendered)
 
   // Loading state flags
   const [loadingDetails, setLoadingDetails] = useState(false);
@@ -58,33 +57,75 @@ export default function App() {
   // Refs
   const chatWindowRef = useRef(null);
 
-  // Initialize reactions and prompts on mount
+  // Carousel state (5 slides)
+  const [carouselIndex, setCarouselIndex] = useState(0);
+  const carouselRef = useRef({ paused: false, intervalId: null });
+
+  // Initialize reactions and prompts
   useEffect(() => {
     fetchReactions()
-      .then((r) => setReactions(r || []))
-      .catch((e) => console.error("fetchReactions error:", e));
+      .then((r) => {
+        setReactions(r || []);
+      })
+      .catch((e) => {
+        console.error("fetchReactions error:", e);
+      });
 
     fetchPrompts()
-      .then((p) => setPrompts(p?.prompts || p || []))
-      .catch((e) => console.warn("fetchPrompts failed:", e));
+      .then((p) => {
+        // some backends return {prompts: [...]}, accept both shapes
+        setPrompts(p?.prompts || p || []);
+      })
+      .catch((e) => {
+        console.warn("fetchPrompts failed:", e);
+      });
 
-    // onboarding message
+    // minimal onboarding message
     setMessages([
       {
         role: "assistant",
         content:
-          "Welcome — type a reaction or product name to find documents, or ask a question directly. Use the Prompt Gallery for ready-made prompts.",
+          "Welcome — type a reaction or product name to find documents, or ask a question directly.",
       },
     ]);
   }, []);
 
-  // message utilities
+  // Carousel autoplay
+  useEffect(() => {
+    startCarousel();
+    return stopCarousel;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const startCarousel = () => {
+    stopCarousel();
+    carouselRef.current.intervalId = setInterval(() => {
+      if (!carouselRef.current.paused) {
+        setCarouselIndex((i) => (i + 1) % 5);
+      }
+    }, 3600);
+  };
+  const stopCarousel = () => {
+    if (carouselRef.current.intervalId) {
+      clearInterval(carouselRef.current.intervalId);
+      carouselRef.current.intervalId = null;
+    }
+  };
+
+  const pauseCarousel = () => {
+    carouselRef.current.paused = true;
+  };
+  const resumeCarousel = () => {
+    carouselRef.current.paused = false;
+  };
+
+  // Utility to push a message
   const pushMessage = (m) => setMessages((prev) => [...prev, m]);
 
-  // normalize helper
+  // Normalize helper
   const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  // === Product selection flow ===
+  // Product selection flow (opens modal, preloads scheme, fetches details)
   const handleSelectProduct = async (productId) => {
     try {
       setLoadingDetails(true);
@@ -94,22 +135,22 @@ export default function App() {
       setSelectedSchemeUrl(null);
       setDetailModalOpen(true);
 
-      // preload scheme image
+      // preload scheme image url for quicker preview
       try {
         const schemeUrl = await fetchSchemeImageUrl(productId);
         setSelectedSchemeUrl(schemeUrl);
       } catch (e) {
-        // ignore if not available
+        // ignore
       }
 
-      // fetch canonical extraction for the product (no question arg -> extraction)
-      const res = await fetchProductDetails(productId);
-      const payload = res?.data ?? res;
+      // fetch full extraction (canonical extraction)
+      const res = await fetchProductDetails(productId); // default extraction
+      const payload = (res && res.data) ? res.data : res;
       setProductDetails(payload);
 
-      // add to history
+      // add to history (kept internal)
       setHistory((h) => [
-        { title: meta.name, content: payload?.procedure ? payload.procedure.slice(0, 120) : "", productId: meta.id },
+        { title: meta.name, content: payload.procedure ? payload.procedure.slice(0, 120) : "", productId: meta.id },
         ...h,
       ]);
     } catch (err) {
@@ -120,7 +161,7 @@ export default function App() {
     }
   };
 
-  // toggle citation (right-click)
+  // When user right-clicks or context-adds a product to citations
   const handleToggleCite = (product) => {
     const exists = selectedCitedDocs.find((p) => p.id === product.id);
     if (exists) {
@@ -132,55 +173,42 @@ export default function App() {
     }
   };
 
+  // Remove citation helper (used by UI)
   const removeCitation = (id) => {
     const found = selectedCitedDocs.find((d) => d.id === id);
     setSelectedCitedDocs((prev) => prev.filter((d) => d.id !== id));
     if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
   };
 
-  // === Upload (file) ===
-  // The ChatWindow component provides the "+" file input and will call this onUploadFile(file)
+  // Upload callback (called from ChatWindow "+" button)
   const handleUploadFile = async (file) => {
     if (!file) return;
     try {
       pushMessage({ role: "assistant", content: `Uploading ${file.name}...` });
       const form = new FormData();
       form.append("file", file);
-      // You can optionally allow the UI to pick reaction_type; default to "Miscellaneous"
       form.append("reaction_type", "Miscellaneous");
-      const resp = await uploadFile(form); // expects backend /upload
+      const resp = await uploadFile(form);
       pushMessage({ role: "assistant", content: `Upload complete: ${file.name}` });
-      // Optionally refresh product list if user wants
-      // If your upload endpoint stored file under Products/<reaction>, it will show in fetchProducts for that reaction
+      // optionally refresh product lists or download response if needed
     } catch (err) {
       console.error("uploadFile error:", err);
       pushMessage({ role: "assistant", content: "File upload failed." });
     }
   };
 
-  // === Prompt gallery handlers ===
-  const openPromptGallery = () => setPromptGalleryOpen(true);
-  const closePromptGallery = () => setPromptGalleryOpen(false);
-
-  const handlePromptPick = async (promptText, sendImmediately = true) => {
-    // By default send immediately. If you'd prefer to populate the input instead,
-    // you can change sendImmediately=false and use chatWindowRef to set input.
-    closePromptGallery();
-    if (sendImmediately) {
-      await handleUserSend(promptText);
-    } else {
-      // populate chat input if ChatWindow exposes a method via ref
-      if (chatWindowRef.current && typeof chatWindowRef.current.setInput === "function") {
-        chatWindowRef.current.setInput(promptText);
-      }
-    }
+  // When user picks a sample prompt from the gallery: send it immediately to the chat
+  const handlePromptPick = async (promptText) => {
+    setPromptGalleryOpen(false);
+    await handleUserSend(promptText);
   };
 
-  // === Main user-send handler ===
+  // Main user-send handler
   const handleUserSend = async (text) => {
+    // push user message
     pushMessage({ role: "user", content: text });
 
-    // 1) If text is exactly a reaction name, list products
+    // Reaction detection: if text is a reaction name, list products
     const norm = normalize(text);
     const match = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
     if (match) {
@@ -191,34 +219,32 @@ export default function App() {
         setProductListVisible(true);
         pushMessage({ role: "assistant", content: `Found ${prods.length} product${prods.length === 1 ? "" : "s"} — pick one below.` });
       } catch (e) {
-        console.error("fetchProducts error:", e);
+        console.error(e);
         pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
       }
       return;
     }
 
-    // 2) If user has selected citations, query across them via /query
+    // If user has selected citations, query across them
     if (selectedCitedDocs && selectedCitedDocs.length > 0) {
       setQueryLoading(true);
-      // show temporary loading message (we'll add final message after)
       pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
       try {
         const ids = selectedCitedDocs.map((d) => d.id);
         const res = await queryWithCitations(ids, text);
-        const payload = res?.data ?? res;
-        // remove the loading placeholder (the last message with loading:true)
+        const payload = (res && res.data) ? res.data : res;
+        // remove loading placeholder
         setMessages((prev) => {
-          const idx = [...prev].reverse().findIndex((m) => m.loading);
+          const idx = prev.map((m) => m.loading).lastIndexOf(true);
           if (idx >= 0) {
-            const realIdx = prev.length - 1 - idx;
             const copy = [...prev];
-            copy.splice(realIdx, 1);
+            copy.splice(idx, 1);
             return copy;
           }
           return prev;
         });
         const answer = payload?.answer || payload?.response || "No relevant answer found.";
-        const sources = payload?.sources || [];
+        const sources = (payload?.sources || []).map((s) => ({ product_id: s.product_id, product_name: s.product_name }));
         pushMessage({ role: "assistant", content: answer, sources });
       } catch (err) {
         console.error("queryWithCitations error:", err);
@@ -229,53 +255,49 @@ export default function App() {
       return;
     }
 
-    // 3) If no selected product, call backend /product/details WITHOUT product_id
-    // backend will try to detect a product name in free-text; if short greeting -> generative LLM
+    // If no selected product, let backend attempt to detect product name inside question or route to LLM
     setQueryLoading(true);
     pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
     try {
-      const res = await fetchProductDetails(undefined, text); // backend handles detection/generative
-      const payload = res?.data ?? res;
+      const res = await fetchProductDetails(undefined, text);
+      const payload = (res && res.data) ? res.data : res;
 
       // remove loading placeholder
       setMessages((prev) => {
-        const idx = [...prev].reverse().findIndex((m) => m.loading);
+        const idx = prev.map((m) => m.loading).lastIndexOf(true);
         if (idx >= 0) {
-          const realIdx = prev.length - 1 - idx;
           const copy = [...prev];
-          copy.splice(realIdx, 1);
+          copy.splice(idx, 1);
           return copy;
         }
         return prev;
       });
 
-      // Handle different payload shapes:
       if (payload && payload.api_name) {
-        // structured extraction result
+        // structured data returned
         let summary = "";
         if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
         if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
         if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
         if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || "").slice(0, 400)}\n\n`;
-        pushMessage({ role: "assistant", content: summary, tables: payload.tables || [] });
-      } else if (payload && (payload.answer || payload.response || payload.response_text)) {
-        // retrieval or generative response
-        const answer = payload.answer || payload.response || payload.response_text;
-        const sources = payload.sources || [];
+        pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
+      } else if (payload && (payload.answer || payload.response)) {
+        const answer = payload.answer || payload.response || "No answer.";
+        const sources = (payload.sources || []).map((s) => ({ product_id: s.product_id, product_name: s.product_name }));
         pushMessage({ role: "assistant", content: answer, sources });
       } else {
-        // fallback
-        pushMessage({ role: "assistant", content: payload?.response || payload?.answer || "No answer found." });
+        pushMessage({ role: "assistant", content: "No structured data found. Try selecting a product or ask for specific extraction." });
       }
     } catch (err) {
-      console.error("fetchProductDetails (no product) error:", err);
+      console.error("fetchProductDetails error (no product):", err);
       pushMessage({ role: "assistant", content: "Error querying documents." });
     } finally {
       setQueryLoading(false);
     }
+    return;
   };
 
-  // Reaction tile click -> fetch products
+  // When user selects a reaction tile, fetch products for that reaction
   const handleReactionClick = async (reactionName) => {
     setSelectedReaction(reactionName);
     try {
@@ -284,40 +306,108 @@ export default function App() {
       setProductListVisible(true);
       pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
     } catch (e) {
-      console.error("fetchProducts error:", e);
+      console.error(e);
       pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
     }
   };
 
-  // === UI: render ===
+  // Render helper: carousel slides
+  const Carousel = () => {
+    // five slides: 0 = welcome + logo; 1-4 = placeholders
+    const slides = [
+      { id: 0, content: "welcome" },
+      { id: 1, content: "placeholder-1" },
+      { id: 2, content: "placeholder-2" },
+      { id: 3, content: "placeholder-3" },
+      { id: 4, content: "placeholder-4" },
+    ];
+
+    return (
+      <div
+        className="w-full overflow-hidden rounded-2xl mb-6"
+        onMouseEnter={pauseCarousel}
+        onMouseLeave={resumeCarousel}
+      >
+        <div
+          className="flex w-[500%] transition-transform duration-700"
+          style={{ transform: `translateX(-${carouselIndex * 100}%)` }}
+        >
+          {/* Slide 0: Welcome + logo */}
+          <div className="w-full flex-shrink-0 flex items-center justify-center p-8 bg-gradient-to-r from-white to-white">
+            <div className="w-full max-w-3xl bg-white/5 rounded-2xl p-6 shadow-lg flex flex-col items-center justify-center">
+              <div className="text-xl font-bold text-gray-700 mb-4">Welcome to</div>
+              <img src={chem_logo} alt="logo" className="h-24 w-auto" />
+            </div>
+          </div>
+
+          {/* Slide 1 */}
+          <div className="w-full flex-shrink-0 flex items-center justify-center p-8">
+            <div className="w-full max-w-3xl h-36 rounded-2xl shadow-lg flex items-center justify-center"
+                 style={{ background: "linear-gradient(135deg,#FFB199,#FF8A8A)" }}>
+              {/* empty placeholder - add images later */}
+            </div>
+          </div>
+
+          {/* Slide 2 */}
+          <div className="w-full flex-shrink-0 flex items-center justify-center p-8">
+            <div className="w-full max-w-3xl h-36 rounded-2xl shadow-lg flex items-center justify-center"
+                 style={{ background: "linear-gradient(135deg,#A0FFAF,#78D9FF)" }}>
+            </div>
+          </div>
+
+          {/* Slide 3 */}
+          <div className="w-full flex-shrink-0 flex items-center justify-center p-8">
+            <div className="w-full max-w-3xl h-36 rounded-2xl shadow-lg flex items-center justify-center"
+                 style={{ background: "linear-gradient(135deg,#C7B2FF,#FFD6A5)" }}>
+            </div>
+          </div>
+
+          {/* Slide 4 */}
+          <div className="w-full flex-shrink-0 flex items-center justify-center p-8">
+            <div className="w-full max-w-3xl h-36 rounded-2xl shadow-lg flex items-center justify-center"
+                 style={{ background: "linear-gradient(135deg,#FFD1DC,#C3F6FF)" }}>
+            </div>
+          </div>
+        </div>
+
+        {/* pager dots */}
+        <div className="flex items-center justify-center gap-2 mt-3">
+          {slides.map((s) => (
+            <button
+              key={s.id}
+              className={`w-2 h-2 rounded-full ${carouselIndex === s.id ? "bg-gray-800" : "bg-gray-300"}`}
+              onClick={() => setCarouselIndex(s.id)}
+              aria-label={`Go to slide ${s.id + 1}`}
+            />
+          ))}
+        </div>
+      </div>
+    );
+  };
+
   return (
     <>
       <Navbar />
 
       <div className="min-h-screen bg-gradient-to-b from-bg to-white flex justify-center">
         <div className="w-full max-w-7xl py-8 px-4">
-          {/* Header */}
-          <div className="flex items-center justify-between mb-6 gap-4">
-            <div className="flex items-center gap-4">
-              <img src={chem_logo} alt="logo" className="h-14 w-auto" />
-              <div>
-                <h1 className="text-2xl font-extrabold text-gray-900">Reaction Database AI</h1>
-                <div className="text-sm text-gray-500">Search, extract and explore reaction documents</div>
-              </div>
-            </div>
-
-            {/* intentionally removed top-right upload — file upload is inside chat bar as "+" */}
-            <div className="text-sm text-gray-400">Signed in as Demo</div>
+          {/* Header - centered logo only */}
+          <div className="flex items-center justify-center mb-6">
+            <img src={chem_logo} alt="logo" className="h-16 w-auto" />
           </div>
 
-          {/* Reaction tiles (visual, clickable) */}
-          <div className="mb-6">
+          {/* Carousel slides (5 sliding rectangles) */}
+          <Carousel />
+
+          {/* Reaction tiles */}
+          <div className="mb-4">
             <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
           </div>
 
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Left and center: chat + prompt gallery */}
+            {/* Left column: chat + prompt gallery */}
             <div className="lg:col-span-2">
+              {/* Chat window */}
               <ChatWindow
                 ref={chatWindowRef}
                 messages={messages}
@@ -332,43 +422,32 @@ export default function App() {
                 removeCitation={removeCitation}
               />
 
-              {/* NOTE: Prompt gallery button is also inside ChatWindow; we also show a modal here */}
+              {/* Prompt gallery modal */}
               <PromptGallery
                 open={promptGalleryOpen}
                 onClose={() => setPromptGalleryOpen(false)}
                 prompts={prompts}
                 onPick={(p) => handlePromptPick(p.prompt || p)}
-                // prompts are objects like {title,prompt} from /prompt-gallery
               />
             </div>
 
-            {/* Right column: matched products and history */}
-            <div className="lg:col-span-1 space-y-4">
+            {/* Right column: products list */}
+            <div className="lg:col-span-1">
               {productListVisible && (
-                <div className="bg-white p-4 rounded-2xl shadow">
+                <div className="mb-4">
                   <h3 className="text-lg font-semibold mb-2">Matched Products</h3>
                   <ProductTabs
                     products={products}
                     onSelect={(id) => handleSelectProduct(id)}
-                    onContext={(product) => handleToggleCite(product)} // right-click handler
+                    onContext={(product) => handleToggleCite(product)}
                     citedIds={new Set(selectedCitedDocs.map((d) => d.id))}
                   />
                 </div>
               )}
-
-              <div className="bg-white p-4 rounded-2xl shadow">
-                <h3 className="text-lg font-semibold mb-2">Recent & Saved</h3>
-                <SidebarHistory
-                  history={history}
-                  onSelect={(h) => {
-                    if (h && h.productId) handleSelectProduct(h.productId);
-                  }}
-                />
-              </div>
             </div>
           </div>
 
-          {/* Detail modal */}
+          {/* Product detail modal */}
           <ProductDetailModal
             open={detailModalOpen}
             onClose={() => setDetailModalOpen(false)}
