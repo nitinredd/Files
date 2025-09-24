@@ -243,109 +243,157 @@ def clean_dataframe_for_summit(df: pd.DataFrame) -> pd.DataFrame:
 def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
     """Run Summit optimization."""
     
-    # Clean the DataFrame first
-    lhs_df_clean = clean_dataframe_for_summit(lhs_df)
+    # Prepare DataFrame for Summit - ensure proper column alignment
+    domain_var_names = [var.name for var in domain.variables if not var.is_objective]
+    domain_obj_names = [var.name for var in domain.variables if var.is_objective]
     
+    # Create a clean DataFrame with only the columns that match domain variables
+    lhs_clean = pd.DataFrame()
+    
+    # Map input variables
+    for var_name in domain_var_names:
+        # Try to find matching column in original DataFrame
+        found = False
+        for col in lhs_df.columns:
+            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+            if col_clean == var_name or str(col) == var_name:
+                lhs_clean[var_name] = lhs_df[col]
+                found = True
+                break
+        
+        if not found:
+            # If no matching column found, fill with NaN (this shouldn't happen with proper domain building)
+            lhs_clean[var_name] = np.nan
+    
+    # Map objective variables  
+    for obj_name in domain_obj_names:
+        found = False
+        for col in lhs_df.columns:
+            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+            if col_clean == obj_name or str(col) == obj_name:
+                lhs_clean[obj_name] = lhs_df[col]
+                found = True
+                break
+        
+        if not found:
+            # For objectives, we might not have data yet
+            lhs_clean[obj_name] = np.nan
+    
+    # Remove rows where ALL input variables are NaN (these can't be used for optimization)
+    input_vars_df = lhs_clean[domain_var_names]
+    valid_rows = ~input_vars_df.isna().all(axis=1)
+    lhs_clean_valid = lhs_clean[valid_rows].copy()
+    
+    # Ensure we have some valid data
+    if len(lhs_clean_valid) == 0:
+        print("Warning: No valid data rows found for optimization")
+        # Return a random suggestion based on domain bounds
+        out = pd.DataFrame()
+        for var in domain.variables:
+            if not var.is_objective:
+                # Generate random value within bounds
+                low, high = var.bounds
+                out[var.name] = [np.random.uniform(low, high)]
+        return out
+    
+    # Create DataSet for Summit
+    try:
+        lhs_ds = DataSet.from_df(lhs_clean_valid)
+    except Exception as e:
+        print(f"Failed to create DataSet: {e}")
+        # Fallback to random suggestion
+        out = pd.DataFrame()
+        for var in domain.variables:
+            if not var.is_objective:
+                low, high = var.bounds
+                out[var.name] = [np.random.uniform(low, high)]
+        return out
+    
+    # Run optimization
     if nobj > 1:
         try:
-            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=4000)
-            lhs_ds = DataSet.from_df(lhs_df_clean)
-            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=100, iterations=100)
+            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
+            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
         except Exception as e:
             print(f"TSEMO failed with error: {e}")
             print("Falling back to SNOBFIT...")
-            # Fallback to SNOBFIT if TSEMO fails
-            strat = SNOBFIT(domain)
-            lhs_ds = DataSet.from_df(lhs_df_clean)
-            out = strat.suggest_experiments(1, lhs_ds)
+            try:
+                strat = SNOBFIT(domain)
+                out = strat.suggest_experiments(1, lhs_ds)
+            except Exception as e2:
+                print(f"SNOBFIT also failed: {e2}")
+                # Final fallback to random
+                out = pd.DataFrame()
+                for var in domain.variables:
+                    if not var.is_objective:
+                        low, high = var.bounds
+                        out[var.name] = [np.random.uniform(low, high)]
+                return out
     else:
-        strat = SNOBFIT(domain)
-        lhs_ds = DataSet.from_df(lhs_df_clean)
-        out = strat.suggest_experiments(1, lhs_ds)
+        try:
+            strat = SNOBFIT(domain)
+            out = strat.suggest_experiments(1, lhs_ds)
+        except Exception as e:
+            print(f"SNOBFIT failed: {e}")
+            # Fallback to random
+            out = pd.DataFrame()
+            for var in domain.variables:
+                if not var.is_objective:
+                    low, high = var.bounds
+                    out[var.name] = [np.random.uniform(low, high)]
+            return out
     
-    # Clean up output column names
-    try:
-        if isinstance(out.columns, pd.MultiIndex):
-            out.columns = [col[0] if isinstance(col, tuple) else str(col) for col in out.columns]
-        else:
-            out.columns = [str(col) for col in out.columns]
-    except Exception:
-        pass
-    
-    # Remove strategy column if present
+    # Clean up output
     if "strategy" in out.columns:
         out = out.drop(columns=["strategy"])
     
-    # Map back to original column structure
-    original_columns = lhs_df.columns
-    cleaned_columns = lhs_df_clean.columns
-    
-    # Create mapping from cleaned names back to original names
-    if len(original_columns) == len(cleaned_columns):
-        column_mapping = dict(zip(cleaned_columns, original_columns))
-        
-        # Get all input variable columns (non-objective columns from output)
-        output_cols = [c for c in out.columns if c != "strategy"]
-        mapped_cols = []
-        
-        for col in output_cols:
-            if col in column_mapping:
-                mapped_cols.append(column_mapping[col])
-            elif col in original_columns:
-                mapped_cols.append(col)
-        
-        if mapped_cols:
-            # Reindex output to match original DataFrame column structure
-            out_reindexed = pd.DataFrame(index=out.index)
-            for orig_col in original_columns:
-                if orig_col in mapped_cols:
-                    # Find the corresponding output column
-                    reverse_mapping = {v: k for k, v in column_mapping.items()}
-                    clean_col = reverse_mapping.get(orig_col, orig_col)
-                    if clean_col in out.columns:
-                        out_reindexed[orig_col] = out[clean_col]
-                    else:
-                        out_reindexed[orig_col] = np.nan
-                else:
-                    out_reindexed[orig_col] = np.nan
-            out = out_reindexed
-    else:
-        # Fallback: create DataFrame with original column structure
-        out_reindexed = pd.DataFrame(index=out.index)
-        for orig_col in original_columns:
-            if isinstance(orig_col, tuple):
-                # Handle MultiIndex columns
-                clean_col = "_".join(str(x) for x in orig_col if str(x).upper() != 'DATA' and str(x).strip())
-                clean_col = clean_col.replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
-            else:
-                clean_col = str(orig_col).replace(' ', '_').replace('(', '').replace(')', '').replace('-', '_')
-            
-            if clean_col in out.columns:
-                out_reindexed[orig_col] = out[clean_col]
-            else:
-                out_reindexed[orig_col] = np.nan
-        out = out_reindexed
-    
     return out
 
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]],lhs):
+def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
     try:
         print("In Domain")
         domain = build_domain_from_df(lhs, objectives)
         print("Out Domain")
+        print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input variables and {len([v for v in domain.variables if v.is_objective])} objectives")
     except Exception as e:
         raise RuntimeError(f"Domain build failed: {e}")
+    
     suggestions = []
-    for _ in range(num_suggestions):
-        print("in run optimization")
-        out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-        print("out run optimization")
-        if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
-            suggested = out.iloc[0].to_dict()
-        else:
-            suggested = {}
+    for i in range(num_suggestions):
+        print(f"Generating suggestion {i+1}/{num_suggestions}")
+        try:
+            out = run_summit_optimization(domain, lhs, len(objectives) or 1)
+            print("Optimization completed successfully")
+            
+            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
+                suggested = out.iloc[0].to_dict()
+            else:
+                suggested = {}
+                print("Warning: No suggestions returned from optimization")
 
-        new_row = {c: (np.nan if c not in suggested else suggested[c]) for c in lhs.columns}
-        suggestions.append(new_row)
-        lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+            # Create new row with proper column mapping
+            new_row = {}
+            for col in lhs.columns:
+                # Check if we have a suggestion for this column
+                col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+                
+                if col_clean in suggested:
+                    new_row[col] = suggested[col_clean]
+                elif col in suggested:
+                    new_row[col] = suggested[col]
+                else:
+                    # For objective columns or unmapped columns, use NaN
+                    new_row[col] = np.nan
+            
+            suggestions.append(new_row)
+            lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+            print(f"Added suggestion {i+1}, total rows: {len(lhs)}")
+            
+        except Exception as e:
+            print(f"Error generating suggestion {i+1}: {e}")
+            # Create a row with all NaN values as fallback
+            new_row = {c: np.nan for c in lhs.columns}
+            suggestions.append(new_row)
+            lhs = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+    
     return lhs
