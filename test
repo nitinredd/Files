@@ -24,13 +24,6 @@ import Footer from "./Footer/Footer";
 
 import chem_logo from "../assets/Chemhub_Logo_Colored.png";
 
-// SAFE environment lookup for browser (works for Vite, CRA and runtime window override)
-const API_BASE =
-  (typeof import !== "undefined" && typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_API_BASE) ||
-  (typeof process !== "undefined" && process.env && process.env.REACT_APP_API_BASE) ||
-  (typeof window !== "undefined" && window.__env && window.__env.API_BASE) ||
-  "";
-
 export default function App() {
   // Global app state
   const [reactions, setReactions] = useState([]);
@@ -48,11 +41,14 @@ export default function App() {
   const [messages, setMessages] = useState([]); // chat messages
   const [history, setHistory] = useState([]); // conversation history list
 
+  // Loading state flags
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [queryLoading, setQueryLoading] = useState(false);
 
+  // Selected citations (right-click / multi-select)
   const [selectedCitedDocs, setSelectedCitedDocs] = useState([]);
 
+  // For scheme preview in chat
   const [selectedSchemeUrl, setSelectedSchemeUrl] = useState(null);
 
   // Prompt gallery UI
@@ -67,18 +63,25 @@ export default function App() {
   const SLIDE_COUNT = 5;
 
   const chatWindowRef = useRef(null);
+  const uploadInputRef = useRef(null);
 
+  // Initialize reactions and prompts
   useEffect(() => {
-    // load reactions + prompts
     fetchReactions()
       .then((r) => setReactions(r || []))
       .catch((e) => console.error("fetchReactions error:", e));
 
     fetchPrompts()
-      .then((p) => setPrompts((p && p.prompts) || p || []))
+      .then((p) => {
+        // fetchPrompts may return {prompts: [...] } or just [...]
+        if (!p) return setPrompts([]);
+        if (Array.isArray(p)) return setPrompts(p);
+        if (p.prompts) return setPrompts(p.prompts);
+        return setPrompts([]);
+      })
       .catch((e) => console.warn("fetchPrompts failed:", e));
 
-    // onboarding message
+    // minimal onboarding message
     setMessages([
       {
         role: "assistant",
@@ -92,17 +95,17 @@ export default function App() {
   useEffect(() => {
     sliderIntervalRef.current = setInterval(() => {
       setSlideIndex((s) => (s + 1) % SLIDE_COUNT);
-    }, 4000);
+    }, 4200);
     return () => clearInterval(sliderIntervalRef.current);
   }, []);
 
-  // helper: push message
+  // Utility to push a message
   const pushMessage = (m) => setMessages((prev) => [...prev, m]);
 
-  // normalize
+  // Normalize helper
   const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  // UPLOAD handler -> uses configurable API_BASE to avoid 404 on different hosts
+  // UPLOAD handler -> posts to relative /upload endpoint (same origin)
   const handleUploadFile = async (file, reaction_type = "Miscellaneous") => {
     if (!file) return;
     const form = new FormData();
@@ -110,43 +113,47 @@ export default function App() {
     form.append("reaction_type", reaction_type || "Miscellaneous");
 
     try {
-      const resp = await fetch(`${API_BASE}/upload`, {
+      // Post to relative endpoint to avoid host mismatch issues (no env variables)
+      const resp = await fetch(`/upload`, {
         method: "POST",
         body: form,
       });
+
       if (!resp.ok) {
-        const text = await resp.text();
-        const errMsg = `Upload failed: ${resp.status} ${text}`;
-        console.error("Upload error (frontend):", errMsg);
-        pushMessage({ role: "assistant", content: `Upload failed: ${resp.status}. See console.` });
-        throw new Error(errMsg);
+        const txt = await resp.text().catch(() => "");
+        console.error("Upload failed:", resp.status, txt);
+        pushMessage({ role: "assistant", content: `Upload failed: ${resp.status}` });
+        return { ok: false, status: resp.status, text: txt };
       }
-      const json = await resp.json();
-      // refresh product list (heuristic)
+
+      const data = await resp.json().catch(() => ({}));
+      pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
+
+      // Refresh product listing for that reaction type (best-effort)
       try {
-        const prods = await fetchProducts("Miscellaneous");
+        const prods = await fetchProducts(reaction_type);
         setProducts(prods || []);
         setProductListVisible(true);
       } catch (e) {
         // ignore
       }
-      pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
-      return json;
+
+      return { ok: true, data };
     } catch (err) {
       console.error("Upload error (frontend):", err);
-      pushMessage({ role: "assistant", content: "Upload failed. See console for details." });
-      throw err;
+      pushMessage({ role: "assistant", content: "Upload failed — see console." });
+      return { ok: false, error: String(err) };
     }
   };
 
-  // When user clicks reaction tile
+  // When user clicks a reaction tile, fetch products for that reaction and open expanded view
   const handleReactionClick = async (reactionName) => {
     setSelectedReaction(reactionName);
     try {
       const prods = await fetchProducts(reactionName);
       setProducts(prods || []);
       setProductListVisible(true);
-      setExpandedViewOpen(true); // open the big workspace
+      setExpandedViewOpen(true);
       pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
     } catch (e) {
       console.error(e);
@@ -154,7 +161,13 @@ export default function App() {
     }
   };
 
-  // handle product select -> open modal + extract
+  // When user picks a sample prompt from the gallery: send it immediately to the chat as if user typed it
+  const handlePromptPick = async (promptText) => {
+    setPromptGalleryOpen(false);
+    await handleUserSend(promptText);
+  };
+
+  // When user selects a product
   const handleSelectProduct = async (productId) => {
     try {
       setLoadingDetails(true);
@@ -164,6 +177,7 @@ export default function App() {
       setSelectedSchemeUrl(null);
       setDetailModalOpen(true);
 
+      // preload scheme image url for quicker preview
       try {
         const schemeUrl = await fetchSchemeImageUrl(productId);
         setSelectedSchemeUrl(schemeUrl);
@@ -171,8 +185,9 @@ export default function App() {
         // ignore
       }
 
+      // fetch full extraction (canonical extraction)
       try {
-        const res = await fetchProductDetails(productId); // canonical extraction
+        const res = await fetchProductDetails(productId); // default extraction
         const payload = (res && res.data) ? res.data : res;
         setProductDetails(payload);
         setHistory((h) => [
@@ -180,18 +195,18 @@ export default function App() {
           ...h,
         ]);
       } catch (e) {
-        console.error("fetchProductDetails error:", e);
+        console.error("fetchProductDetails error (select product):", e);
         pushMessage({ role: "assistant", content: "Failed to load product details." });
       }
-    } catch (e) {
-      console.error("handleSelectProduct error:", e);
+    } catch (err) {
+      console.error("handleSelectProduct error:", err);
       pushMessage({ role: "assistant", content: "Failed to load product metadata." });
     } finally {
       setLoadingDetails(false);
     }
   };
 
-  // citations toggling
+  // When user right-clicks or context-adds a product to citations
   const handleToggleCite = (product) => {
     const exists = selectedCitedDocs.find((p) => p.id === product.id);
     if (exists) {
@@ -203,41 +218,37 @@ export default function App() {
     }
   };
 
+  // Remove citation helper (used by UI)
   const removeCitation = (id) => {
     const found = selectedCitedDocs.find((d) => d.id === id);
     setSelectedCitedDocs((prev) => prev.filter((d) => d.id !== id));
     if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
   };
 
-  // prompt pick
-  const handlePromptPick = async (promptText) => {
-    setPromptGalleryOpen(false);
-    await handleUserSend(promptText);
-  };
-
-  // main send handler (same logic as before: reactions detection, citation queries, product detection, fallback LLM)
+  // Main user-send handler
   const handleUserSend = async (text) => {
+    // push user message
     pushMessage({ role: "user", content: text });
 
-    // reaction exact match
+    // Reaction detection: if text is a reaction name, list products
     const norm = normalize(text);
-    const reactionMatch = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
-    if (reactionMatch) {
-      setSelectedReaction(reactionMatch);
+    const match = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
+    if (match) {
+      setSelectedReaction(match);
       try {
-        const prods = await fetchProducts(reactionMatch);
+        const prods = await fetchProducts(match);
         setProducts(prods || []);
         setProductListVisible(true);
         setExpandedViewOpen(true);
         pushMessage({ role: "assistant", content: `Found ${prods.length} product${prods.length === 1 ? "" : "s"} — opened expanded view.` });
       } catch (e) {
         console.error(e);
-        pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
+        pushMessage({ role: "assistant", content: "Error loading products for that reaction."});
       }
       return;
     }
 
-    // if citations selected -> query with citations
+    // If user has selected citations, query across them
     if (selectedCitedDocs && selectedCitedDocs.length > 0) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
@@ -245,7 +256,7 @@ export default function App() {
         const ids = selectedCitedDocs.map((d) => d.id);
         const res = await queryWithCitations(ids, text);
         const payload = (res && res.data) ? res.data : res;
-        // remove loading message placeholder
+        // remove loading placeholder
         setMessages((prev) => {
           const idx = prev.map((m) => m.loading).lastIndexOf(true);
           if (idx >= 0) {
@@ -260,20 +271,21 @@ export default function App() {
         pushMessage({ role: "assistant", content: answer, sources });
       } catch (err) {
         console.error("queryWithCitations error:", err);
-        pushMessage({ role: "assistant", content: "Error querying selected documents." });
+        pushMessage({ role: "assistant", content: "Error querying selected documents."});
       } finally {
         setQueryLoading(false);
       }
       return;
     }
 
-    // no selected product -> let backend detect or answer generatively
+    // If no selected product, let backend attempt to detect product name inside question
     if (!selectedProduct) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
       try {
         const res = await fetchProductDetails(undefined, text);
         const payload = (res && res.data) ? res.data : res;
+
         // remove loading placeholder
         setMessages((prev) => {
           const idx = prev.map((m) => m.loading).lastIndexOf(true);
@@ -286,13 +298,13 @@ export default function App() {
         });
 
         if (payload && payload.api_name) {
-          // structured extraction
+          // structured data returned
           let summary = "";
           if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
           if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
           if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
           if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || "").slice(0, 400)}\n\n`;
-          pushMessage({ role: "assistant", content: summary, tables: payload.tables || [] });
+          pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
         } else if (payload && (payload.answer || payload.response)) {
           const answer = payload.answer || payload.response || "No answer.";
           const sources = (payload.sources || []).map((s) => ({ product_id: s.product_id, product_name: s.product_name }));
@@ -309,7 +321,7 @@ export default function App() {
       return;
     }
 
-    // product selected -> query it directly
+    // If a product is already selected, query it directly
     setQueryLoading(true);
     pushMessage({ role: "assistant", content: "Fetching answer from selected document...", loading: true });
     try {
@@ -333,10 +345,10 @@ export default function App() {
         if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
         if (payload.yield) summary += `Yield: ${payload.yield}\n\n`;
         if (payload.procedure) summary += `Procedure (excerpt):\n${(payload.procedure || "").slice(0, 400)}\n\n`;
-        pushMessage({ role: "assistant", content: summary, tables: payload.tables || [] });
+        pushMessage({ role: "assistant", content: summary, tables: (payload.tables || []) });
         setProductDetails(payload);
         setDetailModalOpen(true);
-        setHistory((h) => [{ title: selectedProduct.name, content: payload.procedure ? payload.procedure.slice(0, 120) : "", productId: selectedProduct.id }, ...h]);
+        setHistory((h) => [{ title: selectedProduct.name, content: payload.procedure ? payload.procedure.slice(0,120) : '', productId: selectedProduct.id }, ...h]);
       } else if (payload && (payload.answer || payload.response)) {
         const answer = payload.answer || payload.response || "No answer.";
         const sources = (payload.sources || []).map((s) => ({ product_id: s.product_id, product_name: s.product_name }));
@@ -354,15 +366,36 @@ export default function App() {
 
   // build neutral professional slides (only one visible at a time)
   const slides = [
-    { id: 0, content: (<div className="flex flex-col items-center justify-center"><div className="text-lg font-semibold text-gray-700">Welcome to</div><img src={chem_logo} alt="logo" className="h-20 w-auto mt-2" /></div>) },
-    { id: 1, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
-    { id: 2, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
-    { id: 3, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
-    { id: 4, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
+    {
+      id: 0,
+      content: (
+        <div className="flex flex-col items-center justify-center">
+          <div className="text-lg font-semibold text-gray-700">Welcome to</div>
+          <img src={chem_logo} alt="logo" className="h-20 w-auto mt-2" />
+        </div>
+      ),
+    },
+    { id: 1, content: <div className="h-full w-full flex items-center justify-center text-gray-600" /> },
+    { id: 2, content: <div className="h-full w-full flex items-center justify-center text-gray-600" /> },
+    { id: 3, content: <div className="h-full w-full flex items-center justify-center text-gray-600" /> },
+    { id: 4, content: <div className="h-full w-full flex items-center justify-center text-gray-600" /> },
   ];
 
   // small helper to close expanded view
   const closeExpandedView = () => setExpandedViewOpen(false);
+
+  // file input click handler (trigger hidden input)
+  const onPlusClick = () => {
+    if (uploadInputRef.current) uploadInputRef.current.click();
+  };
+
+  const onFileInputChange = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    await handleUploadFile(f, "Miscellaneous");
+    // clear input
+    e.target.value = "";
+  };
 
   return (
     <>
@@ -380,9 +413,7 @@ export default function App() {
               >
                 {slides.map((s, i) => (
                   <div key={s.id} className="w-full flex-shrink-0 p-6 bg-gray-50" style={{ width: `${100 / SLIDE_COUNT}%` }}>
-                    <div className="h-36 flex items-center justify-center">
-                      {s.content}
-                    </div>
+                    <div className="h-36 flex items-center justify-center">{s.content}</div>
                   </div>
                 ))}
               </div>
@@ -404,7 +435,11 @@ export default function App() {
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             {/* Center: chat bar (as centered bar) */}
             <div className="lg:col-span-2 flex justify-center">
-              <div className="w-full max-w-2xl">
+              <div className="w-full max-w-2xl relative">
+                {/* Hidden file input for uploads; plus button triggers it */}
+                <input ref={uploadInputRef} type="file" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg" className="hidden" onChange={onFileInputChange} />
+
+                {/* ChatWindow component (compact centered bar look inside ChatWindow component) */}
                 <ChatWindow
                   ref={chatWindowRef}
                   messages={messages}
@@ -413,9 +448,30 @@ export default function App() {
                   loading={queryLoading || loadingDetails}
                   selectedCitedDocs={selectedCitedDocs}
                   removeCitation={removeCitation}
-                  onUploadFile={handleUploadFile}          // upload button in ChatWindow should call this
-                  openPromptGallery={() => setPromptGalleryOpen(true)}
+                  // NOTE: ChatWindow currently doesn't render the plus button inside; we overlay it from App for visual alignment
                 />
+
+                {/* Plus button visually placed near left side of chat input (approx near microphone) */}
+                <div className="absolute left-4 bottom-6">
+                  <button
+                    onClick={onPlusClick}
+                    title="Upload file"
+                    className="flex items-center justify-center w-10 h-10 rounded-full border border-gray-200 bg-white shadow hover:scale-95"
+                    aria-label="Upload"
+                  >
+                    <span className="text-xl font-extrabold">+</span>
+                  </button>
+                </div>
+
+                {/* Prompt Gallery button centered below chat window */}
+                <div className="flex justify-center mt-4">
+                  <button
+                    onClick={() => setPromptGalleryOpen(true)}
+                    className="px-4 py-2 rounded-full bg-white border shadow-sm hover:shadow-md text-sm font-medium"
+                  >
+                    Prompt Gallery
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -466,8 +522,6 @@ export default function App() {
                           loading={queryLoading || loadingDetails}
                           selectedCitedDocs={selectedCitedDocs}
                           removeCitation={removeCitation}
-                          onUploadFile={handleUploadFile}
-                          openPromptGallery={() => setPromptGalleryOpen(true)}
                         />
                       </div>
                     </div>
