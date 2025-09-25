@@ -8,7 +8,6 @@ import ProductDetailModal from "./components/ProductDetailModal";
 import SidebarHistory from "./components/SidebarHistory";
 import ReactionTiles from "./components/ReactionTiles";
 import PromptGallery from "./components/PromptGallery";
-import UploadPanel from "./components/UploadPanel"; // keep if you still want it; we won't show header upload
 
 import {
   fetchReactions,
@@ -18,13 +17,15 @@ import {
   fetchSchemeImageUrl,
   fetchPrompts,
   queryWithCitations,
-  searchProducts,
 } from "./api";
 
 import Navbar from "./Navbar/Navbar";
 import Footer from "./Footer/Footer";
 
 import chem_logo from "../assets/Chemhub_Logo_Colored.png";
+
+// Base URL for backend (set REACT_APP_API_BASE in .env if backend is on different host)
+const API_BASE = process.env.REACT_APP_API_BASE || "";
 
 export default function App() {
   // Global app state
@@ -53,7 +54,7 @@ export default function App() {
   // Prompt gallery UI
   const [promptGalleryOpen, setPromptGalleryOpen] = useState(false);
 
-  // Expanded full-page view (when user clicks a reaction or wants larger workspace)
+  // Expanded full-page view (when user clicks a reaction type)
   const [expandedViewOpen, setExpandedViewOpen] = useState(false);
 
   // Slider state
@@ -63,59 +64,61 @@ export default function App() {
 
   const chatWindowRef = useRef(null);
 
-  // Init reactions/prompts + onboarding assistant message
   useEffect(() => {
+    // load reactions + prompts
     fetchReactions()
       .then((r) => setReactions(r || []))
       .catch((e) => console.error("fetchReactions error:", e));
 
     fetchPrompts()
-      .then((p) => setPrompts(p?.prompts || p || []))
+      .then((p) => setPrompts((p && p.prompts) || p || []))
       .catch((e) => console.warn("fetchPrompts failed:", e));
 
-    // initial assistant hint
+    // onboarding message
     setMessages([
       {
         role: "assistant",
-        content: "Welcome — type a reaction or product name to find documents, click a reaction tile to explore, or ask a question directly.",
+        content:
+          "Welcome — type a reaction or product name to find documents, click a reaction tile to explore, or ask a question directly.",
       },
     ]);
   }, []);
 
-  // Slider autoplay
+  // Slider autoplay (one slide at a time)
   useEffect(() => {
     sliderIntervalRef.current = setInterval(() => {
       setSlideIndex((s) => (s + 1) % SLIDE_COUNT);
-    }, 3500);
-    return () => {
-      if (sliderIntervalRef.current) clearInterval(sliderIntervalRef.current);
-    };
+    }, 4000);
+    return () => clearInterval(sliderIntervalRef.current);
   }, []);
 
-  // helper push
+  // helper: push message
   const pushMessage = (m) => setMessages((prev) => [...prev, m]);
 
-  // Normalize helper
+  // normalize
   const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  // Upload handler (passed to ChatWindow as onUploadFile). Uses fetch to avoid axios issues.
-  const handleUploadFile = async (file) => {
+  // UPLOAD handler -> uses configurable API_BASE to avoid 404 on different hosts
+  const handleUploadFile = async (file, reaction_type = "Miscellaneous") => {
     if (!file) return;
     const form = new FormData();
     form.append("file", file);
-    // optional reaction_type can be added by user UI; default to "Miscellaneous"
-    form.append("reaction_type", "Miscellaneous");
+    form.append("reaction_type", reaction_type || "Miscellaneous");
+
     try {
-      const res = await fetch("/upload", {
+      const resp = await fetch(`${API_BASE}/upload`, {
         method: "POST",
         body: form,
       });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Upload failed: ${res.status} ${text}`);
+      if (!resp.ok) {
+        const text = await resp.text();
+        const errMsg = `Upload failed: ${resp.status} ${text}`;
+        console.error("Upload error (frontend):", errMsg);
+        pushMessage({ role: "assistant", content: `Upload failed: ${resp.status}. See console.` });
+        throw new Error(errMsg);
       }
-      const payload = await res.json();
-      // refresh products from uploads location (if your backend stores under a reaction folder)
+      const json = await resp.json();
+      // refresh product list (heuristic)
       try {
         const prods = await fetchProducts("Miscellaneous");
         setProducts(prods || []);
@@ -124,7 +127,7 @@ export default function App() {
         // ignore
       }
       pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
-      return payload;
+      return json;
     } catch (err) {
       console.error("Upload error (frontend):", err);
       pushMessage({ role: "assistant", content: "Upload failed. See console for details." });
@@ -132,7 +135,22 @@ export default function App() {
     }
   };
 
-  // When a product is selected (from ProductTabs)
+  // When user clicks reaction tile
+  const handleReactionClick = async (reactionName) => {
+    setSelectedReaction(reactionName);
+    try {
+      const prods = await fetchProducts(reactionName);
+      setProducts(prods || []);
+      setProductListVisible(true);
+      setExpandedViewOpen(true); // open the big workspace
+      pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
+    } catch (e) {
+      console.error(e);
+      pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
+    }
+  };
+
+  // handle product select -> open modal + extract
   const handleSelectProduct = async (productId) => {
     try {
       setLoadingDetails(true);
@@ -142,7 +160,6 @@ export default function App() {
       setSelectedSchemeUrl(null);
       setDetailModalOpen(true);
 
-      // preload scheme image url for quicker preview (API may return 404 if not found)
       try {
         const schemeUrl = await fetchSchemeImageUrl(productId);
         setSelectedSchemeUrl(schemeUrl);
@@ -150,9 +167,8 @@ export default function App() {
         // ignore
       }
 
-      // canonical extraction call
       try {
-        const res = await fetchProductDetails(productId); // extraction default
+        const res = await fetchProductDetails(productId); // canonical extraction
         const payload = (res && res.data) ? res.data : res;
         setProductDetails(payload);
         setHistory((h) => [
@@ -160,18 +176,18 @@ export default function App() {
           ...h,
         ]);
       } catch (e) {
-        console.error("fetchProductDetails (for select) error:", e);
-        pushMessage({ role: "assistant", content: "Failed to extract details for selected product." });
+        console.error("fetchProductDetails error:", e);
+        pushMessage({ role: "assistant", content: "Failed to load product details." });
       }
-    } catch (err) {
-      console.error("handleSelectProduct error:", err);
-      pushMessage({ role: "assistant", content: "Failed to load product details." });
+    } catch (e) {
+      console.error("handleSelectProduct error:", e);
+      pushMessage({ role: "assistant", content: "Failed to load product metadata." });
     } finally {
       setLoadingDetails(false);
     }
   };
 
-  // Toggle citation
+  // citations toggling
   const handleToggleCite = (product) => {
     const exists = selectedCitedDocs.find((p) => p.id === product.id);
     if (exists) {
@@ -189,33 +205,17 @@ export default function App() {
     if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
   };
 
-  // prompt pick -> send
+  // prompt pick
   const handlePromptPick = async (promptText) => {
     setPromptGalleryOpen(false);
     await handleUserSend(promptText);
   };
 
-  // When user clicks a reaction tile: fetch products then open expanded view
-  const handleReactionClick = async (reactionName) => {
-    setSelectedReaction(reactionName);
-    try {
-      const prods = await fetchProducts(reactionName);
-      setProducts(prods || []);
-      setProductListVisible(true);
-      // open expanded workspace so products may be shown beautifully
-      setExpandedViewOpen(true);
-      pushMessage({ role: "assistant", content: `Found ${prods.length} products for ${reactionName}` });
-    } catch (e) {
-      console.error(e);
-      pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
-    }
-  };
-
-  // Main user-send handler (handles citation queries, product detection and fallback to LLM)
+  // main send handler (same logic as before: reactions detection, citation queries, product detection, fallback LLM)
   const handleUserSend = async (text) => {
     pushMessage({ role: "user", content: text });
 
-    // If text exactly matches a reaction name - list products (and open expanded)
+    // reaction exact match
     const norm = normalize(text);
     const reactionMatch = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
     if (reactionMatch) {
@@ -225,7 +225,7 @@ export default function App() {
         setProducts(prods || []);
         setProductListVisible(true);
         setExpandedViewOpen(true);
-        pushMessage({ role: "assistant", content: `Found ${prods.length} product${prods.length === 1 ? "" : "s"} — expanded view opened.` });
+        pushMessage({ role: "assistant", content: `Found ${prods.length} product${prods.length === 1 ? "" : "s"} — opened expanded view.` });
       } catch (e) {
         console.error(e);
         pushMessage({ role: "assistant", content: "Error loading products for that reaction." });
@@ -233,7 +233,7 @@ export default function App() {
       return;
     }
 
-    // If user has selected citations -> query across those docs
+    // if citations selected -> query with citations
     if (selectedCitedDocs && selectedCitedDocs.length > 0) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
@@ -241,7 +241,7 @@ export default function App() {
         const ids = selectedCitedDocs.map((d) => d.id);
         const res = await queryWithCitations(ids, text);
         const payload = (res && res.data) ? res.data : res;
-        // remove loading placeholder
+        // remove loading message placeholder
         setMessages((prev) => {
           const idx = prev.map((m) => m.loading).lastIndexOf(true);
           if (idx >= 0) {
@@ -263,7 +263,7 @@ export default function App() {
       return;
     }
 
-    // If no selected product, let backend detect product name inside question or respond generatively
+    // no selected product -> let backend detect or answer generatively
     if (!selectedProduct) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
@@ -282,7 +282,7 @@ export default function App() {
         });
 
         if (payload && payload.api_name) {
-          // structured extraction returned
+          // structured extraction
           let summary = "";
           if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
           if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
@@ -305,7 +305,7 @@ export default function App() {
       return;
     }
 
-    // If a product is selected, query it directly
+    // product selected -> query it directly
     setQueryLoading(true);
     pushMessage({ role: "assistant", content: "Fetching answer from selected document...", loading: true });
     try {
@@ -348,147 +348,130 @@ export default function App() {
     }
   };
 
-  // Close expanded view
-  const closeExpandedView = () => setExpandedViewOpen(false);
-
-  // UI: slides (first contains logo + welcome)
+  // build neutral professional slides (only one visible at a time)
   const slides = [
-    {
-      id: 0,
-      content: (
-        <div className="flex flex-col items-center justify-center h-full gap-2">
-          <div className="text-lg font-semibold">Welcome to</div>
-          <img src={chem_logo} alt="chemhub-logo" className="h-20 w-auto" />
-        </div>
-      ),
-      bg: "bg-gradient-to-r from-indigo-500 to-purple-500",
-    },
-    { id: 1, content: null, bg: "bg-gradient-to-r from-pink-400 via-red-300 to-yellow-300" },
-    { id: 2, content: null, bg: "bg-gradient-to-r from-emerald-400 to-teal-500" },
-    { id: 3, content: null, bg: "bg-gradient-to-r from-sky-400 to-indigo-400" },
-    { id: 4, content: null, bg: "bg-gradient-to-r from-rose-300 to-fuchsia-500" },
+    { id: 0, content: (<div className="flex flex-col items-center justify-center"><div className="text-lg font-semibold text-gray-700">Welcome to</div><img src={chem_logo} alt="logo" className="h-20 w-auto mt-2" /></div>) },
+    { id: 1, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
+    { id: 2, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
+    { id: 3, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
+    { id: 4, content: (<div className="h-full w-full flex items-center justify-center text-gray-600"> </div>) },
   ];
 
-  // Small helper: when reaction/prods loaded open expanded view
-  const openExpandedFor = async (reactionName) => {
-    try {
-      const prods = await fetchProducts(reactionName);
-      setProducts(prods || []);
-      setProductListVisible(true);
-      setExpandedViewOpen(true);
-    } catch (e) {
-      console.error("openExpandedFor error:", e);
-    }
-  };
+  // small helper to close expanded view
+  const closeExpandedView = () => setExpandedViewOpen(false);
 
   return (
     <>
       <Navbar />
 
-      <div className="min-h-screen bg-gradient-to-b from-bg to-white flex justify-center">
+      <div className="min-h-screen bg-white flex justify-center items-start">
         <div className="w-full max-w-7xl py-8 px-4">
 
-          {/* Top slider */}
+          {/* Carousel: single big rectangle slide visible at a time */}
           <div className="mb-6">
-            <div className="relative rounded-2xl overflow-hidden">
-              <div className="grid grid-cols-5 gap-4">
-                {slides.map((s, i) => {
-                  // show single large sliding row - we will show only current slide visually centered
-                  const isActive = i === slideIndex;
-                  return (
-                    <div
-                      key={s.id}
-                      className={`col-span-1 h-36 rounded-2xl flex items-center justify-center transform transition-all duration-700 ${isActive ? "scale-100 shadow-xl z-20" : "scale-95 opacity-60"} ${s.bg}`}
-                      aria-hidden={!isActive}
-                    >
-                      <div className="text-white text-center p-4 w-full">
-                        {s.content ? s.content : <div className="h-full w-full" />}
-                      </div>
+            <div className="relative overflow-hidden rounded-2xl shadow-sm border border-gray-100">
+              <div
+                className="flex transition-transform duration-700 ease-in-out"
+                style={{ width: `${SLIDE_COUNT * 100}%`, transform: `translateX(-${slideIndex * (100 / SLIDE_COUNT)}%)` }}
+              >
+                {slides.map((s, i) => (
+                  <div key={s.id} className="w-full flex-shrink-0 p-6 bg-gray-50" style={{ width: `${100 / SLIDE_COUNT}%` }}>
+                    <div className="h-36 flex items-center justify-center">
+                      {s.content}
                     </div>
-                  );
-                })}
-              </div>
-            </div>
-          </div>
-
-          {/* Reaction tiles row */}
-          <div className="mb-6">
-            <ReactionTiles reactions={reactions} onSelect={(r) => { handleReactionClick(r); }} />
-          </div>
-
-          {/* Main layout */}
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Chat + prompt gallery (centered single column) */}
-            <div className="lg:col-span-2 flex flex-col items-center">
-              <ChatWindow
-                ref={chatWindowRef}
-                messages={messages}
-                onSend={handleUserSend}
-                centeredWidth="w-full max-w-3xl"
-                loading={queryLoading || loadingDetails}
-                selectedCitedDocs={selectedCitedDocs}
-                removeCitation={removeCitation}
-                onUploadFile={handleUploadFile}
-                openPromptGallery={() => setPromptGalleryOpen(true)}
-              />
-
-              {/* Prompt gallery button/modal handled centrally */}
-              {promptGalleryOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center">
-                  <div className="absolute inset-0 bg-black/40" onClick={() => setPromptGalleryOpen(false)}></div>
-                  <div className="relative w-full max-w-3xl bg-white rounded-2xl p-6 shadow-2xl">
-                    <div className="flex items-center justify-between mb-4">
-                      <h3 className="text-lg font-semibold">Prompt Gallery</h3>
-                      <button className="p-2 rounded-md" onClick={() => setPromptGalleryOpen(false)}>Close</button>
-                    </div>
-                    <PromptGallery prompts={prompts} onPick={handlePromptPick} />
                   </div>
-                </div>
-              )}
-            </div>
-
-            {/* Right column: only history (product cards moved to expanded view) */}
-            <div className="lg:col-span-1">
-              <div className="mb-4">
-                <SidebarHistory history={history} onSelect={(h) => { if (h && h.productId) handleSelectProduct(h.productId); }} />
+                ))}
+              </div>
+              {/* dot indicators */}
+              <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 flex gap-2">
+                {slides.map((s, i) => (
+                  <button key={s.id} onClick={() => setSlideIndex(i)} className={`w-2 h-2 rounded-full ${i === slideIndex ? "bg-gray-700" : "bg-gray-300"}`} />
+                ))}
               </div>
             </div>
           </div>
 
-          {/* Expanded full-page overlay (shows large chat + product cards) */}
+          {/* Reaction tiles */}
+          <div className="mb-6">
+            <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
+          </div>
+
+          {/* Main grid */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* Center: chat bar (as centered bar) */}
+            <div className="lg:col-span-2 flex justify-center">
+              <div className="w-full max-w-2xl">
+                <ChatWindow
+                  ref={chatWindowRef}
+                  messages={messages}
+                  onSend={handleUserSend}
+                  centeredWidth="w-full"
+                  loading={queryLoading || loadingDetails}
+                  selectedCitedDocs={selectedCitedDocs}
+                  removeCitation={removeCitation}
+                  onUploadFile={handleUploadFile}          // upload button in ChatWindow should call this
+                  openPromptGallery={() => setPromptGalleryOpen(true)}
+                />
+              </div>
+            </div>
+
+            {/* Right column: history */}
+            <div className="lg:col-span-1">
+              <SidebarHistory history={history} onSelect={(h) => { if (h && h.productId) handleSelectProduct(h.productId); }} />
+            </div>
+          </div>
+
+          {/* Prompt gallery modal (center below chat is handled by ChatWindow button invoking this) */}
+          {promptGalleryOpen && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center">
+              <div className="absolute inset-0 bg-black/40" onClick={() => setPromptGalleryOpen(false)} />
+              <div className="relative w-full max-w-3xl bg-white rounded-2xl p-6 shadow-2xl">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold">Prompt Gallery</h3>
+                  <button className="px-3 py-1 rounded-md" onClick={() => setPromptGalleryOpen(false)}>Close</button>
+                </div>
+                <PromptGallery prompts={prompts} onPick={handlePromptPick} />
+              </div>
+            </div>
+          )}
+
+          {/* Expanded workspace overlay */}
           {expandedViewOpen && (
             <div className="fixed inset-0 z-50 bg-white/95 backdrop-blur-sm overflow-auto">
               <div className="max-w-7xl mx-auto py-8 px-6">
-                <div className="flex items-start justify-between mb-4">
+                <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-3">
-                    <button className="px-3 py-2 rounded-lg bg-gray-100" onClick={() => setExpandedViewOpen(false)}>Close</button>
-                    <h2 className="text-xl font-semibold">Expanded Workspace — {selectedReaction || "Explore Products"}</h2>
+                    <button className="px-3 py-2 rounded-md bg-gray-100" onClick={closeExpandedView}>Close</button>
+                    <h2 className="text-xl font-semibold">{selectedReaction || "Explore Products"}</h2>
                   </div>
                   <div>
-                    <button className="px-3 py-2 rounded-lg bg-indigo-600 text-white" onClick={() => setExpandedViewOpen(false)}>Done</button>
+                    <button className="px-3 py-2 rounded-md bg-indigo-600 text-white" onClick={closeExpandedView}>Done</button>
                   </div>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                  {/* large chat on left (2/3) */}
+                  {/* Left / center: big chat */}
                   <div className="lg:col-span-2">
-                    <div className="bg-white rounded-2xl shadow p-4">
-                      <ChatWindow
-                        messages={messages}
-                        onSend={handleUserSend}
-                        centeredWidth="w-full"
-                        loading={queryLoading || loadingDetails}
-                        selectedCitedDocs={selectedCitedDocs}
-                        removeCitation={removeCitation}
-                        onUploadFile={handleUploadFile}
-                        openPromptGallery={() => setPromptGalleryOpen(true)}
-                      />
+                    <div className="bg-white rounded-2xl shadow p-4 h-[72vh] flex flex-col">
+                      {/* ChatWindow inside fixed height container so input remains visible */}
+                      <div className="flex-1 overflow-auto">
+                        <ChatWindow
+                          messages={messages}
+                          onSend={handleUserSend}
+                          centeredWidth="w-full"
+                          loading={queryLoading || loadingDetails}
+                          selectedCitedDocs={selectedCitedDocs}
+                          removeCitation={removeCitation}
+                          onUploadFile={handleUploadFile}
+                          openPromptGallery={() => setPromptGalleryOpen(true)}
+                        />
+                      </div>
                     </div>
                   </div>
 
-                  {/* products / product cards on right */}
+                  {/* Right: product cards */}
                   <div className="lg:col-span-1">
-                    <div className="bg-white rounded-2xl shadow p-4">
+                    <div className="bg-white rounded-2xl shadow p-4 h-[72vh] overflow-auto">
                       <h3 className="text-lg font-semibold mb-3">Matched Products</h3>
                       {productListVisible && products && products.length > 0 ? (
                         <ProductTabs
@@ -515,7 +498,6 @@ export default function App() {
             details={productDetails}
             loading={loadingDetails}
           />
-
         </div>
       </div>
 
