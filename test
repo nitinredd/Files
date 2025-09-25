@@ -1,3 +1,108 @@
+// src/api.js
+import axios from "axios";
+
+/**
+ * API helper using relative URLs (no REACT_APP_API_BASE).
+ * If your frontend is served on a different host/port than the backend in dev,
+ * configure a proxy (recommended) or replace the relative URLs with the full backend URL.
+ */
+
+// axios instance (no baseURL so it hits same origin by default)
+const api = axios.create({
+  // You can set a timeout or headers here if you want
+  timeout: 30_000,
+});
+
+// Fetch reactions
+export const fetchReactions = async () => {
+  const res = await api.get("/reactions");
+  return res.data;
+};
+
+// Fetch products for a reaction type
+export const fetchProducts = async (reactionType) => {
+  const res = await api.get("/products", { params: { reaction_type: reactionType }});
+  return res.data;
+};
+
+// Fetch product meta by id
+export const fetchProductMeta = async (productId) => {
+  const res = await api.get(`/product/${encodeURIComponent(productId)}/meta`);
+  return res.data;
+};
+
+// Fetch product details (if productId undefined, backend will attempt detection)
+export const fetchProductDetails = async (productId, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data", session_id = null) => {
+  const payload = { question };
+  if (productId) payload.product_id = productId;
+  if (session_id) payload.session_id = session_id;
+  const res = await api.post("/product/details", payload);
+  return res.data;
+};
+
+// Get scheme image URL (we return a direct path — frontend can use it as src)
+export const fetchSchemeImageUrl = async (productId) => {
+  try {
+    // We simply return the endpoint; the <img> src can be set to this path.
+    // If you want to proactively check existence, you can call the endpoint.
+    return `/product/${encodeURIComponent(productId)}/scheme-image`;
+  } catch (e) {
+    return null;
+  }
+};
+
+// Query with citations (POST /query or backend endpoint you have)
+export const queryWithCitations = async (productIds = [], question = "", session_id = null) => {
+  const payload = { product_ids: productIds, question };
+  if (session_id) payload.session_id = session_id;
+  const res = await api.post("/query", payload);
+  return res.data;
+};
+
+// Search products (autocomplete)
+export const searchProducts = async (q, limit = 10) => {
+  const res = await api.get("/products/search", { params: { q, limit }});
+  return res.data;
+};
+
+// Prompt gallery fetch
+export const fetchPrompts = async () => {
+  const res = await api.get("/prompt-gallery");
+  const data = res.data || {};
+  // backend returns { prompts: [...] } or an array; normalize to array of {id,title,text}
+  const raw = data.prompts || (Array.isArray(data) ? data : []);
+  return raw.map((p, idx) => {
+    // backend uses keys "title" and "prompt" by convention; be flexible
+    return {
+      id: p.id || `prompt-${idx}`,
+      title: p.title || p.name || `Prompt ${idx + 1}`,
+      text: p.prompt || p.text || p.query || ""
+    };
+  });
+};
+
+// Upload file helper: posts file + reaction_type (no spaces) and optional filename
+export const uploadFile = async (file, reaction_type = "Miscellaneous", filename = null) => {
+  if (!file) throw new Error("file required");
+  const fd = new FormData();
+  fd.append("file", file);
+  // backend expects `reaction_type` (not `reaction type`)
+  fd.append("reaction_type", reaction_type || "Miscellaneous");
+  if (filename) fd.append("filename", filename);
+
+  // let axios/browser set the Content-Type (boundary) automatically
+  const res = await api.post("/upload", fd, {
+    headers: {
+      Accept: "application/json"
+    },
+    maxBodyLength: Infinity,
+    maxContentLength: Infinity,
+  });
+  return res.data;
+};
+
+export default api;
+#############################
 // src/App.jsx
 import React, { useEffect, useState, useRef } from "react";
 import { motion } from "framer-motion";
@@ -17,6 +122,7 @@ import {
   fetchSchemeImageUrl,
   fetchPrompts,
   queryWithCitations,
+  uploadFile,
 } from "./api";
 
 import Navbar from "./Navbar/Navbar";
@@ -25,7 +131,6 @@ import Footer from "./Footer/Footer";
 import chem_logo from "../assets/Chemhub_Logo_Colored.png";
 
 export default function App() {
-  // Global app state
   const [reactions, setReactions] = useState([]);
   const [prompts, setPrompts] = useState([]);
 
@@ -57,7 +162,7 @@ export default function App() {
   // Expanded full-page view (when user clicks a reaction type)
   const [expandedViewOpen, setExpandedViewOpen] = useState(false);
 
-  // Slider state
+  // Slider
   const [slideIndex, setSlideIndex] = useState(0);
   const sliderIntervalRef = useRef(null);
   const SLIDE_COUNT = 5;
@@ -65,23 +170,15 @@ export default function App() {
   const chatWindowRef = useRef(null);
   const uploadInputRef = useRef(null);
 
-  // Initialize reactions and prompts
   useEffect(() => {
     fetchReactions()
       .then((r) => setReactions(r || []))
       .catch((e) => console.error("fetchReactions error:", e));
 
     fetchPrompts()
-      .then((p) => {
-        // fetchPrompts may return {prompts: [...] } or just [...]
-        if (!p) return setPrompts([]);
-        if (Array.isArray(p)) return setPrompts(p);
-        if (p.prompts) return setPrompts(p.prompts);
-        return setPrompts([]);
-      })
+      .then((p) => setPrompts(p || []))
       .catch((e) => console.warn("fetchPrompts failed:", e));
 
-    // minimal onboarding message
     setMessages([
       {
         role: "assistant",
@@ -91,7 +188,7 @@ export default function App() {
     ]);
   }, []);
 
-  // Slider autoplay (one slide at a time)
+  // slider autoplay
   useEffect(() => {
     sliderIntervalRef.current = setInterval(() => {
       setSlideIndex((s) => (s + 1) % SLIDE_COUNT);
@@ -99,54 +196,49 @@ export default function App() {
     return () => clearInterval(sliderIntervalRef.current);
   }, []);
 
-  // Utility to push a message
   const pushMessage = (m) => setMessages((prev) => [...prev, m]);
-
-  // Normalize helper
   const normalize = (s) => (s || "").toString().toLowerCase().replace(/[^a-z0-9]/g, "");
 
-  // UPLOAD handler -> posts to relative /upload endpoint (same origin)
+  // handle upload using api.uploadFile (relative endpoint)
   const handleUploadFile = async (file, reaction_type = "Miscellaneous") => {
     if (!file) return;
-    const form = new FormData();
-    form.append("file", file);
-    form.append("reaction_type", reaction_type || "Miscellaneous");
-
+    pushMessage({ role: "assistant", content: "Uploading file...", loading: true });
     try {
-      // Post to relative endpoint to avoid host mismatch issues (no env variables)
-      const resp = await fetch(`/upload`, {
-        method: "POST",
-        body: form,
+      const res = await uploadFile(file, reaction_type);
+      // remove loading placeholder
+      setMessages((prev) => {
+        const idx = prev.map((m) => m.loading).lastIndexOf(true);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy.splice(idx, 1);
+          return copy;
+        }
+        return prev;
       });
-
-      if (!resp.ok) {
-        const txt = await resp.text().catch(() => "");
-        console.error("Upload failed:", resp.status, txt);
-        pushMessage({ role: "assistant", content: `Upload failed: ${resp.status}` });
-        return { ok: false, status: resp.status, text: txt };
-      }
-
-      const data = await resp.json().catch(() => ({}));
       pushMessage({ role: "assistant", content: "Upload complete and indexed (if supported)." });
-
-      // Refresh product listing for that reaction type (best-effort)
+      // refresh product list for the reaction_type
       try {
         const prods = await fetchProducts(reaction_type);
         setProducts(prods || []);
         setProductListVisible(true);
-      } catch (e) {
-        // ignore
-      }
-
-      return { ok: true, data };
+      } catch {}
+      return res;
     } catch (err) {
-      console.error("Upload error (frontend):", err);
-      pushMessage({ role: "assistant", content: "Upload failed — see console." });
-      return { ok: false, error: String(err) };
+      console.error("handleUploadFile error:", err);
+      setMessages((prev) => {
+        const idx = prev.map((m) => m.loading).lastIndexOf(true);
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy.splice(idx, 1);
+          return copy;
+        }
+        return prev;
+      });
+      pushMessage({ role: "assistant", content: `Upload failed: ${err?.message || err}` });
+      return null;
     }
   };
 
-  // When user clicks a reaction tile, fetch products for that reaction and open expanded view
   const handleReactionClick = async (reactionName) => {
     setSelectedReaction(reactionName);
     try {
@@ -161,13 +253,11 @@ export default function App() {
     }
   };
 
-  // When user picks a sample prompt from the gallery: send it immediately to the chat as if user typed it
   const handlePromptPick = async (promptText) => {
     setPromptGalleryOpen(false);
     await handleUserSend(promptText);
   };
 
-  // When user selects a product
   const handleSelectProduct = async (productId) => {
     try {
       setLoadingDetails(true);
@@ -177,17 +267,13 @@ export default function App() {
       setSelectedSchemeUrl(null);
       setDetailModalOpen(true);
 
-      // preload scheme image url for quicker preview
       try {
         const schemeUrl = await fetchSchemeImageUrl(productId);
         setSelectedSchemeUrl(schemeUrl);
-      } catch (e) {
-        // ignore
-      }
+      } catch {}
 
-      // fetch full extraction (canonical extraction)
       try {
-        const res = await fetchProductDetails(productId); // default extraction
+        const res = await fetchProductDetails(productId);
         const payload = (res && res.data) ? res.data : res;
         setProductDetails(payload);
         setHistory((h) => [
@@ -206,7 +292,6 @@ export default function App() {
     }
   };
 
-  // When user right-clicks or context-adds a product to citations
   const handleToggleCite = (product) => {
     const exists = selectedCitedDocs.find((p) => p.id === product.id);
     if (exists) {
@@ -218,19 +303,16 @@ export default function App() {
     }
   };
 
-  // Remove citation helper (used by UI)
   const removeCitation = (id) => {
     const found = selectedCitedDocs.find((d) => d.id === id);
     setSelectedCitedDocs((prev) => prev.filter((d) => d.id !== id));
     if (found) pushMessage({ role: "assistant", content: `Removed citation: ${found.name}` });
   };
 
-  // Main user-send handler
+  // main send handler (same logic as earlier working version)
   const handleUserSend = async (text) => {
-    // push user message
     pushMessage({ role: "user", content: text });
 
-    // Reaction detection: if text is a reaction name, list products
     const norm = normalize(text);
     const match = reactions.find((r) => normalize(r) === norm || normalize(r) === normalize(text.replace(/\s+/g, "_")));
     if (match) {
@@ -248,7 +330,6 @@ export default function App() {
       return;
     }
 
-    // If user has selected citations, query across them
     if (selectedCitedDocs && selectedCitedDocs.length > 0) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching selected documents...", loading: true });
@@ -256,7 +337,6 @@ export default function App() {
         const ids = selectedCitedDocs.map((d) => d.id);
         const res = await queryWithCitations(ids, text);
         const payload = (res && res.data) ? res.data : res;
-        // remove loading placeholder
         setMessages((prev) => {
           const idx = prev.map((m) => m.loading).lastIndexOf(true);
           if (idx >= 0) {
@@ -278,15 +358,12 @@ export default function App() {
       return;
     }
 
-    // If no selected product, let backend attempt to detect product name inside question
     if (!selectedProduct) {
       setQueryLoading(true);
       pushMessage({ role: "assistant", content: "Searching documents...", loading: true });
       try {
         const res = await fetchProductDetails(undefined, text);
         const payload = (res && res.data) ? res.data : res;
-
-        // remove loading placeholder
         setMessages((prev) => {
           const idx = prev.map((m) => m.loading).lastIndexOf(true);
           if (idx >= 0) {
@@ -296,9 +373,7 @@ export default function App() {
           }
           return prev;
         });
-
         if (payload && payload.api_name) {
-          // structured data returned
           let summary = "";
           if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
           if (payload.reaction_chemistry) summary += `Reaction: ${payload.reaction_chemistry}\n\n`;
@@ -321,14 +396,11 @@ export default function App() {
       return;
     }
 
-    // If a product is already selected, query it directly
     setQueryLoading(true);
     pushMessage({ role: "assistant", content: "Fetching answer from selected document...", loading: true });
     try {
       const res = await fetchProductDetails(selectedProduct.id, text);
       const payload = (res && res.data) ? res.data : res;
-
-      // remove loading placeholder
       setMessages((prev) => {
         const idx = prev.map((m) => m.loading).lastIndexOf(true);
         if (idx >= 0) {
@@ -338,7 +410,6 @@ export default function App() {
         }
         return prev;
       });
-
       if (payload && payload.api_name) {
         let summary = "";
         if (payload.api_name) summary += `API: ${payload.api_name}\n\n`;
@@ -364,7 +435,7 @@ export default function App() {
     }
   };
 
-  // build neutral professional slides (only one visible at a time)
+  // slides
   const slides = [
     {
       id: 0,
@@ -381,10 +452,9 @@ export default function App() {
     { id: 4, content: <div className="h-full w-full flex items-center justify-center text-gray-600" /> },
   ];
 
-  // small helper to close expanded view
   const closeExpandedView = () => setExpandedViewOpen(false);
 
-  // file input click handler (trigger hidden input)
+  // file input trigger
   const onPlusClick = () => {
     if (uploadInputRef.current) uploadInputRef.current.click();
   };
@@ -392,8 +462,8 @@ export default function App() {
   const onFileInputChange = async (e) => {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
+    // default reaction_type 'Miscellaneous' — you could surface a small select later
     await handleUploadFile(f, "Miscellaneous");
-    // clear input
     e.target.value = "";
   };
 
@@ -401,26 +471,24 @@ export default function App() {
     <>
       <Navbar />
 
-      <div className="min-h-screen bg-white flex justify-center items-start">
+      <div className="min-h-screen bg-white flex justify-center items-start overflow-x-hidden">
         <div className="w-full max-w-7xl py-8 px-4">
-
-          {/* Carousel: single big rectangle slide visible at a time */}
+          {/* Carousel */}
           <div className="mb-6">
             <div className="relative overflow-hidden rounded-2xl shadow-sm border border-gray-100">
               <div
                 className="flex transition-transform duration-700 ease-in-out"
                 style={{ width: `${SLIDE_COUNT * 100}%`, transform: `translateX(-${slideIndex * (100 / SLIDE_COUNT)}%)` }}
               >
-                {slides.map((s, i) => (
+                {slides.map((s) => (
                   <div key={s.id} className="w-full flex-shrink-0 p-6 bg-gray-50" style={{ width: `${100 / SLIDE_COUNT}%` }}>
                     <div className="h-36 flex items-center justify-center">{s.content}</div>
                   </div>
                 ))}
               </div>
-              {/* dot indicators */}
               <div className="absolute bottom-3 left-1/2 transform -translate-x-1/2 flex gap-2">
-                {slides.map((s, i) => (
-                  <button key={s.id} onClick={() => setSlideIndex(i)} className={`w-2 h-2 rounded-full ${i === slideIndex ? "bg-gray-700" : "bg-gray-300"}`} />
+                {slides.map((_, i) => (
+                  <button key={i} onClick={() => setSlideIndex(i)} className={`w-2 h-2 rounded-full ${i === slideIndex ? "bg-gray-700" : "bg-gray-300"}`} />
                 ))}
               </div>
             </div>
@@ -431,15 +499,12 @@ export default function App() {
             <ReactionTiles reactions={reactions} onSelect={handleReactionClick} />
           </div>
 
-          {/* Main grid */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Center: chat bar (as centered bar) */}
+            {/* Center: chat */}
             <div className="lg:col-span-2 flex justify-center">
               <div className="w-full max-w-2xl relative">
-                {/* Hidden file input for uploads; plus button triggers it */}
                 <input ref={uploadInputRef} type="file" accept=".pdf,.docx,.pptx,.xlsx,.png,.jpg,.jpeg" className="hidden" onChange={onFileInputChange} />
 
-                {/* ChatWindow component (compact centered bar look inside ChatWindow component) */}
                 <ChatWindow
                   ref={chatWindowRef}
                   messages={messages}
@@ -448,10 +513,9 @@ export default function App() {
                   loading={queryLoading || loadingDetails}
                   selectedCitedDocs={selectedCitedDocs}
                   removeCitation={removeCitation}
-                  // NOTE: ChatWindow currently doesn't render the plus button inside; we overlay it from App for visual alignment
                 />
 
-                {/* Plus button visually placed near left side of chat input (approx near microphone) */}
+                {/* plus button near chat (single button) */}
                 <div className="absolute left-4 bottom-6">
                   <button
                     onClick={onPlusClick}
@@ -463,7 +527,6 @@ export default function App() {
                   </button>
                 </div>
 
-                {/* Prompt Gallery button centered below chat window */}
                 <div className="flex justify-center mt-4">
                   <button
                     onClick={() => setPromptGalleryOpen(true)}
@@ -475,13 +538,11 @@ export default function App() {
               </div>
             </div>
 
-            {/* Right column: history */}
             <div className="lg:col-span-1">
               <SidebarHistory history={history} onSelect={(h) => { if (h && h.productId) handleSelectProduct(h.productId); }} />
             </div>
           </div>
 
-          {/* Prompt gallery modal (center below chat is handled by ChatWindow button invoking this) */}
           {promptGalleryOpen && (
             <div className="fixed inset-0 z-50 flex items-center justify-center">
               <div className="absolute inset-0 bg-black/40" onClick={() => setPromptGalleryOpen(false)} />
@@ -495,10 +556,9 @@ export default function App() {
             </div>
           )}
 
-          {/* Expanded workspace overlay */}
           {expandedViewOpen && (
             <div className="fixed inset-0 z-50 bg-white/95 backdrop-blur-sm overflow-auto">
-              <div className="max-w-7xl mx-auto py-8 px-6">
+              <div className="max-w-7xl mx-auto py-8 px-6 overflow-x-hidden">
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-3">
                     <button className="px-3 py-2 rounded-md bg-gray-100" onClick={closeExpandedView}>Close</button>
@@ -510,10 +570,8 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                  {/* Left / center: big chat */}
                   <div className="lg:col-span-2">
                     <div className="bg-white rounded-2xl shadow p-4 h-[72vh] flex flex-col">
-                      {/* ChatWindow inside fixed height container so input remains visible */}
                       <div className="flex-1 overflow-auto">
                         <ChatWindow
                           messages={messages}
@@ -527,7 +585,6 @@ export default function App() {
                     </div>
                   </div>
 
-                  {/* Right: product cards */}
                   <div className="lg:col-span-1">
                     <div className="bg-white rounded-2xl shadow p-4 h-[72vh] overflow-auto">
                       <h3 className="text-lg font-semibold mb-3">Matched Products</h3>
@@ -548,7 +605,6 @@ export default function App() {
             </div>
           )}
 
-          {/* Product detail modal */}
           <ProductDetailModal
             open={detailModalOpen}
             onClose={() => setDetailModalOpen(false)}
