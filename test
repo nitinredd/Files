@@ -1,75 +1,278 @@
-// src/api.js
-import axios from "axios";
+// src/components/ChatWindow.jsx
+import React, { useRef, useEffect, useState } from 'react';
+import { motion } from 'framer-motion';
+import { FiSend, FiPlus } from 'react-icons/fi';
+import MicrophoneButton from './MicrophoneButton';
+import { searchProducts, uploadFile } from '../api'; // <- correct relative path
 
-/**
- * Set API_BASE to empty string to use relative URLs (recommended for dev with proxy)
- * Or set to "http://localhost:8000" (or your backend URL) if you want absolute.
- */
-export const API_BASE = ""; // <-- set to "" or "http://localhost:8000" etc.
+export default function ChatWindow({
+  messages,
+  onSend,
+  centeredWidth = "max-w-3xl",
+  selectedCitedDocs = [],
+  removeCitation = () => {},
+  onUploadComplete = () => {}, // new prop: called with upload response
+}) {
+  const [text, setText] = useState('');
+  const textareaRef = useRef();
+  const [suggestions, setSuggestions] = useState([]); // product suggestions
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const debounceRef = useRef(null);
+  const containerRef = useRef(null);
 
-const api = axios.create({
-  baseURL: API_BASE || "",
-  timeout: 60_000,
-});
+  // upload input ref
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
 
-// Generic wrapper to return backend .data when present
-const unwrap = (res) => (res && res.data !== undefined ? res.data : res);
+  // autosize textarea
+  useEffect(() => {
+    if (textareaRef.current) {
+      textareaRef.current.style.height = 'auto';
+      textareaRef.current.style.height = textareaRef.current.scrollHeight + 'px';
+    }
+  }, [text, messages]);
 
-// ===== Upload file =====
-// Backend expects:
-//  POST /upload
-//  form fields: "file" (file), "reaction_type" (string)
-export const uploadFile = async (file, reaction_type = "Miscellaneous", filename = null) => {
-  if (!file) throw new Error("No file provided");
-  const fd = new FormData();
-  fd.append("file", file);
-  fd.append("reaction_type", reaction_type);
-  if (filename) fd.append("filename", filename);
+  useEffect(() => {
+    const onDocClick = (e) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target)) {
+        setShowSuggestions(false);
+        setActiveIndex(-1);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, []);
 
-  const res = await api.post("/upload", fd, {
-    headers: { "Content-Type": "multipart/form-data" },
-  });
-  return unwrap(res);
-};
+  // product suggestions (only show when user types >=2 chars)
+  useEffect(() => {
+    const q = (text || '').trim();
+    if (q.length < 2) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      setActiveIndex(-1);
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+      return;
+    }
 
-// ===== Fetch prompts (normalize shape) =====
-export const fetchPrompts = async () => {
-  const res = await api.get("/prompt-gallery");
-  const data = unwrap(res) || {};
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await searchProducts(q, 8);
+        setSuggestions(res || []);
+        setShowSuggestions(Array.isArray(res) && res.length > 0);
+        setActiveIndex(-1);
+      } catch (err) {
+        console.error("searchProducts error:", err);
+        setSuggestions([]);
+        setShowSuggestions(false);
+      }
+    }, 240);
 
-  // backend returns { prompts: [...] } (per your backend)
-  const raw = Array.isArray(data) ? data : data.prompts || [];
+    return () => {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+    };
+  }, [text]);
 
-  return (raw || []).map((p, idx) => ({
-    id: p.id || `prompt-${idx}`,
-    title: p.title || p.name || `Prompt ${idx + 1}`,
-    text: p.prompt || p.text || p.query || "",
-  }));
-};
+  const onKeyDown = (e) => {
+    if (showSuggestions && suggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveIndex((i) => Math.min(i + 1, suggestions.length - 1));
+        return;
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveIndex((i) => Math.max(i - 1, 0));
+        return;
+      } else if (e.key === 'Enter' && activeIndex >= 0) {
+        e.preventDefault();
+        chooseSuggestion(suggestions[activeIndex]);
+        return;
+      } else if (e.key === 'Escape') {
+        setShowSuggestions(false);
+        setActiveIndex(-1);
+        return;
+      }
+    }
 
-// ===== Other small helpers you likely already have =====
-export const fetchReactions = async () => unwrap(await api.get("/reactions"));
-export const fetchProducts = async (reactionType) => unwrap(await api.get("/products", { params: reactionType ? { reaction_type: reactionType } : {} }));
-export const fetchProductMeta = async (productId) => unwrap(await api.get(`/product/${encodeURIComponent(productId)}/meta`));
-export const fetchProductDetails = async (productId = undefined, question = "Extract API Name, Reaction Chemistry, Yield, Procedure, and Tabular Data", session_id = undefined) => {
-  const payload = { question };
-  if (productId) payload.product_id = productId;
-  if (session_id) payload.session_id = session_id;
-  const res = await api.post("/product/details", payload);
-  return unwrap(res);
-};
-export const fetchSchemeImageUrl = (productId) => {
-  // construct relative URL — client can directly use it in an <img>
-  return `${API_BASE || ""}/product/${encodeURIComponent(productId)}/scheme-image`;
-};
-export const searchProducts = async (q, limit = 10) => unwrap(await api.get("/products/search", { params: { q, limit } }));
+    if (e.key === 'Enter' && !e.shiftKey && !showSuggestions) {
+      e.preventDefault();
+      submit();
+    }
+  };
 
-// Query with citations helper
-export const queryWithCitations = async (productIds = [], question = "", session_id = undefined) => {
-  const payload = { product_ids: productIds, question };
-  if (session_id) payload.session_id = session_id;
-  const res = await api.post("/query", payload);
-  return unwrap(res);
-};
+  const chooseSuggestion = (s) => {
+    if (!s) return;
+    try {
+      const el = textareaRef.current;
+      if (el) {
+        const cursor = el.selectionStart || text.length;
+        let left = text.slice(0, cursor);
+        let right = text.slice(cursor);
+        const lastWs = left.lastIndexOf(' ');
+        const prefix = lastWs === -1 ? '' : left.slice(0, lastWs + 1);
+        const newText = prefix + s.name + (right && !right.startsWith(' ') ? ' ' + right : right);
+        setText(newText);
+      } else {
+        setText((t) => (t ? t + ' ' + s.name : s.name));
+      }
+    } catch (e) {
+      setText((t) => (t ? t + ' ' + s.name : s.name));
+    }
+    setShowSuggestions(false);
+    setActiveIndex(-1);
+    setTimeout(() => { textareaRef.current && textareaRef.current.focus(); }, 0);
+  };
 
-export default api;
+  const submit = () => {
+    const t = text.trim();
+    if (!t) return;
+    onSend(t);
+    setText('');
+    setSuggestions([]);
+    setShowSuggestions(false);
+    setActiveIndex(-1);
+  };
+
+  // ----- Upload handling -----
+  const triggerUpload = () => {
+    if (fileInputRef.current) fileInputRef.current.click();
+  };
+
+  const handleFileChange = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    setUploading(true);
+    try {
+      // call uploadFile from api.js
+      const resp = await uploadFile(f, "Miscellaneous", null);
+      // callback to parent App.jsx to refresh product list etc
+      try { onUploadComplete && onUploadComplete(resp); } catch (e) {}
+      // show short assistant message (success)
+      // parent will likely call fetchProducts; we just show a confirmation message
+      // pushMessage in your parent will add an assistant message; we don't have it here
+    } catch (err) {
+      console.error("Upload failed:", err);
+      // optionally show small error message as assistant
+    } finally {
+      setUploading(false);
+      // reset input so same file can be re-uploaded later
+      try { e.target.value = ""; } catch {}
+    }
+  };
+
+  return (
+    <div className={`mx-auto ${centeredWidth}`} ref={containerRef}>
+      <div className="bg-white rounded-full shadow-lg p-4 flex flex-col items-center">
+        {/* Messages area — keep visually minimal in 'bar' mode */}
+        <div className="w-full max-w-4xl">
+          <div className="min-h-[220px] max-h-[54vh] overflow-auto pr-2">
+            {messages.map((m, idx) => (
+              <motion.div key={idx} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.28, delay: idx * 0.02 }} className={`mb-3 ${m.role === 'user' ? 'flex justify-end' : 'flex justify-start'}`}>
+                <div className={`${m.role === 'user' ? 'bg-gradient-to-br from-secondary to-primary text-white' : 'bg-gray-50 text-gray-800'} px-4 py-3 rounded-2xl max-w-[80%] whitespace-pre-wrap break-words`}>
+                  {m.content}
+                  {/* render tables if present */}
+                  {m.tables && m.tables.length > 0 && (
+                    <div className="mt-2">
+                      {m.tables.map((t, i) => (
+                        <div key={i} className="overflow-auto mt-2 border rounded">
+                          <table className="min-w-full text-sm">
+                            <thead className="bg-gray-100">
+                              <tr>
+                                {t.headers.map((h, hi) => <th key={hi} className="px-3 py-2 text-left">{h}</th>)}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {t.rows.map((r, ri) => (
+                                <tr key={ri} className={ri % 2 === 0 ? '' : 'bg-white'}>
+                                  {r.map((c, ci) => <td key={ci} className="px-3 py-2 align-top">{c}</td>)}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {/* render sources nicely if present */}
+                  {m.sources && m.sources.length > 0 && (
+                    <div className="mt-2 flex gap-2 flex-wrap">
+                      {m.sources.map((s, si) => (
+                        <a key={si} className="px-3 py-1 bg-white border rounded shadow-sm text-xs" href={`#`} onClick={(ev)=>{ev.preventDefault(); /* parent should implement download behavior */}}>
+                          {s.product_name}
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </div>
+
+        {/* Input row — centered, slim bar */}
+        <div className="w-full max-w-4xl mt-3">
+          <div className="flex items-center gap-3">
+            {/* microphone */}
+            <MicrophoneButton onText={(t) => setText(t)} />
+
+            {/* upload (plus) button placed beside mic */}
+            <div className="relative">
+              <button onClick={triggerUpload} className="p-3 rounded-full bg-white border shadow hover:scale-95 text-gray-700" title="Upload file">
+                {uploading ? <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" fill="none" /></svg> : <FiPlus />}
+              </button>
+              <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
+            </div>
+
+            {/* main input as a "bar" */}
+            <textarea
+              ref={textareaRef}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              rows={1}
+              placeholder="Ask about reaction chemistry or type a product name..."
+              className="flex-1 resize-none px-4 py-3 rounded-3xl border bg-white text-black focus:outline-none focus:ring-2 focus:ring-secondary"
+              onKeyDown={onKeyDown}
+              onFocus={() => { if (suggestions && suggestions.length > 0) setShowSuggestions(true); }}
+            />
+
+            <button onClick={submit} className="p-3 rounded-full bg-primary text-white shadow hover:scale-95">
+              <FiSend />
+            </button>
+          </div>
+
+          {/* Suggestions dropdown */}
+          {showSuggestions && suggestions && suggestions.length > 0 && (
+            <div className="absolute left-28 z-40 mt-2 rounded-xl bg-white border shadow-lg overflow-hidden max-w-4xl">
+              <ul className="max-h-56 overflow-auto">
+                {suggestions.map((s, i) => (
+                  <li key={s.id}>
+                    <button
+                      className={`w-full text-left px-4 py-3 hover:bg-gray-50 flex justify-between items-center ${i === activeIndex ? 'bg-gray-100' : ''}`}
+                      onMouseDown={(e) => { e.preventDefault(); chooseSuggestion(s); }}
+                      onMouseEnter={() => setActiveIndex(i)}
+                    >
+                      <div className="truncate">
+                        <div className="font-medium text-sm text-primary">{s.name}</div>
+                        <div className="text-xs text-gray-400 mt-1">{(s.reaction_type || "").replace(/_/g, ' ')}</div>
+                      </div>
+                      <div className="text-xs text-gray-400 ml-4">Select</div>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+        </div>
+      </div>
+    </div>
+  );
+}
