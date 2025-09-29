@@ -1,4 +1,64 @@
-# Updated sections of utils.py
+# Updated utils.py functions for proper RT filtering
+
+def HPLC_data_read_csv(file_path: str) -> np.ndarray:
+    """
+    Reads HPLC data from a CSV file.
+    Expected columns: Sample Name, RT, Area, Peak Area, Signal Name
+    Returns a NumPy array with [Area, RT].
+    """
+    try:
+        data = pd.read_csv(file_path)
+        data_final = pd.DataFrame()
+        
+        # Handle different possible column names for Area
+        if 'Area' in data.columns:
+            data_final['Peak_Area'] = data['Area']
+        elif 'Peak Area' in data.columns:
+            data_final['Peak_Area'] = data['Peak Area']
+        elif 'Peak_Area' in data.columns:
+            data_final['Peak_Area'] = data['Peak_Area']
+        else:
+            raise ValueError("No Area column found in HPLC data")
+            
+        # Handle RT column
+        if 'RT' in data.columns:
+            data_final['RT'] = data['RT']
+        else:
+            raise ValueError("No RT column found in HPLC data")
+            
+        print(f"HPLC data loaded: {len(data_final)} peaks")
+        print(f"RT range: {data_final['RT'].min():.2f} - {data_final['RT'].max():.2f}")
+        
+        return data_final.to_numpy()
+    except Exception as e:
+        print(f"Error reading HPLC CSV file {file_path}: {e}")
+        return np.array([])
+
+
+def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
+    """
+    Calculates impurity response based on peak area within a given RT range.
+    data_np: NumPy array with [Area, RT]
+    IminRT, ImaxRT: Retention time range for the impurity
+    areaISO: Isocratic peak area for normalization
+    """
+    areaB = 0
+    peaks_found = 0
+    
+    for i in range(data_np.shape[0]):
+        if IminRT <= data_np[i, 1] <= ImaxRT:
+            areaB += data_np[i, 0]
+            peaks_found += 1
+            
+    print(f"Impurity RT range [{IminRT}-{ImaxRT}]: Found {peaks_found} peaks, Total area: {areaB}")
+    
+    if areaISO == 0:
+        print("Warning: Internal standard area is 0, returning 0 for impurity")
+        return 0.0
+        
+    impurity_result = areaB / areaISO
+    return impurity_result
+
 
 def response_HPLC_csv(
     data_np: np.ndarray,
@@ -8,144 +68,141 @@ def response_HPLC_csv(
     nobj: int
 ) -> List[float]:
     """
-    Computes yield and impurity responses from HPLC data.
-    Fixed to properly handle RT filtering for each objective.
+    Computes yield and impurity responses from HPLC data with proper RT filtering.
+    
+    Parameters:
+    - data_np: HPLC data array [Area, RT]
+    - YminRT, YmaxRT: RT range for main product (yield)
+    - IminRT_list, ImaxRT_list: RT ranges for impurities
+    - minRTISO, maxRTISO: RT range for internal standard
+    - nobj: Number of objectives
     """
     if data_np.size == 0:
+        print("Empty HPLC data, returning default values")
         return [float('inf')] * nobj
 
-    # Filter data to only include peaks within overall RT range of interest
-    # This ensures we only process relevant peaks
-    all_rt_ranges = [(YminRT, YmaxRT), (minRTISO, maxRTISO)]
-    all_rt_ranges.extend([(IminRT_list[i], ImaxRT_list[i]) for i in range(min(len(IminRT_list), len(ImaxRT_list)))])
-    
-    min_rt_overall = min([r[0] for r in all_rt_ranges])
-    max_rt_overall = max([r[1] for r in all_rt_ranges])
-    
-    # Filter data to relevant RT range
-    filtered_data = []
-    for i in range(data_np.shape[0]):
-        if min_rt_overall <= data_np[i, 1] <= max_rt_overall:
-            filtered_data.append(data_np[i])
-    
-    if not filtered_data:
-        return [float('inf')] * nobj
-    
-    filtered_data = np.array(filtered_data)
+    print(f"\n=== Processing HPLC Data ===")
+    print(f"Total peaks in file: {data_np.shape[0]}")
+    print(f"Yield RT range: [{YminRT}-{YmaxRT}]")
+    print(f"ISO RT range: [{minRTISO}-{maxRTISO}]")
+    print(f"Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
 
     # Calculate yield area (main product)
     areaA = 0
-    for i in range(filtered_data.shape[0]):
-        if YminRT <= filtered_data[i, 1] <= YmaxRT:
-            areaA += filtered_data[i, 0]
-    print(f"Yield area (areaA): {areaA}")
+    yield_peaks_found = 0
+    for i in range(data_np.shape[0]):
+        if YminRT <= data_np[i, 1] <= YmaxRT:
+            areaA += data_np[i, 0]
+            yield_peaks_found += 1
+    
+    print(f"Yield: Found {yield_peaks_found} peaks, Total area: {areaA}")
 
     # Calculate internal standard area
     areaISO = 0
-    for i in range(filtered_data.shape[0]):
-        if minRTISO <= filtered_data[i, 1] <= maxRTISO:
-            areaISO += filtered_data[i, 0]
-    print(f"Internal standard area (areaISO): {areaISO}")
+    iso_peaks_found = 0
+    for i in range(data_np.shape[0]):
+        if minRTISO <= data_np[i, 1] <= maxRTISO:
+            areaISO += data_np[i, 0]
+            iso_peaks_found += 1
+    
+    print(f"Internal Standard: Found {iso_peaks_found} peaks, Total area: {areaISO}")
 
     response = []
+    
     # Yield calculation (negative log for minimization)
-    yield_result = areaA / areaISO if areaISO != 0 else 0.0
-    response.append(-np.log(yield_result) if yield_result > 0 else float('inf'))
-    print(f"Yield result: {yield_result}, -log(yield): {response[0]}")
+    if areaISO > 0 and areaA > 0:
+        yield_result = areaA / areaISO
+        yield_response = -np.log(yield_result)
+        print(f"Yield ratio: {yield_result:.4f}, -log(yield): {yield_response:.4f}")
+    else:
+        yield_response = float('inf')
+        print(f"Warning: Invalid yield calculation (areaA={areaA}, areaISO={areaISO})")
+    
+    response.append(yield_response)
 
     # Impurities calculation
     for i in range(nobj - 1):
         if i < len(IminRT_list) and i < len(ImaxRT_list):
-            impurities_result = impurity_response_csv(filtered_data, IminRT_list[i], ImaxRT_list[i], areaISO)
-            response.append(impurities_result)
-            print(f"Impurity {i+1} result: {impurities_result}")
+            impurity_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
+            response.append(impurity_result)
+            print(f"Impurity {i+1} result: {impurity_result:.4f}")
         else:
             response.append(0.0)
-            print(f"Impurity {i+1} result: 0.0 (default)")
+            print(f"Impurity {i+1}: No RT range specified, using 0.0")
 
+    print(f"Final response: {response}")
     return response
 
 
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
+def process_uploaded_csv_file(full_path_uploaded_csv,
+                              df,
+                              minRTISO,
+                              maxRTISO,
+                              YminRT,
+                              YmaxRT,
+                              IminRT_list,
+                              ImaxRT_list,
+                              transformed_objectives,
+                              lhs):
     """
-    Fixed to generate only the specified number of suggestions one at a time.
-    This ensures proper SOR iteration control.
+    Process uploaded HPLC CSV file with proper RT parameter handling.
     """
-    try:
-        print("Building domain...")
-        domain = build_domain_from_df(lhs, objectives)
-        print(f"Domain created successfully")
-        print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input variables and {len([v for v in domain.variables if v.is_objective])} objectives")
-        
-        # Print domain details
-        input_vars = [v.name for v in domain.variables if not v.is_objective]
-        obj_vars = [v.name for v in domain.variables if v.is_objective]
-        print(f"Input variables: {input_vars}")
-        print(f"Objective variables: {obj_vars}")
-        
-    except Exception as e:
-        raise RuntimeError(f"Domain build failed: {e}")
+    print(f"\n=== Processing HPLC File: {full_path_uploaded_csv} ===")
     
-    # FIXED: Only generate ONE suggestion per call, not num_suggestions
-    # This allows proper control of SOR iterations
-    print(f"\n=== Generating 1 suggestion (requested: {num_suggestions}) ===")
-    
-    try:
-        out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-        print(f"Optimization returned: {type(out)}, shape: {out.shape if hasattr(out, 'shape') else 'N/A'}")
-        
-        if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
-            print(f"Optimization output shape: {out.shape}")
-            print(f"Optimization output columns: {list(out.columns)}")
-            
-            # Convert to dictionary - handle potential MultiIndex columns
-            try:
-                suggested = out.iloc[0].to_dict()
-                print(f"Raw suggestions from optimization: {dict(list(suggested.items())[:5])}...")
-            except Exception as e:
-                print(f"Error converting output to dict: {e}")
-                suggested = {}
+    # Extract data from DataFrame
+    if 'Area' in df.columns and 'RT' in df.columns:
+        data_np = df[['Area', 'RT']].to_numpy()
+    elif 'Peak Area' in df.columns and 'RT' in df.columns:
+        data_np = df[['Peak Area', 'RT']].to_numpy()
+    else:
+        # Try case-insensitive matching
+        cols_lower = {c.lower(): c for c in df.columns}
+        if 'area' in cols_lower and 'rt' in cols_lower:
+            data_np = df[[cols_lower['area'], cols_lower['rt']]].to_numpy()
+        elif 'peak area' in cols_lower and 'rt' in cols_lower:
+            data_np = df[[cols_lower['peak area'], cols_lower['rt']]].to_numpy()
         else:
-            suggested = {}
-            print("WARNING: No suggestions returned from optimization, using empty dict")
-
-        # Create new row with proper column mapping
-        new_row = {}
-        print("Mapping suggestions to original columns:")
+            raise ValueError(f"Required columns not found. Available columns: {list(df.columns)}")
+    
+    print(f"Extracted {data_np.shape[0]} peaks from HPLC data")
+    
+    # Build HPLC parameters dictionary
+    hplc_params = {
+        'YminRT': float(YminRT) if YminRT is not None else 2.0,
+        'YmaxRT': float(YmaxRT) if YmaxRT is not None else 4.0,
+        'minRTISO': float(minRTISO) if minRTISO is not None else 10.0,
+        'maxRTISO': float(maxRTISO) if maxRTISO is not None else 12.0,
+    }
+    
+    # Process impurity RT lists
+    if IminRT_list is not None:
+        hplc_params['IminRT_list'] = [float(x) for x in IminRT_list if str(x).strip() != '']
+    else:
+        hplc_params['IminRT_list'] = [0.5]  # Default
         
-        for col in lhs.columns:
-            # Check if we have a suggestion for this column
-            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-            
-            if col_clean in suggested:
-                new_row[col] = suggested[col_clean]
-                print(f"  {col} <- {col_clean} = {suggested[col_clean]}")
-            elif col in suggested:
-                new_row[col] = suggested[col]
-                print(f"  {col} = {suggested[col]}")
-            else:
-                # For objective columns or unmapped columns, use NaN
-                new_row[col] = np.nan
-                print(f"  {col} = NaN (no suggestion)")
-        
-        print(f"Final new row: {new_row}")
-        lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-        print(f"Successfully added suggestion, total rows: {len(lhs_updated)}")
-        
-        return lhs_updated
-        
-    except Exception as e:
-        print(f"ERROR generating suggestion: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Create a row with all NaN values as fallback
-        new_row = {c: np.nan for c in lhs.columns}
-        print(f"Using fallback row with all NaN: {new_row}")
-        lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-        return lhs_updated
-############################################
-# Updated WebSocketNotifier class in main.py
+    if ImaxRT_list is not None:
+        hplc_params['ImaxRT_list'] = [float(x) for x in ImaxRT_list if str(x).strip() != '']
+    else:
+        hplc_params['ImaxRT_list'] = [1.0]  # Default
+    
+    print(f"HPLC Parameters: {hplc_params}")
+    
+    # Calculate response using the corrected function
+    resp = response_HPLC_csv(
+        data_np,
+        hplc_params['YminRT'],
+        hplc_params['YmaxRT'], 
+        hplc_params['IminRT_list'],
+        hplc_params['ImaxRT_list'],
+        hplc_params['minRTISO'],
+        hplc_params['maxRTISO'],
+        len(transformed_objectives)
+    )
+    
+    print(f"Calculated response: {resp}")
+    return resp
+#####################################
+# Updated WebSocketNotifier.on_created method in main.py with proper RT parameter handling
 
 class WebSocketNotifier(FileSystemEventHandler):
     def __init__(self, websocket_clients, loop, id):
@@ -159,14 +216,54 @@ class WebSocketNotifier(FileSystemEventHandler):
             object_id = ObjectId(self.id)
             experiment = collection.find_one({"_id": object_id})
             
-            # Get Objectives 
+            # Get Objectives and RT parameters from the database
             optimization = experiment.get("optimization_target", {})
             raw_objectives = optimization.get("objectives", {})
-            lhs = experiment.get('final_result')
-            df = pd.DataFrame(lhs[1:], columns=lhs[0])
-            llm_response_with_objective_columns = df.apply(pd.to_numeric, errors='coerce')
+            
+            # Extract RT parameters properly from UI input
+            # UI provides RTMin and RTMax as arrays where:
+            # - First element is for Yield (main product)
+            # - Remaining elements are for impurities
+            objectives_rtmin = raw_objectives.get('RTMin', [])
+            objectives_rtmax = raw_objectives.get('RTMax', [])
+            
+            print(f"Raw RT Min from UI: {objectives_rtmin}")
+            print(f"Raw RT Max from UI: {objectives_rtmax}")
+            
+            # Parse RT ranges
+            if len(objectives_rtmin) == 0 or len(objectives_rtmax) == 0:
+                raise ValueError("RT ranges not properly configured")
+                
+            # Yield RT range (first element in each array)
+            YminRT = float(objectives_rtmin[0])
+            YmaxRT = float(objectives_rtmax[0])
+            
+            # Impurity RT ranges (remaining elements)
+            IminRT_list = [float(x) for x in objectives_rtmin[1:] if str(x).strip() != '']
+            ImaxRT_list = [float(x) for x in objectives_rtmax[1:] if str(x).strip() != '']
+            
+            # Internal Standard RT range from separate UI fields
+            minRTISO = float(optimization.get("rtMinIso", 0))
+            maxRTISO = float(optimization.get("rtMaxIso", 0))
+            
+            print(f"Parsed RT parameters:")
+            print(f"  Yield RT: [{YminRT}-{YmaxRT}]")
+            print(f"  Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
+            print(f"  Internal Standard RT: [{minRTISO}-{maxRTISO}]")
+            
+            # Validate RT parameters
+            if YminRT >= YmaxRT:
+                raise ValueError(f"Invalid yield RT range: {YminRT} >= {YmaxRT}")
+            if minRTISO >= maxRTISO:
+                raise ValueError(f"Invalid internal standard RT range: {minRTISO} >= {maxRTISO}")
+            if len(IminRT_list) != len(ImaxRT_list):
+                raise ValueError(f"Impurity RT min/max lists length mismatch: {len(IminRT_list)} vs {len(ImaxRT_list)}")
             
             # Transform objectives dynamically
+            lhs = experiment.get('final_result')
+            df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
+            llm_response_with_objective_columns = df_experiment.apply(pd.to_numeric, errors='coerce')
+            
             transformed_objectives = []
             for i, name in enumerate(raw_objectives.get("Objectives", [])):
                 obj = {
@@ -177,112 +274,128 @@ class WebSocketNotifier(FileSystemEventHandler):
                     obj["Property"] = raw_objectives["Property"][i]
                 transformed_objectives.append(obj)
 
-            # Fetch uploaded CSV 
-            df = pd.read_csv(full_path_uploaded_csv)
+            # Read and process the uploaded HPLC CSV file
+            try:
+                df_hplc = pd.read_csv(full_path_uploaded_csv)
+                print(f"HPLC file loaded: {full_path_uploaded_csv}")
+                print(f"HPLC file columns: {list(df_hplc.columns)}")
+                print(f"HPLC file shape: {df_hplc.shape}")
+                
+                # Display first few rows for debugging
+                if len(df_hplc) > 0:
+                    print(f"Sample HPLC data:")
+                    print(df_hplc.head())
+                    if 'RT' in df_hplc.columns:
+                        print(f"RT range in file: {df_hplc['RT'].min():.3f} - {df_hplc['RT'].max():.3f}")
+                
+            except Exception as e:
+                print(f"Error reading HPLC file: {e}")
+                for ws, _ in self.websocket_clients:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(f"Error reading HPLC file: {e}"), self.loop)
+                return
             
-            # Process File with RT parameters
-            objectives_rtmin = raw_objectives.get('RTMin')
-            objectives_rtmax = raw_objectives.get('RTMax')
-            minRTISO = float(optimization.get("rtMinIso", 0))
-            maxRTISO = float(optimization.get("rtMaxIso", 0))
-            YminRT = float(objectives_rtmin[0])
-            YmaxRT = float(objectives_rtmax[0])
-            IminRT_list = [float(x) for x in objectives_rtmin[1:]]
-            ImaxRT_list = [float(x) for x in objectives_rtmax[1:]]
-            
+            # Get experiment status
             full_path = optimization.get("hplcPath", "")
-            completed_experiments = experiment.get('completed')
-            count_of_lhs = experiment.get('lhs_response').get('no_of_LHS')
+            completed_experiments = int(experiment.get('completed', 0))
+            count_of_lhs = int(experiment.get('lhs_response', {}).get('no_of_LHS', 0))
             user_sor_iterations = int(experiment.get('optimization_target', {}).get('iterations', 1))
             sys_sor_iterations = int(experiment.get('sor_iterations', 1))
             
-            print(f"Completed: {completed_experiments}, LHS count: {count_of_lhs}")
-            print(f"User SOR iterations: {user_sor_iterations}, Sys SOR iterations: {sys_sor_iterations}")
+            print(f"\nExperiment Status:")
+            print(f"  Completed: {completed_experiments}/{count_of_lhs} LHS")
+            print(f"  SOR Iterations: {sys_sor_iterations-1}/{user_sor_iterations}")
             
-            # Process the uploaded HPLC file
-            resp = utils.process_uploaded_csv_file(
-                full_path_uploaded_csv,
-                df,
-                minRTISO,
-                maxRTISO,
-                YminRT,
-                YmaxRT,
-                IminRT_list,
-                ImaxRT_list,
-                transformed_objectives,
-                llm_response_with_objective_columns
-            )
+            # Process the HPLC file with corrected RT filtering
+            try:
+                resp = utils.process_uploaded_csv_file(
+                    full_path_uploaded_csv,
+                    df_hplc,
+                    minRTISO,
+                    maxRTISO,
+                    YminRT,
+                    YmaxRT,
+                    IminRT_list,
+                    ImaxRT_list,
+                    transformed_objectives,
+                    llm_response_with_objective_columns
+                )
+                print(f"HPLC processing completed. Response: {resp}")
+                
+            except Exception as e:
+                print(f"Error processing HPLC data: {e}")
+                for ws, _ in self.websocket_clients:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(f"Error processing HPLC data: {e}"), self.loop)
+                return
             
             excel_path = os.path.join(full_path, "optimization.xlsx")
             
-            # FIXED LOGIC: Proper phase handling
-            if int(completed_experiments) < int(count_of_lhs):
-                # LHS Phase: Just update the current row with results
-                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
-                message = f"LHS experiment {completed_experiments + 1}/{count_of_lhs} completed. Upload next HPLC file."
-                
-            elif int(completed_experiments) == int(count_of_lhs):
-                # Transition from LHS to SOR: Process last LHS experiment and generate first SOR row
-                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
-                
-                # Generate ONLY ONE SOR suggestion (fixed num_suggestions=1)
-                sor_response_new_line = utils.suggest_experiments_and_append(1, transformed_objectives, updated_df)
-                
-                # Update final_result with the new SOR row
-                final_result = [sor_response_new_line.columns.tolist()] + sor_response_new_line.values.tolist()
-                collection.update_one(
-                    {"_id": object_id}, 
-                    {
-                        "$set": {"final_result": final_result},
-                        "$inc": {"sor_iterations": 1}
-                    }
-                )
-                
-                # Save updated Excel with new SOR row
-                sor_response_new_line.to_excel(excel_path, index=False)
-                
-                message = f"LHS phase completed. Generated SOR iteration 1/{user_sor_iterations}. Upload HPLC file for next experiment."
-                
-            else:
-                # SOR Phase: Handle ongoing SOR iterations
-                current_sor_iteration = sys_sor_iterations - 1  # Adjust for 0-based indexing
-                
-                if current_sor_iteration < user_sor_iterations:
-                    # Still in SOR phase: Update current row and generate next
+            # Phase-based processing logic (same as before but with better error handling)
+            try:
+                if completed_experiments < count_of_lhs:
+                    # LHS Phase
+                    updated_df = merge_and_save_final_result(excel_path, object_id, resp)
+                    message = f"LHS experiment {completed_experiments + 1}/{count_of_lhs} completed. Upload next HPLC file."
+                    
+                elif completed_experiments == count_of_lhs:
+                    # Transition from LHS to SOR
                     updated_df = merge_and_save_final_result(excel_path, object_id, resp)
                     
-                    if current_sor_iteration + 1 < user_sor_iterations:
-                        # Generate ONLY ONE more SOR suggestion
-                        sor_response_new_line = utils.suggest_experiments_and_append(1, transformed_objectives, updated_df)
+                    # Generate first SOR suggestion
+                    sor_response_new_line = utils.suggest_experiments_and_append(1, transformed_objectives, updated_df)
+                    
+                    final_result = [sor_response_new_line.columns.tolist()] + sor_response_new_line.values.tolist()
+                    collection.update_one(
+                        {"_id": object_id}, 
+                        {
+                            "$set": {"final_result": final_result},
+                            "$inc": {"sor_iterations": 1}
+                        }
+                    )
+                    
+                    sor_response_new_line.to_excel(excel_path, index=False)
+                    message = f"LHS phase completed. Generated SOR iteration 1/{user_sor_iterations}. Upload HPLC file for next experiment."
+                    
+                else:
+                    # SOR Phase
+                    current_sor_iteration = sys_sor_iterations - 1
+                    
+                    if current_sor_iteration < user_sor_iterations:
+                        updated_df = merge_and_save_final_result(excel_path, object_id, resp)
                         
-                        # Update final_result with the new SOR row
-                        final_result = [sor_response_new_line.columns.tolist()] + sor_response_new_line.values.tolist()
-                        collection.update_one(
-                            {"_id": object_id}, 
-                            {
-                                "$set": {"final_result": final_result},
-                                "$inc": {"sor_iterations": 1}
-                            }
-                        )
-                        
-                        # Save updated Excel with new SOR row
-                        sor_response_new_line.to_excel(excel_path, index=False)
-                        
-                        message = f"SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} completed. Generated next experiment. Upload HPLC file."
+                        if current_sor_iteration + 1 < user_sor_iterations:
+                            # Generate next SOR suggestion
+                            sor_response_new_line = utils.suggest_experiments_and_append(1, transformed_objectives, updated_df)
+                            
+                            final_result = [sor_response_new_line.columns.tolist()] + sor_response_new_line.values.tolist()
+                            collection.update_one(
+                                {"_id": object_id}, 
+                                {
+                                    "$set": {"final_result": final_result},
+                                    "$inc": {"sor_iterations": 1}
+                                }
+                            )
+                            
+                            sor_response_new_line.to_excel(excel_path, index=False)
+                            message = f"SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} completed. Generated next experiment. Upload HPLC file."
+                        else:
+                            # Last SOR iteration completed
+                            message = f"SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} completed. All experiments finished!"
+                            collection.update_one(
+                                {"_id": object_id},
+                                {"$set": {"current_phase": "completed"}}
+                            )
                     else:
-                        # Last SOR iteration completed
-                        message = f"SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} completed. All experiments finished!"
+                        message = "All SOR iterations completed. Optimization finished!"
                         collection.update_one(
                             {"_id": object_id},
                             {"$set": {"current_phase": "completed"}}
                         )
-                else:
-                    # All SOR iterations completed
-                    message = "All SOR iterations completed. Optimization finished!"
-                    collection.update_one(
-                        {"_id": object_id},
-                        {"$set": {"current_phase": "completed"}}
-                    )
+                
+            except Exception as e:
+                print(f"Error in phase processing: {e}")
+                import traceback
+                traceback.print_exc()
+                message = f"Error processing experiment: {e}"
             
             # Send message to WebSocket clients
             for ws, _ in self.websocket_clients:
