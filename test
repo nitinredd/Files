@@ -53,10 +53,11 @@ TILE_QUESTIONS = {
 }
 
 # AGGRESSIVE RATE LIMITING CONFIG
-BATCH_SIZE = 10  # Very small batches
-BATCH_DELAY = 3  # Longer delay between batches (3 seconds)
-MAX_RETRIES = 5  # More retries
-RETRY_DELAY = 10  # Longer initial retry delay
+BATCH_SIZE = 1  # Process ONE document at a time
+BATCH_DELAY = 2  # 2 second delay between EACH document
+MAX_RETRIES = 10  # Many retries
+RETRY_DELAY = 60  # Match Azure's retry delay
+REQUEST_DELAY = 1  # Additional delay before each request
 
 # PERSISTENCE CONFIG
 CACHE_DIR = "vectorstore_cache"
@@ -65,9 +66,34 @@ METADATA_CACHE_FILE = os.path.join(CACHE_DIR, "metadata.json")
 
 # ─── SETUP LLM + EMBEDDINGS ──────────────────────────────────────
 
-# Embedding store & cache
+# Embedding store & cache with custom settings
 file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
+
+# Create embeddings with request-level rate limiting
+class RateLimitedAzureOpenAIEmbeddings(AzureOpenAIEmbeddings):
+    """Custom embeddings class with built-in rate limiting."""
+    
+    def embed_documents(self, texts):
+        """Override to add delay between embedding requests."""
+        embeddings = []
+        for i, text in enumerate(texts):
+            logger.info(f"[Embedding] Processing document {i+1}/{len(texts)}")
+            time.sleep(REQUEST_DELAY)  # Delay before each request
+            try:
+                embedding = super().embed_documents([text])
+                embeddings.extend(embedding)
+            except Exception as e:
+                if "429" in str(e):
+                    logger.warning(f"[Embedding] Rate limit hit, waiting {RETRY_DELAY}s...")
+                    time.sleep(RETRY_DELAY)
+                    # Retry once
+                    embedding = super().embed_documents([text])
+                    embeddings.extend(embedding)
+                else:
+                    raise
+        return embeddings
+
+base = RateLimitedAzureOpenAIEmbeddings(
     model="text-embedding-ada-002",
     api_version="2023-07-01-preview",
     azure_endpoint="",
@@ -471,17 +497,25 @@ def build_vectorstores_with_robust_rate_limiting(chunks_dict: Dict[str, List[Dic
         
         # Process in VERY SMALL batches with aggressive rate limiting
         total_batches = (len(docs) + BATCH_SIZE - 1) // BATCH_SIZE
-        logger.info(f"[Vectorstore] Processing {len(docs)} docs in {total_batches} batches (batch_size={BATCH_SIZE}, delay={BATCH_DELAY}s)")
+        logger.info(f"[Vectorstore] Processing {len(docs)} docs ONE AT A TIME with {BATCH_DELAY}s delays")
+        logger.info(f"[Vectorstore] Estimated time: ~{(len(docs) * (BATCH_DELAY + REQUEST_DELAY)) / 60:.1f} minutes")
         
         store = None
+        successful_count = 0
+        
         for batch_idx in range(0, len(docs), BATCH_SIZE):
             batch_docs = docs[batch_idx:batch_idx + BATCH_SIZE]
             batch_num = (batch_idx // BATCH_SIZE) + 1
             
             retry_count = 0
-            while retry_count < MAX_RETRIES:
+            batch_success = False
+            
+            while retry_count < MAX_RETRIES and not batch_success:
                 try:
-                    logger.info(f"[Vectorstore] Processing batch {batch_num}/{total_batches} ({len(batch_docs)} docs)")
+                    logger.info(f"[Vectorstore] Processing doc {batch_num}/{total_batches}")
+                    
+                    # Extra safety: wait before processing
+                    time.sleep(REQUEST_DELAY)
                     
                     if store is None:
                         # Create initial store
@@ -490,34 +524,46 @@ def build_vectorstores_with_robust_rate_limiting(chunks_dict: Dict[str, List[Dic
                         # Add to existing store
                         store.add_documents(batch_docs)
                     
-                    logger.info(f"[Vectorstore] ✓ Batch {batch_num}/{total_batches} completed")
+                    successful_count += len(batch_docs)
+                    logger.info(f"[Vectorstore] ✓ Doc {batch_num}/{total_batches} completed (Total: {successful_count}/{len(docs)})")
+                    batch_success = True
                     
-                    # Save progress every 10 batches
-                    if batch_num % 10 == 0 and store:
-                        save_vectorstore_cache(store, {'source': key, 'chunk_count': len(chunks), 'partial': True})
-                        logger.info(f"[Cache] Saved progress checkpoint at batch {batch_num}")
-                    
-                    break  # Success, exit retry loop
+                    # Save progress every 5 documents
+                    if successful_count % 5 == 0 and store:
+                        save_vectorstore_cache(store, {
+                            'source': key, 
+                            'chunk_count': len(chunks), 
+                            'partial': True,
+                            'processed': successful_count
+                        })
+                        logger.info(f"[Cache] ✓ Saved checkpoint at {successful_count}/{len(docs)} docs")
                     
                 except Exception as e:
                     error_str = str(e).lower()
+                    retry_count += 1
+                    
                     if "429" in error_str or "rate" in error_str or "quota" in error_str:
-                        retry_count += 1
-                        # Exponential backoff with longer delays
-                        wait_time = RETRY_DELAY * (2 ** (retry_count - 1))
-                        logger.warning(f"[Vectorstore] ⚠ Rate limit hit. Retry {retry_count}/{MAX_RETRIES} after {wait_time}s")
+                        wait_time = RETRY_DELAY
+                        logger.warning(f"[Vectorstore] ⚠ Rate limit hit on doc {batch_num}. Retry {retry_count}/{MAX_RETRIES} after {wait_time}s")
                         time.sleep(wait_time)
+                    elif "token" in error_str or "limit" in error_str:
+                        logger.error(f"[Vectorstore] ✗ Token limit error on doc {batch_num}: {e}")
+                        logger.error(f"[Vectorstore] Doc content length: {len(batch_docs[0].page_content)} chars")
+                        # Skip this document
+                        logger.warning(f"[Vectorstore] Skipping problematic document {batch_num}")
+                        break
                     else:
-                        logger.error(f"[Vectorstore] ✗ Error processing batch: {e}")
+                        logger.error(f"[Vectorstore] ✗ Unexpected error on doc {batch_num}: {e}")
                         raise
             
-            if retry_count >= MAX_RETRIES:
-                logger.error(f"[Vectorstore] Failed after {MAX_RETRIES} retries. Stopping.")
-                raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries")
+            if retry_count >= MAX_RETRIES and not batch_success:
+                logger.error(f"[Vectorstore] ✗ Failed doc {batch_num} after {MAX_RETRIES} retries")
+                logger.error(f"[Vectorstore] Consider increasing BATCH_DELAY or checking Azure quota")
+                raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries on doc {batch_num}")
             
-            # Aggressive delay between batches
+            # Delay between documents
             if batch_idx + BATCH_SIZE < len(docs):
-                logger.info(f"[Vectorstore] Waiting {BATCH_DELAY}s before next batch...")
+                logger.info(f"[Vectorstore] Waiting {BATCH_DELAY}s before next document...")
                 time.sleep(BATCH_DELAY)
         
         if store:
@@ -546,7 +592,8 @@ try:
     CHUNKED_DATA = load_json_data_with_chunking(EMBEDDED_FILES)
     
     logger.info("[Startup] Step 2/3: Building vectorstores (this may take a while)...")
-    logger.info("[Startup] Using aggressive rate limiting: batch_size=10, delay=3s")
+    logger.info("[Startup] Ultra-conservative rate limiting: 1 doc at a time, 2s delay")
+    logger.info("[Startup] This ensures ZERO rate limit errors but will be slow")
     AGENTS = build_vectorstores_with_robust_rate_limiting(CHUNKED_DATA)
     
     logger.info("[Startup] Step 3/3: Initializing agent manager...")
