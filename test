@@ -1,26 +1,30 @@
 import os
 import io
 import json
+import sqlite3
 import pandas as pd
 import logging
 import speech_recognition as sr
-import re
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
+import tempfile
 
 from gtts import gTTS
 from langchain_openai import AzureChatOpenAI
 from langchain.prompts import ChatPromptTemplate
+from langchain.tools import Tool
+from langchain.agents import create_react_agent, AgentExecutor
+from langchain import hub
 
 # ─── CONFIG ──────────────────────────────────────────────────────
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Azure GPT configuration (fill these in)
+# Azure GPT configuration
 base_url=""
 api_version="2024-02-15-preview"
 api_key=""
@@ -32,7 +36,7 @@ EMBEDDED_FILES = {
     'data_1': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Prime_M+F_JSON.json",
 }
 
-# Sample‑prompt tiles (for frontend to fetch)
+# Sample tiles
 TILE_QUESTIONS = {
     "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
     "Line B":    ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
@@ -45,7 +49,7 @@ TILE_QUESTIONS = {
 
 # ─── SETUP LLM ───────────────────────────────────────────────────
 
-chat_model = AzureChatOpenAI(
+llm = AzureChatOpenAI(
     azure_deployment=deployment_name,
     model=model_name,
     api_version=api_version,
@@ -54,281 +58,288 @@ chat_model = AzureChatOpenAI(
     temperature=0
 )
 
-# ─── INTELLIGENT DATA LOADER ─────────────────────────────────────
+# ─── INTELLIGENT DATABASE SYSTEM ─────────────────────────────────
 
-def normalize_json_to_dataframe(data: Any) -> pd.DataFrame:
+class IntelligentDataStore:
     """
-    Convert JSON (list or single object) to a normalized DataFrame.
-    Flattens nested structures for easy querying.
+    Creates an in-memory SQLite database from JSON data.
+    Allows complex querying without embeddings.
     """
-    if isinstance(data, list):
-        df = pd.json_normalize(data)
-    else:
-        df = pd.json_normalize([data])
     
-    # Convert all column names to lowercase for case-insensitive search
-    df.columns = [col.lower().replace('.', '_') for col in df.columns]
+    def __init__(self):
+        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
+        self.tables = {}
+        self.schema_info = {}
     
-    return df
-
-def load_data_as_dataframes(paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
-    """Load JSON files and convert to DataFrames."""
-    dataframes = {}
+    def load_json_to_db(self, name: str, json_path: str):
+        """Load JSON data into SQLite database."""
+        logger.info(f"[DB] Loading {name} into database...")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Normalize JSON to DataFrame
+        if isinstance(data, list):
+            df = pd.json_normalize(data)
+        else:
+            df = pd.json_normalize([data])
+        
+        # Clean column names for SQL compatibility
+        df.columns = [col.lower().replace('.', '_').replace(' ', '_').replace('-', '_') 
+                      for col in df.columns]
+        
+        # Store in SQLite
+        table_name = name.lower().replace(' ', '_')
+        df.to_sql(table_name, self.conn, if_exists='replace', index=False)
+        
+        self.tables[table_name] = df
+        self.schema_info[table_name] = {
+            'columns': list(df.columns),
+            'row_count': len(df),
+            'sample_values': {col: df[col].dropna().head(3).tolist() for col in df.columns[:10]}
+        }
+        
+        logger.info(f"[DB] ✓ Loaded {len(df)} records with {len(df.columns)} columns into '{table_name}'")
+        logger.info(f"[DB] Columns: {list(df.columns[:15])}")
     
-    for name, path in paths.items():
-        if not path:
-            continue
+    def get_schema_description(self) -> str:
+        """Generate a natural language description of the database schema."""
+        description = "Database Schema:\n\n"
+        
+        for table_name, info in self.schema_info.items():
+            description += f"Table: {table_name}\n"
+            description += f"  Records: {info['row_count']}\n"
+            description += f"  Columns: {', '.join(info['columns'][:20])}\n"
+            description += f"  Sample values:\n"
+            for col, values in list(info['sample_values'].items())[:5]:
+                if values:
+                    description += f"    {col}: {values}\n"
+            description += "\n"
+        
+        return description
+    
+    def execute_query(self, query: str) -> str:
+        """Execute SQL query and return results as formatted string."""
         try:
-            logger.info(f"[Loading] Reading file: {name}")
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            logger.info(f"[DB] Executing query: {query[:200]}...")
             
-            df = normalize_json_to_dataframe(data)
-            dataframes[name] = df
+            df = pd.read_sql_query(query, self.conn)
             
-            logger.info(f"[Data] Loaded {len(df)} records with {len(df.columns)} columns from '{name}'")
-            logger.info(f"[Data] Columns: {list(df.columns[:10])}...")
+            if df.empty:
+                return "No results found for this query."
+            
+            # Format results
+            result = f"Found {len(df)} records:\n\n"
+            
+            # Show up to 20 results
+            for idx, row in df.head(20).iterrows():
+                result += f"Record {idx + 1}:\n"
+                for col, val in row.items():
+                    if pd.notna(val):
+                        result += f"  {col}: {val}\n"
+                result += "\n"
+            
+            if len(df) > 20:
+                result += f"\n(Showing 20 of {len(df)} total results)\n"
+            
+            return result
             
         except Exception as e:
-            logger.error(f"[Data] Failed to load '{name}': {e}")
+            logger.error(f"[DB] Query error: {e}")
+            return f"Query execution error: {str(e)}"
     
-    return dataframes
-
-# ─── INTELLIGENT QUERY ROUTER ────────────────────────────────────
-
-class QueryRouter:
-    """
-    Routes queries to the appropriate search strategy:
-    - Exact search for IDs, codes, names
-    - Filtered search for ranges, comparisons
-    - Semantic search for complex natural language queries
-    """
-    
-    def __init__(self, dataframes: Dict[str, pd.DataFrame]):
-        self.dataframes = dataframes
-        self.all_columns = self._get_all_columns()
-    
-    def _get_all_columns(self) -> List[str]:
-        """Get all unique columns across all dataframes."""
-        all_cols = set()
-        for df in self.dataframes.values():
-            all_cols.update(df.columns)
-        return sorted(list(all_cols))
-    
-    def extract_search_terms(self, query: str) -> Dict[str, Any]:
-        """Extract key search terms from query."""
-        query_lower = query.lower()
+    def get_column_info(self, table_name: str, column_name: str) -> Dict:
+        """Get detailed information about a specific column."""
+        if table_name not in self.tables:
+            return {"error": "Table not found"}
         
-        # Extract quoted terms (exact matches)
-        quoted_terms = re.findall(r'"([^"]+)"', query)
+        df = self.tables[table_name]
         
-        # Extract numbers (batch sizes, IDs, etc.)
-        numbers = re.findall(r'\b\d+(?:\.\d+)?\b', query)
+        if column_name not in df.columns:
+            return {"error": "Column not found"}
         
-        # Extract comparison operators
-        comparisons = {
-            'greater_than': re.search(r'(?:greater than|more than|above|>)\s*(\d+(?:\.\d+)?)', query_lower),
-            'less_than': re.search(r'(?:less than|below|under|<)\s*(\d+(?:\.\d+)?)', query_lower),
-            'equals': re.search(r'(?:equals?|is|=)\s*(\d+(?:\.\d+)?)', query_lower)
+        col_data = df[column_name].dropna()
+        
+        info = {
+            "data_type": str(df[column_name].dtype),
+            "non_null_count": len(col_data),
+            "unique_values": int(col_data.nunique()),
         }
         
-        return {
-            'quoted_terms': quoted_terms,
-            'numbers': numbers,
-            'comparisons': {k: v.group(1) if v else None for k, v in comparisons.items()},
-            'original_query': query
-        }
-    
-    def find_relevant_columns(self, query: str) -> List[str]:
-        """Find columns that might be relevant to the query."""
-        query_lower = query.lower()
-        relevant = []
+        # Add numeric stats if applicable
+        if pd.api.types.is_numeric_dtype(col_data):
+            info.update({
+                "min": float(col_data.min()),
+                "max": float(col_data.max()),
+                "mean": float(col_data.mean()),
+            })
+        else:
+            # Add sample values for non-numeric
+            info["sample_values"] = col_data.head(10).tolist()
         
-        for col in self.all_columns:
-            # Check if column name or parts of it appear in query
-            col_parts = col.split('_')
-            if any(part in query_lower for part in col_parts if len(part) > 2):
-                relevant.append(col)
-        
-        return relevant
-    
-    def search_exact(self, df: pd.DataFrame, search_terms: Dict[str, Any]) -> pd.DataFrame:
-        """Perform exact search on DataFrame."""
-        result = df.copy()
-        
-        # Search for quoted terms in all text columns
-        if search_terms['quoted_terms']:
-            for term in search_terms['quoted_terms']:
-                mask = pd.Series([False] * len(result))
-                for col in result.select_dtypes(include=['object']).columns:
-                    mask |= result[col].astype(str).str.contains(term, case=False, na=False)
-                result = result[mask]
-        
-        # Search for numbers in numeric columns
-        if search_terms['numbers']:
-            for num in search_terms['numbers']:
-                mask = pd.Series([False] * len(result))
-                for col in result.select_dtypes(include=['number']).columns:
-                    mask |= result[col] == float(num)
-                if mask.any():
-                    result = result[mask]
-        
-        return result
-    
-    def search_keyword(self, df: pd.DataFrame, keywords: List[str]) -> pd.DataFrame:
-        """Search for keywords across all columns."""
-        if not keywords:
-            return df
-        
-        mask = pd.Series([False] * len(df))
-        for keyword in keywords:
-            for col in df.columns:
-                mask |= df[col].astype(str).str.contains(keyword, case=False, na=False, regex=False)
-        
-        return df[mask]
+        return info
 
-# ─── SMART QUERY HANDLER ─────────────────────────────────────────
+# ─── INTELLIGENT AGENT SYSTEM ────────────────────────────────────
 
-class SmartQueryHandler:
+class SmartQueryAgent:
     """
-    Handles queries intelligently:
-    1. First tries direct DataFrame search (fast, accurate, no API calls)
-    2. If results found, uses LLM to format answer from data
-    3. Only uses LLM for complex reasoning, not for retrieval
+    LLM-powered agent that understands natural language queries
+    and translates them into SQL queries.
     """
     
-    def __init__(self, dataframes: Dict[str, pd.DataFrame], llm):
-        self.router = QueryRouter(dataframes)
-        self.dataframes = dataframes
+    def __init__(self, db_store: IntelligentDataStore, llm):
+        self.db = db_store
         self.llm = llm
+        self.query_history = []
     
-    def search_all_dataframes(self, query: str) -> tuple[pd.DataFrame, str]:
-        """Search across all dataframes."""
-        all_results = []
-        source_info = []
+    def create_sql_query_tool(self):
+        """Create a tool for executing SQL queries."""
+        def run_sql(query: str) -> str:
+            """Execute a SQL query on the database. Use this to retrieve data."""
+            return self.db.execute_query(query)
         
-        search_terms = self.router.extract_search_terms(query)
-        
-        # Extract keywords from query
-        keywords = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
-        keywords = [k for k in keywords if k not in ['what', 'the', 'is', 'are', 'for', 'and', 'or']]
-        
-        for name, df in self.dataframes.items():
-            # Try exact search first
-            exact_results = self.router.search_exact(df, search_terms)
-            
-            if len(exact_results) > 0:
-                all_results.append(exact_results)
-                source_info.append(f"{name} (exact match)")
-                logger.info(f"[Search] Found {len(exact_results)} exact matches in {name}")
-                continue
-            
-            # Try keyword search
-            keyword_results = self.router.search_keyword(df, keywords)
-            
-            if len(keyword_results) > 0:
-                all_results.append(keyword_results.head(20))  # Limit to top 20
-                source_info.append(f"{name} (keyword match)")
-                logger.info(f"[Search] Found {len(keyword_results)} keyword matches in {name}")
-        
-        if all_results:
-            combined_df = pd.concat(all_results, ignore_index=True)
-            return combined_df, ", ".join(source_info)
-        
-        return pd.DataFrame(), "No sources"
+        return Tool(
+            name="sql_query",
+            func=run_sql,
+            description="Execute SQL queries on the database to retrieve information. Input should be a valid SQL SELECT query."
+        )
     
-    def format_dataframe_for_llm(self, df: pd.DataFrame, max_rows: int = 10) -> str:
-        """Convert DataFrame to a readable format for LLM."""
-        if df.empty:
-            return "No data found."
+    def create_schema_tool(self):
+        """Create a tool for getting schema information."""
+        def get_schema(dummy: str = "") -> str:
+            """Get the database schema and table information."""
+            return self.db.get_schema_description()
         
-        # Limit rows to prevent token overflow
-        df_limited = df.head(max_rows)
-        
-        # Convert to dict format for clarity
-        records = df_limited.to_dict('records')
-        
-        formatted = "Found Records:\n\n"
-        for idx, record in enumerate(records, 1):
-            formatted += f"Record {idx}:\n"
-            for key, value in record.items():
-                if pd.notna(value):
-                    formatted += f"  {key}: {value}\n"
-            formatted += "\n"
-        
-        if len(df) > max_rows:
-            formatted += f"\n(Showing {max_rows} of {len(df)} total records)\n"
-        
-        return formatted
+        return Tool(
+            name="get_schema",
+            func=get_schema,
+            description="Get information about available tables and their columns. Use this first to understand what data is available."
+        )
     
-    def generate_answer(self, query: str, data: str, source: str) -> str:
-        """Use LLM to generate answer from retrieved data."""
+    def query_with_llm(self, user_query: str) -> str:
+        """
+        Use LLM to understand the query and generate appropriate SQL.
+        This is the intelligent part - LLM figures out what the user wants.
+        """
+        
+        schema = self.db.get_schema_description()
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a precise data assistant. Answer the user's question using ONLY the data provided below.
+            ("system", """You are an expert data analyst with SQL expertise. Your job is to help users query a database containing formulation and manufacturing data.
 
-CRITICAL RULES:
-1. ONLY use information explicitly stated in the provided data
-2. If the answer is in the data, provide specific details with exact values
-3. If the data doesn't contain the answer, say "I don't have that information in the available data"
-4. Never make up, infer, or assume information not in the data
-5. Quote exact values when available (e.g., "Batch size: 500 kg")
-6. If multiple records match, mention all relevant ones
+Database Schema:
+{schema}
 
-Provided Data:
-{data}
+Your task:
+1. Understand the user's natural language question
+2. Generate an appropriate SQL query to answer it
+3. Execute the query and explain the results
 
-Source: {source}"""),
+IMPORTANT RULES:
+- Always use proper SQL syntax (SELECT, FROM, WHERE, etc.)
+- Column names and table names are case-insensitive
+- Use LIKE with % wildcards for partial text matching
+- Use proper SQL operators (=, >, <, BETWEEN, IN, etc.)
+- If the user asks about multiple things, use multiple queries or JOIN if needed
+- Always limit results to avoid overwhelming output (LIMIT 50)
+- If you're not sure about exact column names, query the schema first
+
+For text searches, use: WHERE column_name LIKE '%search_term%'
+For numeric comparisons, use: WHERE column_name > value
+For multiple conditions, use: WHERE condition1 AND condition2
+
+Examples:
+- "Show me products with batch size over 1000" → SELECT * FROM table WHERE batch_size > 1000 LIMIT 50
+- "Find formulations containing lactose" → SELECT * FROM table WHERE formulation LIKE '%lactose%' LIMIT 50
+- "What equipment is used for product X?" → SELECT equipment FROM table WHERE product_name LIKE '%X%' LIMIT 50
+"""),
             ("human", "{question}")
         ])
         
+        # Generate SQL query using LLM
         chain = prompt | self.llm
         response = chain.invoke({
-            "question": query,
-            "data": data,
-            "source": source
+            "question": user_query,
+            "schema": schema
         })
         
-        return response.content
+        # Extract SQL from response
+        response_text = response.content
+        
+        # Try to find SQL query in response
+        import re
+        sql_match = re.search(r'```sql\n(.*?)\n```', response_text, re.DOTALL)
+        if not sql_match:
+            sql_match = re.search(r'SELECT.*?(?:;|$)', response_text, re.IGNORECASE | re.DOTALL)
+        
+        if sql_match:
+            sql_query = sql_match.group(1) if sql_match.lastindex else sql_match.group(0)
+            sql_query = sql_query.strip().rstrip(';')
+            
+            logger.info(f"[Agent] Generated SQL: {sql_query}")
+            
+            # Execute the query
+            results = self.db.execute_query(sql_query)
+            
+            # Have LLM format the final answer
+            final_prompt = ChatPromptTemplate.from_messages([
+                ("system", """You are a helpful assistant. Format the database query results into a clear, natural language answer to the user's question.
+
+Query Results:
+{results}
+
+Provide a clear, concise answer based on these results. If no results were found, say so clearly."""),
+                ("human", "Original question: {question}")
+            ])
+            
+            final_chain = final_prompt | self.llm
+            final_response = final_chain.invoke({
+                "question": user_query,
+                "results": results
+            })
+            
+            return final_response.content
+        else:
+            # LLM didn't generate SQL - it might be answering directly from schema
+            return response_text
     
     def handle_query(self, query: str) -> str:
         """Main entry point for handling queries."""
-        logger.info(f"[Query] Processing: '{query}'")
+        logger.info(f"[Agent] Processing query: '{query}'")
         
-        # Search dataframes
-        results_df, source = self.search_all_dataframes(query)
-        
-        if results_df.empty:
-            return "I couldn't find any relevant information for your query. Please try rephrasing or ask about specific products, batches, or formulations in the dataset."
-        
-        # Format data for LLM
-        data_context = self.format_dataframe_for_llm(results_df)
-        
-        # Generate answer using LLM
-        answer = self.generate_answer(query, data_context, source)
-        
-        logger.info(f"[Query] Found {len(results_df)} results from {source}")
-        
-        return answer
+        try:
+            answer = self.query_with_llm(query)
+            self.query_history.append({"query": query, "answer": answer})
+            return answer
+            
+        except Exception as e:
+            logger.error(f"[Agent] Error: {e}")
+            return f"I encountered an error processing your query: {str(e)}. Please try rephrasing your question."
 
 # ─── INITIALIZE ON STARTUP ───────────────────────────────────────
 
 logger.info("=" * 70)
-logger.info("[Startup] Initializing Smart Query System (NO EMBEDDINGS NEEDED!)")
+logger.info("[Startup] Initializing Intelligent Query System")
 logger.info("=" * 70)
 
 try:
-    logger.info("[Startup] Loading data as DataFrames...")
-    DATAFRAMES = load_data_as_dataframes(EMBEDDED_FILES)
+    logger.info("[Startup] Creating in-memory database...")
+    DB_STORE = IntelligentDataStore()
     
-    logger.info("[Startup] Initializing Smart Query Handler...")
-    QUERY_HANDLER = SmartQueryHandler(DATAFRAMES, chat_model)
+    logger.info("[Startup] Loading data into database...")
+    for name, path in EMBEDDED_FILES.items():
+        if path:
+            DB_STORE.load_json_to_db(name, path)
+    
+    logger.info("[Startup] Initializing LLM-powered query agent...")
+    AGENT = SmartQueryAgent(DB_STORE, llm)
     
     recognizer = sr.Recognizer()
     
     logger.info("=" * 70)
-    logger.info("[Startup] ✓ System ready! (Instant startup, no rate limits)")
+    logger.info("[Startup] ✓ System ready! (Fast startup, intelligent querying)")
     logger.info("=" * 70)
+    
 except Exception as e:
     logger.error("=" * 70)
     logger.error(f"[Startup] ✗ FATAL ERROR: {e}")
@@ -337,7 +348,7 @@ except Exception as e:
 
 # ─── FASTAPI APP ─────────────────────────────────────────────────
 
-app = FastAPI(title="Smart Query System - Zero Hallucinations")
+app = FastAPI(title="Intelligent Query System")
 
 app.add_middleware(
     CORSMiddleware,
@@ -353,7 +364,6 @@ class ChatRequest(BaseModel):
 
 @app.get("/sample-tiles")
 def sample_tiles():
-    """Return the sample-prompt tiles and questions."""
     return JSONResponse(TILE_QUESTIONS)
 
 @app.post("/chat")
@@ -361,18 +371,18 @@ def chat(req: ChatRequest):
     q = req.message.strip()
     if not q:
         raise HTTPException(400, "Empty query")
-    logger.info(f"[API] /chat query='{q}'")
+    
+    logger.info(f"[API] Query: '{q}'")
     
     try:
-        ans = QUERY_HANDLER.handle_query(q)
-        return {"response": ans}
+        answer = AGENT.handle_query(q)
+        return {"response": answer}
     except Exception as e:
-        logger.error(f"[API] Error processing query: {e}")
-        return {"response": "I encountered an error processing your query. Please try rephrasing it."}
+        logger.error(f"[API] Error: {e}")
+        return {"response": "I encountered an error. Please try rephrasing your question."}
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
-    """Accepts an uploaded audio file and returns transcribed text."""
     try:
         data = await file.read()
         audio = sr.AudioFile(io.BytesIO(data))
@@ -386,7 +396,6 @@ async def speech_to_text(file: UploadFile = File(...)):
 
 @app.get("/text-to-speech")
 def text_to_speech(text: str):
-    """Returns an MP3 audio stream of the given text."""
     try:
         buf = io.BytesIO()
         gTTS(text).write_to_fp(buf)
@@ -398,30 +407,29 @@ def text_to_speech(text: str):
 
 @app.get("/health")
 def health():
-    total_records = sum(len(df) for df in DATAFRAMES.values())
     return {
         "status": "ok",
-        "total_records": total_records,
-        "dataframes": {name: len(df) for name, df in DATAFRAMES.items()},
-        "approach": "Direct DataFrame search (no embeddings)"
+        "tables": list(DB_STORE.tables.keys()),
+        "total_records": sum(len(df) for df in DB_STORE.tables.values()),
+        "approach": "LLM-powered SQL generation"
+    }
+
+@app.get("/schema")
+def get_schema():
+    """Get database schema information."""
+    return {
+        "schema": DB_STORE.schema_info,
+        "description": DB_STORE.get_schema_description()
     }
 
 @app.get("/stats")
 def stats():
-    """Get statistics about the loaded data."""
+    """Get detailed statistics."""
     stats_info = {}
-    for name, df in DATAFRAMES.items():
-        stats_info[name] = {
+    for table_name, df in DB_STORE.tables.items():
+        stats_info[table_name] = {
             "total_records": len(df),
-            "columns": list(df.columns[:20]),
-            "sample_data": df.head(2).to_dict('records') if len(df) > 0 else []
+            "columns": list(df.columns),
+            "sample_data": df.head(2).to_dict('records')
         }
     return stats_info
-
-@app.get("/columns")
-def get_columns():
-    """Get all available columns across datasets."""
-    all_cols = set()
-    for df in DATAFRAMES.values():
-        all_cols.update(df.columns)
-    return {"columns": sorted(list(all_cols))}
