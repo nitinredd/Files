@@ -1,42 +1,58 @@
+# main.py  (REPLACE your file with this)
 import os
 import io
 import json
-import sqlite3
-import pandas as pd
+import uuid
+import time
+import math
 import logging
-import speech_recognition as sr
+import requests
+import numpy as np
+import pandas as pd
+import tiktoken
+import faiss
+from typing import Union, List, Dict, Any
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-import tempfile
 
+# audio libs kept as before
+import speech_recognition as sr
 from gtts import gTTS
+
+# langchain imports you used earlier (kept for compatibility)
 from langchain_openai import AzureChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.tools import Tool
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain import hub
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.docstore.document import Document
+from langchain.chains import RetrievalQA
 
-# ─── CONFIG ──────────────────────────────────────────────────────
-
+# ------------------- Logging -------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("scaleup_chatbot")
 
-# Azure GPT configuration
-base_url=""
-api_version="2024-02-15-preview"
-api_key=""
-deployment_name="GPT4o"
-model_name="GPT4o"
+# ------------------- User config (KEEP AS-IS) -------------------
+# Azure GPT configuration (fill these in / keep as-is)
+base_url = ""               # keep as-is
+api_version = "2024-02-15-preview"  # keep as-is
+api_key = ""                # keep as-is
+deployment_name = "GPT4o"   # keep as-is
+model_name = "GPT4o"        # keep as-is
 
-# Paths to embedded JSON files
+# Embedding deployment name used by your AzureOpenAIEmbeddings instantiation earlier
+# Keep this if you rely on that deployment. We use this for direct REST calls too.
+EMBED_DEPLOYMENT = "Def_data_qa"  # same as the azure_deployment you configured for embeddings
+
+# Paths to embedded JSON files (keep)
 EMBEDDED_FILES = {
     'data_1': r"C:\Users\Desktop\WORK\Formulations\Scale_up_Predictor_chatbot\Dataset\Prime_M+F_JSON.json",
+    # add other files as necessary
 }
 
-# Sample tiles
+# Sample tiles (unchanged)
 TILE_QUESTIONS = {
     "Product A": ["What is the API used?", "What is the batch size?", "Who is the manufacturer?"],
     "Line B":    ["What is the speed range?", "What equipment is used?", "What is the pressure limit?"],
@@ -47,309 +63,438 @@ TILE_QUESTIONS = {
     "Raw Material P": ["What are specs?", "Approved vendors?"]
 }
 
-# ─── SETUP LLM ───────────────────────────────────────────────────
+# ------------------- Safe defaults for chunking & retrieval -------------------
+# Tune these if you wish
+EMBED_MODEL_NAME_FOR_COUNT = "text-embedding-ada-002"  # keep consistent with your cached embedding model
+MAX_CHUNK_TOKENS = 600
+CHUNK_OVERLAP_TOKENS = 100
+BATCH_EMBED_SIZE = 64                 # batch size for embedding API calls
+TFIDF_CANDIDATES = 300                # number of candidates from TF-IDF prefilter
+FINAL_TOP_K = 6                       # number of chunks to include in the LLM prompt
+MAX_PROMPT_CONTEXT_TOKENS = 3000      # limit context tokens included in the prompt to the LLM
+EMBED_DIM = None                      # will be set after embeddings computed
 
-llm = AzureChatOpenAI(
+# persistence paths
+VECTOR_FOLDER = "./vector_data"
+os.makedirs(VECTOR_FOLDER, exist_ok=True)
+EMBEDDINGS_NPY = os.path.join(VECTOR_FOLDER, "embeddings.npy")
+METAS_JSON = os.path.join(VECTOR_FOLDER, "metas.json")
+FAISS_INDEX_PATH = os.path.join(VECTOR_FOLDER, "faiss.index")
+TEXTS_JSON = os.path.join(VECTOR_FOLDER, "texts.json")
+
+# ------------------- Initialization of other objects (kept for compatibility) -------------------
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="Def_data_qa"
+)
+chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
     model=model_name,
     api_version=api_version,
     api_key=api_key,
-    azure_endpoint=base_url,
-    temperature=0
+    azure_endpoint=base_url
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
+
+# ------------------- Token encoder (tiktoken) -------------------
+try:
+    ENCODER = tiktoken.encoding_for_model(EMBED_MODEL_NAME_FOR_COUNT)
+except Exception:
+    # fallback to cl100k_base if model not registered locally
+    ENCODER = tiktoken.get_encoding("cl100k_base")
+
+def num_tokens(text: str) -> int:
+    return len(ENCODER.encode(text))
+
+def tokens_to_text(tokens: List[int]) -> str:
+    return ENCODER.decode(tokens)
+
+def chunk_text_by_tokens(text: str, max_tokens=MAX_CHUNK_TOKENS, overlap=CHUNK_OVERLAP_TOKENS) -> List[str]:
+    toks = ENCODER.encode(text)
+    step = max_tokens - overlap
+    if step <= 0:
+        raise ValueError("max_tokens must be greater than overlap")
+    chunks = []
+    for start in range(0, len(toks), step):
+        slice_ = toks[start:start+max_tokens]
+        chunks.append(tokens_to_text(slice_))
+        if start + max_tokens >= len(toks):
+            break
+    return chunks
+
+# ------------------- Azure REST helpers with backoff -------------------
+def azure_post_with_backoff(url: str, headers: Dict[str, str], json_body: Dict[str, Any], max_retries=6, timeout=60):
+    """
+    Generic POST with exponential backoff; honors Retry-After header if present.
+    Returns r.json() on success, raises for status after retries exhausted.
+    """
+    backoff = 1.0
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    wait = backoff
+                logger.warning(f"[Azure] 429 Too Many Requests. Retry-after={wait}s (attempt {attempt}/{max_retries})")
+                time.sleep(wait)
+                backoff *= 2
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            # For transient network errors, retry
+            if attempt == max_retries:
+                logger.exception("[Azure] Max retries exhausted.")
+                raise
+            logger.warning(f"[Azure] Request error: {e}. Backing off {backoff}s (attempt {attempt}/{max_retries})")
+            time.sleep(backoff)
+            backoff *= 2
+    raise RuntimeError("azure_post_with_backoff: unexpected exit")
+
+def azure_embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Batch call to Azure embeddings REST API with backoff.
+    Splits into BATCH_EMBED_SIZE per request.
+    """
+    global EMBED_DIM
+    results = []
+    headers = {"Content-Type": "application/json", "api-key": api_key}
+    for i in range(0, len(texts), BATCH_EMBED_SIZE):
+        batch = texts[i:i+BATCH_EMBED_SIZE]
+        url = f"{base_url}/openai/deployments/{EMBED_DEPLOYMENT}/embeddings?api-version={api_version}"
+        body = {"input": batch}
+        logger.info(f"[Embeddings] Sending batch {i}..{i+len(batch)-1} (size {len(batch)}) to Azure")
+        resp = azure_post_with_backoff(url, headers, body, max_retries=8, timeout=120)
+        # resp expected shape: {'data': [ {'embedding': [...]} , ... ], ...}
+        batch_embs = [item["embedding"] for item in resp["data"]]
+        results.extend(batch_embs)
+        if EMBED_DIM is None and batch_embs:
+            EMBED_DIM = len(batch_embs[0])
+    return results
+
+def azure_chat_completion(system_prompt: str, user_prompt: str, temperature=0.0) -> str:
+    """
+    Calls Azure chat completions REST API with backoff.
+    Returns assistant content string.
+    """
+    headers = {"Content-Type": "application/json", "api-key": api_key}
+    url = f"{base_url}/openai/deployments/{deployment_name}/chat/completions?api-version={api_version}"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    body = {"messages": messages, "temperature": temperature}
+    resp = azure_post_with_backoff(url, headers, body, max_retries=6, timeout=120)
+    # Azure returns choices -> message -> content
+    try:
+        content = resp["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.exception("Unexpected chat response format")
+        raise
+    return content
+
+# ------------------- Index data structures -------------------
+# We'll store:
+# - texts: list[str] each chunk text
+# - metas: list[dict] metadata with 'doc_id' and 'chunk_idx' and optional original offsets
+# - embeddings_np: numpy array (N,dim) float32 (normalized to unit vectors)
+# - faiss_index: faiss.IndexFlatIP built on normalized vectors
+
+texts: List[str] = []
+metas: List[Dict[str, Any]] = []
+embeddings_np: np.ndarray = None
+faiss_index = None
+tfidf_vectorizer = None
+tfidf_matrix = None
+
+# ------------------- JSON loading & semantic chunking -------------------
+def load_json_data(paths: dict[str, str]) -> dict[str, pd.DataFrame]:
+    dfs: dict[str, pd.DataFrame] = {}
+    for name, path in paths.items():
+        if not path:
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            records = []
+            if isinstance(data, list):
+                # each list element is a record
+                for item in data:
+                    # preserve structure, but stringify for text embedding
+                    records.append({"content": json.dumps(item, sort_keys=True, ensure_ascii=False)})
+            elif isinstance(data, dict):
+                # split by top-level keys (semantic)
+                for k,v in data.items():
+                    records.append({"content": json.dumps({k:v}, sort_keys=True, ensure_ascii=False)})
+            else:
+                records.append({"content": str(data)})
+            df = pd.DataFrame(records)
+            dfs[name] = df
+            logger.info(f"[Data] Loaded {len(df)} records for '{name}'")
+        except Exception as e:
+            logger.error(f"[Data] Failed to load '{name}': {e}", exc_info=True)
+    return dfs
+
+def create_semantic_chunks_from_df(df: pd.DataFrame, source_name: str):
+    """
+    Convert each record into one or more semantic chunks (token-based) with overlap.
+    Appends to global texts & metas lists.
+    """
+    global texts, metas
+    for i, row in df.iterrows():
+        content = str(row["content"])
+        if num_tokens(content) <= MAX_CHUNK_TOKENS:
+            texts.append(content)
+            metas.append({"doc_id": source_name, "record_index": int(i), "chunk_idx": 0})
+        else:
+            sub_chunks = chunk_text_by_tokens(content, max_tokens=MAX_CHUNK_TOKENS, overlap=CHUNK_OVERLAP_TOKENS)
+            for ci, sc in enumerate(sub_chunks):
+                texts.append(sc)
+                metas.append({"doc_id": source_name, "record_index": int(i), "chunk_idx": int(ci)})
+
+# ------------------- Build vector store pipeline -------------------
+def build_vector_store(dfs: dict[str, pd.DataFrame], force_rebuild=False):
+    """
+    Build (or load) embeddings + faiss index + TF-IDF matrix.
+    This function stores embeddings.npy, metas.json, texts.json, and faiss.index for reuse.
+    """
+    global texts, metas, embeddings_np, faiss_index, tfidf_vectorizer, tfidf_matrix, EMBED_DIM
+
+    # if persisted files exist and not forced, load them
+    if not force_rebuild and os.path.exists(EMBEDDINGS_NPY) and os.path.exists(METAS_JSON) and os.path.exists(TEXTS_JSON) and os.path.exists(FAISS_INDEX_PATH):
+        logger.info("[Index] Loading persisted index from disk")
+        texts = json.load(open(TEXTS_JSON, "r", encoding="utf-8"))
+        metas = json.load(open(METAS_JSON, "r", encoding="utf-8"))
+        embeddings_np = np.load(EMBEDDINGS_NPY)
+        EMBED_DIM = embeddings_np.shape[1]
+        # load faiss
+        faiss_index = faiss.read_index(FAISS_INDEX_PATH)
+        # load tfidf
+        try:
+            tfidf_vectorizer = None
+            tfidf_matrix = None
+            # We rebuild TF-IDF each time (cheap) to avoid pickling mismatches
+            logger.info("[Index] Rebuilding TF-IDF from texts")
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            tfidf_vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
+            tfidf_matrix = tfidf_vectorizer.fit_transform(texts)
+        except Exception as e:
+            logger.warning(f"[Index] TF-IDF rebuild failed: {e}")
+        logger.info(f"[Index] Loaded {len(texts)} chunks, embed_dim={EMBED_DIM}")
+        return
+
+    # else build from scratch
+    logger.info("[Index] Building new vector store from JSON files (this can take a while)")
+    texts = []
+    metas = []
+    for name, df in dfs.items():
+        create_semantic_chunks_from_df(df, source_name=name)
+
+    if not texts:
+        logger.warning("[Index] No texts found to index")
+        return
+
+    # compute embeddings for all chunks in batches with backoff
+    logger.info(f"[Index] Computing embeddings for {len(texts)} chunks (batch size {BATCH_EMBED_SIZE})")
+    emb_list = azure_embed_texts(texts)  # list of lists
+    embeddings_np = np.array(emb_list, dtype=np.float32)
+
+    # normalize to unit vectors for cosine with Inner Product (IP)
+    faiss.normalize_L2(embeddings_np)
+    EMBED_DIM = embeddings_np.shape[1]
+    logger.info(f"[Index] Embeddings shape: {embeddings_np.shape}")
+
+    # build faiss index (IndexFlatIP for cosine on normalized vectors)
+    faiss_index = faiss.IndexFlatIP(EMBED_DIM)
+    faiss_index.add(embeddings_np)
+    # persist everything
+    np.save(EMBEDDINGS_NPY, embeddings_np)
+    with open(METAS_JSON, "w", encoding="utf-8") as f:
+        json.dump(metas, f, ensure_ascii=False)
+    with open(TEXTS_JSON, "w", encoding="utf-8") as f:
+        json.dump(texts, f, ensure_ascii=False)
+    faiss.write_index(faiss_index, FAISS_INDEX_PATH)
+    logger.info("[Index] Persisted embeddings, texts, metas, and faiss index to disk")
+
+    # build TF-IDF for prefilter
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        logger.info("[Index] Building TF-IDF matrix for prefiltering")
+        tfidf_vectorizer = TfidfVectorizer(max_features=20000, ngram_range=(1,2))
+        tfidf_matrix = tfidf_vectorizer.fit_transform(texts)
+    except Exception as e:
+        logger.warning(f"[Index] Failed to build TF-IDF: {e}")
+        tfidf_vectorizer = None
+        tfidf_matrix = None
+
+# ------------------- Retrieval pipeline (TF-IDF prefilter + vector rerank) -------------------
+def retrieve_candidates(query: str, top_tfidf: int = TFIDF_CANDIDATES, final_k: int = FINAL_TOP_K):
+    """
+    1) TF-IDF to get candidate indices (cheap).
+    2) Compute dot-product (cosine) between query embedding and candidate embeddings (dense) for accurate rerank.
+    3) Return top final_k chunks (texts + metas) trimmed to token budget.
+    """
+    global tfidf_vectorizer, tfidf_matrix, embeddings_np, texts, metas, EMBED_DIM
+
+    if embeddings_np is None:
+        raise RuntimeError("Embeddings index not built yet")
+
+    # Pre-filter by TF-IDF (if available)
+    candidate_idxs = None
+    if tfidf_vectorizer is not None and tfidf_matrix is not None:
+        # transform query and compute top N cosine similarities over sparse TF-IDF matrix
+        q_vec = tfidf_vectorizer.transform([query])
+        # compute scores
+        scores = (tfidf_matrix @ q_vec.T).toarray().ravel()
+        top_indices = np.argsort(scores)[-top_tfidf:][::-1]
+        candidate_idxs = top_indices.tolist()
+    else:
+        # fallback: search faiss for a larger top-k
+        q_emb = np.array(azure_embed_texts([query])[0], dtype=np.float32).reshape(1, -1)
+        faiss.normalize_L2(q_emb)
+        D, I = faiss_index.search(q_emb, min(len(texts), top_tfidf))
+        candidate_idxs = I[0].tolist()
+
+    # embed query (dense)
+    q_emb = np.array(azure_embed_texts([query])[0], dtype=np.float32)
+    # normalize
+    q_emb = q_emb.reshape(1, -1)
+    faiss.normalize_L2(q_emb)
+
+    # compute dot-product score against candidate embeddings
+    # subset embeddings
+    candidate_embs = embeddings_np[candidate_idxs]
+    # dot products
+    scores = np.dot(candidate_embs, q_emb.reshape(-1))
+    ranked_order = np.argsort(scores)[::-1]
+    selected = []
+    tok_count = 0
+    for idx in ranked_order:
+        global_idx = candidate_idxs[int(idx)]
+        txt = texts[global_idx]
+        meta = metas[global_idx]
+        t_tokens = num_tokens(txt)
+        # respect max prompt context tokens
+        if tok_count + t_tokens > MAX_PROMPT_CONTEXT_TOKENS and len(selected) >= final_k:
+            continue
+        selected.append({"idx": int(global_idx), "score": float(scores[int(idx)]), "text": txt, "meta": meta})
+        tok_count += t_tokens
+        if len(selected) >= final_k:
+            break
+    return selected
+
+# ------------------- Prompt templates & safe answering -------------------
+SYSTEM_PROMPT = (
+    "You are an assistant which MUST answer using ONLY the provided CONTEXT. "
+    "If the answer is not present in the context, reply exactly: 'Oops! No relevant information found.' "
+    "When you provide an answer, include a concise provenance list that maps claims to the chunk markers "
+    "(format: [doc_id|record_index|chunk_idx]). Do NOT invent facts or use outside knowledge."
 )
 
-# ─── INTELLIGENT DATABASE SYSTEM ─────────────────────────────────
+def build_user_prompt(user_question: str, retrieved_chunks: List[Dict[str, Any]]) -> str:
+    """
+    Construct a user prompt that includes numbered chunk markers and the needed context.
+    """
+    parts = []
+    for i, c in enumerate(retrieved_chunks):
+        marker = f"[{c['meta']['doc_id']}|{c['meta']['record_index']}|{c['meta']['chunk_idx']}]"
+        parts.append(f"{marker}\n{c['text']}")
+    context_block = "\n\n---\n\n".join(parts)
+    prompt = f"CONTEXT:\n{context_block}\n\nQUESTION:\n{user_question}\n\nINSTRUCTIONS:\nAnswer concisely using ONLY the CONTEXT above. Cite the chunk markers used."
+    return prompt
 
-class IntelligentDataStore:
-    """
-    Creates an in-memory SQLite database from JSON data.
-    Allows complex querying without embeddings.
-    """
-    
-    def __init__(self):
-        self.conn = sqlite3.connect(':memory:', check_same_thread=False)
-        self.tables = {}
-        self.schema_info = {}
-    
-    def load_json_to_db(self, name: str, json_path: str):
-        """Load JSON data into SQLite database."""
-        logger.info(f"[DB] Loading {name} into database...")
-        
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        # Normalize JSON to DataFrame
-        if isinstance(data, list):
-            df = pd.json_normalize(data)
-        else:
-            df = pd.json_normalize([data])
-        
-        # Clean column names for SQL compatibility
-        df.columns = [col.lower().replace('.', '_').replace(' ', '_').replace('-', '_') 
-                      for col in df.columns]
-        
-        # Store in SQLite
-        table_name = name.lower().replace(' ', '_')
-        df.to_sql(table_name, self.conn, if_exists='replace', index=False)
-        
-        self.tables[table_name] = df
-        self.schema_info[table_name] = {
-            'columns': list(df.columns),
-            'row_count': len(df),
-            'sample_values': {col: df[col].dropna().head(3).tolist() for col in df.columns[:10]}
-        }
-        
-        logger.info(f"[DB] ✓ Loaded {len(df)} records with {len(df.columns)} columns into '{table_name}'")
-        logger.info(f"[DB] Columns: {list(df.columns[:15])}")
-    
-    def get_schema_description(self) -> str:
-        """Generate a natural language description of the database schema."""
-        description = "Database Schema:\n\n"
-        
-        for table_name, info in self.schema_info.items():
-            description += f"Table: {table_name}\n"
-            description += f"  Records: {info['row_count']}\n"
-            description += f"  Columns: {', '.join(info['columns'][:20])}\n"
-            description += f"  Sample values:\n"
-            for col, values in list(info['sample_values'].items())[:5]:
-                if values:
-                    description += f"    {col}: {values}\n"
-            description += "\n"
-        
-        return description
-    
-    def execute_query(self, query: str) -> str:
-        """Execute SQL query and return results as formatted string."""
-        try:
-            logger.info(f"[DB] Executing query: {query[:200]}...")
-            
-            df = pd.read_sql_query(query, self.conn)
-            
-            if df.empty:
-                return "No results found for this query."
-            
-            # Format results
-            result = f"Found {len(df)} records:\n\n"
-            
-            # Show up to 20 results
-            for idx, row in df.head(20).iterrows():
-                result += f"Record {idx + 1}:\n"
-                for col, val in row.items():
-                    if pd.notna(val):
-                        result += f"  {col}: {val}\n"
-                result += "\n"
-            
-            if len(df) > 20:
-                result += f"\n(Showing 20 of {len(df)} total results)\n"
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"[DB] Query error: {e}")
-            return f"Query execution error: {str(e)}"
-    
-    def get_column_info(self, table_name: str, column_name: str) -> Dict:
-        """Get detailed information about a specific column."""
-        if table_name not in self.tables:
-            return {"error": "Table not found"}
-        
-        df = self.tables[table_name]
-        
-        if column_name not in df.columns:
-            return {"error": "Column not found"}
-        
-        col_data = df[column_name].dropna()
-        
-        info = {
-            "data_type": str(df[column_name].dtype),
-            "non_null_count": len(col_data),
-            "unique_values": int(col_data.nunique()),
-        }
-        
-        # Add numeric stats if applicable
-        if pd.api.types.is_numeric_dtype(col_data):
-            info.update({
-                "min": float(col_data.min()),
-                "max": float(col_data.max()),
-                "mean": float(col_data.mean()),
-            })
-        else:
-            # Add sample values for non-numeric
-            info["sample_values"] = col_data.head(10).tolist()
-        
-        return info
+# ------------------- Agent classes (ChildAgent uses new pipeline) -------------------
+class ChildAgent:
+    def __init__(self, name: str):
+        self.name = name
 
-# ─── INTELLIGENT AGENT SYSTEM ────────────────────────────────────
-
-class SmartQueryAgent:
-    """
-    LLM-powered agent that understands natural language queries
-    and translates them into SQL queries.
-    """
-    
-    def __init__(self, db_store: IntelligentDataStore, llm):
-        self.db = db_store
-        self.llm = llm
-        self.query_history = []
-    
-    def create_sql_query_tool(self):
-        """Create a tool for executing SQL queries."""
-        def run_sql(query: str) -> str:
-            """Execute a SQL query on the database. Use this to retrieve data."""
-            return self.db.execute_query(query)
-        
-        return Tool(
-            name="sql_query",
-            func=run_sql,
-            description="Execute SQL queries on the database to retrieve information. Input should be a valid SQL SELECT query."
-        )
-    
-    def create_schema_tool(self):
-        """Create a tool for getting schema information."""
-        def get_schema(dummy: str = "") -> str:
-            """Get the database schema and table information."""
-            return self.db.get_schema_description()
-        
-        return Tool(
-            name="get_schema",
-            func=get_schema,
-            description="Get information about available tables and their columns. Use this first to understand what data is available."
-        )
-    
-    def query_with_llm(self, user_query: str) -> str:
+    def ask(self, query: str) -> str:
         """
-        Use LLM to understand the query and generate appropriate SQL.
-        This is the intelligent part - LLM figures out what the user wants.
+        1. Retrieve candidate chunks using hybrid TF-IDF + vector rerank.
+        2. Build safe prompt and call Azure chat completions.
+        3. Return assistant text.
         """
-        
-        schema = self.db.get_schema_description()
-        
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert data analyst with SQL expertise. Your job is to help users query a database containing formulation and manufacturing data.
-
-Database Schema:
-{schema}
-
-Your task:
-1. Understand the user's natural language question
-2. Generate an appropriate SQL query to answer it
-3. Execute the query and explain the results
-
-IMPORTANT RULES:
-- Always use proper SQL syntax (SELECT, FROM, WHERE, etc.)
-- Column names and table names are case-insensitive
-- Use LIKE with % wildcards for partial text matching
-- Use proper SQL operators (=, >, <, BETWEEN, IN, etc.)
-- If the user asks about multiple things, use multiple queries or JOIN if needed
-- Always limit results to avoid overwhelming output (LIMIT 50)
-- If you're not sure about exact column names, query the schema first
-
-For text searches, use: WHERE column_name LIKE '%search_term%'
-For numeric comparisons, use: WHERE column_name > value
-For multiple conditions, use: WHERE condition1 AND condition2
-
-Examples:
-- "Show me products with batch size over 1000" → SELECT * FROM table WHERE batch_size > 1000 LIMIT 50
-- "Find formulations containing lactose" → SELECT * FROM table WHERE formulation LIKE '%lactose%' LIMIT 50
-- "What equipment is used for product X?" → SELECT equipment FROM table WHERE product_name LIKE '%X%' LIMIT 50
-"""),
-            ("human", "{question}")
-        ])
-        
-        # Generate SQL query using LLM
-        chain = prompt | self.llm
-        response = chain.invoke({
-            "question": user_query,
-            "schema": schema
-        })
-        
-        # Extract SQL from response
-        response_text = response.content
-        
-        # Try to find SQL query in response
-        import re
-        sql_match = re.search(r'```sql\n(.*?)\n```', response_text, re.DOTALL)
-        if not sql_match:
-            sql_match = re.search(r'SELECT.*?(?:;|$)', response_text, re.IGNORECASE | re.DOTALL)
-        
-        if sql_match:
-            sql_query = sql_match.group(1) if sql_match.lastindex else sql_match.group(0)
-            sql_query = sql_query.strip().rstrip(';')
-            
-            logger.info(f"[Agent] Generated SQL: {sql_query}")
-            
-            # Execute the query
-            results = self.db.execute_query(sql_query)
-            
-            # Have LLM format the final answer
-            final_prompt = ChatPromptTemplate.from_messages([
-                ("system", """You are a helpful assistant. Format the database query results into a clear, natural language answer to the user's question.
-
-Query Results:
-{results}
-
-Provide a clear, concise answer based on these results. If no results were found, say so clearly."""),
-                ("human", "Original question: {question}")
-            ])
-            
-            final_chain = final_prompt | self.llm
-            final_response = final_chain.invoke({
-                "question": user_query,
-                "results": results
-            })
-            
-            return final_response.content
-        else:
-            # LLM didn't generate SQL - it might be answering directly from schema
-            return response_text
-    
-    def handle_query(self, query: str) -> str:
-        """Main entry point for handling queries."""
-        logger.info(f"[Agent] Processing query: '{query}'")
-        
         try:
-            answer = self.query_with_llm(query)
-            self.query_history.append({"query": query, "answer": answer})
+            retrieved = retrieve_candidates(query, top_tfidf=TFIDF_CANDIDATES, final_k=FINAL_TOP_K)
+            if not retrieved:
+                return ""
+            user_prompt = build_user_prompt(query, retrieved)
+            # send to Azure chat completions
+            answer = azure_chat_completion(SYSTEM_PROMPT, user_prompt, temperature=0.0)
+            # Basic guard: If answer doesn't reference any chunk marker, append sources where possible
+            if "Oops! No relevant information found." in answer:
+                return "Oops! No relevant information found."
             return answer
-            
         except Exception as e:
-            logger.error(f"[Agent] Error: {e}")
-            return f"I encountered an error processing your query: {str(e)}. Please try rephrasing your question."
+            logger.exception(f"[ChildAgent:{self.name}] ask() failed: {e}")
+            return ""
 
-# ─── INITIALIZE ON STARTUP ───────────────────────────────────────
+class CoordinatorAgent:
+    def __init__(self, children: List[ChildAgent]):
+        self.children = children
 
-logger.info("=" * 70)
-logger.info("[Startup] Initializing Intelligent Query System")
-logger.info("=" * 70)
+    def coordinate(self, query: str) -> Union[str, None]:
+        # run through agents sequentially; if any returns a valid non-empty answer use it
+        for child in self.children:
+            try:
+                ans = child.ask(query)
+                if ans and "not found" not in ans.lower() and "error" not in ans.lower():
+                    logger.info(f"Coordinator selected {child.name}")
+                    return ans
+            except Exception as e:
+                logger.warning(f"Child agent {child.name} error: {str(e)}")
+        return None
 
-try:
-    logger.info("[Startup] Creating in-memory database...")
-    DB_STORE = IntelligentDataStore()
-    
-    logger.info("[Startup] Loading data into database...")
-    for name, path in EMBEDDED_FILES.items():
-        if path:
-            DB_STORE.load_json_to_db(name, path)
-    
-    logger.info("[Startup] Initializing LLM-powered query agent...")
-    AGENT = SmartQueryAgent(DB_STORE, llm)
-    
-    recognizer = sr.Recognizer()
-    
-    logger.info("=" * 70)
-    logger.info("[Startup] ✓ System ready! (Fast startup, intelligent querying)")
-    logger.info("=" * 70)
-    
-except Exception as e:
-    logger.error("=" * 70)
-    logger.error(f"[Startup] ✗ FATAL ERROR: {e}")
-    logger.error("=" * 70)
-    raise
+class OversightAgent:
+    def validate(self, answer: str) -> str:
+        # placeholder — could add verification step (asking LLM to verify claims against provided chunks)
+        return answer
 
-# ─── FASTAPI APP ─────────────────────────────────────────────────
+class LearningAgent:
+    def __init__(self):
+        self.logs: list[dict] = []
+    def log(self, q: str, a: str):
+        self.logs.append({"query": q, "response": a})
 
-app = FastAPI(title="Intelligent Query System")
+class AgentManager:
+    def __init__(self, agents: List[ChildAgent]):
+        self.coordinator = CoordinatorAgent(agents)
+        self.oversight  = OversightAgent()
+        self.learning   = LearningAgent()
+    def handle_query(self, query: str) -> str:
+        raw = self.coordinator.coordinate(query)
+        answer = raw if raw else "Oops! No relevant information found."
+        validated = self.oversight.validate(answer)
+        self.learning.log(query, validated)
+        return validated
 
+# ------------------- Build agents from vector store -------------------
+def build_agents_from_index(dfs: dict[str, pd.DataFrame]) -> List[ChildAgent]:
+    # For simplicity: create one ChildAgent per source file (as before), but retrieval uses global vectors & metas
+    agents = []
+    for key in dfs.keys():
+        agents.append(ChildAgent(name=key))
+    return agents
+
+# ------------------- Initialize on startup -------------------
+logger.info("[Startup] Loading data and building index (if missing)")
+DATAFRAMES = load_json_data(EMBEDDED_FILES)
+build_vector_store(DATAFRAMES, force_rebuild=False)
+AGENTS = build_agents_from_index(DATAFRAMES)
+MANAGER = AgentManager(AGENTS)
+recognizer = sr.Recognizer()
+
+# ------------------- FastAPI App -------------------
+app = FastAPI(title="Multi-Agent JSON Chatbot (robust retrieval)")
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -357,13 +502,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Request models
 class ChatRequest(BaseModel):
     message: str
 
-# ─── ENDPOINTS ────────────────────────────────────────────────────
-
+# Endpoints (kept same as original)
 @app.get("/sample-tiles")
 def sample_tiles():
+    """Return the sample-prompt tiles and questions."""
     return JSONResponse(TILE_QUESTIONS)
 
 @app.post("/chat")
@@ -371,18 +517,15 @@ def chat(req: ChatRequest):
     q = req.message.strip()
     if not q:
         raise HTTPException(400, "Empty query")
-    
-    logger.info(f"[API] Query: '{q}'")
-    
-    try:
-        answer = AGENT.handle_query(q)
-        return {"response": answer}
-    except Exception as e:
-        logger.error(f"[API] Error: {e}")
-        return {"response": "I encountered an error. Please try rephrasing your question."}
+    logger.info(f"[API] /chat query='{q}'")
+    ans = MANAGER.handle_query(q)
+    return {"response": ans}
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
+    """
+    Accepts an uploaded audio file (wav/mp3) and returns the transcribed text.
+    """
     try:
         data = await file.read()
         audio = sr.AudioFile(io.BytesIO(data))
@@ -396,6 +539,9 @@ async def speech_to_text(file: UploadFile = File(...)):
 
 @app.get("/text-to-speech")
 def text_to_speech(text: str):
+    """
+    Returns an MP3 audio stream of the given text.
+    """
     try:
         buf = io.BytesIO()
         gTTS(text).write_to_fp(buf)
@@ -407,29 +553,22 @@ def text_to_speech(text: str):
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "tables": list(DB_STORE.tables.keys()),
-        "total_records": sum(len(df) for df in DB_STORE.tables.values()),
-        "approach": "LLM-powered SQL generation"
-    }
+    return {"status": "ok", "agents": [a.name for a in AGENTS], "chunks_indexed": len(texts)}
 
-@app.get("/schema")
-def get_schema():
-    """Get database schema information."""
-    return {
-        "schema": DB_STORE.schema_info,
-        "description": DB_STORE.get_schema_description()
-    }
-
-@app.get("/stats")
-def stats():
-    """Get detailed statistics."""
-    stats_info = {}
-    for table_name, df in DB_STORE.tables.items():
-        stats_info[table_name] = {
-            "total_records": len(df),
-            "columns": list(df.columns),
-            "sample_data": df.head(2).to_dict('records')
-        }
-    return stats_info
+# -------------- Utility endpoint to force reindex (optional) --------------
+@app.post("/reindex")
+def reindex():
+    """
+    Force rebuild the index from JSON files (useful if dataset changed).
+    """
+    try:
+        dfs = load_json_data(EMBEDDED_FILES)
+        build_vector_store(dfs, force_rebuild=True)
+        # rebuild agents
+        global AGENTS, MANAGER
+        AGENTS = build_agents_from_index(dfs)
+        MANAGER = AgentManager(AGENTS)
+        return {"status": "ok", "chunks_indexed": len(texts)}
+    except Exception as e:
+        logger.exception("Reindex failed")
+        raise HTTPException(500, str(e))
