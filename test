@@ -1,28 +1,19 @@
 import os
 import io
 import json
-import uuid
 import pandas as pd
 import logging
 import speech_recognition as sr
-import time
-import pickle
-from pathlib import Path
+import re
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import Union, List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from gtts import gTTS
 from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+from langchain.prompts import ChatPromptTemplate
 
 # ─── CONFIG ──────────────────────────────────────────────────────
 
@@ -52,54 +43,8 @@ TILE_QUESTIONS = {
     "Raw Material P": ["What are specs?", "Approved vendors?"]
 }
 
-# AGGRESSIVE RATE LIMITING CONFIG
-BATCH_SIZE = 1  # Process ONE document at a time
-BATCH_DELAY = 2  # 2 second delay between EACH document
-MAX_RETRIES = 10  # Many retries
-RETRY_DELAY = 60  # Match Azure's retry delay
-REQUEST_DELAY = 1  # Additional delay before each request
+# ─── SETUP LLM ───────────────────────────────────────────────────
 
-# PERSISTENCE CONFIG
-CACHE_DIR = "vectorstore_cache"
-FAISS_CACHE_FILE = os.path.join(CACHE_DIR, "faiss_store.pkl")
-METADATA_CACHE_FILE = os.path.join(CACHE_DIR, "metadata.json")
-
-# ─── SETUP LLM + EMBEDDINGS ──────────────────────────────────────
-
-# Embedding store & cache with custom settings
-file_store = LocalFileStore('langchain-embeddings')
-
-# Create embeddings with request-level rate limiting
-class RateLimitedAzureOpenAIEmbeddings(AzureOpenAIEmbeddings):
-    """Custom embeddings class with built-in rate limiting."""
-    
-    def embed_documents(self, texts):
-        """Override to add delay between embedding requests."""
-        embeddings = []
-        for i, text in enumerate(texts):
-            logger.info(f"[Embedding] Processing document {i+1}/{len(texts)}")
-            time.sleep(REQUEST_DELAY)  # Delay before each request
-            try:
-                embedding = super().embed_documents([text])
-                embeddings.extend(embedding)
-            except Exception as e:
-                if "429" in str(e):
-                    logger.warning(f"[Embedding] Rate limit hit, waiting {RETRY_DELAY}s...")
-                    time.sleep(RETRY_DELAY)
-                    # Retry once
-                    embedding = super().embed_documents([text])
-                    embeddings.extend(embedding)
-                else:
-                    raise
-        return embeddings
-
-base = RateLimitedAzureOpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_version="2023-07-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment="Def_data_qa"
-)
 chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
     model=model_name,
@@ -108,324 +53,27 @@ chat_model = AzureChatOpenAI(
     azure_endpoint=base_url,
     temperature=0
 )
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
-# ─── SMART CHUNKING UTILITIES ────────────────────────────────────
+# ─── INTELLIGENT DATA LOADER ─────────────────────────────────────
 
-def flatten_json(data: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
-    """Flatten nested JSON to make it easier to chunk semantically."""
-    items = []
-    for k, v in data.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_json(v, new_key, sep=sep).items())
-        elif isinstance(v, list):
-            if v and isinstance(v[0], dict):
-                for i, item in enumerate(v):
-                    items.extend(flatten_json(item, f"{new_key}[{i}]", sep=sep).items())
-            else:
-                items.append((new_key, str(v)))
-        else:
-            items.append((new_key, v))
-    return dict(items)
-
-def create_semantic_chunks(record: Dict[str, Any], record_id: str) -> List[Dict[str, Any]]:
+def normalize_json_to_dataframe(data: Any) -> pd.DataFrame:
     """
-    Create semantic chunks with SMART strategy to prevent hallucinations.
-    - Creates 1-2 chunks per record (not 4+)
-    - Each chunk is COMPLETE and SELF-CONTAINED
-    - Preserves full record context to prevent information loss
+    Convert JSON (list or single object) to a normalized DataFrame.
+    Flattens nested structures for easy querying.
     """
-    chunks = []
-    
-    flat_record = flatten_json(record)
-    
-    # Extract identifiers that should be in EVERY chunk
-    identifier_fields = ['id', 'name', 'product', 'batch', 'formula', 'code', 'number']
-    identifiers = {}
-    identifier_content = []
-    
-    for key, value in flat_record.items():
-        key_lower = key.lower()
-        if any(id_field in key_lower for id_field in identifier_fields):
-            identifiers[key] = value
-            identifier_content.append(f"{key}: {value}")
-    
-    # Build complete content string
-    all_fields = [f"{k}: {v}" for k, v in flat_record.items()]
-    
-    # STRATEGY: Create chunks that stay under token limits but remain complete
-    # Token limit is ~8191 for embeddings, ~2000 tokens = safe chunk
-    # Rough estimate: 1 token ≈ 4 characters
-    MAX_CHUNK_CHARS = 7000  # ~1750 tokens, leaves room for safety
-    
-    full_content = " | ".join(all_fields)
-    
-    if len(full_content) <= MAX_CHUNK_CHARS:
-        # Small record: One complete chunk with ALL information
-        chunks.append({
-            "content": f"RECORD {record_id}: {full_content}",
-            "metadata": {
-                "record_id": record_id,
-                "full_record": json.dumps(record),
-                "chunk_part": "complete",
-                **identifiers
-            }
-        })
+    if isinstance(data, list):
+        df = pd.json_normalize(data)
     else:
-        # Large record: Split into 2 overlapping chunks
-        # CRITICAL: Both chunks include identifiers for context continuity
-        mid_point = len(all_fields) // 2
-        
-        # First half with identifiers
-        first_half = identifier_content + all_fields[:mid_point]
-        chunk1_content = " | ".join(first_half)
-        
-        chunks.append({
-            "content": f"RECORD {record_id} (Part 1/2): {chunk1_content}",
-            "metadata": {
-                "record_id": record_id,
-                "full_record": json.dumps(record),
-                "chunk_part": "1_of_2",
-                **identifiers
-            }
-        })
-        
-        # Second half with identifiers (overlap ensures context)
-        second_half = identifier_content + all_fields[mid_point:]
-        chunk2_content = " | ".join(second_half)
-        
-        chunks.append({
-            "content": f"RECORD {record_id} (Part 2/2): {chunk2_content}",
-            "metadata": {
-                "record_id": record_id,
-                "full_record": json.dumps(record),
-                "chunk_part": "2_of_2",
-                **identifiers
-            }
-        })
+        df = pd.json_normalize([data])
     
-    return chunks
-
-# ─── ENHANCED PROMPT TEMPLATE ────────────────────────────────────
-
-ENHANCED_PROMPT = PromptTemplate(
-    template="""You are a precise data assistant. Use ONLY the information provided in the context below to answer the question.
-
-Context Information:
-{context}
-
-Question: {question}
-
-CRITICAL INSTRUCTIONS:
-1. Answer ONLY based on the provided context above
-2. If the information is clearly stated in the context, provide specific details with exact values
-3. If the context contains partial information, state exactly what you know and what's missing
-4. If the answer is NOT in the context, you MUST say "I don't have that information in the provided data"
-5. NEVER make up, infer, or assume information not explicitly stated in the context
-6. When multiple records match, provide information from all relevant records
-7. Do not use phrases like "based on my knowledge" - only use "based on the provided data"
-
-Answer:""",
-    input_variables=["context", "question"]
-)
-
-# ─── AGENT CLASSES ───────────────────────────────────────────────
-
-class ChildAgent:
-    def __init__(self, name: str, retriever):
-        self.name = name
-        self.chain = RetrievalQA.from_chain_type(
-            llm=chat_model,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=True,
-            chain_type_kwargs={"prompt": ENHANCED_PROMPT}
-        )
+    # Convert all column names to lowercase for case-insensitive search
+    df.columns = [col.lower().replace('.', '_') for col in df.columns]
     
-    def ask(self, query: str) -> tuple[str, List[Document]]:
-        resp = self.chain.invoke({"query": query})
-        answer = resp.get("result", "")
-        sources = resp.get("source_documents", [])
-        
-        # ANTI-HALLUCINATION: Reconstruct full records from metadata
-        # If we retrieved partial chunks, get the complete record
-        enhanced_sources = []
-        seen_records = set()
-        
-        for doc in sources:
-            record_id = doc.metadata.get("record_id")
-            if record_id and record_id not in seen_records:
-                seen_records.add(record_id)
-                # Get full record from metadata
-                full_record = doc.metadata.get("full_record")
-                if full_record:
-                    enhanced_sources.append(Document(
-                        page_content=f"COMPLETE RECORD: {full_record}",
-                        metadata=doc.metadata
-                    ))
-                else:
-                    enhanced_sources.append(doc)
-            elif not record_id:
-                enhanced_sources.append(doc)
-        
-        return answer, enhanced_sources
+    return df
 
-class CoordinatorAgent:
-    def __init__(self, children: List[ChildAgent]):
-        self.children = children
-
-    def coordinate(self, query: str) -> Union[tuple[str, List[Document]], tuple[None, None]]:
-        best_answer = None
-        best_sources = []
-        best_confidence = 0
-        
-        for child in self.children:
-            try:
-                ans, sources = child.ask(query)
-                
-                confidence = 0
-                if ans and len(ans) > 20:
-                    confidence += 30
-                if "don't have" not in ans.lower() and "not found" not in ans.lower():
-                    confidence += 40
-                if sources:
-                    confidence += 30
-                
-                if confidence > best_confidence:
-                    best_confidence = confidence
-                    best_answer = ans
-                    best_sources = sources
-                    
-                logger.info(f"Child {child.name} confidence: {confidence}")
-                
-            except Exception as e:
-                logger.warning(f"Child agent {child.name} error: {str(e)}")
-        
-        if best_confidence > 50:
-            return best_answer, best_sources
-        return None, None
-
-class OversightAgent:
-    def validate(self, answer: str, sources: List[Document]) -> str:
-        """
-        Validate answer quality and check for hallucinations.
-        """
-        if not answer or "don't have" in answer.lower():
-            return answer
-        if len(answer.strip()) < 10:
-            return "The answer appears incomplete. Please try rephrasing your question."
-        
-        # ANTI-HALLUCINATION CHECK: Verify key facts appear in sources
-        # Extract specific values from answer (numbers, names, etc.)
-        import re
-        
-        # Extract quoted values, numbers, and specific terms from answer
-        answer_facts = set()
-        
-        # Get numbers (like batch sizes, temperatures, etc.)
-        numbers = re.findall(r'\b\d+(?:\.\d+)?\b', answer)
-        answer_facts.update(numbers)
-        
-        # Get capitalized words (likely names, products, etc.)
-        words = re.findall(r'\b[A-Z][a-zA-Z0-9]+\b', answer)
-        answer_facts.update(words)
-        
-        # Check if main facts appear in source documents
-        if sources and answer_facts:
-            source_text = " ".join([doc.page_content for doc in sources])
-            
-            # Count how many answer facts appear in sources
-            facts_found = sum(1 for fact in answer_facts if fact in source_text)
-            confidence_ratio = facts_found / len(answer_facts) if answer_facts else 0
-            
-            # If less than 50% of specific facts are in sources, it might be hallucinated
-            if confidence_ratio < 0.5 and len(answer_facts) > 3:
-                logger.warning(f"Low confidence answer detected: {confidence_ratio:.2%} facts verified")
-                return "I found some information, but I'm not fully confident in the answer. Please verify or rephrase your question for better accuracy."
-        
-        return answer
-
-class LearningAgent:
-    def __init__(self):
-        self.logs: List[Dict] = []
-    
-    def log(self, q: str, a: str, sources: List[Document] = None):
-        self.logs.append({
-            "query": q,
-            "response": a,
-            "source_count": len(sources) if sources else 0
-        })
-
-class AgentManager:
-    def __init__(self, agents: List[ChildAgent]):
-        self.coordinator = CoordinatorAgent(agents)
-        self.oversight  = OversightAgent()
-        self.learning   = LearningAgent()
-    
-    def handle_query(self, query: str) -> str:
-        raw, sources = self.coordinator.coordinate(query)
-        answer = raw if raw else "I couldn't find relevant information for your query. Please try rephrasing or ask about specific fields in the dataset."
-        validated = self.oversight.validate(answer, sources or [])
-        self.learning.log(query, validated, sources)
-        return validated
-
-# ─── PERSISTENT CACHE UTILITIES ──────────────────────────────────
-
-def ensure_cache_dir():
-    """Create cache directory if it doesn't exist."""
-    Path(CACHE_DIR).mkdir(exist_ok=True)
-
-def save_vectorstore_cache(store, metadata):
-    """Save FAISS vectorstore and metadata to disk."""
-    ensure_cache_dir()
-    try:
-        # Save FAISS index
-        store.save_local(CACHE_DIR)
-        logger.info(f"[Cache] Saved FAISS vectorstore to {CACHE_DIR}")
-        
-        # Save metadata
-        with open(METADATA_CACHE_FILE, 'w') as f:
-            json.dump(metadata, f)
-        logger.info(f"[Cache] Saved metadata to {METADATA_CACHE_FILE}")
-        return True
-    except Exception as e:
-        logger.error(f"[Cache] Failed to save cache: {e}")
-        return False
-
-def load_vectorstore_cache(embeddings):
-    """Load FAISS vectorstore and metadata from disk."""
-    try:
-        if not os.path.exists(CACHE_DIR):
-            return None, None
-        
-        # Check if FAISS files exist
-        index_file = os.path.join(CACHE_DIR, "index.faiss")
-        if not os.path.exists(index_file):
-            return None, None
-        
-        # Load FAISS index
-        store = FAISS.load_local(CACHE_DIR, embeddings, allow_dangerous_deserialization=True)
-        logger.info(f"[Cache] Loaded FAISS vectorstore from {CACHE_DIR}")
-        
-        # Load metadata
-        if os.path.exists(METADATA_CACHE_FILE):
-            with open(METADATA_CACHE_FILE, 'r') as f:
-                metadata = json.load(f)
-            logger.info(f"[Cache] Loaded metadata from {METADATA_CACHE_FILE}")
-        else:
-            metadata = {}
-        
-        return store, metadata
-    except Exception as e:
-        logger.error(f"[Cache] Failed to load cache: {e}")
-        return None, None
-
-# ─── DATA LOADING & VECTORSTORE BUILD ────────────────────────────
-
-def load_json_data_with_chunking(paths: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
-    """Load JSON data and create semantic chunks."""
-    all_chunks: Dict[str, List[Dict[str, Any]]] = {}
+def load_data_as_dataframes(paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
+    """Load JSON files and convert to DataFrames."""
+    dataframes = {}
     
     for name, path in paths.items():
         if not path:
@@ -435,173 +83,251 @@ def load_json_data_with_chunking(paths: Dict[str, str]) -> Dict[str, List[Dict[s
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
-            chunks = []
-            if isinstance(data, list):
-                total_records = len(data)
-                logger.info(f"[Chunking] Processing {total_records} records from '{name}'")
-                
-                for idx, item in enumerate(data):
-                    record_id = f"{name}_{idx}"
-                    record_chunks = create_semantic_chunks(item, record_id)
-                    chunks.extend(record_chunks)
-                    
-                    if (idx + 1) % 500 == 0:
-                        logger.info(f"[Chunking] Processed {idx + 1}/{total_records} records")
-            else:
-                record_chunks = create_semantic_chunks(data, f"{name}_0")
-                chunks.extend(record_chunks)
+            df = normalize_json_to_dataframe(data)
+            dataframes[name] = df
             
-            all_chunks[name] = chunks
-            logger.info(f"[Data] Created {len(chunks)} chunks from {name}")
+            logger.info(f"[Data] Loaded {len(df)} records with {len(df.columns)} columns from '{name}'")
+            logger.info(f"[Data] Columns: {list(df.columns[:10])}...")
             
         except Exception as e:
             logger.error(f"[Data] Failed to load '{name}': {e}")
     
-    return all_chunks
+    return dataframes
 
-def build_vectorstores_with_robust_rate_limiting(chunks_dict: Dict[str, List[Dict[str, Any]]]) -> List[ChildAgent]:
+# ─── INTELLIGENT QUERY ROUTER ────────────────────────────────────
+
+class QueryRouter:
     """
-    Build FAISS vectorstores with ROBUST rate limiting and caching.
-    Uses persistent cache to avoid re-embedding on restarts.
+    Routes queries to the appropriate search strategy:
+    - Exact search for IDs, codes, names
+    - Filtered search for ranges, comparisons
+    - Semantic search for complex natural language queries
     """
-    agents: List[ChildAgent] = []
     
-    for key, chunks in chunks_dict.items():
-        logger.info(f"[Vectorstore] Building store for '{key}' with {len(chunks)} chunks")
-        
-        # Check if we have a cached version
-        cached_store, cached_metadata = load_vectorstore_cache(cached_embeddings)
-        
-        if cached_store and cached_metadata.get('source') == key and cached_metadata.get('chunk_count') == len(chunks):
-            logger.info(f"[Cache] Using cached vectorstore for '{key}'")
-            retriever = cached_store.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": 10}
-            )
-            agents.append(ChildAgent(name=key, retriever=retriever))
-            continue
-        
-        # No cache, build from scratch
-        logger.info(f"[Vectorstore] No cache found. Building new vectorstore...")
-        
-        docs = [
-            Document(
-                page_content=chunk["content"],
-                metadata=chunk["metadata"]
-            )
-            for chunk in chunks
-        ]
-        
-        if not docs:
-            continue
-        
-        # Process in VERY SMALL batches with aggressive rate limiting
-        total_batches = (len(docs) + BATCH_SIZE - 1) // BATCH_SIZE
-        logger.info(f"[Vectorstore] Processing {len(docs)} docs ONE AT A TIME with {BATCH_DELAY}s delays")
-        logger.info(f"[Vectorstore] Estimated time: ~{(len(docs) * (BATCH_DELAY + REQUEST_DELAY)) / 60:.1f} minutes")
-        
-        store = None
-        successful_count = 0
-        
-        for batch_idx in range(0, len(docs), BATCH_SIZE):
-            batch_docs = docs[batch_idx:batch_idx + BATCH_SIZE]
-            batch_num = (batch_idx // BATCH_SIZE) + 1
-            
-            retry_count = 0
-            batch_success = False
-            
-            while retry_count < MAX_RETRIES and not batch_success:
-                try:
-                    logger.info(f"[Vectorstore] Processing doc {batch_num}/{total_batches}")
-                    
-                    # Extra safety: wait before processing
-                    time.sleep(REQUEST_DELAY)
-                    
-                    if store is None:
-                        # Create initial store
-                        store = FAISS.from_documents(batch_docs, cached_embeddings)
-                    else:
-                        # Add to existing store
-                        store.add_documents(batch_docs)
-                    
-                    successful_count += len(batch_docs)
-                    logger.info(f"[Vectorstore] ✓ Doc {batch_num}/{total_batches} completed (Total: {successful_count}/{len(docs)})")
-                    batch_success = True
-                    
-                    # Save progress every 5 documents
-                    if successful_count % 5 == 0 and store:
-                        save_vectorstore_cache(store, {
-                            'source': key, 
-                            'chunk_count': len(chunks), 
-                            'partial': True,
-                            'processed': successful_count
-                        })
-                        logger.info(f"[Cache] ✓ Saved checkpoint at {successful_count}/{len(docs)} docs")
-                    
-                except Exception as e:
-                    error_str = str(e).lower()
-                    retry_count += 1
-                    
-                    if "429" in error_str or "rate" in error_str or "quota" in error_str:
-                        wait_time = RETRY_DELAY
-                        logger.warning(f"[Vectorstore] ⚠ Rate limit hit on doc {batch_num}. Retry {retry_count}/{MAX_RETRIES} after {wait_time}s")
-                        time.sleep(wait_time)
-                    elif "token" in error_str or "limit" in error_str:
-                        logger.error(f"[Vectorstore] ✗ Token limit error on doc {batch_num}: {e}")
-                        logger.error(f"[Vectorstore] Doc content length: {len(batch_docs[0].page_content)} chars")
-                        # Skip this document
-                        logger.warning(f"[Vectorstore] Skipping problematic document {batch_num}")
-                        break
-                    else:
-                        logger.error(f"[Vectorstore] ✗ Unexpected error on doc {batch_num}: {e}")
-                        raise
-            
-            if retry_count >= MAX_RETRIES and not batch_success:
-                logger.error(f"[Vectorstore] ✗ Failed doc {batch_num} after {MAX_RETRIES} retries")
-                logger.error(f"[Vectorstore] Consider increasing BATCH_DELAY or checking Azure quota")
-                raise Exception(f"Rate limit exceeded after {MAX_RETRIES} retries on doc {batch_num}")
-            
-            # Delay between documents
-            if batch_idx + BATCH_SIZE < len(docs):
-                logger.info(f"[Vectorstore] Waiting {BATCH_DELAY}s before next document...")
-                time.sleep(BATCH_DELAY)
-        
-        if store:
-            # Save final completed cache
-            save_vectorstore_cache(store, {'source': key, 'chunk_count': len(chunks), 'partial': False})
-            
-            # Create retriever
-            retriever = store.as_retriever(
-                search_type="similarity",
-                search_kwargs={"k": 10}
-            )
-            
-            agents.append(ChildAgent(name=key, retriever=retriever))
-            logger.info(f"[Vectorstore] ✓ Completed store for '{key}' with {len(docs)} total docs")
+    def __init__(self, dataframes: Dict[str, pd.DataFrame]):
+        self.dataframes = dataframes
+        self.all_columns = self._get_all_columns()
     
-    return agents
+    def _get_all_columns(self) -> List[str]:
+        """Get all unique columns across all dataframes."""
+        all_cols = set()
+        for df in self.dataframes.values():
+            all_cols.update(df.columns)
+        return sorted(list(all_cols))
+    
+    def extract_search_terms(self, query: str) -> Dict[str, Any]:
+        """Extract key search terms from query."""
+        query_lower = query.lower()
+        
+        # Extract quoted terms (exact matches)
+        quoted_terms = re.findall(r'"([^"]+)"', query)
+        
+        # Extract numbers (batch sizes, IDs, etc.)
+        numbers = re.findall(r'\b\d+(?:\.\d+)?\b', query)
+        
+        # Extract comparison operators
+        comparisons = {
+            'greater_than': re.search(r'(?:greater than|more than|above|>)\s*(\d+(?:\.\d+)?)', query_lower),
+            'less_than': re.search(r'(?:less than|below|under|<)\s*(\d+(?:\.\d+)?)', query_lower),
+            'equals': re.search(r'(?:equals?|is|=)\s*(\d+(?:\.\d+)?)', query_lower)
+        }
+        
+        return {
+            'quoted_terms': quoted_terms,
+            'numbers': numbers,
+            'comparisons': {k: v.group(1) if v else None for k, v in comparisons.items()},
+            'original_query': query
+        }
+    
+    def find_relevant_columns(self, query: str) -> List[str]:
+        """Find columns that might be relevant to the query."""
+        query_lower = query.lower()
+        relevant = []
+        
+        for col in self.all_columns:
+            # Check if column name or parts of it appear in query
+            col_parts = col.split('_')
+            if any(part in query_lower for part in col_parts if len(part) > 2):
+                relevant.append(col)
+        
+        return relevant
+    
+    def search_exact(self, df: pd.DataFrame, search_terms: Dict[str, Any]) -> pd.DataFrame:
+        """Perform exact search on DataFrame."""
+        result = df.copy()
+        
+        # Search for quoted terms in all text columns
+        if search_terms['quoted_terms']:
+            for term in search_terms['quoted_terms']:
+                mask = pd.Series([False] * len(result))
+                for col in result.select_dtypes(include=['object']).columns:
+                    mask |= result[col].astype(str).str.contains(term, case=False, na=False)
+                result = result[mask]
+        
+        # Search for numbers in numeric columns
+        if search_terms['numbers']:
+            for num in search_terms['numbers']:
+                mask = pd.Series([False] * len(result))
+                for col in result.select_dtypes(include=['number']).columns:
+                    mask |= result[col] == float(num)
+                if mask.any():
+                    result = result[mask]
+        
+        return result
+    
+    def search_keyword(self, df: pd.DataFrame, keywords: List[str]) -> pd.DataFrame:
+        """Search for keywords across all columns."""
+        if not keywords:
+            return df
+        
+        mask = pd.Series([False] * len(df))
+        for keyword in keywords:
+            for col in df.columns:
+                mask |= df[col].astype(str).str.contains(keyword, case=False, na=False, regex=False)
+        
+        return df[mask]
+
+# ─── SMART QUERY HANDLER ─────────────────────────────────────────
+
+class SmartQueryHandler:
+    """
+    Handles queries intelligently:
+    1. First tries direct DataFrame search (fast, accurate, no API calls)
+    2. If results found, uses LLM to format answer from data
+    3. Only uses LLM for complex reasoning, not for retrieval
+    """
+    
+    def __init__(self, dataframes: Dict[str, pd.DataFrame], llm):
+        self.router = QueryRouter(dataframes)
+        self.dataframes = dataframes
+        self.llm = llm
+    
+    def search_all_dataframes(self, query: str) -> tuple[pd.DataFrame, str]:
+        """Search across all dataframes."""
+        all_results = []
+        source_info = []
+        
+        search_terms = self.router.extract_search_terms(query)
+        
+        # Extract keywords from query
+        keywords = re.findall(r'\b[a-zA-Z]{3,}\b', query.lower())
+        keywords = [k for k in keywords if k not in ['what', 'the', 'is', 'are', 'for', 'and', 'or']]
+        
+        for name, df in self.dataframes.items():
+            # Try exact search first
+            exact_results = self.router.search_exact(df, search_terms)
+            
+            if len(exact_results) > 0:
+                all_results.append(exact_results)
+                source_info.append(f"{name} (exact match)")
+                logger.info(f"[Search] Found {len(exact_results)} exact matches in {name}")
+                continue
+            
+            # Try keyword search
+            keyword_results = self.router.search_keyword(df, keywords)
+            
+            if len(keyword_results) > 0:
+                all_results.append(keyword_results.head(20))  # Limit to top 20
+                source_info.append(f"{name} (keyword match)")
+                logger.info(f"[Search] Found {len(keyword_results)} keyword matches in {name}")
+        
+        if all_results:
+            combined_df = pd.concat(all_results, ignore_index=True)
+            return combined_df, ", ".join(source_info)
+        
+        return pd.DataFrame(), "No sources"
+    
+    def format_dataframe_for_llm(self, df: pd.DataFrame, max_rows: int = 10) -> str:
+        """Convert DataFrame to a readable format for LLM."""
+        if df.empty:
+            return "No data found."
+        
+        # Limit rows to prevent token overflow
+        df_limited = df.head(max_rows)
+        
+        # Convert to dict format for clarity
+        records = df_limited.to_dict('records')
+        
+        formatted = "Found Records:\n\n"
+        for idx, record in enumerate(records, 1):
+            formatted += f"Record {idx}:\n"
+            for key, value in record.items():
+                if pd.notna(value):
+                    formatted += f"  {key}: {value}\n"
+            formatted += "\n"
+        
+        if len(df) > max_rows:
+            formatted += f"\n(Showing {max_rows} of {len(df)} total records)\n"
+        
+        return formatted
+    
+    def generate_answer(self, query: str, data: str, source: str) -> str:
+        """Use LLM to generate answer from retrieved data."""
+        
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """You are a precise data assistant. Answer the user's question using ONLY the data provided below.
+
+CRITICAL RULES:
+1. ONLY use information explicitly stated in the provided data
+2. If the answer is in the data, provide specific details with exact values
+3. If the data doesn't contain the answer, say "I don't have that information in the available data"
+4. Never make up, infer, or assume information not in the data
+5. Quote exact values when available (e.g., "Batch size: 500 kg")
+6. If multiple records match, mention all relevant ones
+
+Provided Data:
+{data}
+
+Source: {source}"""),
+            ("human", "{question}")
+        ])
+        
+        chain = prompt | self.llm
+        response = chain.invoke({
+            "question": query,
+            "data": data,
+            "source": source
+        })
+        
+        return response.content
+    
+    def handle_query(self, query: str) -> str:
+        """Main entry point for handling queries."""
+        logger.info(f"[Query] Processing: '{query}'")
+        
+        # Search dataframes
+        results_df, source = self.search_all_dataframes(query)
+        
+        if results_df.empty:
+            return "I couldn't find any relevant information for your query. Please try rephrasing or ask about specific products, batches, or formulations in the dataset."
+        
+        # Format data for LLM
+        data_context = self.format_dataframe_for_llm(results_df)
+        
+        # Generate answer using LLM
+        answer = self.generate_answer(query, data_context, source)
+        
+        logger.info(f"[Query] Found {len(results_df)} results from {source}")
+        
+        return answer
 
 # ─── INITIALIZE ON STARTUP ───────────────────────────────────────
 
 logger.info("=" * 70)
-logger.info("[Startup] Initializing Multi-Agent Chatbot with Robust Rate Limiting")
+logger.info("[Startup] Initializing Smart Query System (NO EMBEDDINGS NEEDED!)")
 logger.info("=" * 70)
 
 try:
-    logger.info("[Startup] Step 1/3: Loading and chunking data...")
-    CHUNKED_DATA = load_json_data_with_chunking(EMBEDDED_FILES)
+    logger.info("[Startup] Loading data as DataFrames...")
+    DATAFRAMES = load_data_as_dataframes(EMBEDDED_FILES)
     
-    logger.info("[Startup] Step 2/3: Building vectorstores (this may take a while)...")
-    logger.info("[Startup] Ultra-conservative rate limiting: 1 doc at a time, 2s delay")
-    logger.info("[Startup] This ensures ZERO rate limit errors but will be slow")
-    AGENTS = build_vectorstores_with_robust_rate_limiting(CHUNKED_DATA)
+    logger.info("[Startup] Initializing Smart Query Handler...")
+    QUERY_HANDLER = SmartQueryHandler(DATAFRAMES, chat_model)
     
-    logger.info("[Startup] Step 3/3: Initializing agent manager...")
-    MANAGER = AgentManager(AGENTS)
     recognizer = sr.Recognizer()
     
     logger.info("=" * 70)
-    logger.info("[Startup] ✓ System ready!")
+    logger.info("[Startup] ✓ System ready! (Instant startup, no rate limits)")
     logger.info("=" * 70)
 except Exception as e:
     logger.error("=" * 70)
@@ -611,7 +337,7 @@ except Exception as e:
 
 # ─── FASTAPI APP ─────────────────────────────────────────────────
 
-app = FastAPI(title="Multi-Agent JSON Chatbot - Production Ready")
+app = FastAPI(title="Smart Query System - Zero Hallucinations")
 
 app.add_middleware(
     CORSMiddleware,
@@ -636,8 +362,13 @@ def chat(req: ChatRequest):
     if not q:
         raise HTTPException(400, "Empty query")
     logger.info(f"[API] /chat query='{q}'")
-    ans = MANAGER.handle_query(q)
-    return {"response": ans}
+    
+    try:
+        ans = QUERY_HANDLER.handle_query(q)
+        return {"response": ans}
+    except Exception as e:
+        logger.error(f"[API] Error processing query: {e}")
+        return {"response": "I encountered an error processing your query. Please try rephrasing it."}
 
 @app.post("/speech-to-text")
 async def speech_to_text(file: UploadFile = File(...)):
@@ -667,37 +398,30 @@ def text_to_speech(text: str):
 
 @app.get("/health")
 def health():
-    total_chunks = sum(len(chunks) for chunks in CHUNKED_DATA.values())
+    total_records = sum(len(df) for df in DATAFRAMES.values())
     return {
         "status": "ok",
-        "agents": [a.name for a in AGENTS],
-        "total_chunks": total_chunks,
-        "cache_enabled": True
+        "total_records": total_records,
+        "dataframes": {name: len(df) for name, df in DATAFRAMES.items()},
+        "approach": "Direct DataFrame search (no embeddings)"
     }
 
 @app.get("/stats")
 def stats():
     """Get statistics about the loaded data."""
     stats_info = {}
-    for name, chunks in CHUNKED_DATA.items():
-        chunk_types = {}
-        for chunk in chunks:
-            ctype = chunk["metadata"].get("chunk_part", "unknown")
-            chunk_types[ctype] = chunk_types.get(ctype, 0) + 1
+    for name, df in DATAFRAMES.items():
         stats_info[name] = {
-            "total_chunks": len(chunks),
-            "chunk_types": chunk_types
+            "total_records": len(df),
+            "columns": list(df.columns[:20]),
+            "sample_data": df.head(2).to_dict('records') if len(df) > 0 else []
         }
     return stats_info
 
-@app.post("/clear-cache")
-def clear_cache():
-    """Clear the vectorstore cache (use if data changes)."""
-    try:
-        import shutil
-        if os.path.exists(CACHE_DIR):
-            shutil.rmtree(CACHE_DIR)
-            return {"status": "cache cleared", "message": "Please restart the server"}
-        return {"status": "no cache found"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+@app.get("/columns")
+def get_columns():
+    """Get all available columns across datasets."""
+    all_cols = set()
+    for df in DATAFRAMES.values():
+        all_cols.update(df.columns)
+    return {"columns": sorted(list(all_cols))}
