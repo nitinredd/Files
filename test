@@ -5,6 +5,7 @@ import uuid
 import pandas as pd
 import logging
 import speech_recognition as sr
+import time
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -49,6 +50,12 @@ TILE_QUESTIONS = {
     "Raw Material P": ["What are specs?", "Approved vendors?"]
 }
 
+# RATE LIMITING CONFIG
+BATCH_SIZE = 50  # Process 50 documents at a time
+BATCH_DELAY = 2  # Wait 2 seconds between batches
+MAX_RETRIES = 3
+RETRY_DELAY = 5
+
 # ─── SETUP LLM + EMBEDDINGS ──────────────────────────────────────
 
 # Embedding store & cache
@@ -58,7 +65,8 @@ base = AzureOpenAIEmbeddings(
     api_version="2023-07-01-preview",
     azure_endpoint="",
     api_key="",
-    azure_deployment="Def_data_qa"
+    azure_deployment="Def_data_qa",
+    chunk_size=16  # Reduce concurrent requests
 )
 chat_model = AzureChatOpenAI(
     azure_deployment=deployment_name,
@@ -66,7 +74,7 @@ chat_model = AzureChatOpenAI(
     api_version=api_version,
     api_key=api_key,
     azure_endpoint=base_url,
-    temperature=0  # Reduce hallucination
+    temperature=0
 )
 cached_embeddings = CacheBackedEmbeddings.from_bytes_store(base, file_store, namespace=base.model)
 
@@ -91,72 +99,79 @@ def flatten_json(data: Dict[str, Any], parent_key: str = '', sep: str = '.') -> 
 
 def create_semantic_chunks(record: Dict[str, Any], record_id: str) -> List[Dict[str, Any]]:
     """
-    Create semantic chunks from a JSON record while preserving context.
-    Each chunk contains related fields with full metadata for accurate retrieval.
+    Create semantic chunks with SMART strategy to prevent hallucinations.
+    - Creates 1-2 chunks per record (not 4+)
+    - Each chunk is COMPLETE and SELF-CONTAINED
+    - Preserves full record context to prevent information loss
     """
     chunks = []
     
-    # Strategy 1: Create a summary chunk with key identifiers
-    identifier_fields = ['id', 'name', 'product', 'batch', 'formula', 'code', 'number']
-    summary_parts = []
-    identifiers = {}
-    
     flat_record = flatten_json(record)
+    
+    # Extract identifiers that should be in EVERY chunk
+    identifier_fields = ['id', 'name', 'product', 'batch', 'formula', 'code', 'number']
+    identifiers = {}
+    identifier_content = []
     
     for key, value in flat_record.items():
         key_lower = key.lower()
         if any(id_field in key_lower for id_field in identifier_fields):
-            summary_parts.append(f"{key}: {value}")
             identifiers[key] = value
+            identifier_content.append(f"{key}: {value}")
     
-    if summary_parts:
+    # Build complete content string
+    all_fields = [f"{k}: {v}" for k, v in flat_record.items()]
+    
+    # STRATEGY: Create chunks that stay under token limits but remain complete
+    # Token limit is ~8191 for embeddings, ~2000 tokens = safe chunk
+    # Rough estimate: 1 token ≈ 4 characters
+    MAX_CHUNK_CHARS = 7000  # ~1750 tokens, leaves room for safety
+    
+    full_content = " | ".join(all_fields)
+    
+    if len(full_content) <= MAX_CHUNK_CHARS:
+        # Small record: One complete chunk with ALL information
         chunks.append({
-            "content": "RECORD SUMMARY: " + " | ".join(summary_parts[:10]),
+            "content": f"RECORD {record_id}: {full_content}",
             "metadata": {
                 "record_id": record_id,
-                "chunk_type": "summary",
                 "full_record": json.dumps(record),
+                "chunk_part": "complete",
                 **identifiers
             }
         })
-    
-    # Strategy 2: Group related fields semantically
-    field_groups = {
-        "product_info": ['product', 'api', 'formulation', 'formula', 'ingredient', 'component'],
-        "manufacturing": ['batch', 'size', 'scale', 'equipment', 'machine', 'line', 'facility'],
-        "process": ['temperature', 'pressure', 'speed', 'time', 'step', 'process', 'method'],
-        "quality": ['specification', 'test', 'quality', 'dissolution', 'assay', 'purity'],
-        "supplier": ['manufacturer', 'supplier', 'vendor', 'source'],
-        "regulatory": ['approval', 'regulatory', 'compliance', 'standard']
-    }
-    
-    for group_name, keywords in field_groups.items():
-        group_content = []
-        for key, value in flat_record.items():
-            if any(keyword in key.lower() for keyword in keywords):
-                group_content.append(f"{key}: {value}")
+    else:
+        # Large record: Split into 2 overlapping chunks
+        # CRITICAL: Both chunks include identifiers for context continuity
+        mid_point = len(all_fields) // 2
         
-        if group_content:
-            chunks.append({
-                "content": f"{group_name.upper()}: " + " | ".join(group_content),
-                "metadata": {
-                    "record_id": record_id,
-                    "chunk_type": group_name,
-                    "full_record": json.dumps(record),
-                    **identifiers
-                }
-            })
-    
-    # Strategy 3: Ensure we have the full record as a fallback
-    chunks.append({
-        "content": f"COMPLETE RECORD: {json.dumps(record, indent=2)}",
-        "metadata": {
-            "record_id": record_id,
-            "chunk_type": "complete",
-            "full_record": json.dumps(record),
-            **identifiers
-        }
-    })
+        # First half with identifiers
+        first_half = identifier_content + all_fields[:mid_point]
+        chunk1_content = " | ".join(first_half)
+        
+        chunks.append({
+            "content": f"RECORD {record_id} (Part 1/2): {chunk1_content}",
+            "metadata": {
+                "record_id": record_id,
+                "full_record": json.dumps(record),
+                "chunk_part": "1_of_2",
+                **identifiers
+            }
+        })
+        
+        # Second half with identifiers (overlap ensures context)
+        second_half = identifier_content + all_fields[mid_point:]
+        chunk2_content = " | ".join(second_half)
+        
+        chunks.append({
+            "content": f"RECORD {record_id} (Part 2/2): {chunk2_content}",
+            "metadata": {
+                "record_id": record_id,
+                "full_record": json.dumps(record),
+                "chunk_part": "2_of_2",
+                **identifiers
+            }
+        })
     
     return chunks
 
@@ -191,7 +206,7 @@ class ChildAgent:
             llm=chat_model,
             chain_type="stuff",
             retriever=retriever,
-            return_source_documents=True,  # Get sources for better accuracy
+            return_source_documents=True,
             chain_type_kwargs={"prompt": ENHANCED_PROMPT}
         )
     
@@ -199,7 +214,29 @@ class ChildAgent:
         resp = self.chain.invoke({"query": query})
         answer = resp.get("result", "")
         sources = resp.get("source_documents", [])
-        return answer, sources
+        
+        # ANTI-HALLUCINATION: Reconstruct full records from metadata
+        # If we retrieved partial chunks, get the complete record
+        enhanced_sources = []
+        seen_records = set()
+        
+        for doc in sources:
+            record_id = doc.metadata.get("record_id")
+            if record_id and record_id not in seen_records:
+                seen_records.add(record_id)
+                # Get full record from metadata
+                full_record = doc.metadata.get("full_record")
+                if full_record:
+                    enhanced_sources.append(Document(
+                        page_content=f"COMPLETE RECORD: {full_record}",
+                        metadata=doc.metadata
+                    ))
+                else:
+                    enhanced_sources.append(doc)
+            elif not record_id:
+                enhanced_sources.append(doc)
+        
+        return answer, enhanced_sources
 
 class CoordinatorAgent:
     def __init__(self, children: List[ChildAgent]):
@@ -214,7 +251,6 @@ class CoordinatorAgent:
             try:
                 ans, sources = child.ask(query)
                 
-                # Confidence scoring
                 confidence = 0
                 if ans and len(ans) > 20:
                     confidence += 30
@@ -239,13 +275,41 @@ class CoordinatorAgent:
 
 class OversightAgent:
     def validate(self, answer: str, sources: List[Document]) -> str:
-        """Validate answer quality and add source information if helpful."""
+        """
+        Validate answer quality and check for hallucinations.
+        """
         if not answer or "don't have" in answer.lower():
             return answer
-        
-        # Check if answer seems complete
         if len(answer.strip()) < 10:
             return "The answer appears incomplete. Please try rephrasing your question."
+        
+        # ANTI-HALLUCINATION CHECK: Verify key facts appear in sources
+        # Extract specific values from answer (numbers, names, etc.)
+        import re
+        
+        # Extract quoted values, numbers, and specific terms from answer
+        answer_facts = set()
+        
+        # Get numbers (like batch sizes, temperatures, etc.)
+        numbers = re.findall(r'\b\d+(?:\.\d+)?\b', answer)
+        answer_facts.update(numbers)
+        
+        # Get capitalized words (likely names, products, etc.)
+        words = re.findall(r'\b[A-Z][a-zA-Z0-9]+\b', answer)
+        answer_facts.update(words)
+        
+        # Check if main facts appear in source documents
+        if sources and answer_facts:
+            source_text = " ".join([doc.page_content for doc in sources])
+            
+            # Count how many answer facts appear in sources
+            facts_found = sum(1 for fact in answer_facts if fact in source_text)
+            confidence_ratio = facts_found / len(answer_facts) if answer_facts else 0
+            
+            # If less than 50% of specific facts are in sources, it might be hallucinated
+            if confidence_ratio < 0.5 and len(answer_facts) > 3:
+                logger.warning(f"Low confidence answer detected: {confidence_ratio:.2%} facts verified")
+                return "I found some information, but I'm not fully confident in the answer. Please verify or rephrase your question for better accuracy."
         
         return answer
 
@@ -273,7 +337,7 @@ class AgentManager:
         self.learning.log(query, validated, sources)
         return validated
 
-# ─── DATA LOADING & VECTORSTORE BUILD ────────────────────────────
+# ─── DATA LOADING & VECTORSTORE BUILD WITH RATE LIMITING ─────────
 
 def load_json_data_with_chunking(paths: Dict[str, str]) -> Dict[str, List[Dict[str, Any]]]:
     """Load JSON data and create semantic chunks."""
@@ -283,19 +347,22 @@ def load_json_data_with_chunking(paths: Dict[str, str]) -> Dict[str, List[Dict[s
         if not path:
             continue
         try:
+            logger.info(f"[Loading] Reading file: {name}")
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             
             chunks = []
             if isinstance(data, list):
+                total_records = len(data)
+                logger.info(f"[Chunking] Processing {total_records} records from '{name}'")
+                
                 for idx, item in enumerate(data):
                     record_id = f"{name}_{idx}"
                     record_chunks = create_semantic_chunks(item, record_id)
                     chunks.extend(record_chunks)
                     
-                    # Log progress for large files
                     if (idx + 1) % 1000 == 0:
-                        logger.info(f"[Chunking] Processed {idx + 1} records from '{name}'")
+                        logger.info(f"[Chunking] Processed {idx + 1}/{total_records} records")
             else:
                 record_chunks = create_semantic_chunks(data, f"{name}_0")
                 chunks.extend(record_chunks)
@@ -308,11 +375,16 @@ def load_json_data_with_chunking(paths: Dict[str, str]) -> Dict[str, List[Dict[s
     
     return all_chunks
 
-def build_vectorstores(chunks_dict: Dict[str, List[Dict[str, Any]]]) -> List[ChildAgent]:
-    """Build FAISS vectorstores from chunked data."""
+def build_vectorstores_with_rate_limiting(chunks_dict: Dict[str, List[Dict[str, Any]]]) -> List[ChildAgent]:
+    """
+    Build FAISS vectorstores with rate limiting to avoid 429 errors.
+    Processes documents in batches with delays.
+    """
     agents: List[ChildAgent] = []
     
     for key, chunks in chunks_dict.items():
+        logger.info(f"[Vectorstore] Building store for '{key}' with {len(chunks)} chunks")
+        
         docs = [
             Document(
                 page_content=chunk["content"],
@@ -324,33 +396,75 @@ def build_vectorstores(chunks_dict: Dict[str, List[Dict[str, Any]]]) -> List[Chi
         if not docs:
             continue
         
-        # Create FAISS store with optimal parameters
-        store = FAISS.from_documents(docs, cached_embeddings)
+        # Process in batches to avoid rate limits
+        total_batches = (len(docs) + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(f"[Vectorstore] Processing {len(docs)} docs in {total_batches} batches")
         
-        # Retrieve more documents to ensure we get complete information
-        retriever = store.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": 8}  # Increased from 5 to get more context
-        )
+        store = None
+        for batch_idx in range(0, len(docs), BATCH_SIZE):
+            batch_docs = docs[batch_idx:batch_idx + BATCH_SIZE]
+            batch_num = (batch_idx // BATCH_SIZE) + 1
+            
+            retry_count = 0
+            while retry_count < MAX_RETRIES:
+                try:
+                    logger.info(f"[Vectorstore] Processing batch {batch_num}/{total_batches} ({len(batch_docs)} docs)")
+                    
+                    if store is None:
+                        # Create initial store
+                        store = FAISS.from_documents(batch_docs, cached_embeddings)
+                    else:
+                        # Add to existing store
+                        store.add_documents(batch_docs)
+                    
+                    logger.info(f"[Vectorstore] Batch {batch_num}/{total_batches} completed")
+                    break  # Success, exit retry loop
+                    
+                except Exception as e:
+                    if "429" in str(e) or "rate" in str(e).lower():
+                        retry_count += 1
+                        wait_time = RETRY_DELAY * (2 ** (retry_count - 1))  # Exponential backoff
+                        logger.warning(f"[Vectorstore] Rate limit hit. Retry {retry_count}/{MAX_RETRIES} after {wait_time}s")
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"[Vectorstore] Error processing batch: {e}")
+                        raise
+            
+            # Delay between batches to respect rate limits
+            if batch_idx + BATCH_SIZE < len(docs):
+                logger.info(f"[Vectorstore] Waiting {BATCH_DELAY}s before next batch...")
+                time.sleep(BATCH_DELAY)
         
-        agents.append(ChildAgent(name=key, retriever=retriever))
-        logger.info(f"[Vectorstore] Built store for '{key}' ({len(docs)} chunks)")
+        if store:
+            # Create retriever with optimal settings
+            retriever = store.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": 10}  # Retrieve more since we have fewer chunks per record
+            )
+            
+            agents.append(ChildAgent(name=key, retriever=retriever))
+            logger.info(f"[Vectorstore] Completed store for '{key}' with {len(docs)} total docs")
     
     return agents
 
 # Initialize on startup
+logger.info("=" * 60)
+logger.info("[Startup] Initializing Multi-Agent Chatbot")
+logger.info("=" * 60)
 logger.info("[Startup] Loading and chunking data...")
 CHUNKED_DATA = load_json_data_with_chunking(EMBEDDED_FILES)
-logger.info("[Startup] Building vectorstores...")
-AGENTS = build_vectorstores(CHUNKED_DATA)
+logger.info("[Startup] Building vectorstores with rate limiting...")
+AGENTS = build_vectorstores_with_rate_limiting(CHUNKED_DATA)
 logger.info("[Startup] Initializing agent manager...")
 MANAGER = AgentManager(AGENTS)
 recognizer = sr.Recognizer()
+logger.info("=" * 60)
 logger.info("[Startup] System ready!")
+logger.info("=" * 60)
 
 # ─── FASTAPI APP ─────────────────────────────────────────────────
 
-app = FastAPI(title="Multi-Agent JSON Chatbot with Smart Chunking")
+app = FastAPI(title="Multi-Agent JSON Chatbot with Rate Limiting")
 
 app.add_middleware(
     CORSMiddleware,
@@ -418,12 +532,8 @@ def stats():
     """Get statistics about the loaded data."""
     stats_info = {}
     for name, chunks in CHUNKED_DATA.items():
-        chunk_types = {}
-        for chunk in chunks:
-            ctype = chunk["metadata"].get("chunk_type", "unknown")
-            chunk_types[ctype] = chunk_types.get(ctype, 0) + 1
         stats_info[name] = {
             "total_chunks": len(chunks),
-            "chunk_types": chunk_types
+            "total_records": len(chunks)  # Since we now create 1 chunk per record
         }
     return stats_info
