@@ -1,706 +1,1359 @@
-# Complete Dissolution Similarity Analyzer - Streamlit Application
-# Integrates all backend modules for pharmaceutical dissolution testing
-
-import streamlit as st
-import pandas as pd
+#sa_main
 import numpy as np
-import plotly.graph_objects as go
-from io import BytesIO
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.ticker import MaxNLocator
 import warnings
+from scipy.stats import skew, kurtosis, norm
+from joblib import Parallel, delayed
+import pandas as pd
+import plotly.graph_objects as go
+
+from scipy import stats
+
+
+
+
+
+# Suppress warnings
 warnings.filterwarnings('ignore')
 
-# Import backend modules
-from Similarity_analyzer_final_version import (
-    main_function,
-    dissolution_curve,
-    dissolution_curve_interval,
-    check_time_points,
-    two_time_points,
-    min15__check,
-    check_cv,
-    check_same_time_points
-)
+# Initialize global array for bootstrap
+arrayboot = []
 
-from sa_main import (
-    main_f2,
-    prepare_data,
-    check_sample_units
-)
+# Set random seed for reproducibility
+np.random.seed(306)
 
-from Recommended_time_points import check_cv_criteria
+# --------------------------
+# Data Processing Functions
+# --------------------------
 
-# Page configuration
-st.set_page_config(
-    page_title="Dissolution Similarity Analyzer",
-    page_icon="💊",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+def prepare_data(reference_df, test_df):
+    """Remove time zero if present and reset index"""
+    if reference_df.iloc[0, 0] == 0 or reference_df.iloc[0, 0] == '0':
+        reference_df = reference_df.iloc[1:].reset_index(drop=True)
+    if test_df.iloc[0, 0] == 0 or test_df.iloc[0, 0] == '0':
+        test_df = test_df.iloc[1:].reset_index(drop=True)
+    return reference_df, test_df
 
-# Custom CSS styling
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 3rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        padding: 1rem 0;
-    }
-    .sub-header {
-        font-size: 1.5rem;
-        font-weight: bold;
-        color: #2ca02c;
-        margin-top: 2rem;
-    }
-    .info-box {
-        background-color: #e7f3ff;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #1f77b4;
-        margin: 1rem 0;
-    }
-    .success-box {
-        background-color: #d4edda;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #28a745;
-    }
-    .warning-box {
-        background-color: #fff3cd;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #ffc107;
-    }
-    .error-box {
-        background-color: #f8d7da;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 5px solid #dc3545;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
-    }
-    .stTabs [data-baseweb="tab"] {
-        padding: 1rem 2rem;
-        font-size: 1.1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+# --------------------------
+# Visualization Functions
 
-# Session state initialization
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
-if 'results' not in st.session_state:
-    st.session_state.results = None
 
-def validate_data(df, name):
-    """Validate uploaded data format"""
-    errors = []
-
-    if df is None or df.empty:
-        errors.append(f"{name} dataframe is empty")
-        return errors
-
-    if df.shape[1] < 2:
-        errors.append(f"{name} must have at least 2 columns (Time + at least 1 unit)")
-
-    # Check if first column is numeric (time points)
+def dissolution_curve(reference_df, test_df):
     try:
-        pd.to_numeric(df.iloc[:, 0])
-    except:
-        errors.append(f"{name} first column (Time) must be numeric")
+        # Calculate means for reference and test data
+        ref_means = reference_df.iloc[:, 1:].mean(axis=1)
+        test_means = test_df.iloc[:, 1:].mean(axis=1)
+        times = reference_df.iloc[:, 0]
 
-    # Check if subsequent columns are numeric (dissolution values)
-    for col_idx in range(1, df.shape[1]):
-        try:
-            pd.to_numeric(df.iloc[:, col_idx])
-        except:
-            errors.append(f"{name} column {col_idx+1} must be numeric")
-
-    return errors
-
-def display_validation_checks(ref_df, test_df, market):
-    """Display validation checks in a nice format"""
-    st.markdown('<div class="sub-header">📋 Validation Checks</div>', unsafe_allow_html=True)
-
-    checks = {
-        "Minimum 3 time points (excl. zero)":
-            [check_time_points(ref_df), check_time_points(test_df)],
-        "First two points ≤85% dissolution":
-            [two_time_points(ref_df), two_time_points(test_df)],
-        "No >85% dissolution in first 15 min":
-            [not min15__check(ref_df), not min15__check(test_df)],
-        "CV requirements met":
-            [check_cv(ref_df), check_cv(test_df)],
-        "≥12 individual units":
-            [check_sample_units(ref_df), check_sample_units(test_df)],
-        "Same time points for both products":
-            [check_same_time_points(ref_df, test_df), check_same_time_points(ref_df, test_df)]
-    }
-
-    # Create dataframe for display
-    check_df = pd.DataFrame({
-        "Validation Check": list(checks.keys()),
-        "Reference": ["✅ Pass" if checks[k][0] else "❌ Fail" for k in checks.keys()],
-        "Test": ["✅ Pass" if checks[k][1] else "❌ Fail" for k in checks.keys()]
-    })
-
-    st.dataframe(check_df)
-
-    # Check if all validations passed
-    all_passed = all([all(v) for v in checks.values()])
-
-    if all_passed:
-        st.markdown('<div class="success-box">✅ All validation checks passed!</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="warning-box">⚠️ Some validation checks failed. Results should be interpreted with caution.</div>', unsafe_allow_html=True)
-
-    return all_passed
-
-def download_excel(dataframes_dict, filename="results.xlsx"):
-    """Create downloadable Excel file with multiple sheets"""
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        for sheet_name, df in dataframes_dict.items():
-            if df is not None and not df.empty:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-    output.seek(0)
-    return output
-
-def main():
-    # Header
-    st.markdown('<div class="main-header">💊 Dissolution Similarity Analyzer</div>', unsafe_allow_html=True)
-    st.markdown("---")
-
-    # Sidebar
-    with st.sidebar:
-        st.markdown("## 📁 Data Upload")
-
-        # File uploaders
-        ref_file = st.file_uploader(
-            "Upload Reference Data (Excel)",
-            type=['xlsx', 'xls'],
-            help="Excel file with Time in first column, followed by unit columns"
+        # Create traces
+        ref_trace = go.Scatter(
+            x=times,
+            y=ref_means,
+            mode='lines+markers',
+            name='Reference mean',
+            marker=dict(symbol='circle', size=8),
+            line=dict(color='blue')
         )
 
-        test_file = st.file_uploader(
-            "Upload Test Data (Excel)",
-            type=['xlsx', 'xls'],
-            help="Excel file with Time in first column, followed by unit columns"
+        test_trace = go.Scatter(
+            x=times,
+            y=test_means,
+            mode='lines+markers',
+            name='Test mean',
+            marker=dict(symbol='circle', size=8),
+            line=dict(color='green', dash='dash')
         )
 
-        st.markdown("---")
-        st.markdown("## 🌍 Regulatory Market")
-
-        market = st.selectbox(
-            "Select Regulatory Agency",
-            ["US FDA", "EMA/ICH/Canada/Australia", "CHINA", "ASEAN", "ANVISA", "WHO"],
-            help="Different markets have different dissolution testing requirements"
+        # Layout
+        layout = go.Layout(
+            title='Dissolution Curves',
+            xaxis=dict(title='Time (minutes)', zeroline=True, zerolinewidth=1, zerolinecolor='black'),
+            yaxis=dict(title='Dissolution (%)', tickmode='linear', dtick=10,
+                       zeroline=True, zerolinewidth=1, zerolinecolor='black',
+                       showgrid=True, gridcolor='lightgray'),
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            plot_bgcolor='white',
+            paper_bgcolor='white'
         )
 
-        st.markdown("---")
-        st.markdown("## ⚙️ Analysis Settings")
-
-        include_bootstrap = st.checkbox(
-            "Include Bootstrap Analysis",
-            value=True,
-            help="Run bootstrap simulations for confidence intervals (10,000 iterations)"
-        )
-
-        show_optimal_timepoints = st.checkbox(
-            "Show Optimal Timepoint Predictions",
-            value=True,
-            help="Calculate optimal timepoint sequences using predictive algorithms"
-        )
-
-        st.markdown("---")
-
-        # Analyze button
-        analyze_button = st.button("🚀 Run Analysis")
-
-    # Main content area
-    if not ref_file or not test_file:
-        st.markdown('<div class="info-box">👈 Please upload both Reference and Test data files to begin analysis</div>', unsafe_allow_html=True)
-
-        # Show example data format
-        with st.expander("📖 Expected Data Format"):
-            st.markdown("""
-            **Excel File Format:**
-            - First column: Time points (e.g., 0, 5, 10, 15, 30, 45, 60 minutes)
-            - Subsequent columns: Dissolution values for each unit (minimum 12 units recommended)
-            - All values should be numeric
-            - Header row is optional
-
-            **Example:**
-            ```
-            Time  Unit1  Unit2  Unit3  ...  Unit12
-            0     0      0      0      ...  0
-            5     25     27     24     ...  26
-            10    45     48     43     ...  46
-            15    65     68     62     ...  66
-            ...
-            ```
-            """)
-
-        # Show market-specific requirements
-        with st.expander("🌍 Market-Specific Requirements"):
-            st.markdown("""
-            **US FDA:**
-            - Both products must exceed 85% dissolution simultaneously
-            - CV ≤20% at first non-zero timepoint, ≤10% thereafter
-            - Minimum 12 units per product
-
-            **EMA/ICH/Canada/Australia:**
-            - Either product exceeds 85% dissolution
-            - CV ≤20% up to 10 minutes, ≤10% after
-            - Expected f2 preferred when CV criteria met
-
-            **China/ASEAN:**
-            - Similar to EMA requirements
-            - Either 85% rule applies
-
-            **ANVISA:**
-            - Both 85% rule (similar to FDA)
-            - CV ≤20% for first 40% of timepoints, ≤10% thereafter
-
-            **WHO:**
-            - Similar to EMA requirements
-            - Either 85% rule applies
-            """)
-
-        return
-
-    # Load data
-    try:
-        reference_df = pd.read_excel(ref_file, header=None)
-        test_df = pd.read_excel(test_file, header=None)
-
-        st.success(f"✅ Files loaded successfully! Reference: {reference_df.shape}, Test: {test_df.shape}")
+        # Create figure
+        fig = go.Figure(data=[ref_trace, test_trace], layout=layout)
+        return fig
 
     except Exception as e:
-        st.error(f"❌ Error loading files: {str(e)}")
-        return
+        print(e, "dissolution_curve")
 
-    # Validate data
-    ref_errors = validate_data(reference_df, "Reference")
-    test_errors = validate_data(test_df, "Test")
+def dissolution_curve_interval(reference_df, test_df):
+    try:
+        # Calculate statistics for reference
+        ref_means = reference_df.iloc[:, 1:].mean(axis=1)
+        ref_mins = reference_df.iloc[:, 1:].min(axis=1)
+        ref_maxs = reference_df.iloc[:, 1:].max(axis=1)
 
-    if ref_errors or test_errors:
-        st.markdown('<div class="error-box">❌ Data Validation Errors:</div>', unsafe_allow_html=True)
-        for error in ref_errors + test_errors:
-            st.error(error)
-        return
+        # Calculate statistics for test
+        test_means = test_df.iloc[:, 1:].mean(axis=1)
+        test_mins = test_df.iloc[:, 1:].min(axis=1)
+        test_maxs = test_df.iloc[:, 1:].max(axis=1)
 
-    # Display data preview
-    with st.expander("👀 Preview Uploaded Data", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Reference Data**")
-            st.dataframe(reference_df.head(10))
-        with col2:
-            st.markdown("**Test Data**")
-            st.dataframe(test_df.head(10))
+        # Time points
+        times = reference_df.iloc[:, 0]
 
-    # Display validation checks (outside of button click)
-    validation_passed = display_validation_checks(reference_df, test_df, market)
+        # Reference trace with error bars
+        ref_trace = go.Scatter(
+            x=times,
+            y=ref_means,
+            mode='lines+markers',
+            name='Reference',
+            marker=dict(symbol='circle', size=8),
+            line=dict(color='blue'),
+            error_y=dict(
+                type='data',
+                symmetric=False,
+                array=ref_maxs - ref_means,
+                arrayminus=ref_means - ref_mins,
+                thickness=1.5,
+                width=3
+            )
+        )
 
-    st.markdown("---")
+        # Test trace with error bars
+        test_trace = go.Scatter(
+            x=times,
+            y=test_means,
+            mode='lines+markers',
+            name='Test',
+            marker=dict(symbol='square', size=8),
+            line=dict(color='green', dash='dash'),
+            error_y=dict(
+                type='data',
+                symmetric=False,
+                array=test_maxs - test_means,
+                arrayminus=test_means - test_mins,
+                thickness=1.5,
+                width=3
+            )
+        )
 
-    # Determine recommended methodologies based on CV criteria
-    st.markdown('<div class="sub-header">🎯 Methodology Selection</div>', unsafe_allow_html=True)
+        # Layout
+        layout = go.Layout(
+            title='Dissolution Profiles with Variability Ranges',
+            xaxis=dict(title='Time (minutes)', zeroline=True, zerolinewidth=1, zerolinecolor='black'),
+            yaxis=dict(title='Dissolution (%)', tickmode='linear', dtick=10,
+                       zeroline=True, zerolinewidth=1, zerolinecolor='black',
+                       showgrid=True, gridcolor='lightgray', range=[0, 100]),
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            plot_bgcolor='white',
+            paper_bgcolor='white'
+        )
 
-    recommended_methods = check_cv_criteria(reference_df, test_df, market)
+        # Create figure
+        fig = go.Figure(data=[ref_trace, test_trace], layout=layout)
+        return fig
 
-    # Show recommendations in an expander
-    with st.expander("📋 View Recommended Methods (Based on CV Criteria)", expanded=True):
-        st.info(f"**Based on CV criteria and market selection ({market}), our recommendations are:**")
-        for method in recommended_methods:
-            st.markdown(f"- {method}")
-        st.caption("💡 These are suggestions only - you have full control to select any methods you prefer below.")
+    except Exception as e:
+        print(e, "dissolution_curve_interval")
 
-    # Allow user to choose selection mode
-    st.markdown("---")
-    selection_mode = st.radio(
-        "How would you like to select methodologies?",
-        ["Use Recommended Methods", "Custom Selection", "Run All Available Methods"],
-        help="Choose whether to use our recommendations or select your own preferred methodologies"
-    )
+def simulate_lilliefors_critical_value(n, alpha=0.05, num_simulations=1000):
+    """Simulate Lilliefors critical value for confidence bands"""
+    D_values = []
+    for _ in range(num_simulations):
+        sample = np.random.normal(loc=0, scale=1, size=n)
+        sample_mean = np.mean(sample)
+        sample_std = np.std(sample, ddof=1)
+        z_scores = (sample - sample_mean) / sample_std
+        z_scores.sort()
+        ecdf_sim = np.arange(1, n + 1) / (n + 1)
+        cdf = norm.cdf(z_scores)
+        D = np.max(np.abs(ecdf_sim - cdf))
+        D_values.append(D)
+    return np.percentile(D_values, 100 * (1 - alpha))
 
-    # Prepare all available methods
-    all_methods = [
-        "Conventional F2",
-        "Expected F2",
-        "Bias-Corrected F2",
-        "Conventional Bootstrap F2",
-        "Expected Bootstrap F2",
-        "Bias-Corrected Bootstrap F2"
-    ]
-
-    # Filter bootstrap methods based on user selection
-    if not include_bootstrap:
-        all_methods = [m for m in all_methods if "Bootstrap" not in m]
-
-    # Determine default selection based on mode
-    if selection_mode == "Use Recommended Methods":
-        default_selection = recommended_methods
-        st.success("✅ Using recommended methods based on your data and market requirements")
-    elif selection_mode == "Run All Available Methods":
-        default_selection = all_methods
-        st.success(f"✅ Running all {len(all_methods)} available methodologies")
-    else:  # Custom Selection
-        default_selection = []
-        st.info("🎨 Select your preferred methodologies from the list below")
-
-    selected_methods = st.multiselect(
-        "Select methodologies to calculate:",
-        all_methods,
-        default=default_selection,
-        help="You can add or remove any methods regardless of recommendations",
-        disabled=(selection_mode == "Run All Available Methods")
-    )
-
-    if not selected_methods:
-        st.warning("⚠️ Please select at least one methodology before running analysis")
-    else:
-        st.success(f"✅ Ready to analyze with {len(selected_methods)} method(s): {', '.join(selected_methods)}")
-
-    st.markdown("---")
-
-    # Run analysis button and execution
-    if analyze_button:
-        if not selected_methods:
-            st.error("❌ Cannot run analysis: Please select at least one methodology above")
+def check_cv(df):
+    try:
+        if df.iloc[0, 0] == 0:  # Check if the first time point is zero
+            cv_values = df.iloc[1:, 1:].std(axis=1) / df.iloc[1:, 1:].mean(axis=1) * 100  # Exclude the zero time point and Time Points column
+            return cv_values.iloc[0] < 20 and (cv_values.iloc[1:] < 10).all()
         else:
-            with st.spinner("🔬 Running analysis... This may take a few minutes for bootstrap simulations."):
-                try:
-                    # Run main function analysis
-                    st.markdown('<div class="sub-header">📊 Dissolution Profile Analysis</div>', unsafe_allow_html=True)
+            cv_values = df.iloc[:, 1:].std(axis=1) / df.iloc[:, 1:].mean(axis=1) * 100 # Calculate CV for all time points
+            #print(df)
+            #print(cv_values)
+            return cv_values.iloc[0] < 20 and (cv_values.iloc[1:] < 10).all()
+    except Exception as e:
+        print(e,"check_cv")
 
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
+# import numpy as np
+# from scipy.stats import norm, skew, kurtosis
+# from scipy import stats
+# import plotly.graph_objects as go
 
-                    status_text.text("Step 1/4: Preparing data and calculating conventional f2...")
-                    progress_bar.progress(25)
+# def create_jmp_style_qq_plot(data, title, method_name):
+#     if len(data) == 0:
+#         return None
 
-                    # Prepare data - remove time zero before calculations
-                    ref_prepared, test_prepared = prepare_data(reference_df, test_df)
+#     n = len(data)
+#     sorted_data = np.sort(data)
+#     plotting_positions = norm.ppf((np.arange(1, n + 1)) / (n + 2))
+#     slope, intercept, r, _, _ = stats.linregress(plotting_positions, sorted_data)
+#     fit_line = intercept + slope * plotting_positions
+#     ecdf = (np.arange(1, n + 1)) / (n + 1)
 
-                    # Call main_function from Similarity_analyzer_final_version.py
-                    main_results = main_function(market, test_prepared, ref_prepared)
+#     D_critical = simulate_lilliefors_critical_value(n=n, alpha=0.05)
+#     lower_quantile = norm.ppf(np.clip(ecdf - D_critical, 1e-10, 1 - 1e-10))
+#     upper_quantile = norm.ppf(np.clip(ecdf + D_critical, 1e-10, 1 - 1e-10))
+#     lower_band = intercept + slope * lower_quantile
+#     upper_band = intercept + slope * upper_quantile
 
-                    # Unpack results based on return values
-                    if len(main_results) == 8:
-                        conv_f2, fig1, fig2, seq_print, recom_f2, plotly_fig, cv_checks, ai_df = main_results
-                    else:
-                        st.error("Unexpected number of return values from main_function")
-                        return
+#     fig = go.Figure()
 
-                    status_text.text("Step 2/4: Generating dissolution plots...")
-                    progress_bar.progress(50)
+#     fig.add_trace(go.Scatter(x=plotting_positions, y=upper_band, mode='lines',
+#                              name='Upper Confidence Band', line=dict(color='red', width=1, dash='dot')))
+#     fig.add_trace(go.Scatter(x=plotting_positions, y=lower_band, mode='lines',
+#                              name='Lower Confidence Band', line=dict(color='red', width=1, dash='dot')))
+#     fig.add_trace(go.Scatter(x=plotting_positions, y=fit_line, mode='lines',
+#                              name='Normal Reference Line', line=dict(color='red', width=2)))
+#     fig.add_trace(go.Scatter(x=plotting_positions, y=sorted_data, mode='markers',
+#                              name='Data Points', marker=dict(color='black', size=6)))
 
-                    # Display conventional f2 result
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric(
-                            label="Conventional f2",
-                            value=f"{conv_f2:.2f}" if isinstance(conv_f2, (int, float)) else "N/A",
-                            delta="Similar" if isinstance(conv_f2, (int, float)) and conv_f2 >= 50 else "Not Similar"
-                        )
-                    with col2:
-                        st.metric(
-                            label="CV Criteria",
-                            value="Pass" if cv_checks == "True" else "Fail"
-                        )
-                    with col3:
-                        if recom_f2:
-                            st.metric(
-                                label="Recommended f2",
-                                value=f"{recom_f2:.2f}" if isinstance(recom_f2, (int, float)) else "N/A"
-                            )
+#     x_range = max(plotting_positions) - min(plotting_positions)
+#     y_range = max(sorted_data) - min(sorted_data)
+#     x_margin = x_range * 0.1
+#     y_margin = y_range * 0.1
 
-                    # Display dissolution curves
-                    st.plotly_chart(fig1)
-                    st.plotly_chart(fig2)
+#     x_ticks = [-2.5, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2]
+#     x_ticks = [tick for tick in x_ticks if min(plotting_positions)-x_margin <= tick <= max(plotting_positions)+x_margin]
 
-                    # Display optimal profile if available
-                    if plotly_fig and show_optimal_timepoints:
-                        st.markdown('<div class="sub-header">🎯 Optimal Predicted Profile</div>', unsafe_allow_html=True)
-                        st.plotly_chart(plotly_fig)
+#     fig.update_layout(
+#         title=dict(
+#             text=f"Normal Quantile Plot",
+#             x=0.5
+#         ),
+#         xaxis=dict(
+#             title='Normal Quantile',
+#             range=[min(plotting_positions)-x_margin, max(plotting_positions)+x_margin],
+#             tickvals=x_ticks,
+#             # tickmode='array',
+#             # gridcolor='lightgray',
+#             # gridwidth=0.5,
+#             # showgrid=True,
+#             # zeroline=True,
+#             # zerolinecolor='lightgray',
+#             # zerolinewidth=0.8,
+#             # tickfont=dict(size=10, color='black', family='Arial'),
+#             # linecolor='black',
+#             # linewidth=1,
+#             # mirror=True
+#         ),
 
-                        if ai_df is not None and not ai_df.empty:
-                            st.markdown("**Predicted Dissolution Values:**")
-                            st.dataframe(ai_df)
+#         yaxis=dict(
+#             title='Sample Quantile',
+#             range=[min(sorted_data)-y_margin, max(sorted_data)+y_margin]
+#         ),
+#         plot_bgcolor='white',
+#         paper_bgcolor='white',
+#         hovermode='closest',
+#         width=600,
+#         height=500,
+#         margin=dict(l=80, r=250, t=80, b=60),
+#         showlegend=True,
+#         legend=dict(
+#             title=dict(text='Legend'),
+#             orientation="v",
+#             yanchor="top",
+#             y=1,
+#             xanchor="left",
+#             x=1.05
+#         )
+#     )
 
-                    status_text.text("Step 3/4: Calculating point estimates...")
-                    progress_bar.progress(75)
+#     return fig
 
-                    # Run bootstrap analysis if selected
-                    if include_bootstrap and any("Bootstrap" in m for m in selected_methods):
-                        st.markdown("---")
-                        st.markdown('<div class="sub-header">🔄 Bootstrap Analysis</div>', unsafe_allow_html=True)
+# import numpy as np
+# import plotly.graph_objects as go
+# from scipy import stats
+# from scipy.stats import norm
 
-                        status_text.text("Step 4/4: Running bootstrap simulations (10,000 iterations)...")
+# def simulate_lilliefors_critical_value(n, alpha=0.05):
+#     # Placeholder for critical value simulation
+#     return 0.05  # Example fixed value
 
-                        # Prepare data for bootstrap
-                        ref_clean, test_clean = prepare_data(reference_df, test_df)
 
-                        # Call main_f2 from sa_main.py
-                        try:
-                            results, bootstrap_results, qq_plots = main_f2(
-                                ref_clean,
-                                test_clean,
-                                selected_methods,
-                                conv_f2,
-                                market
-                            )
 
-                            if results is None:
-                                results = {}
-                            if bootstrap_results is None:
-                                bootstrap_results = {}
-                            if qq_plots is None:
-                                qq_plots = {}
 
-                        except Exception as bootstrap_error:
-                            st.error(f"⚠️ Bootstrap analysis encountered an error: {str(bootstrap_error)}")
-                            st.info("Continuing with available results...")
-                            results = {}
-                            bootstrap_results = {}
-                            qq_plots = {}
+def create_jmp_style_qq_plot(data, title, method_name):
+    if len(data) == 0:
+        return None
 
-                        progress_bar.progress(100)
-                        status_text.text("✅ Analysis complete!")
+    n = len(data)
+    sorted_data = np.sort(data)
+    plotting_positions = norm.ppf((np.arange(1, n + 1)) / (n + 2))
+    slope, intercept, r, _, _ = stats.linregress(plotting_positions, sorted_data)
+    fit_line = intercept + slope * plotting_positions
+    ecdf = (np.arange(1, n + 1)) / (n + 1)
 
-                        # Display point estimates
-                        if results:
-                            st.markdown("### Point Estimates")
+    D_critical = simulate_lilliefors_critical_value(n=n, alpha=0.05)
+    lower_quantile = norm.ppf(np.clip(ecdf - D_critical, 1e-10, 1 - 1e-10))
+    upper_quantile = norm.ppf(np.clip(ecdf + D_critical, 1e-10, 1 - 1e-10))
+    lower_band = intercept + slope * lower_quantile
+    upper_band = intercept + slope * upper_quantile
 
-                            point_est_df = pd.DataFrame([
-                                {"Method": k, "f2 Value": v}
-                                for k, v in results.items()
-                                if k not in ['cv_result_expected_f2']
-                            ])
 
-                            if not point_est_df.empty:
-                                st.dataframe(point_est_df)
+    fig = go.Figure()
 
-                        # Display bootstrap results
-                        if bootstrap_results:
-                            st.markdown("### Bootstrap Results")
+    fig.add_trace(go.Scatter(x=plotting_positions, y=upper_band, mode='lines', line=dict(color='red', width=1, dash='dot'), showlegend=False))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=lower_band, mode='lines', line=dict(color='red', width=1, dash='dot'), showlegend=False))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=fit_line, mode='lines', line=dict(color='red', width=2), showlegend=False))
+    fig.add_trace(go.Scatter(x=plotting_positions, y=sorted_data, mode='markers', marker=dict(color='black', size=6), showlegend=False))
 
-                            # Create summary table with all bootstrap statistics
-                            st.markdown("#### Summary Table (10,000 Iterations)")
+    x_range = max(plotting_positions) - min(plotting_positions)
+    y_range = max(sorted_data) - min(sorted_data)
+    x_margin = x_range * 0.1 # Increased margin for more spacing
+    y_margin = y_range * 0.1
 
-                            bootstrap_summary = []
-                            for method, boot_res in bootstrap_results.items():
-                                if boot_res and isinstance(boot_res, dict):
-                                    # Extract confidence interval values
-                                    ci = boot_res.get("Confidence Interval", "")
-                                    lower_5 = None
-                                    upper_95 = None
-                                    if ci and ci not in [None, "None", "N/A"] and isinstance(ci, str) and " - " in ci:
-                                        try:
-                                            parts = ci.split(" - ")
-                                            lower_5 = float(parts[0])
-                                            upper_95 = float(parts[1])
-                                        except (ValueError, IndexError):
-                                            pass
+    x_ticks = [-7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7]
+    x_ticks = [tick for tick in x_ticks if min(plotting_positions)-x_margin <= tick <= max(plotting_positions)+x_margin]
+    # x_ticks = [tick for tick in x_ticks if min(plotting_positions) <= tick <= max(plotting_positions)]
 
-                                    bootstrap_summary.append({
-                                        "Method": method,
-                                        "Observed F2": boot_res.get("Observed F2", "N/A"),
-                                        "Bootstrap Mean": boot_res.get("Mean", "N/A"),
-                                        "Bootstrap Median": boot_res.get("Median", "N/A"),
-                                        "5th Percentile": f"{lower_5:.2f}" if lower_5 is not None else "N/A",
-                                        "95th Percentile": f"{upper_95:.2f}" if upper_95 is not None else "N/A",
-                                        "Skewness": boot_res.get("Skewness", "N/A"),
-                                        "Kurtosis": boot_res.get("Kurtosis", "N/A"),
-                                        "5th %ile > 50": boot_res.get("Is 5% percentile > 50", "N/A"),
-                                        "Similarity": boot_res.get("Similarity of R and T", "N/A")
-                                    })
+    fig.update_layout(
+        title=dict(
+            text="Normal Quantile Plot",
+            x=0.5
+        ),
+        xaxis=dict(
+           title=dict(
+                text='<b>Normal Quantile</b>',
+                font=dict(size=12, color='black', family='Arial')
+            ),
+            range=[min(plotting_positions)-x_margin, max(plotting_positions)+x_margin],
+            tickvals=x_ticks,
+            tickmode='array',
+            gridcolor='lightgray',
+            gridwidth=1.0,
+            showgrid=True,
+            zeroline=True,
+            zerolinecolor='lightgray',
+            zerolinewidth=0.3,
+            tickfont=dict(size=10, color='black', family='Arial'),
+            linecolor='black',
+            linewidth=1,
+            mirror=True
+        ),
+        yaxis=dict(
+            title='Sample Quantile',
+            range=[min(sorted_data)-y_margin, max(sorted_data)+y_margin],
+            # gridcolor='lightgray', 
+            # gridwidth=1,
+            # showgrid=True,
 
-                            if bootstrap_summary:
-                                bootstrap_df = pd.DataFrame(bootstrap_summary)
-                                st.dataframe(bootstrap_df)
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        hovermode='closest',
+        width=600, 
+        height=500,
+        margin=dict(l=40, r=10, t=40, b=60),
+    )
 
-                                # Add download button for bootstrap table
-                                csv = bootstrap_df.to_csv(index=False)
-                                st.download_button(
-                                    label="📥 Download Bootstrap Results (CSV)",
-                                    data=csv,
-                                    file_name=f"bootstrap_results_{market.replace('/', '_')}.csv",
-                                    mime="text/csv"
-                                )
+    return fig
 
-                            st.markdown("---")
-                            st.markdown("#### Detailed Results by Method")
 
-                            for method, boot_res in bootstrap_results.items():
-                                if not boot_res or not isinstance(boot_res, dict):
-                                    st.warning(f"⚠️ {method}: No valid results available")
-                                    continue
 
-                                with st.expander(f"📈 {method}", expanded=True):
-                                    col1, col2, col3, col4 = st.columns(4)
 
-                                    with col1:
-                                        obs_f2 = boot_res.get("Observed F2", "N/A")
-                                        st.metric("Observed f2", str(obs_f2) if obs_f2 is not None else "N/A")
-                                    with col2:
-                                        mean_val = boot_res.get("Mean", "N/A")
-                                        st.metric("Mean", str(mean_val) if mean_val not in [None, "None"] else "N/A")
-                                    with col3:
-                                        median_val = boot_res.get("Median", "N/A")
-                                        st.metric("Median", str(median_val) if median_val not in [None, "None"] else "N/A")
-                                    with col4:
-                                        ci = boot_res.get("Confidence Interval", "N/A")
-                                        st.metric("90% CI", str(ci) if ci not in [None, "None"] else "N/A")
+def generate_qq_plots(bootstrap_data):
+    """Generate all QQ plots and return them as a dictionary."""
+    qq_plots_data = {}
 
-                                    col5, col6, col7 = st.columns(3)
-                                    with col5:
-                                        skew_val = boot_res.get("Skewness", "N/A")
-                                        st.metric("Skewness", str(skew_val) if skew_val not in [None, "None"] else "N/A")
-                                    with col6:
-                                        kurt_val = boot_res.get("Kurtosis", "N/A")
-                                        st.metric("Kurtosis", str(kurt_val) if kurt_val not in [None, "None"] else "N/A")
-                                    with col7:
-                                        similarity = boot_res.get("Similarity of R and T", "N/A")
-                                        st.metric("Similarity", str(similarity) if similarity not in [None, "None"] else "N/A")
+    # Generate individual plots
+    for method, data in bootstrap_data.items():
+        plots = None  # Initialize plots for each method
+        if len(data) > 0:
+            fig = create_jmp_style_qq_plot(data, f"QQ Plot", method)
+            plots = fig
 
-                                    # Display histogram plot
-                                    if "Hist Plot" in boot_res and boot_res["Hist Plot"]:
-                                        st.plotly_chart(boot_res["Hist Plot"])
-                                    else:
-                                        st.info("Bootstrap profile plot not available")
+        # Only add to dictionary if we have valid plots
+        if plots is not None:
+            qq_plots_data[method] = plots
 
-                            # Display QQ plots
-                            if qq_plots:
-                                st.markdown("### QQ Plots (Normality Assessment)")
+    return qq_plots_data
+# --------------------------
+# Validation Checks
+# --------------------------
+def check_time_points(df):
+    """Check minimum time points requirement"""
+    if df.iloc[0, 0] == 0 or str(df.iloc[0, 0]).lower() == '0':
+        return len(df) - 1 >= 3
+    return len(df) >= 3
 
-                                qq_cols = st.columns(min(len(qq_plots), 3))
-                                for idx, (method, qq_fig) in enumerate(qq_plots.items()):
-                                    with qq_cols[idx % 3]:
-                                        st.markdown(f"**{method}**")
-                                        st.plotly_chart(qq_fig)
+def two_time_points(df):
+    """Check if first two time points exceed 85%"""
+    means = df.iloc[:, 1:].mean(axis=1)
+    if len(means) >= 2:
+        return means.iloc[0] <= 85 and means.iloc[1] <= 85
+    return True
 
-                    else:
-                        progress_bar.progress(100)
-                        status_text.text("✅ Analysis complete!")
+def min15_check(df):
+    """Check if dissolution exceeds 85% within 15 minutes"""
+    time_col = df.columns[0]
+    if "min" in str(time_col).lower() or "minutes" in str(time_col).lower():
+        early_times = df[df.iloc[:, 0] <= 15]
+        if not early_times.empty:
+            means = early_times.iloc[:, 1:].mean(axis=1)
+            return any(means > 85)
+    return False
 
-                    st.markdown("---")
+def check_cv(df):
+    """Check coefficient of variation requirements"""
+    if df.iloc[0, 0] == 0 or str(df.iloc[0, 0]).lower() == '0':
+        df = df.iloc[1:]
+    
+    cv_values = []
+    for i in range(len(df)):
+        row = df.iloc[i, 1:]
+        mean = row.mean()
+        std = row.std()
+        cv = (std / mean) * 100 if mean > 0 else 0
+        cv_values.append(cv)
+    
+    if len(cv_values) > 0:
+        first_cv = cv_values[0]
+        other_cv = cv_values[1:] if len(cv_values) > 1 else []
+        return first_cv < 20 and all(cv < 10 for cv in other_cv)
+    return False
 
-                    # Summary and interpretation
-                    st.markdown('<div class="sub-header">📝 Summary & Interpretation</div>', unsafe_allow_html=True)
+def check_same_time_points(df1, df2):
+    """Check if time points are the same for both products"""
+    return df1.iloc[:, 0].equals(df2.iloc[:, 0])
 
-                    if isinstance(conv_f2, (int, float)):
-                        if conv_f2 >= 50:
-                            st.markdown(
-                                '<div class="success-box">'
-                                f'✅ <b>Conclusion:</b> The test and reference products are considered <b>similar</b> '
-                                f'based on conventional f2 value of {conv_f2:.2f} (≥50).'
-                                '</div>',
-                                unsafe_allow_html=True
-                            )
-                        else:
-                            st.markdown(
-                                '<div class="warning-box">'
-                                f'⚠️ <b>Conclusion:</b> The test and reference products are <b>not similar</b> '
-                                f'based on conventional f2 value of {conv_f2:.2f} (<50).'
-                                '</div>',
-                                unsafe_allow_html=True
-                            )
+def check_sample_units(df):
+    """Check minimum sample units requirement"""
+    return df.shape[1] - 1 >= 12
 
-                    # Bootstrap interpretation
-                    if include_bootstrap and bootstrap_results:
-                        st.markdown("**Bootstrap Interpretation:**")
-                        for method, boot_res in bootstrap_results.items():
-                            if not boot_res or not isinstance(boot_res, dict):
-                                continue
-                            ci = boot_res.get("Confidence Interval", "")
-                            if ci and ci not in [None, "None", "N/A"] and isinstance(ci, str) and " - " in ci:
-                                try:
-                                    lower = float(ci.split(" - ")[0])
-                                    if lower > 50:
-                                        st.success(f"✅ {method}: 5th percentile ({lower:.2f}) > 50, supporting similarity")
-                                    else:
-                                        st.warning(f"⚠️ {method}: 5th percentile ({lower:.2f}) ≤ 50, similarity not confirmed")
-                                except (ValueError, IndexError) as e:
-                                    st.info(f"ℹ️ {method}: Could not interpret confidence interval")
-                            else:
-                                st.info(f"ℹ️ {method}: Confidence interval not available")
+# --------------------------
+# f2 Calculation Functions
+# --------------------------
+def row_variance(df):
+    """Calculate row-wise variance"""
+    return df.iloc[:, 1:].var(axis=1, ddof=1)
 
-                    st.markdown("---")
+def conventional_f2(ref_means, test_means):
+    """Calculate conventional f2"""
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    p = len(ref_means)
+    res = 50 if p == 0 else 100 - 25 * np.log10(1 + (1/p) * sum_sq_diff)
+    return res
 
-                    # Download results
-                    st.markdown('<div class="sub-header">💾 Download Results</div>', unsafe_allow_html=True)
+def expected_f2(ref_df, test_df):
+    """Calculate expected f2"""
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
+    
+    # Conventional f2 component
+    diff = test_means - ref_means
+    sum_sq_diff = (diff ** 2).sum()
+    
+    # Variance components
+    ref_var = row_variance(ref_df)
+    test_var = row_variance(test_df)
+    sum_var = (ref_var + test_var).sum()
+    
+    n = ref_df.shape[1] - 1  # Number of units per time point
+    p = len(ref_means)
+    
+    adjustment = (1/n) * sum_var
+    result = 100 - 25 * np.log10(1 + (1/p) * (sum_sq_diff + adjustment))
+    return result
 
-                    # Prepare data for download
-                    download_data = {
-                        "Reference_Data": reference_df,
-                        "Test_Data": test_df,
-                    }
+def bias_corrected_f2(ref_df, test_df):
+    """Calculate bias-corrected f2"""
+    try:
+        ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+        test_means = test_df.iloc[:, 1:].mean(axis=1)
 
-                    if ai_df is not None and not ai_df.empty:
-                        download_data["Optimal_Timepoints"] = ai_df
+        diff = test_means - ref_means
+        sum_sq_diff = (diff ** 2).sum()
 
-                    if results:
-                        results_df = pd.DataFrame([
-                            {"Metric": k, "Value": v}
-                            for k, v in results.items()
-                        ])
-                        download_data["Point_Estimates"] = results_df
+        ref_var = row_variance(ref_df)
+        test_var = row_variance(test_df)
+        sum_var = (ref_var + test_var).sum()
 
-                    if bootstrap_results:
-                        boot_summary = []
-                        for method, boot_res in bootstrap_results.items():
-                            if boot_res and isinstance(boot_res, dict):
-                                # Extract confidence interval values
-                                ci = boot_res.get("Confidence Interval", "")
-                                lower_5 = "N/A"
-                                upper_95 = "N/A"
-                                if ci and ci not in [None, "None", "N/A"] and isinstance(ci, str) and " - " in ci:
-                                    try:
-                                        parts = ci.split(" - ")
-                                        lower_5 = float(parts[0])
-                                        upper_95 = float(parts[1])
-                                    except (ValueError, IndexError):
-                                        pass
+        n = ref_df.shape[1] - 1
+        p = len(ref_means)
 
-                                boot_summary.append({
-                                    "Method": method,
-                                    "Observed_f2": boot_res.get("Observed F2", "N/A"),
-                                    "Bootstrap_Mean": boot_res.get("Mean", "N/A"),
-                                    "Bootstrap_Median": boot_res.get("Median", "N/A"),
-                                    "5th_Percentile": lower_5,
-                                    "95th_Percentile": upper_95,
-                                    "Skewness": boot_res.get("Skewness", "N/A"),
-                                    "Kurtosis": boot_res.get("Kurtosis", "N/A"),
-                                    "5th_Percentile_gt_50": boot_res.get("Is 5% percentile > 50", "N/A"),
-                                    "Similarity": boot_res.get("Similarity of R and T", "N/A")
-                                })
-                        download_data["Bootstrap_Results"] = pd.DataFrame(boot_summary)
+        adjustment = (1 / n) * sum_var
+        right_side = sum_sq_diff + p
 
-                    excel_file = download_excel(download_data)
+        try:
+            if adjustment < right_side:
+                adjusted_diff = sum_sq_diff - adjustment
+                if adjusted_diff > 0:
+                    results = 100 - 25 * np.log10(1 + (1 / p) * adjusted_diff)
+                    return results
+                else:
+                    return "Bias-corrected F2 could not be calculated due to high within-batch variability and minimal profile differences in the provided dataset, please proceed with alternative method such as Bootstrap F2 and BCa bootstrap F2"
+            else:
+                return "Bias-corrected F2 could not be calculated due to high within-batch variability and minimal profile differences in the provided dataset, please proceed with alternative method such as Bootstrap F2 and BCa bootstrap F2"
+        except Exception as e:
+            print(e,"IN EXCEPTION ERROR")
 
-                    st.download_button(
-                        label="📥 Download Complete Results (Excel)",
-                        data=excel_file,
-                        file_name=f"dissolution_analysis_{market.replace('/', '_')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+    except Exception:
+        print("IN ELSE 3 RESULTS IN bias_corrected_f2")
+        return None
 
-                    st.success("✅ Analysis completed successfully!")
+def calculate_all_f2(ref_df, test_df):
+    """Calculate all f2 metrics"""
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
 
-                except Exception as e:
-                    st.error(f"❌ An error occurred during analysis: {str(e)}")
-                    st.exception(e)
+    expected_f2_result = expected_f2(ref_df, test_df)
 
-if __name__ == "__main__":
-    main()
+    bias_corrected_f2_result = bias_corrected_f2(ref_df, test_df)
+    
+    return {
+    # "Conventional": conventional_f2(ref_means, test_means),
+        "Expected f2": f"{expected_f2_result:.2f}" if isinstance(expected_f2_result, float) else expected_f2_result,
+        "Bias Corrected f2": f"{bias_corrected_f2_result:.2f}" if isinstance(bias_corrected_f2_result, float) else bias_corrected_f2_result
+    }
+
+
+# --------------------------
+# Bootstrap Functions
+# --------------------------
+# import numpy as np
+# from scipy.stats import skew, kurtosis
+# from scipy import stats
+# from joblib import Parallel, delayed
+# import plotly.graph_objects as go
+
+# def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000, n_jobs=-1):
+#     try:
+#         n_ref_units = ref_df.shape[1] - 1
+#         n_test_units = test_df.shape[1] - 1
+
+#         def single_iteration():
+#             ref_sample_idx = np.random.choice(range(1, ref_df.shape[1]), n_ref_units, replace=True)
+#             test_sample_idx = np.random.choice(range(1, test_df.shape[1]), n_test_units, replace=True)
+#             ref_sample = ref_df.iloc[:, [0] + list(ref_sample_idx)]
+#             test_sample = test_df.iloc[:, [0] + list(test_sample_idx)]
+#             original_f2 = calc_func(ref_sample, test_sample)
+#             if original_f2 is not None and isinstance(original_f2, (int, float)):
+#                 return original_f2
+#             return None
+
+#         f2_values = Parallel(n_jobs=n_jobs)(delayed(single_iteration)() for _ in range(n_iterations))
+#         f2_values = [val for val in f2_values if val is not None]
+#         f2_values = np.array(f2_values) if f2_values else calc_func(ref_df, test_df)
+
+#         mean_f2 = np.mean(f2_values)
+#         median_f2 = np.median(f2_values)
+#         skewness_f2 = skew(f2_values)
+#         kurtosis_f2 = kurtosis(f2_values)
+#         lower_bound = np.percentile(f2_values, 5)
+#         upper_bound = np.percentile(f2_values, 95)
+
+#         return lower_bound, upper_bound, mean_f2, median_f2, skewness_f2, kurtosis_f2, f2_values
+
+#     except Exception as e:
+#         return None, None, None, None, None, None, []
+
+# def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000):
+#     """
+#     Bootstrap f2 calculation. Optimized version.
+
+#     Args:
+#         ref_df (pd.DataFrame): Reference DataFrame. First column is time, subsequent columns are units.
+#         test_df (pd.DataFrame): Test DataFrame. First column is time, subsequent columns are units.
+#         calc_func (callable): Function to calculate f2. It must accept two DataFrames
+#                               (ref_sample, test_sample) and return a numeric f2 value.
+#         n_iterations (int): Number of bootstrap iterations.
+
+#     Returns:
+#       original_f2 (float): f2 value calculated from the original DataFrames.
+#       lower_bound (float or None): 5th percentile of bootstrapped f2s. None if no valid f2s.
+#       upper_bound (float or None): 95th percentile of bootstrapped f2s. None if no valid f2s.
+#       mean_f2 (float or None): Mean of bootstrapped f2s. None if no valid f2s.
+#       median_f2 (float or None): Median of bootstrapped f2s. None if no valid f2s.
+#       skewness_f2 (float or None): Skewness of bootstrapped f2s. None if no valid f2s.
+#       kurtosis_f2 (float or None): Kurtosis of bootstrapped f2s. None if no valid f2s.
+#       f2_values (np.array): Array of all valid bootstrapped f2 values. Empty if no valid f2s.
+#       ref_mean_profiles (np.array): Array of mean profiles for reference samples
+#                                     (shape [n_iterations, n_timepoints]).
+#       test_mean_profiles (np.array): Array of mean profiles for test samples
+#                                      (shape [n_iterations, n_timepoints]).
+#     """
+#     timepoints = ref_df.shape[0]
+#     ref_units = ref_df.shape[1] - 1
+#     test_units = test_df.shape[1] - 1
+
+#     # Handle edge cases where there are no units to sample
+#     if ref_units <= 0 or test_units <= 0:
+#         # The original code returns calc_func(ref_df, test_df) directly.
+#         # This implies calc_func should handle cases with empty or single-column DataFrames.
+#         return calc_func(ref_df, test_df), None, None, None, None, None, None, np.array([]), np.array([]), np.array([])
+
+#     # Calculate original f2 once
+#     original_f2 = calc_func(ref_df, test_df)
+
+#     # Pre-allocate arrays for results
+#     f2_values = np.empty(n_iterations)
+#     f2_values.fill(np.nan) # Initialize with NaN to easily filter invalid results
+
+#     ref_mean_profiles = np.empty((n_iterations, timepoints))
+#     test_mean_profiles = np.empty((n_iterations, timepoints))
+
+#     # Pre-extract data into NumPy arrays and the time column DataFrame
+#     # This avoids repeated .iloc and DataFrame slicing inside the loop
+#     time_col_df = ref_df.iloc[:, [0]] # Keep as DataFrame for pd.concat later
+#     ref_data_np = ref_df.iloc[:, 1:].values # NumPy array of shape (timepoints, ref_units)
+#     test_data_np = test_df.iloc[:, 1:].values # NumPy array of shape (timepoints, test_units)
+
+#     # Pre-generate all random choices for column indices
+#     # This avoids repeated calls to np.random.choice inside the loop, reducing Python overhead.
+#     all_ref_sample_indices = np.random.choice(ref_units, size=(n_iterations, ref_units), replace=True)
+#     all_test_sample_indices = np.random.choice(test_units, size=(n_iterations, test_units), replace=True)
+
+#     for i in range(n_iterations):
+#         # Get the pre-generated 0-based column indices for the current iteration
+#         ref_sample_col_indices = all_ref_sample_indices[i, :]
+#         test_sample_col_indices = all_test_sample_indices[i, :]
+
+#         # Select columns from the pre-extracted NumPy arrays (very fast)
+#         ref_sample_data_np = ref_data_np[:, ref_sample_col_indices]
+#         test_sample_data_np = test_data_np[:, test_sample_col_indices]
+
+#         # Calculate mean profiles directly from NumPy arrays (very fast)
+#         ref_mean_profiles[i] = ref_sample_data_np.mean(axis=1)
+#         test_mean_profiles[i] = test_sample_data_np.mean(axis=1)
+
+#         # Reconstruct Dataframes for calc_func. This is the most expensive part if calc_func
+#         # strictly requires DataFrames. However, creating a DataFrame from a NumPy array
+#         # and concatenating with a pre-existing time column is more efficient than
+#         # repeated .iloc and .reset_index on the original DataFrames.
+#         ref_sample_df = pd.concat([time_col_df, pd.DataFrame(ref_sample_data_np)], axis=1)
+#         test_sample_df = pd.concat([time_col_df, pd.DataFrame(test_sample_data_np)], axis=1)
+
+#         # Call the calculation function
+#         f2_val = calc_func(ref_sample_df, test_sample_df)
+
+#         # Store valid f2 values
+#         if f2_val is not None and isinstance(f2_val, (int, float, np.floating, np.integer)):
+#             f2_values[i] = f2_val
+
+#     # Filter out NaN values (from iterations where calc_func might have returned None or non-numeric)
+#     valid_f2 = f2_values[~np.isnan(f2_values)]
+
+#     # Handle case where no valid f2 values were computed
+#     if valid_f2.size == 0:
+#         return original_f2, None, None, None, None, None, None, np.array([]), ref_mean_profiles, test_mean_profiles
+
+#     # Calculate statistics from valid f2 values
+#     lower_bound = np.percentile(valid_f2, 5)
+#     upper_bound = np.percentile(valid_f2, 95)
+#     mean_f2 = np.mean(valid_f2)
+#     median_f2 = np.median(valid_f2)
+#     skewness_f2 = skew(valid_f2)
+#     kurtosis_f2 = kurtosis(valid_f2)
+
+#     print(
+#         original_f2,
+#         lower_bound,
+#         upper_bound,
+#         mean_f2,
+#         median_f2,
+#         skewness_f2,
+#         kurtosis_f2,
+#         valid_f2,
+#         ref_mean_profiles,
+#         test_mean_profiles
+#     )
+
+#     return (
+#         original_f2,
+#         lower_bound,
+#         upper_bound,
+#         mean_f2,
+#         median_f2,
+#         skewness_f2,
+#         kurtosis_f2,
+#         valid_f2,
+#         ref_mean_profiles,
+#         test_mean_profiles
+#     )
+
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from scipy.stats import skew, kurtosis
+
+def bootstrap_f2(ref_df, test_df, calc_func, n_iterations=10000, n_jobs=-1, track_profiles=False):
+    """
+    Optimized and parallelized bootstrap f2 calculation.
+
+    Args:
+        ref_df (pd.DataFrame): Reference DataFrame. First column is time, rest are units.
+        test_df (pd.DataFrame): Test DataFrame. First column is time, rest are units.
+        calc_func (callable): Function to calculate f2. Accepts two DataFrames.
+        n_iterations (int): Number of bootstrap iterations.
+        n_jobs (int): Number of parallel jobs (-1 uses all cores).
+        track_profiles (bool): Whether to return mean profiles for each iteration.
+
+    Returns:
+        original_f2 (float): f2 from original data.
+        lower_bound (float): 5th percentile of bootstrapped f2s.
+        upper_bound (float): 95th percentile of bootstrapped f2s.
+        mean_f2 (float): Mean of bootstrapped f2s.
+        median_f2 (float): Median of bootstrapped f2s.
+        skewness_f2 (float): Skewness of bootstrapped f2s.
+        kurtosis_f2 (float): Kurtosis of bootstrapped f2s.
+        f2_values (np.array): Array of valid bootstrapped f2 values.
+        ref_mean_profiles (np.array or None): Mean profiles of reference samples.
+        test_mean_profiles (np.array or None): Mean profiles of test samples.
+    """
+    try:
+        time_col = ref_df.iloc[:, [0]]
+        ref_data = ref_df.iloc[:, 1:].values
+        test_data = test_df.iloc[:, 1:].values
+        n_ref_units = ref_data.shape[1]
+        n_test_units = test_data.shape[1]
+        timepoints = ref_data.shape[0]
+
+        original_f2 = calc_func(ref_df, test_df)
+
+        # DEBUGGING: Print original f2 value
+        print(f"[BOOTSTRAP DEBUG] Original F2 calculated: {original_f2}")
+        print(f"[BOOTSTRAP DEBUG] Data shape - Ref: {ref_df.shape}, Test: {test_df.shape}")
+
+        # Check if original_f2 is a string error message
+        if isinstance(original_f2, str):
+            print(f"[BOOTSTRAP WARNING] Calculation returned error message: {original_f2}")
+            return (original_f2, None, None, None, None, None, None, np.array([]), None, None)
+
+        # Pre-generate indices for reproducibility and speed
+        ref_indices = np.random.randint(0, n_ref_units, size=(n_iterations, n_ref_units))
+        test_indices = np.random.randint(0, n_test_units, size=(n_iterations, n_test_units))
+
+        def compute_f2(i):
+            ref_sample = ref_data[:, ref_indices[i]]
+            test_sample = test_data[:, test_indices[i]]
+
+            ref_mean = ref_sample.mean(axis=1) if track_profiles else None
+            test_mean = test_sample.mean(axis=1) if track_profiles else None
+
+            ref_df_sample = pd.concat([time_col, pd.DataFrame(ref_sample)], axis=1)
+            test_df_sample = pd.concat([time_col, pd.DataFrame(test_sample)], axis=1)
+
+            f2 = calc_func(ref_df_sample, test_df_sample)
+            if isinstance(f2, (int, float, np.integer, np.floating)):
+                return f2, ref_mean, test_mean
+            return None, None, None
+
+        # Run parallel jobs
+        results = Parallel(n_jobs=n_jobs)(delayed(compute_f2)(i) for i in range(n_iterations))
+
+        # Collect results
+        f2_values = []
+        ref_profiles_list = []
+        test_profiles_list = []
+
+        for f2, ref_mean, test_mean in results:
+            if f2 is not None:
+                f2_values.append(f2)
+                if track_profiles:
+                    ref_profiles_list.append(ref_mean)
+                    test_profiles_list.append(test_mean)
+
+        f2_values = np.array(f2_values)
+        ref_profiles = np.array(ref_profiles_list) if track_profiles and ref_profiles_list else None
+        test_profiles = np.array(test_profiles_list) if track_profiles and test_profiles_list else None
+
+        if f2_values.size == 0:
+            return original_f2, None, None, None, None, None, None, np.array([]), ref_profiles, test_profiles
+
+        # Calculate statistics
+        percentile_5 = np.percentile(f2_values, 5)
+        percentile_95 = np.percentile(f2_values, 95)
+        mean_f2 = np.mean(f2_values)
+        median_f2 = np.median(f2_values)
+
+        # DEBUGGING: Print statistics
+        print(f"[BOOTSTRAP DEBUG] Statistics from {len(f2_values)} iterations:")
+        if isinstance(original_f2, (int, float, np.integer, np.floating)):
+            print(f"  Original F2: {original_f2:.4f}")
+        else:
+            print(f"  Original F2: {original_f2}")
+        print(f"  5th percentile: {percentile_5:.4f}")
+        print(f"  95th percentile: {percentile_95:.4f}")
+        print(f"  Mean: {mean_f2:.4f}")
+        print(f"  Median: {median_f2:.4f}")
+        print(f"  Min bootstrap f2: {np.min(f2_values):.4f}")
+        print(f"  Max bootstrap f2: {np.max(f2_values):.4f}")
+
+        # Check for the issue
+        if isinstance(original_f2, (int, float, np.integer, np.floating)) and percentile_5 > original_f2:
+            print(f"[BOOTSTRAP WARNING] 5th percentile ({percentile_5:.4f}) > Original F2 ({original_f2:.4f}) - THIS IS THE ISSUE!")
+            print(f"[BOOTSTRAP WARNING] Sample of first 20 bootstrap f2 values: {f2_values[:20]}")
+
+        return (
+            original_f2,
+            percentile_5,
+            percentile_95,
+            mean_f2,
+            median_f2,
+            skew(f2_values),
+            kurtosis(f2_values),
+            f2_values,
+            ref_profiles,
+            test_profiles
+        )
+
+    except Exception as e:
+        print(f"Error during bootstrap: {e}")
+        return (
+            None, None, None, None, None, None, None, np.array([]), None, None
+        )
+
+
+
+    
+# ----------------------------------------
+# Create Bootstrap profile plot (intervals) and save HTML
+# ----------------------------------------
+
+# def create_bootstrap_profile_plot(times, ref_profiles, test_profiles):
+#     """
+#     Create a plot showing median and 5-95 percentile bands from bootstrap profiles,
+#     plus mean lines with SD error bars (caps) to match the user's example picture.
+#     ref_profiles/test_profiles: np.array shape (n_iterations, n_timepoints)
+#     times: array-like length n_timepoints
+#     """
+#     if ref_profiles.size == 0 or test_profiles.size == 0:
+#         return None
+
+#     # compute percentiles per timepoint
+#     ref_p05 = np.percentile(ref_profiles, 5, axis=0)
+#     ref_p50 = np.percentile(ref_profiles, 50, axis=0)
+#     ref_p95 = np.percentile(ref_profiles, 95, axis=0)
+
+#     test_p05 = np.percentile(test_profiles, 5, axis=0)
+#     test_p50 = np.percentile(test_profiles, 50, axis=0)
+#     test_p95 = np.percentile(test_profiles, 95, axis=0)
+
+#     # compute mean and sd (for error bars like in example)
+#     ref_mean = np.mean(ref_profiles, axis=0)
+#     ref_sd = np.std(ref_profiles, axis=0, ddof=1)
+#     test_mean = np.mean(test_profiles, axis=0)
+#     test_sd = np.std(test_profiles, axis=0, ddof=1)
+
+#     fig = go.Figure()
+
+#     # Reference: shaded 5-95 band (behind)
+#     fig.add_trace(go.Scatter(
+#         x=np.concatenate([times, times[::-1]]),
+#         y=np.concatenate([ref_p95, ref_p05[::-1]]),
+#         fill='toself', fillcolor='rgba(52,152,219,0.14)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Ref 5-95%'
+#     ))
+#     # Reference median
+#     fig.add_trace(go.Scatter(x=times, y=ref_p50, mode='lines', name='Ref median', line=dict(color='#3498DB', width=2), hoverinfo='skip'))
+
+#     # Reference mean with error bars (SD) and markers (showcaps)
+#     fig.add_trace(go.Scatter(
+#         x=times,
+#         y=ref_mean,
+#         mode='markers+lines',
+#         name='Ref mean ±SD',
+#         marker=dict(color='#2A6FBB', size=8, symbol='circle'),
+#         line=dict(color='#2A6FBB', width=1, dash='solid'),
+#         error_y=dict(type='data', array=ref_sd, visible=True, thickness=1.5, width=6)
+#     ))
+
+#     # Test: shaded 5-95 band (behind)
+#     fig.add_trace(go.Scatter(
+#         x=np.concatenate([times, times[::-1]]),
+#         y=np.concatenate([test_p95, test_p05[::-1]]),
+#         fill='toself', fillcolor='rgba(231,76,60,0.12)', line=dict(color='rgba(255,255,255,0)'), hoverinfo='skip', showlegend=False, name='Test 5-95%'
+#     ))
+#     # Test median
+#     fig.add_trace(go.Scatter(x=times, y=test_p50, mode='lines', name='Test median', line=dict(color='#E74C3C', width=2), hoverinfo='skip'))
+
+#     # Test mean with error bars (SD) and square markers
+#     fig.add_trace(go.Scatter(
+#         x=times,
+#         y=test_mean,
+#         mode='markers+lines',
+#         name='Test mean ±SD',
+#         marker=dict(color='#C0392B', size=8, symbol='square'),
+#         line=dict(color='#C0392B', width=1, dash='solid'),
+#         error_y=dict(type='data', array=test_sd, visible=True, thickness=1.5, width=6)
+#     ))
+
+#     # Styling to match the image
+#     # Determine y-range with margin
+#     all_vals = np.concatenate([ref_p95, test_p95, ref_p05, test_p05])
+#     ymin = max(0, np.min(all_vals) - 5)
+#     ymax = max(120, np.max(all_vals) + 8)  # keep a top margin and minimum top (120)
+#     fig.update_layout(
+#         xaxis_title="Time (min)",
+#         yaxis_title="Fraction dissolved (%)",
+#         legend=dict(orientation="v", yanchor="top", y=0.98, xanchor="left", x=0.02),
+#         plot_bgcolor='#faf6ef',  # slightly creamy
+#         paper_bgcolor='#e6e6e6',
+#         hovermode='closest',
+#         margin=dict(l=100, r=10, t=10, b=10),
+#         width=900,
+#         height=500,
+#         yaxis=dict(range=[ymin, ymax], tick0=0, dtick=10),
+#         xaxis=dict(tickmode='array', tickvals=list(times))
+#     )
+
+#     # gridlines, framed border
+#     fig.update_xaxes(showgrid=True, gridcolor='lightgray', zeroline=False, linecolor='black', mirror=True)
+#     fig.update_yaxes(showgrid=True, gridcolor='lightgray', zeroline=False, linecolor='black', mirror=True)
+
+#     # Add small styling to markers to emulate the example's tiny horizontal caps on error bars
+#     # (plotly error bars already show caps controlled by 'width'; we set width=6 above)
+#     # Add annotation describing percentiles
+#     fig.add_annotation(x=1.02, y=0.98, xref='paper', yref='paper', text="Band: 5–95% (bootstrap)<br>Markers: bootstrap mean ± SD", showarrow=False, align='left', bgcolor='white', bordercolor='black', borderwidth=1)
+
+#     return fig
+
+
+def create_bootstrap_profile_plot(times, ref_profiles, test_profiles):
+    """
+    Create a plot showing mean lines with 5-95 percentile error bars (caps)
+    to match the user's example picture.
+    ref_profiles/test_profiles: np.array shape (n_iterations, n_timepoints)
+    times: array-like length n_timepoints
+    """
+    max_time = max(times)
+
+    if max_time > 60:
+        xticks = list(range(0, int(max_time) + 11, 10))  # +11 ensures the last tick covers max_time
+    elif max_time > 30: # This covers 30 < max_time <= 60
+        xticks = list(range(0, int(max_time) + 6, 5))    # +6 ensures the last tick covers max_time
+    elif max_time > 12: # This covers 12 < max_time <= 30 (a reasonable interval for this unspecified range)
+        xticks = list(range(0, int(max_time) + 3, 2.5))    # +6 ensures the last tick covers max_time
+    
+    else:
+        xticks = list(range(0, int(max_time) + 1, 1))    # +6 ensures the last tick covers max_time
+
+        if ref_profiles.size == 0 or test_profiles.size == 0:
+            return None
+        
+
+
+    # compute percentiles per timepoint (will be used for error bar ranges)
+    ref_p05 = np.percentile(ref_profiles, 5, axis=0)
+    ref_p95 = np.percentile(ref_profiles, 95, axis=0)
+
+    test_p05 = np.percentile(test_profiles, 5, axis=0)
+    test_p95 = np.percentile(test_profiles, 95, axis=0)
+
+    # compute mean (for the main line and center of error bars)
+    ref_mean = np.mean(ref_profiles, axis=0)
+    test_mean = np.mean(test_profiles, axis=0)
+
+    fig = go.Figure()
+
+    # Reference mean with 5-95 percentile error bars
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=ref_mean,
+        mode='lines+markers',
+        name='Reference Mean',
+        marker=dict(color='blue', symbol='circle'),
+        line=dict(color='blue', dash='solid'),
+        error_y=dict(
+            type='data',
+            symmetric=False,
+            array=ref_p95 - ref_mean,  # Upper error: 95th percentile - mean
+            arrayminus=ref_mean - ref_p05, # Lower error: mean - 5th percentile
+            visible=True,
+            thickness=1.5,
+            width=6, # Caps width
+            color='blue'
+        )
+    ))
+
+    # Test mean with 5-95 percentile error bars
+    fig.add_trace(go.Scatter(
+        x=times,
+        y=test_mean,
+        mode='lines+markers',
+        name='Test Mean',
+        marker=dict(color='red', symbol='circle'),
+        line=dict(color='red', dash='solid'),
+        error_y=dict(
+            type='data',
+            symmetric=False,
+            array=test_p95 - test_mean,  # Upper error: 95th percentile - mean
+            arrayminus=test_mean - test_p05, # Lower error: mean - 5th percentile
+            visible=True,
+            thickness=1.5,
+            width=6, # Caps width
+            color='green'
+        )
+    ))
+
+    # Styling to match the example image
+    # Determine y-range with margin
+    all_vals = np.concatenate([ref_p95, test_p95, ref_p05, test_p05])
+    ymin = max(0, np.min(all_vals) - 5)
+    ymax = max(120, np.max(all_vals) + 8) # Ensure a minimum top and margin
+
+    fig.update_layout(
+        title='Dissolution Curves with Intervals',
+        xaxis=dict(
+            title='Time (min)',
+            tickmode='array',
+            tickvals=xticks,
+            showgrid=False,
+            gridcolor='lightgray',
+            showline=False,  # Removes axis line
+            zeroline=False   # Removes zero line
+        ),
+
+        yaxis=dict(
+            title='Fraction dissolved (%)',
+            tickmode='linear', dtick=10,
+            zeroline=False, zerolinewidth=1, zerolinecolor='black',
+            showgrid=True, gridcolor='lightgray',
+            range=[ymin, ymax]
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h", # Horizontal legend
+            yanchor="top", y=-0.15, # Position below the plot area
+            xanchor="center", x=0.5
+        ),
+        plot_bgcolor='white', # Set plot background color to white
+        paper_bgcolor='white', # Set paper background color to white
+        hovermode='closest',
+        margin=dict(b=80), # Adjust margins, especially bottom for legend
+    )
+
+    return fig
+
+def trim_by_85_rule(ref_df, test_df, market):
+    """
+    Trim timepoints according to market rules for >85% truncation.
+    """
+    times = pd.to_numeric(ref_df.iloc[:, 0], errors='coerce')
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
+    both_mask = (ref_means >= 85) & (test_means >= 85)
+    either_mask = (ref_means >= 85) | (test_means >= 85)
+    idx_both = np.where(both_mask)[0]
+    idx_either = np.where(either_mask)[0]
+    trim_idx = None
+    m = (market or "").strip().upper()
+    if m in ['US FDA', 'FDA']:
+        idx_time15 = np.where(times <= 15)[0]
+        last_idx_time15 = idx_time15[-1] if len(idx_time15) > 0 else None
+        if len(idx_both) > 0:
+            first_both = int(idx_both[0])
+            if last_idx_time15 is not None:
+                trim_idx = min(first_both, last_idx_time15)
+            else:
+                trim_idx = first_both
+        else:
+            trim_idx = last_idx_time15
+    elif m == 'ANVISA':
+        if len(idx_both) > 0:
+            trim_idx = int(idx_both[0])
+        else:
+            trim_idx = None
+    elif m in ['EMA/ICH/Canada/Australia', 'CHINA', 'ASEAN']:
+        if len(idx_either) > 0:
+            trim_idx = int(idx_either[0])
+        else:
+            trim_idx = None
+    else:
+        trim_idx = None
+    if trim_idx is None:
+        return ref_df.copy().reset_index(drop=True), test_df.copy().reset_index(drop=True)
+    else:
+        ref_trim = ref_df.iloc[: trim_idx + 1].reset_index(drop=True)
+        test_trim = test_df.iloc[: trim_idx + 1].reset_index(drop=True)
+        return ref_trim, test_trim
+
+def calc_conventional_f2_no_trim(ref_df, test_df):
+    """Calculate conventional f2 WITHOUT any trimming - uses ALL timepoints"""
+    if ref_df.shape[0] == 0:
+        return None
+    ref_means = ref_df.iloc[:, 1:].mean(axis=1)
+    test_means = test_df.iloc[:, 1:].mean(axis=1)
+    return conventional_f2(ref_means, test_means)
+
+def calc_conventional_f2_for_market(ref_df, test_df, market):
+    """Calculate conventional f2 WITH market-specific trimming (for Expected/Bias-Corrected only)"""
+    r_trim, t_trim = trim_by_85_rule(ref_df, test_df, market)
+    if r_trim.shape[0] == 0:
+        return None
+    ref_means = r_trim.iloc[:, 1:].mean(axis=1)
+    test_means = t_trim.iloc[:, 1:].mean(axis=1)
+    return conventional_f2(ref_means, test_means)
+
+def calc_expected_f2_for_market(ref_df, test_df, market):
+    r_trim, t_trim = trim_by_85_rule(ref_df, test_df, market)
+    return expected_f2(r_trim, t_trim)
+
+def calc_bias_corrected_f2_for_market(ref_df, test_df, market):
+    r_trim, t_trim = trim_by_85_rule(ref_df, test_df, market)
+    return bias_corrected_f2(r_trim, t_trim)
+# --------------------------
+# Streamlit App
+# --------------------------
+def main_f2(reference_df, test_df, selected_methodology, conv_result, market):
+    print("IN MAIN F2")
+    print(selected_methodology,"SELECTED METHODOLOGY IN MAIN F2")
+    print(f"[MAIN_F2 DEBUG] conv_result (from main_function) = {conv_result}")
+    try:
+        checks = {
+            "Minimum 3 time points (excl. zero)": 
+                [check_time_points(reference_df), check_time_points(test_df)],
+            "First two points ≤85% dissolution": 
+                [two_time_points(reference_df), two_time_points(test_df)],
+            "No >85% dissolution in first 15 min": 
+                [not min15_check(reference_df), not min15_check(test_df)],
+            "CV requirements met": 
+                [check_cv(reference_df), check_cv(test_df)],
+            "≥12 individual units": 
+                [check_sample_units(reference_df), check_sample_units(test_df)],
+            "Same time points for both products": 
+                [check_same_time_points(reference_df, test_df)]
+        }
+        
+        # Display check results
+        check_df = pd.DataFrame(
+            checks.values(),
+            index=checks.keys(),
+            columns=["Reference", "Test"]
+        )
+        
+        # Show dissolution profiles
+        # diss_plot_f2 = dissolution_curve(reference_df, test_df)
+        # diss_int_plot_f2 = dissolution_curve_interval(reference_df, test_df)
+        
+
+        
+        # Agency recommendations
+        # recommendations = {
+        #     "US FDA": ["Conventional f2", "F2 Conventional Bootstrap"],
+        #     "EMA/ICH/Canada/Australia": ["Expected f2", "Expected bootstrap f2"],
+        #     "China": ["Conventional f2", "Expected f2", "Bias Corrected f2"],
+        #     "ASEAN": ["Conventional f2", "Expected f2", "Bias Corrected f2"],
+        #     "ANVISA": ["Conventional f2", "Expected f2", "Bias Corrected f2"],
+        #     "Other": ["All Methods"]
+        # }
+        
+        
+        # Set defaults based on agency
+        # if agency == "US FDA":
+        #     default = ["F2 Conventional Bootstrap",]
+        # elif agency == "EMA/ICH/Canada/Australia":
+        #     default = ["Expected f2", "Expected bootstrap f2"]
+        # else:
+        #     default = ["Conventional f2", "Expected f2", "Bias Corrected f2"]
+        
+        
+        # Prepare data - remove time zero
+        ref_clean, test_clean = prepare_data(reference_df, test_df)
+        selected_methods = selected_methodology
+        results = {}
+        
+        # Point estimates
+        if any(m in selected_methods for m in ["Expected F2", "Bias-Corrected F2", "Expected Bootstrap F2", "Bias-Corrected Bootstrap F2"]):
+            f2_estimates = calculate_all_f2(ref_clean, test_clean)
+            
+            if "Bias-Corrected F2" in selected_methods or "Bias-Corrected Bootstrap F2" in selected_methods:
+                print("IN BIAS-CORRECTED F2", selected_methods)
+                results["Bias-Corrected F2"] = f2_estimates["Bias Corrected f2"]
+                print("OUT BIAS-CORRECTED F2", selected_methods)
+
+                    
+                # results["Expected f2 plots"] = {
+                #     "Diss_expected_f2": diss_plot_f2,
+                #     "Diss_int_expected_f2": diss_int_plot_f2
+                # } 
+            
+            if "Expected F2" in selected_methods or "Expected Bootstrap F2" in selected_methods:
+                cv_result = check_cv(reference_df) and check_cv(test_df)
+
+                if cv_result == True:
+                    cv_results = "True"
+                else:
+                    cv_results = "False"
+                print("IN EXPECTED F2", selected_methods)
+                results["Expected F2"] = f2_estimates["Expected f2"]
+                results["cv_result_expected_f2"]=cv_results
+                print("OUT EXPECTED F2", selected_methods)
+
+                # results["Bias Corrected f2 plots"] = {
+                #     "Diss_bias_corrected_f2": diss_plot_f2,
+                #     "Diss_int_bias_corrected_f2": diss_int_plot_f2
+                # } 
+        
+        # Bootstrap calculations
+        bootstrap_results = {}
+        boostrap_f2_values = {}
+        bootstrap_profile_matrices = {}
+        n_iterations = 10000  # Reduced for demo, use 10000 for production
+
+
+        if "Conventional Bootstrap F2" in selected_methods:
+            print(f"[MAIN_F2 DEBUG] Starting Conventional Bootstrap F2 for market: {market}")
+            print(f"[MAIN_F2 DEBUG] Data shape - Ref: {ref_clean.shape}, Test: {test_clean.shape}")
+
+            def conv_func(r, t):
+                # For CONVENTIONAL f2, use NO trimming - use ALL timepoints
+                result_conv = calc_conventional_f2_no_trim(r.reset_index(drop=True), t.reset_index(drop=True))
+                return result_conv
+
+            # Test the function once before bootstrap
+            test_f2 = conv_func(ref_clean, test_clean)
+            print(f"[MAIN_F2 DEBUG] Test calculation of conv_func on original data (NO TRIM): {test_f2}")
+
+            org, lower, upper, mean, median, skewness, kurt, f2_values, ref_profiles, test_profiles = bootstrap_f2(ref_clean, test_clean, conv_func, n_iterations=10000, n_jobs=-1, track_profiles=True)
+
+            print(f"[MAIN_F2 DEBUG] Bootstrap returned org={org}, lower={lower}, upper={upper}")
+            times = ref_clean.iloc[:, 0].to_numpy()
+            fig = create_bootstrap_profile_plot(times, ref_profiles, test_profiles) if ref_profiles is not None and test_profiles is not None else None
+            bootstrap_results["Conventional Bootstrap F2"] = {
+                "Observed F2": f"{org:.2f}" if (org is not None and isinstance(org, (int, float))) else (conv_result if conv_result else None),
+                "Confidence Interval": f"{lower:.2f} - {upper:.2f}" if (lower is not None and upper is not None) else None,
+                "Mean": str(mean) if mean is not None else None,
+                "Median": str(median) if median is not None else None,
+                "Skewness": str(skewness) if skewness is not None else None,
+                "Kurtosis": str(kurt) if kurt is not None else None,
+                "Hist Plot":fig,
+                "Is 5% percentile > 50": "Yes" if (lower is not None and float(lower) > 50) else "No",
+                "Similarity of R and T": "Accept" if (lower is not None and float(lower) > 50) else "Reject",
+            }
+            boostrap_f2_values['Conventional Bootstrap F2'] = f2_values
+
+            bootstrap_profile_matrices["Conventional Bootstrap F2"] = {
+                'ref_profiles': ref_profiles,
+                'test_profiles': test_profiles,
+                'times': ref_clean.iloc[:, 0].to_numpy()
+            }
+
+        if "Expected Bootstrap F2" in selected_methods:
+            def exp_func(r, t):
+                return_value = calc_expected_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
+                return return_value
+            org, lower, upper, mean, median, skewness, kurt, f2_values, ref_profiles, test_profiles = bootstrap_f2(ref_clean, test_clean, exp_func, n_iterations=10000, n_jobs=-1, track_profiles=True)
+            times = ref_clean.iloc[:, 0].to_numpy()
+            fig = create_bootstrap_profile_plot(times, ref_profiles, test_profiles) if ref_profiles is not None and test_profiles is not None else None
+            bootstrap_results["Expected Bootstrap F2"] = {
+                'Observed F2': f"{org:.2f}" if (org is not None and isinstance(org, (int, float))) else results.get("Expected F2", None),
+                "Confidence Interval": f"{lower:.2f} - {upper:.2f}" if (lower is not None and upper is not None) else None,
+                "Mean": str(mean) if mean is not None else None,
+                "Median": str(median) if median is not None else None,
+                "Skewness": str(skewness) if skewness is not None else None,
+                "Kurtosis": str(kurt) if kurt is not None else None,
+                "Hist Plot":fig,
+                "Is 5% percentile > 50": "Yes" if (lower is not None and float(lower) > 50) else "No",
+                "Similarity of R and T": "Accept" if (lower is not None and float(lower) > 50) else "Reject",
+                # "QQ Plot":qq_plot
+            }
+            boostrap_f2_values['Expected Bootstrap F2'] = f2_values
+
+            bootstrap_profile_matrices["Expected Bootstrap F2"] = {
+                'ref_profiles': ref_profiles,
+                'test_profiles': test_profiles,
+                'times': ref_clean.iloc[:, 0].to_numpy()
+            }
+
+        if "Bias-Corrected Bootstrap F2" in selected_methods:
+            def bc_func(r, t): 
+                return_value = calc_bias_corrected_f2_for_market(r.reset_index(drop=True), t.reset_index(drop=True), market)
+                return return_value
+                # bc = bias_corrected_f2(r, t)
+                # return bc if isinstance(bc, float) else None
+            times = ref_clean.iloc[:, 0].to_numpy()
+            org, lower, upper, mean, median, skewness, kurt, f2_values, ref_profiles, test_profiles = bootstrap_f2(ref_clean, test_clean, bc_func, n_iterations=10000, n_jobs=-1, track_profiles=True)
+            fig = create_bootstrap_profile_plot(times, ref_profiles, test_profiles) if ref_profiles is not None and test_profiles is not None else None
+            bootstrap_results["Bias-Corrected Bootstrap F2"] = {
+                "Observed F2": f"{org:.2f}" if (org is not None and isinstance(org, (int, float))) else (results.get("Bias-Corrected F2", "N/A") if results.get("Bias-Corrected F2", "") != "Bias-corrected F2 could not be calculated due to high within-batch variability and minimal profile differences in the provided dataset, please proceed with alternative method such as Bootstrap F2 and BCa bootstrap F2" else "N/A"),
+                "Confidence Interval": f"{lower:.2f} - {upper:.2f}" if (lower is not None and upper is not None) else None,
+                "Mean": str(mean) if mean is not None else None,
+                "Median": str(median) if median is not None else None,
+                "Skewness": str(skewness) if skewness is not None else None,
+                "Kurtosis": str(kurt) if kurt is not None else None,
+                "Hist Plot":fig,
+                "Is 5% percentile > 50": "Yes" if (lower is not None and float(lower) > 50) else "No",
+                "Similarity of R and T": "Accept" if (lower is not None and float(lower) > 50) else "Reject",
+                # "QQ Plot":qq_plot
+            }
+            boostrap_f2_values['Bias-Corrected Bootstrap F2'] = f2_values
+
+            bootstrap_profile_matrices["Bias-Corrected Bootstrap F2"] = {
+                'ref_profiles': ref_profiles,
+                'test_profiles': test_profiles,
+                'times': times
+            }
+
+        if boostrap_f2_values:
+            qq_plots = generate_qq_plots(boostrap_f2_values)
+
+        else:
+            qq_plots = []
+        
+        
+        # Merge bootstrap results
+        # for method, (orig, lower, upper) in bootstrap_results.items():
+        #     if method in results:
+        #         results[method]["ci"] = (lower, upper)
+        #     else:
+        #         results[method] = {
+        #             "value": orig,
+        #             "ci": (lower, upper)
+        #         }
+        
+        # Display results
+        # st.subheader("📊 Results")
+        
+        # for method, data in results.items():
+        #     st.markdown(f"##### {method} f2")
+        #     col1, col2 = st.columns([1, 3])
+            
+        #     with col1:
+        #         if isinstance(data["value"], str):
+        #             st.metric("Value", data["value"])
+        #         else:
+        #             st.metric("Value", f"{data['value']:.2f}")
+                
+        #         if data["ci"] and all(x is not None for x in data["ci"]):
+        #             st.metric("90% Confidence Interval", 
+        #                         f"{data['ci'][0]:.2f} - {data['ci'][1]:.2f}")
+        
+        
+        # Similarity assessment
+        # st.subheader("📝 Similarity Assessment")
+        # conv_f2 = results.get("Conventional", {}).get("value", 0)
+        
+        # if isinstance(conv_f2, (int, float)):
+        #     if conv_f2 >= 50:
+        #         st.success("✅ Profiles are similar (f2 ≥ 50)")
+        #     else:
+        #         st.error("❌ Profiles are NOT similar (f2 < 50)")
+        #     st.info("**Note:** Similarity assessment based on conventional f2 ≥ 50")
+        # else:
+        #     st.warning("⚠️ Conventional f2 not available for similarity assessment")
+
+        return results, bootstrap_results, qq_plots
+
+    except Exception as e:
+        print(e,"ERROR in main_f2")
+        import traceback
+        traceback.print_exc()
+        # Return empty structures instead of None to prevent unpacking errors
+        return {}, {}, {}
+   
+
+# if __name__ == "__main__":
+#     main()
