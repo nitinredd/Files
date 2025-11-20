@@ -1,724 +1,253 @@
-def generate_multiple_sor_rows(num_iterations: int, objectives: List[Dict[str, Any]], lhs):
-    """Generate multiple SOR experiment rows at once (without objectives filled)."""
-    
-    print(f"\n{'='*60}")
-    print(f"GENERATING {num_iterations} SOR ROWS")
-    print(f"{'='*60}")
-    
-    current_df = lhs.copy()
-    
-    print(f"Starting DataFrame shape: {current_df.shape}")
-    print(f"Starting DataFrame dtypes:\n{current_df.dtypes}")
+def on_created(self, event):
+    if not event.is_directory:
+        full_path_uploaded_csv = event.src_path
+        object_id = ObjectId(self.id)
+        experiment = collection.find_one({"_id": object_id})
+        
+        # Get Objectives and RT parameters from the database
+        optimization = experiment.get("optimization_target", {})
+        raw_objectives = optimization.get("objectives", {})
+        
+        # CORRECTED: Extract RT parameters properly from UI input
+        objectives_rtmin = raw_objectives.get('RTMin', [])
+        objectives_rtmax = raw_objectives.get('RTMax', [])
+        
+        print(f"Raw RT Min from UI: {objectives_rtmin}")
+        print(f"Raw RT Max from UI: {objectives_rtmax}")
+        
+        if len(objectives_rtmin) != len(objectives_rtmax):
+            raise ValueError(f"RTMin and RTMax arrays must have same length: {len(objectives_rtmin)} vs {len(objectives_rtmax)}")
+        
+        # Method 1: Assume first RT pair is yield, rest are impurities
+        YminRT = float(objectives_rtmin[0])  
+        YmaxRT = float(objectives_rtmax[0])  
+        
+        # Impurity RT ranges from remaining pairs
+        IminRT_list = []
+        ImaxRT_list = []
+        
+        for i in range(1, len(objectives_rtmin)):
+            if str(objectives_rtmin[i]).strip() != '' and str(objectives_rtmax[i]).strip() != '':
+                IminRT_list.append(float(objectives_rtmin[i]))
+                ImaxRT_list.append(float(objectives_rtmax[i]))
+        
+        # Internal Standard RT range from separate UI fields
+        minRTISO = float(optimization.get("rtMinIso", 0))
+        maxRTISO = float(optimization.get("rtMaxIso", 0))
+        
+        print(f"CORRECTED RT parameters:")
+        print(f"  Yield RT: [{YminRT}-{YmaxRT}]")
+        print(f"  Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
+        print(f"  Internal Standard RT: [{minRTISO}-{maxRTISO}]")
+        
+        # Validate RT parameters
+        if YminRT >= YmaxRT:
+            raise ValueError(f"Invalid yield RT range: {YminRT} >= {YmaxRT}")
+        if minRTISO >= maxRTISO:
+            raise ValueError(f"Invalid internal standard RT range: {minRTISO} >= {maxRTISO}")
+        if len(IminRT_list) != len(ImaxRT_list):
+            raise ValueError(f"Impurity RT min/max lists length mismatch: {len(IminRT_list)} vs {len(ImaxRT_list)}")
+        
+        # Check for range overlaps (warning only)
+        all_ranges = [("Yield", YminRT, YmaxRT), ("ISO", minRTISO, maxRTISO)]
+        for i, (imin, imax) in enumerate(zip(IminRT_list, ImaxRT_list)):
+            all_ranges.append((f"Impurity{i+1}", imin, imax))
+        
+        print("Checking for range overlaps:")
+        for i, (name1, min1, max1) in enumerate(all_ranges):
+            for j, (name2, min2, max2) in enumerate(all_ranges[i+1:], i+1):
+                if not (max1 <= min2 or max2 <= min1):  # Ranges overlap
+                    print(f"WARNING: {name1} [{min1}-{max1}] overlaps with {name2} [{min2}-{max2}]")
+        
+        # ✅ CRITICAL FIX: Transform objectives BEFORE using it
+        transformed_objectives = []
+        for i, name in enumerate(raw_objectives.get("Objectives", [])):
+            obj = {
+                "name": name,
+                "maximize": raw_objectives.get("Condition", [])[i].lower() == "maximize"
+            }
+            if i < len(raw_objectives.get("Property", [])):
+                obj["Property"] = raw_objectives["Property"][i]
+            transformed_objectives.append(obj)
+        
+        print(f"\nTransformed objectives: {transformed_objectives}")
+        
+        # NOW we can use transformed_objectives to prepare the DataFrame
+        lhs = experiment.get('final_result')
+        df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
 
-    for i in range(num_iterations):
+        # ✅ CRITICAL FIX: Convert ALL columns to numeric
         print(f"\n{'='*60}")
-        print(f"Generating SOR row {i+1}/{num_iterations}...")
+        print("PREPARING DATAFRAME FOR OPTIMIZATION")
         print(f"{'='*60}")
+        print(f"Original DataFrame shape: {df_experiment.shape}")
+        print(f"Original DataFrame columns: {list(df_experiment.columns)}")
+        print(f"Original DataFrame dtypes:\n{df_experiment.dtypes}")
 
-        try:
-            # Build domain from current data
-            domain = build_domain_from_df(current_df, objectives)
+        # Get objective names
+        objective_names = [obj.get("name", "") for obj in transformed_objectives]
+        print(f"\nObjective columns: {objective_names}")
 
-            # Run optimization to get next suggestion
-            out = run_summit_optimization(domain, current_df, len(objectives) or 1)
-
-            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
-                suggested = out.iloc[0].to_dict()
-                print(f"✓ Got {len(suggested)} suggestions")
-            else:
-                suggested = {}
-                print("✗ WARNING: No suggestions returned")
-
-            # Create new row with proper column mapping
-            def normalize_col_name(name):
-                return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
+        # Convert ALL columns to numeric
+        df_numeric = pd.DataFrame()
+        for col in df_experiment.columns:
+            original_dtype = df_experiment[col].dtype
+            original_sample = df_experiment[col].iloc[0] if len(df_experiment) > 0 else None
             
-            suggested_normalized = {normalize_col_name(k): v for k, v in suggested.items()}
-            objective_names = [obj.get("name", "") for obj in objectives]
-            objective_names_normalized = {normalize_col_name(name) for name in objective_names}
+            # Convert to numeric, coerce errors (like empty strings) to NaN
+            df_numeric[col] = pd.to_numeric(df_experiment[col], errors='coerce')
+            
+            new_dtype = df_numeric[col].dtype
+            new_sample = df_numeric[col].iloc[0] if len(df_numeric) > 0 else None
+            non_null_count = df_numeric[col].notna().sum()
+            
+            print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
+            print(f"    Sample: {original_sample} -> {new_sample} ({non_null_count}/{len(df_numeric)} valid)")
 
-            new_row = {}
+        llm_response_with_objective_columns = df_numeric
 
-            for col in current_df.columns:
-                col_normalized = normalize_col_name(col)
-                
-                # Check if this is an objective column
-                if col_normalized in objective_names_normalized:
-                    # Leave objectives empty for user to fill via HPLC
-                    new_row[col] = ""
-                    print(f"  ○ {col:30s} = '' (objective)")
-                else:
-                    # Fill input variables from optimization suggestion
-                    if col_normalized in suggested_normalized:
-                        new_row[col] = suggested_normalized[col_normalized]
-                        print(f"  ✓ {col:30s} = {suggested_normalized[col_normalized]:.6f}")
-                    elif col in suggested:
-                        new_row[col] = suggested[col]
-                        print(f"  ✓ {col:30s} = {suggested[col]:.6f}")
-                    else:
-                        # This should not happen
-                        new_row[col] = np.nan
-                        print(f"  ✗ {col:30s} = NaN (not found)")
+        print(f"\nConverted DataFrame dtypes:\n{llm_response_with_objective_columns.dtypes}")
+        print(f"\nSample data (first row):")
+        if len(llm_response_with_objective_columns) > 0:
+            for col in llm_response_with_objective_columns.columns:
+                val = llm_response_with_objective_columns[col].iloc[0]
+                print(f"  {col:30s}: {val} (type: {type(val).__name__})")
 
-            # Append the new row
-            current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
-            print(f"✓ Added SOR row {i+1}, total rows now: {len(current_df)}")
-
+        # Read and process the uploaded HPLC CSV file
+        try:
+            df_hplc = pd.read_csv(full_path_uploaded_csv)
+            print(f"HPLC file loaded: {full_path_uploaded_csv}")
+            print(f"HPLC file columns: {list(df_hplc.columns)}")
+            print(f"HPLC file shape: {df_hplc.shape}")
+            
+            # Display first few rows for debugging
+            if len(df_hplc) > 0:
+                print(f"Sample HPLC data:")
+                print(df_hplc.head())
+                if 'RT' in df_hplc.columns:
+                    print(f"RT range in file: {df_hplc['RT'].min():.3f} - {df_hplc['RT'].max():.3f}")
+            
         except Exception as e:
-            print(f"✗ ERROR generating SOR row {i+1}: {e}")
+            print(f"Error reading HPLC file: {e}")
+            for ws, _ in self.websocket_clients:
+                asyncio.run_coroutine_threadsafe(ws.send_text(f"Error reading HPLC file: {e}"), self.loop)
+            return
+        
+        # Get experiment status
+        full_path = optimization.get("hplcPath", "")
+        completed_experiments = int(experiment.get('completed', 0))
+        count_of_lhs = int(experiment.get('lhs_response', {}).get('no_of_LHS', 0))
+        user_sor_iterations = int(experiment.get('optimization_target', {}).get('iterations', 1))
+        sys_sor_iterations = int(experiment.get('sor_iterations', 1))
+        
+        print(f"\nExperiment Status:")
+        print(f"  Completed: {completed_experiments}/{count_of_lhs} LHS")
+        print(f"  SOR Iterations: {sys_sor_iterations-1}/{user_sor_iterations}")
+        
+        # Process the HPLC file with corrected RT filtering
+        try:
+            resp = utils.process_uploaded_csv_file(
+                full_path_uploaded_csv,
+                df_hplc,
+                minRTISO,
+                maxRTISO,
+                YminRT,
+                YmaxRT,
+                IminRT_list,
+                ImaxRT_list,
+                transformed_objectives,
+                llm_response_with_objective_columns
+            )
+            print(f"HPLC processing completed. Response: {resp}")
+            
+        except Exception as e:
+            print(f"Error processing HPLC data: {e}")
             import traceback
             traceback.print_exc()
+            for ws, _ in self.websocket_clients:
+                asyncio.run_coroutine_threadsafe(ws.send_text(f"Error processing HPLC data: {e}"), self.loop)
+            return
+        
+        excel_path = os.path.join(full_path, "optimization.xlsx")
+        
+        # Phase-based processing logic
+        try:
+            if completed_experiments < count_of_lhs:
+                # LHS Phase: Just update the current row with results
+                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
+                message = f"LHS experiment {completed_experiments + 1}/{count_of_lhs} completed. Upload next HPLC file."
 
-            # Create a fallback row with empty objectives and NaN for inputs
-            objective_names = [obj.get("name", "") for obj in objectives]
-            new_row = {}
-            for col in current_df.columns:
-                if col in objective_names:
-                    new_row[col] = ""
-                else:
-                    new_row[col] = np.nan
+            elif completed_experiments == count_of_lhs:
+                # Transition from LHS to SOR: Process last LHS experiment and generate FIRST SOR row
+                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
 
-            current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
-            print(f"Used fallback row for SOR {i+1}")
+                # Generate FIRST SOR row based on all LHS rows (with optimized inputs, empty objectives)
+                print(f"Generating first SOR row based on {len(updated_df)} completed LHS experiments...")
+                sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
 
-    print(f"\n{'='*60}")
-    print(f"✓ Successfully generated {num_iterations} SOR rows")
-    print(f"{'='*60}")
-    print(f"Final DataFrame shape: {current_df.shape}")
-    print(f"Final DataFrame dtypes:\n{current_df.dtypes}")
+                # Update final_result with the first SOR row
+                final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                collection.update_one(
+                    {"_id": object_id},
+                    {
+                        "$set": {"final_result": final_result},
+                        "$inc": {"sor_iterations": 1}
+                    }
+                )
 
-    return current_df
+                # Save updated Excel with first SOR row
+                sor_response_new_row.to_excel(excel_path, index=False)
 
-########
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
-    """Generate experiment suggestions based on completed experiments."""
-    
-    def normalize_col_name(name):
-        return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
-    
-    print(f"\n{'#'*60}")
-    print(f"SUGGEST EXPERIMENTS")
-    print(f"{'#'*60}")
-    print(f"Requested suggestions: {num_suggestions}")
-    print(f"Input DataFrame shape: {lhs.shape}")
-    print(f"Input DataFrame columns: {list(lhs.columns)}")
-    print(f"Input DataFrame dtypes:\n{lhs.dtypes}")
-    
-    # Debug: Show data types and sample values
-    print("\nDataFrame sample (first row):")
-    if len(lhs) > 0:
-        for col in lhs.columns:
-            val = lhs[col].iloc[0]
-            print(f"  {col:30s}: {val} (type: {type(val).__name__})")
-    
-    try:
-        domain = build_domain_from_df(lhs, objectives)
-        print(f"\n✓ Domain created successfully")
-        
-        input_vars = [v.name for v in domain.variables if not v.is_objective]
-        obj_vars = [v.name for v in domain.variables if v.is_objective]
-        print(f"  Input variables ({len(input_vars)}): {input_vars}")
-        print(f"  Objective variables ({len(obj_vars)}): {obj_vars}")
+                message = f"LHS phase completed. Generated SOR iteration 1/{user_sor_iterations} based on {count_of_lhs} LHS rows. Upload HPLC file to fill objectives."
 
-    except Exception as e:
-        print(f"✗ Domain build failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Domain build failed: {e}")
-
-    # Run optimization
-    try:
-        out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-        
-        if not isinstance(out, pd.DataFrame) or out.shape[0] == 0 or out.shape[1] == 0:
-            raise ValueError(f"Optimization returned invalid output: shape={out.shape if hasattr(out, 'shape') else 'N/A'}")
-        
-        suggested = out.iloc[0].to_dict()
-        print(f"\n✓ Got {len(suggested)} suggestions from optimization")
-
-    except Exception as e:
-        print(f"\n✗ OPTIMIZATION FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Cannot generate suggestions - optimization failed: {e}")
-
-    # Map suggestions back to original column names
-    print(f"\n{'='*60}")
-    print("MAPPING SUGGESTIONS TO ORIGINAL COLUMNS:")
-    print(f"{'='*60}")
-    
-    suggested_normalized = {normalize_col_name(k): v for k, v in suggested.items()}
-    objective_names_normalized = {normalize_col_name(obj.get("name", "")) for obj in objectives}
-    
-    new_row = {}
-    
-    for col in lhs.columns:
-        col_normalized = normalize_col_name(col)
-        
-        # Check if this is an objective column
-        is_objective = col_normalized in objective_names_normalized
-        
-        if col_normalized in suggested_normalized:
-            new_row[col] = suggested_normalized[col_normalized]
-            print(f"  ✓ {col:30s} = {suggested_normalized[col_normalized]:.6f}")
-        elif col in suggested:
-            new_row[col] = suggested[col]
-            print(f"  ✓ {col:30s} = {suggested[col]:.6f}")
-        elif is_objective:
-            # Objectives should be empty (to be filled by HPLC)
-            new_row[col] = ""
-            print(f"  ○ {col:30s} = '' (objective - will be filled by HPLC)")
-        else:
-            # This should NOT happen for input variables
-            print(f"  ✗ ERROR: {col:30s} = NOT FOUND IN SUGGESTIONS")
-            raise ValueError(f"Input variable '{col}' not found in optimization output!")
-
-    print(f"\n✓ New row created with {len(new_row)} values")
-    lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-    print(f"✓ Updated DataFrame shape: {lhs_updated.shape}")
-
-    return lhs_updated
-#######
-def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    """Run Summit optimization - FIXED to handle objective columns properly."""
-    
-    print(f"\n{'='*60}")
-    print(f"STARTING OPTIMIZATION")
-    print(f"{'='*60}")
-    print(f"Input DataFrame shape: {lhs_df.shape}")
-    print(f"Input DataFrame columns: {list(lhs_df.columns)}")
-    print(f"Input DataFrame dtypes:\n{lhs_df.dtypes}")
-    print(f"Number of objectives: {nobj}")
-    
-    # Get domain variable names
-    domain_input_vars = [var.name for var in domain.variables if not var.is_objective]
-    domain_obj_vars = [var.name for var in domain.variables if var.is_objective]
-    
-    print(f"\nDomain Input Variables: {domain_input_vars}")
-    print(f"Domain Objective Variables: {domain_obj_vars}")
-    
-    # Normalize column names
-    def normalize_col_name(name):
-        return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
-    
-    # Create mapping: normalized_name -> original_column_name
-    df_col_normalized = {normalize_col_name(col): col for col in lhs_df.columns}
-    domain_input_normalized = {normalize_col_name(var): var for var in domain_input_vars}
-    domain_obj_normalized = {normalize_col_name(var): var for var in domain_obj_vars}
-    
-    print(f"\nDataFrame columns (normalized): {list(df_col_normalized.keys())}")
-    print(f"Domain inputs (normalized): {list(domain_input_normalized.keys())}")
-    print(f"Domain objectives (normalized): {list(domain_obj_normalized.keys())}")
-    
-    # STEP 1: Create clean DataFrame with domain column names
-    lhs_clean = pd.DataFrame()
-    input_col_mapping = {}
-    obj_col_mapping = {}
-    
-    # Map input variables
-    print(f"\n{'='*60}")
-    print("MAPPING INPUT VARIABLES:")
-    print(f"{'='*60}")
-    for domain_var in domain_input_vars:
-        domain_var_norm = normalize_col_name(domain_var)
-        
-        if domain_var_norm in df_col_normalized:
-            original_col = df_col_normalized[domain_var_norm]
-            lhs_clean[domain_var] = pd.to_numeric(lhs_df[original_col], errors='coerce')
-            input_col_mapping[domain_var] = original_col
-            print(f"✓ {original_col:30s} -> {domain_var}")
-            if len(lhs_df) > 0:
-                print(f"  Sample values: {lhs_df[original_col].head(3).tolist()}")
-        else:
-            print(f"✗ WARNING: No DataFrame column found for domain variable '{domain_var}'")
-            print(f"  Looking for normalized: '{domain_var_norm}'")
-    
-    # Map objective variables
-    print(f"\n{'='*60}")
-    print("MAPPING OBJECTIVE VARIABLES:")
-    print(f"{'='*60}")
-    for domain_obj in domain_obj_vars:
-        domain_obj_norm = normalize_col_name(domain_obj)
-        
-        if domain_obj_norm in df_col_normalized:
-            original_col = df_col_normalized[domain_obj_norm]
-            lhs_clean[domain_obj] = pd.to_numeric(lhs_df[original_col], errors='coerce')
-            obj_col_mapping[domain_obj] = original_col
-            print(f"✓ {original_col:30s} -> {domain_obj}")
-            if len(lhs_df) > 0:
-                print(f"  Sample values: {lhs_df[original_col].head(3).tolist()}")
-                print(f"  After conversion: {lhs_clean[domain_obj].head(3).tolist()}")
-        else:
-            lhs_clean[domain_obj] = np.nan
-            print(f"○ No DataFrame column for objective '{domain_obj}', using NaN")
-    
-    print(f"\nClean DataFrame shape: {lhs_clean.shape}")
-    print(f"Clean DataFrame dtypes:\n{lhs_clean.dtypes}")
-    
-    # STEP 2: Validate we have the necessary columns
-    if len(input_col_mapping) == 0:
-        raise ValueError("CRITICAL ERROR: No input variables were mapped! Cannot optimize.")
-    
-    print(f"\n{'='*60}")
-    print("VALIDATING DATA ROWS:")
-    print(f"{'='*60}")
-    
-    # STEP 3: Filter for valid rows
-    input_cols = list(input_col_mapping.keys())
-    obj_cols = list(obj_col_mapping.keys())
-    
-    print(f"Checking {len(lhs_clean)} rows for completeness...")
-    print(f"Required: {len(input_cols)} inputs + {len(obj_cols)} objectives")
-    
-    # Check each row
-    valid_rows_mask = pd.Series([True] * len(lhs_clean), index=lhs_clean.index)
-    
-    for idx in lhs_clean.index:
-        row = lhs_clean.loc[idx]
-        
-        # Check inputs
-        inputs_valid = row[input_cols].notna().all()
-        inputs_numeric = all(isinstance(row[col], (int, float, np.number)) for col in input_cols if pd.notna(row[col]))
-        
-        # Check objectives
-        objs_valid = row[obj_cols].notna().all()
-        objs_numeric = all(isinstance(row[col], (int, float, np.number)) for col in obj_cols if pd.notna(row[col]))
-        
-        row_valid = inputs_valid and inputs_numeric and objs_valid and objs_numeric
-        valid_rows_mask[idx] = row_valid
-        
-        status = "✓ VALID" if row_valid else "✗ INVALID"
-        print(f"Row {idx}: {status}")
-        if not row_valid:
-            print(f"  Inputs valid: {inputs_valid} (numeric: {inputs_numeric})")
-            print(f"  Objectives valid: {objs_valid} (numeric: {objs_numeric})")
-            for col in input_cols:
-                val = row[col]
-                if pd.isna(val):
-                    print(f"    Input '{col}': NaN")
-            for col in obj_cols:
-                val = row[col]
-                if pd.isna(val):
-                    print(f"    Objective '{col}': NaN")
-    
-    lhs_clean_valid = lhs_clean[valid_rows_mask].copy()
-    
-    print(f"\n{'='*60}")
-    print(f"VALIDATION RESULTS:")
-    print(f"{'='*60}")
-    print(f"Total rows in input: {len(lhs_clean)}")
-    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
-    print(f"Invalid rows: {len(lhs_clean) - len(lhs_clean_valid)}")
-    
-    if len(lhs_clean_valid) == 0:
-        print("\n" + "!"*60)
-        print("CRITICAL ERROR: NO VALID ROWS FOR OPTIMIZATION")
-        print("!"*60)
-        raise ValueError("No valid rows found - cannot perform optimization without complete experimental data")
-    
-    # STEP 4: Show sample of valid data
-    print(f"\nSample of valid data (first valid row):")
-    first_valid = lhs_clean_valid.iloc[0]
-    for col in lhs_clean_valid.columns:
-        print(f"  {col:30s}: {first_valid[col]}")
-    
-    # STEP 5: Create Summit DataSet
-    try:
-        print(f"\n{'='*60}")
-        print("CREATING SUMMIT DATASET:")
-        print(f"{'='*60}")
-        lhs_ds = DataSet.from_df(lhs_clean_valid)
-        print(f"✓ DataSet created successfully")
-        print(f"  Rows: {len(lhs_ds)}")
-    except Exception as e:
-        print(f"✗ Failed to create DataSet: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"DataSet creation failed: {e}")
-    
-    # STEP 6: Run optimization
-    print(f"\n{'='*60}")
-    print("RUNNING OPTIMIZATION:")
-    print(f"{'='*60}")
-    
-    try:
-        if nobj > 1:
-            print("Using TSEMO (multi-objective optimization)...")
-            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
-            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
-            print("✓ TSEMO completed successfully")
-        else:
-            print("Using SNOBFIT (single-objective optimization)...")
-            strat = SNOBFIT(domain)
-            out = strat.suggest_experiments(1, lhs_ds)
-            print("✓ SNOBFIT completed successfully")
-            
-    except Exception as e:
-        print(f"✗ Primary optimization strategy failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        if nobj > 1:
-            print("\nTrying fallback to SNOBFIT...")
-            try:
-                strat = SNOBFIT(domain)
-                out = strat.suggest_experiments(1, lhs_ds)
-                print("✓ SNOBFIT fallback successful")
-            except Exception as e2:
-                print(f"✗ Fallback also failed: {e2}")
-                raise RuntimeError(f"All optimization strategies failed. Last error: {e2}")
-        else:
-            raise RuntimeError(f"Optimization failed: {e}")
-    
-    # STEP 7: Clean up output
-    if "strategy" in out.columns:
-        out = out.drop(columns=["strategy"])
-    
-    # Handle MultiIndex columns
-    if isinstance(out.columns, pd.MultiIndex):
-        print("Flattening MultiIndex columns...")
-        new_columns = []
-        for col in out.columns:
-            if isinstance(col, tuple):
-                name = next((str(x) for x in col if str(x).strip() and str(x) != 'nan'), str(col[0]))
-                new_columns.append(name)
             else:
-                new_columns.append(str(col))
-        out.columns = new_columns
-    
-    print(f"\n{'='*60}")
-    print("OPTIMIZATION OUTPUT:")
-    print(f"{'='*60}")
-    print(f"Output shape: {out.shape}")
-    print(f"Output columns: {list(out.columns)}")
-    if len(out) > 0:
-        print(f"\nSuggested values:")
-        for col in out.columns:
-            print(f"  {col:30s}: {out[col].iloc[0]}")
-    
-    return out
-#####
-# Transform objectives dynamically
-lhs = experiment.get('final_result')
-df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
+                # SOR Phase: Fill objectives for current row, then generate next row if needed
+                current_sor_iteration = sys_sor_iterations - 1  # Adjust for 0-based indexing
 
-# ✅ CRITICAL FIX: Convert ALL columns to numeric
-print(f"\n{'='*60}")
-print("PREPARING DATAFRAME FOR OPTIMIZATION")
-print(f"{'='*60}")
-print(f"Original DataFrame shape: {df_experiment.shape}")
-print(f"Original DataFrame columns: {list(df_experiment.columns)}")
-print(f"Original DataFrame dtypes:\n{df_experiment.dtypes}")
+                if current_sor_iteration <= user_sor_iterations:
+                    # Fill objectives for current SOR row
+                    updated_df = merge_and_save_final_result(excel_path, object_id, resp)
 
-# Get objective names
-objective_names = [obj.get("name", "") for obj in transformed_objectives]
-print(f"\nObjective columns: {objective_names}")
+                    if current_sor_iteration < user_sor_iterations:
+                        # Generate next SOR row based on all previous rows (LHS + completed SOR)
+                        print(f"Generating SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} completed experiments...")
+                        sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
 
-# Convert ALL columns to numeric
-df_numeric = pd.DataFrame()
-for col in df_experiment.columns:
-    original_dtype = df_experiment[col].dtype
-    original_sample = df_experiment[col].iloc[0] if len(df_experiment) > 0 else None
-    
-    # Convert to numeric, coerce errors (like empty strings) to NaN
-    df_numeric[col] = pd.to_numeric(df_experiment[col], errors='coerce')
-    
-    new_dtype = df_numeric[col].dtype
-    new_sample = df_numeric[col].iloc[0] if len(df_numeric) > 0 else None
-    non_null_count = df_numeric[col].notna().sum()
-    
-    print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
-    print(f"    Sample: {original_sample} -> {new_sample} ({non_null_count}/{len(df_numeric)} valid)")
+                        # Update final_result with the new SOR row
+                        final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                        collection.update_one(
+                            {"_id": object_id},
+                            {
+                                "$set": {"final_result": final_result},
+                                "$inc": {"sor_iterations": 1}
+                            }
+                        )
 
-llm_response_with_objective_columns = df_numeric
+                        # Save updated Excel with new SOR row
+                        sor_response_new_row.to_excel(excel_path, index=False)
 
-print(f"\nConverted DataFrame dtypes:\n{llm_response_with_objective_columns.dtypes}")
-print(f"\nSample data (first row):")
-if len(llm_response_with_objective_columns) > 0:
-    for col in llm_response_with_objective_columns.columns:
-        val = llm_response_with_objective_columns[col].iloc[0]
-        print(f"  {col:30s}: {val} (type: {type(val).__name__})")
-#####
-if key == "optimization_target":
-    experiment = collection.find_one({"_id": object_id})
-    lhs_response_data = experiment.get("lhs_response")
-    objectives = value.get("objectives", {}).get("Objectives", [])
-    lhs_table = lhs_response_data.get("table") if isinstance(lhs_response_data, dict) else []
-    
-    if lhs_table and isinstance(lhs_table, list):
-        input_headers = lhs_table[0]
-        data_rows = lhs_table[1:]
-        merged_headers = input_headers + objectives
-        
-        # ✅ CRITICAL FIX: Convert all data rows to numeric
-        print(f"\n{'='*60}")
-        print("CONVERTING LHS DATA TO NUMERIC")
-        print(f"{'='*60}")
-        print(f"Original data rows: {len(data_rows)}")
-        print(f"Columns per row: {len(data_rows[0]) if data_rows else 0}")
-        
-        numeric_data_rows = []
-        for row_idx, row in enumerate(data_rows):
-            numeric_row = []
-            for col_idx, val in enumerate(row):
-                # Try to convert to float
-                try:
-                    if val == '' or val is None:
-                        numeric_val = val  # Keep empty strings for objectives
+                        message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} objectives filled. Generated SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} rows. Upload HPLC file."
                     else:
-                        numeric_val = float(val)
-                    numeric_row.append(numeric_val)
-                except (ValueError, TypeError):
-                    # If conversion fails, keep original value
-                    numeric_row.append(val)
-                    print(f"  WARNING: Could not convert row {row_idx}, col {col_idx}: {val} (type: {type(val).__name__})")
-            
-            numeric_data_rows.append(numeric_row)
-        
-        # Show sample conversion
-        if numeric_data_rows:
-            print(f"\nSample row conversion:")
-            print(f"  Original: {data_rows[0]}")
-            print(f"  Numeric:  {numeric_data_rows[0]}")
-        
-        # Add empty strings for objectives
-        merged_rows = [row + [""] * len(objectives) for row in numeric_data_rows]
-        final_result = [merged_headers] + merged_rows
-        
-        print(f"\n✓ Created final_result with {len(merged_rows)} data rows")
-        
-        # Save to Excel with numeric conversion
-        hplc_path = value.get("hplcPath")
-        if hplc_path:
-            excel_path = os.path.join(hplc_path, "optimization.xlsx")
-            try:
-                # Create DataFrame
-                df = pd.DataFrame(merged_rows, columns=merged_headers)
-                
-                # Convert all columns to numeric (except objectives which are empty strings)
-                print(f"\nConverting DataFrame columns to numeric before saving to Excel...")
-                for col in df.columns:
-                    if col not in objectives:  # Don't convert objective columns (they're empty strings)
-                        original_dtype = df[col].dtype
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                        new_dtype = df[col].dtype
-                        print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
-                
-                # Save to Excel
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Optimization Result"
-                
-                # Write headers
-                ws.append(merged_headers)
-                
-                # Write data rows (convert to list to ensure proper Excel formatting)
-                for row in df.values.tolist():
-                    ws.append(row)
-                
-                wb.save(excel_path)
-                print(f"✓ Excel file saved to: {excel_path}")
-                
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to write Excel file: {str(e)}")
-        
-        collection.update_one({"_id": object_id}, {"$set": {"final_result": final_result}})
-######
-def merge_and_save_final_result(full_path, object_id, response):
-    """Merge HPLC response into final result and save to Excel."""
-    
-    print(f"\n{'='*60}")
-    print("MERGE AND SAVE FINAL RESULT")
-    print(f"{'='*60}")
-    
-    experiment = collection.find_one({"_id": ObjectId(object_id)})
-    if not experiment:
-        raise ValueError(f"No document found with _id: {object_id}")
-    
-    final_result = experiment.get("final_result")
-    no_of_LHS = int(experiment.get("lhs_response", {}).get("no_of_LHS", 0))
-    completed = int(experiment.get("completed", 0))
-    
-    print(f"Experiment status: {completed}/{no_of_LHS} LHS completed")
-    print(f"Response to add: {response}")
-    
-    if not isinstance(final_result, list) or len(final_result) <= completed:
-        raise ValueError(f"final_result must contain enough rows to update. Has {len(final_result)}, need at least {completed + 1}")
-
-    # Update the row with HPLC response data
-    row = final_result[completed]
-    empty_indices = [i for i, val in enumerate(row) if val == '']
-    
-    print(f"Row {completed} before update: {row}")
-    print(f"Empty indices to fill: {empty_indices[-len(response):]}")
-    
-    for i, val in zip(empty_indices[-len(response):], response):
-        row[i] = val
-    
-    final_result[completed] = row
-    print(f"Row {completed} after update: {row}")
-    
-    # Create DataFrame
-    df = pd.DataFrame(final_result[1:], columns=final_result[0])
-    
-    print(f"\nDataFrame before conversion:")
-    print(f"  Shape: {df.shape}")
-    print(f"  Dtypes:\n{df.dtypes}")
-    
-    # ✅ CRITICAL FIX: Convert ALL columns to numeric
-    print(f"\nConverting all columns to numeric...")
-    for col in df.columns:
-        original_dtype = df[col].dtype
-        original_sample = df[col].iloc[0] if len(df) > 0 else None
-        
-        # Convert to numeric, coerce errors to NaN
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        new_dtype = df[col].dtype
-        new_sample = df[col].iloc[0] if len(df) > 0 else None
-        non_null = df[col].notna().sum()
-        
-        print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
-        print(f"    Sample: {original_sample} -> {new_sample} ({non_null}/{len(df)} valid)")
-    
-    print(f"\nDataFrame after conversion:")
-    print(f"  Dtypes:\n{df.dtypes}")
-    
-    # Save to Excel
-    df.to_excel(full_path, index=False)
-    print(f"✓ Excel saved to: {full_path}")
-    
-    # Update MongoDB
-    collection.update_one(
-        {"_id": ObjectId(object_id)},
-        {
-            "$set": {"final_result": final_result},
-            "$inc": {"completed": 1}
-        }
-    )
-    print(f"✓ MongoDB updated: completed incremented to {completed + 1}")
-    
-    return df
-#####
-def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
-    """Build optimization domain from DataFrame with proper column filtering."""
-    
-    print(f"\n{'='*60}")
-    print("BUILDING DOMAIN FROM DATAFRAME")
-    print(f"{'='*60}")
-    print(f"DataFrame shape: {df.shape}")
-    print(f"DataFrame columns: {list(df.columns)}")
-    print(f"DataFrame dtypes:\n{df.dtypes}")
-    print(f"Number of objectives: {len(objectives)}")
-    
-    # Normalize column names for comparison
-    def normalize_col_name(name):
-        return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
-    
-    # Get objective column names (normalized)
-    objective_names = [obj.get("name", "").strip() for obj in objectives]
-    objective_names_normalized = {normalize_col_name(name) for name in objective_names if name}
-    
-    print(f"Objective names from config: {objective_names}")
-    print(f"Objective names (normalized): {objective_names_normalized}")
-    
-    # Get all numeric columns
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    print(f"\nNumeric columns in DataFrame: {numeric_cols}")
-    
-    if len(numeric_cols) == 0:
-        raise ValueError(
-            "No numeric columns found in DataFrame - cannot build domain.\n"
-            f"DataFrame dtypes: {df.dtypes.to_dict()}\n"
-            "All columns must be numeric (float or int) for optimization."
-        )
-    
-    # Separate input variables from objectives
-    input_variable_cols = []
-    objective_cols = []
-    
-    for col in numeric_cols:
-        col_normalized = normalize_col_name(col)
-        
-        if col_normalized in objective_names_normalized:
-            objective_cols.append(col)
-            print(f"  Objective: {col} (normalized: {col_normalized})")
-        else:
-            input_variable_cols.append(col)
-            print(f"  Input var: {col} (normalized: {col_normalized})")
-    
-    print(f"\nFinal classification:")
-    print(f"  Input variables: {len(input_variable_cols)} - {input_variable_cols}")
-    print(f"  Objectives: {len(objective_cols)} - {objective_cols}")
-    
-    if len(input_variable_cols) == 0:
-        raise ValueError(
-            f"No input variables identified! All {len(numeric_cols)} numeric columns are classified as objectives.\n"
-            f"This usually means the input variable columns are not numeric.\n"
-            f"Numeric columns: {numeric_cols}\n"
-            f"Objective names: {objective_names}\n"
-            f"All DataFrame columns: {list(df.columns)}\n"
-            f"DataFrame dtypes: {df.dtypes.to_dict()}"
-        )
-    
-    # Build domain
-    domain = Domain()
-    
-    # Add input variables with bounds from data
-    print(f"\nAdding input variables to domain:")
-    for col in input_variable_cols:
-        # Calculate bounds from existing data
-        col_data = df[col].dropna()
-        
-        if len(col_data) == 0:
-            print(f"  WARNING: No data for column '{col}', using default bounds [0, 1]")
-            lb, ub = 0.0, 1.0
-        else:
-            lb = float(col_data.min())
-            ub = float(col_data.max())
-            
-            # Ensure bounds are different
-            if lb == ub:
-                if lb == 0:
-                    lb, ub = 0.0, 1.0
+                        # Last SOR iteration completed - no more rows to generate
+                        collection.update_one(
+                            {"_id": object_id},
+                            {"$set": {"current_phase": "completed"}}
+                        )
+                        message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} completed. All experiments finished!"
                 else:
-                    margin = abs(lb) * 0.1
-                    lb -= margin
-                    ub += margin
+                    # All SOR iterations completed
+                    message = "All SOR iterations completed. Optimization finished!"
+                    collection.update_one(
+                        {"_id": object_id},
+                        {"$set": {"current_phase": "completed"}}
+                    )
             
-            print(f"  {col:30s}: [{lb:.4f}, {ub:.4f}]")
+        except Exception as e:
+            print(f"Error in phase processing: {e}")
+            import traceback
+            traceback.print_exc()
+            message = f"Error processing experiment: {e}"
         
-        # Sanitize name for Summit (replace spaces with underscores)
-        sanitized_name = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-        
-        domain += ContinuousVariable(
-            name=sanitized_name,
-            description=str(col),
-            bounds=[lb, ub]
-        )
-    
-    # Add objectives
-    print(f"\nAdding objectives to domain:")
-    for obj in objectives:
-        obj_name = obj.get("name", "obj").strip()
-        maximize = bool(obj.get("maximize", False))
-        
-        # Sanitize objective name
-        sanitized_name = obj_name.replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
-        
-        print(f"  {sanitized_name:30s}: {'maximize' if maximize else 'minimize'}")
-        
-        domain += ContinuousVariable(
-            name=sanitized_name,
-            description=obj_name,
-            bounds=[0, 100],
-            is_objective=True,
-            maximize=maximize
-        )
-    
-    print(f"\n✓ Domain created successfully:")
-    print(f"  Total variables: {len(domain.variables)}")
-    print(f"  Input variables: {len([v for v in domain.variables if not v.is_objective])}")
-    print(f"  Objectives: {len([v for v in domain.variables if v.is_objective])}")
-    
-    return domain
+        # Send message to WebSocket clients
+        for ws, _ in self.websocket_clients:
+            asyncio.run_coroutine_threadsafe(ws.send_text(message), self.loop)
