@@ -1,327 +1,115 @@
-def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    """Run Summit optimization - FIXED to handle objective columns properly."""
+def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
+    """Build optimization domain from DataFrame with proper column filtering."""
     
     print(f"\n{'='*60}")
-    print(f"STARTING OPTIMIZATION")
+    print("BUILDING DOMAIN FROM DATAFRAME")
     print(f"{'='*60}")
-    print(f"Input DataFrame shape: {lhs_df.shape}")
-    print(f"Input DataFrame columns: {list(lhs_df.columns)}")
-    print(f"Number of objectives: {nobj}")
+    print(f"DataFrame shape: {df.shape}")
+    print(f"DataFrame columns: {list(df.columns)}")
+    print(f"Number of objectives: {len(objectives)}")
     
-    # Get domain variable names
-    domain_input_vars = [var.name for var in domain.variables if not var.is_objective]
-    domain_obj_vars = [var.name for var in domain.variables if var.is_objective]
-    
-    print(f"\nDomain Input Variables: {domain_input_vars}")
-    print(f"Domain Objective Variables: {domain_obj_vars}")
-    
-    # Normalize column names
+    # Normalize column names for comparison
     def normalize_col_name(name):
         return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
     
-    # Create mapping: normalized_name -> original_column_name
-    df_col_normalized = {normalize_col_name(col): col for col in lhs_df.columns}
-    domain_input_normalized = {normalize_col_name(var): var for var in domain_input_vars}
-    domain_obj_normalized = {normalize_col_name(var): var for var in domain_obj_vars}
+    # Get objective column names (normalized)
+    objective_names = [obj.get("name", "").strip() for obj in objectives]
+    objective_names_normalized = {normalize_col_name(name) for name in objective_names if name}
     
-    print(f"\nDataFrame columns (normalized): {list(df_col_normalized.keys())}")
-    print(f"Domain inputs (normalized): {list(domain_input_normalized.keys())}")
-    print(f"Domain objectives (normalized): {list(domain_obj_normalized.keys())}")
+    print(f"Objective names from config: {objective_names}")
+    print(f"Objective names (normalized): {objective_names_normalized}")
     
-    # STEP 1: Create clean DataFrame with domain column names
-    lhs_clean = pd.DataFrame()
-    input_col_mapping = {}  # domain_var_name -> original_df_column
-    obj_col_mapping = {}
+    # Get all numeric columns
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    print(f"\nNumeric columns in DataFrame: {numeric_cols}")
     
-    # Map input variables
-    print(f"\n{'='*60}")
-    print("MAPPING INPUT VARIABLES:")
-    print(f"{'='*60}")
-    for domain_var in domain_input_vars:
-        domain_var_norm = normalize_col_name(domain_var)
-        
-        if domain_var_norm in df_col_normalized:
-            original_col = df_col_normalized[domain_var_norm]
-            lhs_clean[domain_var] = pd.to_numeric(lhs_df[original_col], errors='coerce')
-            input_col_mapping[domain_var] = original_col
-            print(f"✓ {original_col:30s} -> {domain_var}")
-            print(f"  Sample values: {lhs_df[original_col].head(3).tolist()}")
-        else:
-            print(f"✗ WARNING: No DataFrame column found for domain variable '{domain_var}'")
-            print(f"  Looking for normalized: '{domain_var_norm}'")
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric columns found in DataFrame - cannot build domain")
     
-    # Map objective variables
-    print(f"\n{'='*60}")
-    print("MAPPING OBJECTIVE VARIABLES:")
-    print(f"{'='*60}")
-    for domain_obj in domain_obj_vars:
-        domain_obj_norm = normalize_col_name(domain_obj)
-        
-        if domain_obj_norm in df_col_normalized:
-            original_col = df_col_normalized[domain_obj_norm]
-            # CRITICAL: Convert objectives to numeric, coerce errors to NaN
-            # This handles empty strings "" from SOR rows
-            lhs_clean[domain_obj] = pd.to_numeric(lhs_df[original_col], errors='coerce')
-            obj_col_mapping[domain_obj] = original_col
-            print(f"✓ {original_col:30s} -> {domain_obj}")
-            print(f"  Sample values: {lhs_df[original_col].head(3).tolist()}")
-            print(f"  After conversion: {lhs_clean[domain_obj].head(3).tolist()}")
-        else:
-            lhs_clean[domain_obj] = np.nan
-            print(f"○ No DataFrame column for objective '{domain_obj}', using NaN")
+    # Separate input variables from objectives
+    input_variable_cols = []
+    objective_cols = []
     
-    print(f"\nClean DataFrame shape: {lhs_clean.shape}")
-    print(f"Clean DataFrame dtypes:")
-    print(lhs_clean.dtypes)
-    
-    # STEP 2: Validate we have the necessary columns
-    if len(input_col_mapping) == 0:
-        raise ValueError("CRITICAL ERROR: No input variables were mapped! Cannot optimize.")
-    
-    print(f"\n{'='*60}")
-    print("VALIDATING DATA ROWS:")
-    print(f"{'='*60}")
-    
-    # STEP 3: Filter for valid rows
-    # A valid row must have:
-    # 1. ALL input variables with numeric values (not NaN)
-    # 2. ALL objective variables with numeric values (not NaN) 
-    
-    input_cols = list(input_col_mapping.keys())
-    obj_cols = list(obj_col_mapping.keys())
-    
-    print(f"Checking {len(lhs_clean)} rows for completeness...")
-    print(f"Required: {len(input_cols)} inputs + {len(obj_cols)} objectives")
-    
-    # Check each row
-    valid_rows_mask = pd.Series([True] * len(lhs_clean), index=lhs_clean.index)
-    
-    for idx in lhs_clean.index:
-        row = lhs_clean.loc[idx]
-        
-        # Check inputs
-        inputs_valid = row[input_cols].notna().all()
-        inputs_numeric = all(isinstance(row[col], (int, float, np.number)) for col in input_cols if pd.notna(row[col]))
-        
-        # Check objectives
-        objs_valid = row[obj_cols].notna().all()
-        objs_numeric = all(isinstance(row[col], (int, float, np.number)) for col in obj_cols if pd.notna(row[col]))
-        
-        row_valid = inputs_valid and inputs_numeric and objs_valid and objs_numeric
-        valid_rows_mask[idx] = row_valid
-        
-        status = "✓ VALID" if row_valid else "✗ INVALID"
-        print(f"Row {idx}: {status}")
-        if not row_valid:
-            print(f"  Inputs valid: {inputs_valid} (numeric: {inputs_numeric})")
-            print(f"  Objectives valid: {objs_valid} (numeric: {objs_numeric})")
-            # Show which columns are problematic
-            for col in input_cols:
-                val = row[col]
-                if pd.isna(val):
-                    print(f"    Input '{col}': NaN")
-                elif not isinstance(val, (int, float, np.number)):
-                    print(f"    Input '{col}': {val} (type: {type(val).__name__})")
-            for col in obj_cols:
-                val = row[col]
-                if pd.isna(val):
-                    print(f"    Objective '{col}': NaN")
-                elif not isinstance(val, (int, float, np.number)):
-                    print(f"    Objective '{col}': {val} (type: {type(val).__name__})")
-    
-    lhs_clean_valid = lhs_clean[valid_rows_mask].copy()
-    
-    print(f"\n{'='*60}")
-    print(f"VALIDATION RESULTS:")
-    print(f"{'='*60}")
-    print(f"Total rows in input: {len(lhs_clean)}")
-    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
-    print(f"Invalid rows (missing/non-numeric data): {len(lhs_clean) - len(lhs_clean_valid)}")
-    
-    if len(lhs_clean_valid) == 0:
-        print("\n" + "!"*60)
-        print("CRITICAL ERROR: NO VALID ROWS FOR OPTIMIZATION")
-        print("!"*60)
-        print("\nDEBUG INFO:")
-        print("Input DataFrame preview:")
-        print(lhs_df.head(10))
-        print("\nCleaned DataFrame preview:")
-        print(lhs_clean.head(10))
-        print("\nDiagnosis:")
-        print("- Check that LHS experiments have been completed and HPLC data uploaded")
-        print("- Verify that objective columns contain numeric values, not empty strings")
-        print("- Ensure all input variable columns have numeric data")
-        raise ValueError("No valid rows found - cannot perform optimization without complete experimental data")
-    
-    # STEP 4: Show sample of valid data
-    print(f"\nSample of valid data (first valid row):")
-    first_valid = lhs_clean_valid.iloc[0]
-    for col in lhs_clean_valid.columns:
-        print(f"  {col:30s}: {first_valid[col]}")
-    
-    # STEP 5: Create Summit DataSet
-    try:
-        print(f"\n{'='*60}")
-        print("CREATING SUMMIT DATASET:")
-        print(f"{'='*60}")
-        lhs_ds = DataSet.from_df(lhs_clean_valid)
-        print(f"✓ DataSet created successfully")
-        print(f"  Rows: {len(lhs_ds)}")
-        print(f"  Columns: {lhs_ds.data.shape[1]}")
-    except Exception as e:
-        print(f"✗ Failed to create DataSet: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"DataSet creation failed: {e}")
-    
-    # STEP 6: Run optimization
-    print(f"\n{'='*60}")
-    print("RUNNING OPTIMIZATION:")
-    print(f"{'='*60}")
-    
-    try:
-        if nobj > 1:
-            print("Using TSEMO (multi-objective optimization)...")
-            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
-            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
-            print("✓ TSEMO completed successfully")
-        else:
-            print("Using SNOBFIT (single-objective optimization)...")
-            strat = SNOBFIT(domain)
-            out = strat.suggest_experiments(1, lhs_ds)
-            print("✓ SNOBFIT completed successfully")
-            
-    except Exception as e:
-        print(f"✗ Primary optimization strategy failed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        if nobj > 1:
-            print("\nTrying fallback to SNOBFIT...")
-            try:
-                strat = SNOBFIT(domain)
-                out = strat.suggest_experiments(1, lhs_ds)
-                print("✓ SNOBFIT fallback successful")
-            except Exception as e2:
-                print(f"✗ Fallback also failed: {e2}")
-                raise RuntimeError(f"All optimization strategies failed. Last error: {e2}")
-        else:
-            raise RuntimeError(f"Optimization failed: {e}")
-    
-    # STEP 7: Clean up output
-    if "strategy" in out.columns:
-        out = out.drop(columns=["strategy"])
-    
-    # Handle MultiIndex columns
-    if isinstance(out.columns, pd.MultiIndex):
-        print("Flattening MultiIndex columns...")
-        new_columns = []
-        for col in out.columns:
-            if isinstance(col, tuple):
-                name = next((str(x) for x in col if str(x).strip() and str(x) != 'nan'), str(col[0]))
-                new_columns.append(name)
-            else:
-                new_columns.append(str(col))
-        out.columns = new_columns
-    
-    print(f"\n{'='*60}")
-    print("OPTIMIZATION OUTPUT:")
-    print(f"{'='*60}")
-    print(f"Output shape: {out.shape}")
-    print(f"Output columns: {list(out.columns)}")
-    print(f"\nSuggested values:")
-    if len(out) > 0:
-        for col in out.columns:
-            print(f"  {col:30s}: {out[col].iloc[0]}")
-    
-    return out
-
-#########
-def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
-    """Generate experiment suggestions based on completed experiments."""
-    
-    def normalize_col_name(name):
-        return str(name).strip().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_").lower()
-    
-    print(f"\n{'#'*60}")
-    print(f"SUGGEST EXPERIMENTS")
-    print(f"{'#'*60}")
-    print(f"Requested suggestions: {num_suggestions}")
-    print(f"Input DataFrame shape: {lhs.shape}")
-    print(f"Input DataFrame columns: {list(lhs.columns)}")
-    
-    # Debug: Show data types and sample values
-    print("\nDataFrame info:")
-    for col in lhs.columns:
-        dtype = lhs[col].dtype
-        non_null = lhs[col].notna().sum()
-        sample = lhs[col].iloc[0] if len(lhs) > 0 else None
-        print(f"  {col:30s}: dtype={dtype}, non-null={non_null}/{len(lhs)}, sample={sample}")
-    
-    try:
-        domain = build_domain_from_df(lhs, objectives)
-        print(f"\n✓ Domain created successfully")
-        
-        input_vars = [v.name for v in domain.variables if not v.is_objective]
-        obj_vars = [v.name for v in domain.variables if v.is_objective]
-        print(f"  Input variables ({len(input_vars)}): {input_vars}")
-        print(f"  Objective variables ({len(obj_vars)}): {obj_vars}")
-
-    except Exception as e:
-        print(f"✗ Domain build failed: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Domain build failed: {e}")
-
-    # Run optimization
-    try:
-        out = run_summit_optimization(domain, lhs, len(objectives) or 1)
-        
-        if not isinstance(out, pd.DataFrame) or out.shape[0] == 0 or out.shape[1] == 0:
-            raise ValueError(f"Optimization returned invalid output: shape={out.shape if hasattr(out, 'shape') else 'N/A'}")
-        
-        suggested = out.iloc[0].to_dict()
-        print(f"\n✓ Got {len(suggested)} suggestions from optimization")
-
-    except Exception as e:
-        print(f"\n✗ OPTIMIZATION FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        raise RuntimeError(f"Cannot generate suggestions - optimization failed: {e}")
-
-    # Map suggestions back to original column names
-    print(f"\n{'='*60}")
-    print("MAPPING SUGGESTIONS TO ORIGINAL COLUMNS:")
-    print(f"{'='*60}")
-    
-    suggested_normalized = {normalize_col_name(k): v for k, v in suggested.items()}
-    objective_names_normalized = {normalize_col_name(obj.get("name", "")) for obj in objectives}
-    
-    new_row = {}
-    
-    for col in lhs.columns:
+    for col in numeric_cols:
         col_normalized = normalize_col_name(col)
         
-        # Check if this is an objective column
-        is_objective = col_normalized in objective_names_normalized
-        
-        if col_normalized in suggested_normalized:
-            new_row[col] = suggested_normalized[col_normalized]
-            print(f"  ✓ {col:30s} = {suggested_normalized[col_normalized]:.6f}")
-        elif col in suggested:
-            new_row[col] = suggested[col]
-            print(f"  ✓ {col:30s} = {suggested[col]:.6f}")
-        elif is_objective:
-            # Objectives should be empty (to be filled by HPLC)
-            new_row[col] = ""
-            print(f"  ○ {col:30s} = '' (objective - will be filled by HPLC)")
+        if col_normalized in objective_names_normalized:
+            objective_cols.append(col)
+            print(f"  Objective: {col} (normalized: {col_normalized})")
         else:
-            # This should NOT happen for input variables
-            print(f"  ✗ ERROR: {col:30s} = NOT FOUND IN SUGGESTIONS")
-            raise ValueError(f"Input variable '{col}' not found in optimization output - this should not happen!")
-
-    print(f"\n✓ New row created successfully with {len(new_row)} values")
-    lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
-    print(f"✓ Updated DataFrame shape: {lhs_updated.shape}")
-
-    return lhs_updated
+            input_variable_cols.append(col)
+            print(f"  Input var: {col} (normalized: {col_normalized})")
+    
+    print(f"\nFinal classification:")
+    print(f"  Input variables: {len(input_variable_cols)} - {input_variable_cols}")
+    print(f"  Objectives: {len(objective_cols)} - {objective_cols}")
+    
+    if len(input_variable_cols) == 0:
+        raise ValueError(
+            f"No input variables identified! All {len(numeric_cols)} numeric columns are classified as objectives. "
+            f"Check that objective names match DataFrame columns.\n"
+            f"Numeric columns: {numeric_cols}\n"
+            f"Objective names: {objective_names}"
+        )
+    
+    # Build domain
+    domain = Domain()
+    
+    # Add input variables with bounds from data
+    print(f"\nAdding input variables to domain:")
+    for col in input_variable_cols:
+        # Calculate bounds from existing data
+        col_data = df[col].dropna()
+        
+        if len(col_data) == 0:
+            print(f"  WARNING: No data for column '{col}', using default bounds [0, 1]")
+            lb, ub = 0.0, 1.0
+        else:
+            lb = float(col_data.min())
+            ub = float(col_data.max())
+            
+            # Ensure bounds are different
+            if lb == ub:
+                if lb == 0:
+                    lb, ub = 0.0, 1.0
+                else:
+                    margin = abs(lb) * 0.1
+                    lb -= margin
+                    ub += margin
+            
+            print(f"  {col:30s}: [{lb:.4f}, {ub:.4f}]")
+        
+        # Sanitize name for Summit (replace spaces with underscores)
+        sanitized_name = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+        
+        domain += ContinuousVariable(
+            name=sanitized_name,
+            description=str(col),
+            bounds=[lb, ub]
+        )
+    
+    # Add objectives
+    print(f"\nAdding objectives to domain:")
+    for obj in objectives:
+        obj_name = obj.get("name", "obj").strip()
+        maximize = bool(obj.get("maximize", False))
+        
+        # Sanitize objective name
+        sanitized_name = obj_name.replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+        
+        print(f"  {sanitized_name:30s}: {'maximize' if maximize else 'minimize'}")
+        
+        domain += ContinuousVariable(
+            name=sanitized_name,
+            description=obj_name,
+            bounds=[0, 100],
+            is_objective=True,
+            maximize=maximize
+        )
+    
+    print(f"\n✓ Domain created successfully:")
+    print(f"  Total variables: {len(domain.variables)}")
+    print(f"  Input variables: {len([v for v in domain.variables if not v.is_objective])}")
+    print(f"  Objectives: {len([v for v in domain.variables if v.is_objective])}")
+    
+    return domain
