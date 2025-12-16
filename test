@@ -1,253 +1,519 @@
-def on_created(self, event):
-    if not event.is_directory:
-        full_path_uploaded_csv = event.src_path
-        object_id = ObjectId(self.id)
-        experiment = collection.find_one({"_id": object_id})
-        
-        # Get Objectives and RT parameters from the database
-        optimization = experiment.get("optimization_target", {})
-        raw_objectives = optimization.get("objectives", {})
-        
-        # CORRECTED: Extract RT parameters properly from UI input
-        objectives_rtmin = raw_objectives.get('RTMin', [])
-        objectives_rtmax = raw_objectives.get('RTMax', [])
-        
-        print(f"Raw RT Min from UI: {objectives_rtmin}")
-        print(f"Raw RT Max from UI: {objectives_rtmax}")
-        
-        if len(objectives_rtmin) != len(objectives_rtmax):
-            raise ValueError(f"RTMin and RTMax arrays must have same length: {len(objectives_rtmin)} vs {len(objectives_rtmax)}")
-        
-        # Method 1: Assume first RT pair is yield, rest are impurities
-        YminRT = float(objectives_rtmin[0])  
-        YmaxRT = float(objectives_rtmax[0])  
-        
-        # Impurity RT ranges from remaining pairs
-        IminRT_list = []
-        ImaxRT_list = []
-        
-        for i in range(1, len(objectives_rtmin)):
-            if str(objectives_rtmin[i]).strip() != '' and str(objectives_rtmax[i]).strip() != '':
-                IminRT_list.append(float(objectives_rtmin[i]))
-                ImaxRT_list.append(float(objectives_rtmax[i]))
-        
-        # Internal Standard RT range from separate UI fields
-        minRTISO = float(optimization.get("rtMinIso", 0))
-        maxRTISO = float(optimization.get("rtMaxIso", 0))
-        
-        print(f"CORRECTED RT parameters:")
-        print(f"  Yield RT: [{YminRT}-{YmaxRT}]")
-        print(f"  Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
-        print(f"  Internal Standard RT: [{minRTISO}-{maxRTISO}]")
-        
-        # Validate RT parameters
-        if YminRT >= YmaxRT:
-            raise ValueError(f"Invalid yield RT range: {YminRT} >= {YmaxRT}")
-        if minRTISO >= maxRTISO:
-            raise ValueError(f"Invalid internal standard RT range: {minRTISO} >= {maxRTISO}")
-        if len(IminRT_list) != len(ImaxRT_list):
-            raise ValueError(f"Impurity RT min/max lists length mismatch: {len(IminRT_list)} vs {len(ImaxRT_list)}")
-        
-        # Check for range overlaps (warning only)
-        all_ranges = [("Yield", YminRT, YmaxRT), ("ISO", minRTISO, maxRTISO)]
-        for i, (imin, imax) in enumerate(zip(IminRT_list, ImaxRT_list)):
-            all_ranges.append((f"Impurity{i+1}", imin, imax))
-        
-        print("Checking for range overlaps:")
-        for i, (name1, min1, max1) in enumerate(all_ranges):
-            for j, (name2, min2, max2) in enumerate(all_ranges[i+1:], i+1):
-                if not (max1 <= min2 or max2 <= min1):  # Ranges overlap
-                    print(f"WARNING: {name1} [{min1}-{max1}] overlaps with {name2} [{min2}-{max2}]")
-        
-        # ✅ CRITICAL FIX: Transform objectives BEFORE using it
-        transformed_objectives = []
-        for i, name in enumerate(raw_objectives.get("Objectives", [])):
-            obj = {
-                "name": name,
-                "maximize": raw_objectives.get("Condition", [])[i].lower() == "maximize"
-            }
-            if i < len(raw_objectives.get("Property", [])):
-                obj["Property"] = raw_objectives["Property"][i]
-            transformed_objectives.append(obj)
-        
-        print(f"\nTransformed objectives: {transformed_objectives}")
-        
-        # NOW we can use transformed_objectives to prepare the DataFrame
-        lhs = experiment.get('final_result')
-        df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
+from fastapi import FastAPI, Depends, HTTPException, Request, status, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
+from datetime import datetime, timedelta
+from fastapi.responses import JSONResponse
+from jose import jwt, JWTError
+from pymongo import MongoClient
+from bson import ObjectId, json_util
+from bson.errors import InvalidId
+from typing import Optional
+import config, csv, redis, os, uvicorn, utils, json
+from openpyxl import Workbook
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+import asyncio
+import pandas as pd
+import time
 
-        # ✅ CRITICAL FIX: Convert ALL columns to numeric
-        print(f"\n{'='*60}")
-        print("PREPARING DATAFRAME FOR OPTIMIZATION")
-        print(f"{'='*60}")
-        print(f"Original DataFrame shape: {df_experiment.shape}")
-        print(f"Original DataFrame columns: {list(df_experiment.columns)}")
-        print(f"Original DataFrame dtypes:\n{df_experiment.dtypes}")
+# JWT Configuration
+SECRET_KEY = "myFAVsecretKEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 200
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-        # Get objective names
-        objective_names = [obj.get("name", "") for obj in transformed_objectives]
-        print(f"\nObjective columns: {objective_names}")
+# MongoDB Setup
+try:
+    client = MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=5000)
+    client.server_info()
+    print("✅ MongoDB is reachable")
+except Exception as e:
+    print("❌ MongoDB connection failed:", e)
 
-        # Convert ALL columns to numeric
-        df_numeric = pd.DataFrame()
-        for col in df_experiment.columns:
-            original_dtype = df_experiment[col].dtype
-            original_sample = df_experiment[col].iloc[0] if len(df_experiment) > 0 else None
+db = client["self_optimization_reactions"]
+collection = db["self_optimization_reactions"]
+
+# Redis Setup
+try:
+    redis_client = redis.Redis(host='localhost', port=6379, db=12, decode_responses=True)
+    redis_client.ping()
+    print("✅ Redis is reachable")
+except Exception as e:
+    print("❌ Redis connection failed:", e)
+
+# FastAPI App Initialization
+app = FastAPI(
+    title="Self Optimization Reactions (SOR) Server",
+    redoc_url=None,
+    root_path="/sor/api",
+)
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Assets Directory
+ASSETS_DIR = "assets"
+os.makedirs(ASSETS_DIR, exist_ok=True)
+
+# JWT Token Generator
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# JWT Token Validator
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return username
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Login Endpoint
+@app.post("/login")
+async def login(user_info: dict = Depends(config.check_ldap_auth)):
+    if not user_info:
+        raise HTTPException(status_code=400, detail="Invalid Credentials")
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user_info["first_name"]},
+        expires_delta=access_token_expires
+    )
+    login_record = {
+        "first_name": user_info["first_name"],
+        "last_name": user_info.get("last_name"),
+        "email": user_info.get("email"),
+        "login_time": datetime.utcnow(),
+        "access_token": access_token,
+        "type": "login_event",
+        "sor_iterations": 1,
+        "completed": 1,
+    }
+    result = collection.insert_one(login_record)
+    return {
+        "access_token": access_token,
+        "token_type": "Bearer",
+        "firstname": user_info["first_name"],
+        "_id": str(result.inserted_id)
+    }
+
+@app.get("/fetch_by_firstname/{firstname}")
+async def fetch_by_firstname(firstname: str, user: str = Depends(get_current_user)):
+    try:
+        if not firstname:
+            raise HTTPException(status_code=400, detail="Firstname is required")
+
+        # Query MongoDB for matching documents
+        results = list(collection.find({"first_name": firstname}))
+
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No records found for first_name: {firstname}")
+
+        # Convert ObjectId and datetime fields to strings
+        for doc in results:
+            doc["_id"] = str(doc["_id"])
+            if "login_time" in doc and isinstance(doc["login_time"], datetime):
+                doc["login_time"] = doc["login_time"].isoformat()
+
+        return JSONResponse(content={"results": results})
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.delete("/delete_by_id/{id}")
+async def delete_by_id(id: str, user: str = Depends(get_current_user)):
+    try:
+        object_id = ObjectId(id)
+        result = collection.delete_one({"_id": object_id})
+
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        return {"message": "Document deleted successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+# Update Experiment Endpoint
+@app.post("/update/{id}")
+async def update_experiment(id: str, request: Request, user: str = Depends(get_current_user)):
+    try:
+        data = await request.json()
+        object_id = ObjectId(id)
+        key = list(data.keys())[0]
+        value = data[key]
+        result = collection.update_one({"_id": object_id}, {"$set": {key: value}})
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Experiment not found")
+        if key == "optimization_target":
+            experiment = collection.find_one({"_id": object_id})
+            lhs_response_data = experiment.get("lhs_response")
+            objectives = value.get("objectives", {}).get("Objectives", [])
+            lhs_table = lhs_response_data.get("table") if isinstance(lhs_response_data, dict) else []
+            if lhs_table and isinstance(lhs_table, list):
+                input_headers = lhs_table[0]
+                data_rows = lhs_table[1:]
+                merged_headers = input_headers + objectives
+                merged_rows = [row + [""] * len(objectives) for row in data_rows]
+                final_result = [merged_headers] + merged_rows
+                hplc_path = value.get("hplcPath")
+                if hplc_path:
+                    excel_path = os.path.join(hplc_path, "optimization.xlsx")
+                    try:
+                        wb = Workbook()
+                        ws = wb.active
+                        ws.title = "Optimization Result"
+                        for row in final_result:
+                            ws.append(row)
+                        wb.save(excel_path)
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to write Excel file: {str(e)}")
+                collection.update_one({"_id": object_id}, {"$set": {"final_result": final_result}})
+        return {"message": "updated successfully"}
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Invalid MongoDB ID format")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Get Result Endpoint
+@app.get("/result/{id}")
+async def get_lhs_response(id: str, user: str = Depends(get_current_user)):
+    try:
+        if not ObjectId.is_valid(id):
+            raise HTTPException(status_code=400, detail="Invalid ID format")
+        experiment = collection.find_one({"_id": ObjectId(id)})
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="Experiment not found")
+        serialized_experiment = json.loads(json_util.dumps(experiment))
+        return {"data": serialized_experiment}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+
+# Get Experiment Data
+@app.get("/experiment/{id}")
+async def get_experiment(id: str, user: str = Depends(get_current_user)):
+    try:
+        object_id = ObjectId(id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid MongoDB ID format")
+    experiment = collection.find_one({"_id": object_id})
+    if not experiment:
+        raise HTTPException(status_code=404, detail="Experiment not found")
+    experiment["_id"] = str(experiment["_id"])
+    return {"source": "mongodb", "data": experiment}
+
+# Function to merge and save final result
+def merge_and_save_final_result(full_path, object_id, response):
+    experiment = collection.find_one({"_id": ObjectId(object_id)})
+    if not experiment:
+        raise ValueError(f"No document found with _id: {object_id}")
+    final_result = experiment.get("final_result")
+    no_of_LHS = int(experiment.get("lhs_response", {}).get("no_of_LHS", 0))
+    completed = int(experiment.get("completed", 0))
+    if not isinstance(final_result, list) or len(final_result) <= completed:
+        raise ValueError("final_result must contain enough rows to update")
+
+    row = final_result[completed]
+    empty_indices = [i for i, val in enumerate(row) if val == '']
+    for i, val in zip(empty_indices[-len(response):], response):
+        row[i] = val
+    final_result[completed] = row
+    df = pd.DataFrame(final_result[1:], columns=final_result[0])
+    df.to_excel(full_path, index=False)
+    collection.update_one(
+        {"_id": ObjectId(object_id)},
+        {
+            "$set": {"final_result": final_result},
+            "$inc": {"completed": 1}
+        }
+    )
+    print(f"Row {completed} updated. Excel saved to {full_path} and MongoDB updated.")
+    return df
+
+# WebSocket Clients and Watcher
+websocket_clients = []
+watcher_started = False
+
+# WebSocket Notifier Class with on_created method
+class WebSocketNotifier(FileSystemEventHandler):
+    def __init__(self, websocket_clients, loop, id):
+        self.websocket_clients = websocket_clients
+        self.loop = loop
+        self.id = id
+
+    def on_created(self, event):
+        if not event.is_directory:
+            full_path_uploaded_csv = event.src_path
+            object_id = ObjectId(self.id)
+            experiment = collection.find_one({"_id": object_id})
             
-            # Convert to numeric, coerce errors (like empty strings) to NaN
-            df_numeric[col] = pd.to_numeric(df_experiment[col], errors='coerce')
+            # Get Objectives and RT parameters from the database
+            optimization = experiment.get("optimization_target", {})
+            raw_objectives = optimization.get("objectives", {})
             
-            new_dtype = df_numeric[col].dtype
-            new_sample = df_numeric[col].iloc[0] if len(df_numeric) > 0 else None
-            non_null_count = df_numeric[col].notna().sum()
+            # CORRECTED: Extract RT parameters properly from UI input
+            # UI provides RTMin and RTMax as arrays where each pair defines a specific RT range:
+            # - RTMin[0], RTMax[0] = Yield RT range 
+            # - RTMin[1], RTMax[1] = First impurity RT range
+            # - RTMin[2], RTMax[2] = Second impurity RT range, etc.
+            objectives_rtmin = raw_objectives.get('RTMin', [])
+            objectives_rtmax = raw_objectives.get('RTMax', [])
             
-            print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
-            print(f"    Sample: {original_sample} -> {new_sample} ({non_null_count}/{len(df_numeric)} valid)")
-
-        llm_response_with_objective_columns = df_numeric
-
-        print(f"\nConverted DataFrame dtypes:\n{llm_response_with_objective_columns.dtypes}")
-        print(f"\nSample data (first row):")
-        if len(llm_response_with_objective_columns) > 0:
-            for col in llm_response_with_objective_columns.columns:
-                val = llm_response_with_objective_columns[col].iloc[0]
-                print(f"  {col:30s}: {val} (type: {type(val).__name__})")
-
-        # Read and process the uploaded HPLC CSV file
-        try:
-            df_hplc = pd.read_csv(full_path_uploaded_csv)
-            print(f"HPLC file loaded: {full_path_uploaded_csv}")
-            print(f"HPLC file columns: {list(df_hplc.columns)}")
-            print(f"HPLC file shape: {df_hplc.shape}")
+            print(f"Raw RT Min from UI: {objectives_rtmin}")
+            print(f"Raw RT Max from UI: {objectives_rtmax}")
             
-            # Display first few rows for debugging
-            if len(df_hplc) > 0:
-                print(f"Sample HPLC data:")
-                print(df_hplc.head())
-                if 'RT' in df_hplc.columns:
-                    print(f"RT range in file: {df_hplc['RT'].min():.3f} - {df_hplc['RT'].max():.3f}")
+            # CORRECTED: RT pairs should be interpreted as compound-specific ranges
+            # Each RTMin[i] pairs with RTMax[i] to define a specific compound's RT range
             
-        except Exception as e:
-            print(f"Error reading HPLC file: {e}")
-            for ws, _ in self.websocket_clients:
-                asyncio.run_coroutine_threadsafe(ws.send_text(f"Error reading HPLC file: {e}"), self.loop)
-            return
-        
-        # Get experiment status
-        full_path = optimization.get("hplcPath", "")
-        completed_experiments = int(experiment.get('completed', 0))
-        count_of_lhs = int(experiment.get('lhs_response', {}).get('no_of_LHS', 0))
-        user_sor_iterations = int(experiment.get('optimization_target', {}).get('iterations', 1))
-        sys_sor_iterations = int(experiment.get('sor_iterations', 1))
-        
-        print(f"\nExperiment Status:")
-        print(f"  Completed: {completed_experiments}/{count_of_lhs} LHS")
-        print(f"  SOR Iterations: {sys_sor_iterations-1}/{user_sor_iterations}")
-        
-        # Process the HPLC file with corrected RT filtering
-        try:
-            resp = utils.process_uploaded_csv_file(
-                full_path_uploaded_csv,
-                df_hplc,
-                minRTISO,
-                maxRTISO,
-                YminRT,
-                YmaxRT,
-                IminRT_list,
-                ImaxRT_list,
-                transformed_objectives,
-                llm_response_with_objective_columns
-            )
-            print(f"HPLC processing completed. Response: {resp}")
+            if len(objectives_rtmin) != len(objectives_rtmax):
+                raise ValueError(f"RTMin and RTMax arrays must have same length: {len(objectives_rtmin)} vs {len(objectives_rtmax)}")
             
-        except Exception as e:
-            print(f"Error processing HPLC data: {e}")
-            import traceback
-            traceback.print_exc()
-            for ws, _ in self.websocket_clients:
-                asyncio.run_coroutine_threadsafe(ws.send_text(f"Error processing HPLC data: {e}"), self.loop)
-            return
-        
-        excel_path = os.path.join(full_path, "optimization.xlsx")
-        
-        # Phase-based processing logic
-        try:
-            if completed_experiments < count_of_lhs:
-                # LHS Phase: Just update the current row with results
-                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
-                message = f"LHS experiment {completed_experiments + 1}/{count_of_lhs} completed. Upload next HPLC file."
+            # Method 1: Assume first RT pair is yield, rest are impurities
+            YminRT = float(objectives_rtmin[0])  
+            YmaxRT = float(objectives_rtmax[0])  
+            
+            # Impurity RT ranges from remaining pairs
+            IminRT_list = []
+            ImaxRT_list = []
+            
+            for i in range(1, len(objectives_rtmin)):
+                if str(objectives_rtmin[i]).strip() != '' and str(objectives_rtmax[i]).strip() != '':
+                    IminRT_list.append(float(objectives_rtmin[i]))
+                    ImaxRT_list.append(float(objectives_rtmax[i]))
+            
+            # ALTERNATIVE: If your UI means consecutive RT values define ranges
+            # Uncomment this section if RT values are meant to be consecutive boundaries:
+            # YminRT = float(objectives_rtmin[0])
+            # YmaxRT = float(objectives_rtmin[1]) if len(objectives_rtmin) > 1 else float(objectives_rtmax[0])
+            # IminRT_list = [float(objectives_rtmax[0])] if len(objectives_rtmax) > 1 else []
+            # ImaxRT_list = [float(objectives_rtmax[1])] if len(objectives_rtmax) > 1 else []
+            
+            # Internal Standard RT range from separate UI fields
+            minRTISO = float(optimization.get("rtMinIso", 0))
+            maxRTISO = float(optimization.get("rtMaxIso", 0))
+            
+            print(f"CORRECTED RT parameters:")
+            print(f"  Yield RT: [{YminRT}-{YmaxRT}]")
+            print(f"  Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
+            print(f"  Internal Standard RT: [{minRTISO}-{maxRTISO}]")
+            
+            # Validate RT parameters
+            if YminRT >= YmaxRT:
+                raise ValueError(f"Invalid yield RT range: {YminRT} >= {YmaxRT}")
+            if minRTISO >= maxRTISO:
+                raise ValueError(f"Invalid internal standard RT range: {minRTISO} >= {maxRTISO}")
+            if len(IminRT_list) != len(ImaxRT_list):
+                raise ValueError(f"Impurity RT min/max lists length mismatch: {len(IminRT_list)} vs {len(ImaxRT_list)}")
+            
+            # Check for range overlaps (warning only)
+            all_ranges = [("Yield", YminRT, YmaxRT), ("ISO", minRTISO, maxRTISO)]
+            for i, (imin, imax) in enumerate(zip(IminRT_list, ImaxRT_list)):
+                all_ranges.append((f"Impurity{i+1}", imin, imax))
+            
+            print("Checking for range overlaps:")
+            for i, (name1, min1, max1) in enumerate(all_ranges):
+                for j, (name2, min2, max2) in enumerate(all_ranges[i+1:], i+1):
+                    if not (max1 <= min2 or max2 <= min1):  # Ranges overlap
+                        print(f"WARNING: {name1} [{min1}-{max1}] overlaps with {name2} [{min2}-{max2}]")
+            
+            # Transform objectives dynamically
+            lhs = experiment.get('final_result')
+            df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
+            llm_response_with_objective_columns = df_experiment.apply(pd.to_numeric, errors='coerce')
+            
+            transformed_objectives = []
+            for i, name in enumerate(raw_objectives.get("Objectives", [])):
+                obj = {
+                    "name": name,
+                    "maximize": raw_objectives.get("Condition", [])[i].lower() == "maximize"
+                }
+                if i < len(raw_objectives.get("Property", [])):
+                    obj["Property"] = raw_objectives["Property"][i]
+                transformed_objectives.append(obj)
 
-            elif completed_experiments == count_of_lhs:
-                # Transition from LHS to SOR: Process last LHS experiment and generate FIRST SOR row
-                updated_df = merge_and_save_final_result(excel_path, object_id, resp)
-
-                # Generate FIRST SOR row based on all LHS rows (with optimized inputs, empty objectives)
-                print(f"Generating first SOR row based on {len(updated_df)} completed LHS experiments...")
-                sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
-
-                # Update final_result with the first SOR row
-                final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
-                collection.update_one(
-                    {"_id": object_id},
-                    {
-                        "$set": {"final_result": final_result},
-                        "$inc": {"sor_iterations": 1}
-                    }
+            # Read and process the uploaded HPLC CSV file
+            try:
+                df_hplc = pd.read_csv(full_path_uploaded_csv)
+                print(f"HPLC file loaded: {full_path_uploaded_csv}")
+                print(f"HPLC file columns: {list(df_hplc.columns)}")
+                print(f"HPLC file shape: {df_hplc.shape}")
+                
+                # Display first few rows for debugging
+                if len(df_hplc) > 0:
+                    print(f"Sample HPLC data:")
+                    print(df_hplc.head())
+                    if 'RT' in df_hplc.columns:
+                        print(f"RT range in file: {df_hplc['RT'].min():.3f} - {df_hplc['RT'].max():.3f}")
+                
+            except Exception as e:
+                print(f"Error reading HPLC file: {e}")
+                for ws, _ in self.websocket_clients:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(f"Error reading HPLC file: {e}"), self.loop)
+                return
+            
+            # Get experiment status
+            full_path = optimization.get("hplcPath", "")
+            completed_experiments = int(experiment.get('completed', 0))
+            count_of_lhs = int(experiment.get('lhs_response', {}).get('no_of_LHS', 0))
+            user_sor_iterations = int(experiment.get('optimization_target', {}).get('iterations', 1))
+            sys_sor_iterations = int(experiment.get('sor_iterations', 1))
+            
+            print(f"\nExperiment Status:")
+            print(f"  Completed: {completed_experiments}/{count_of_lhs} LHS")
+            print(f"  SOR Iterations: {sys_sor_iterations-1}/{user_sor_iterations}")
+            
+            # Process the HPLC file with corrected RT filtering
+            try:
+                resp = utils.process_uploaded_csv_file(
+                    full_path_uploaded_csv,
+                    df_hplc,
+                    minRTISO,
+                    maxRTISO,
+                    YminRT,
+                    YmaxRT,
+                    IminRT_list,
+                    ImaxRT_list,
+                    transformed_objectives,
+                    llm_response_with_objective_columns
                 )
+                print(f"HPLC processing completed. Response: {resp}")
+                
+            except Exception as e:
+                print(f"Error processing HPLC data: {e}")
+                import traceback
+                traceback.print_exc()
+                for ws, _ in self.websocket_clients:
+                    asyncio.run_coroutine_threadsafe(ws.send_text(f"Error processing HPLC data: {e}"), self.loop)
+                return
+            
+            excel_path = os.path.join(full_path, "optimization.xlsx")
+            
+            # Phase-based processing logic
+            try:
+                if completed_experiments < count_of_lhs:
+                    # LHS Phase: Just update the current row with results
+                    updated_df = merge_and_save_final_result(excel_path, object_id, resp)
+                    message = f"LHS experiment {completed_experiments + 1}/{count_of_lhs} completed. Upload next HPLC file."
 
-                # Save updated Excel with first SOR row
-                sor_response_new_row.to_excel(excel_path, index=False)
-
-                message = f"LHS phase completed. Generated SOR iteration 1/{user_sor_iterations} based on {count_of_lhs} LHS rows. Upload HPLC file to fill objectives."
-
-            else:
-                # SOR Phase: Fill objectives for current row, then generate next row if needed
-                current_sor_iteration = sys_sor_iterations - 1  # Adjust for 0-based indexing
-
-                if current_sor_iteration <= user_sor_iterations:
-                    # Fill objectives for current SOR row
+                elif completed_experiments == count_of_lhs:
+                    # Transition from LHS to SOR: Process last LHS experiment and generate FIRST SOR row
                     updated_df = merge_and_save_final_result(excel_path, object_id, resp)
 
-                    if current_sor_iteration < user_sor_iterations:
-                        # Generate next SOR row based on all previous rows (LHS + completed SOR)
-                        print(f"Generating SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} completed experiments...")
-                        sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
+                    # Generate FIRST SOR row based on all LHS rows (with optimized inputs, empty objectives)
+                    print(f"Generating first SOR row based on {len(updated_df)} completed LHS experiments...")
+                    sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
 
-                        # Update final_result with the new SOR row
-                        final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
-                        collection.update_one(
-                            {"_id": object_id},
-                            {
-                                "$set": {"final_result": final_result},
-                                "$inc": {"sor_iterations": 1}
-                            }
-                        )
+                    # Update final_result with the first SOR row
+                    final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                    collection.update_one(
+                        {"_id": object_id},
+                        {
+                            "$set": {"final_result": final_result},
+                            "$inc": {"sor_iterations": 1}
+                        }
+                    )
 
-                        # Save updated Excel with new SOR row
-                        sor_response_new_row.to_excel(excel_path, index=False)
+                    # Save updated Excel with first SOR row
+                    sor_response_new_row.to_excel(excel_path, index=False)
 
-                        message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} objectives filled. Generated SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} rows. Upload HPLC file."
+                    message = f"LHS phase completed. Generated SOR iteration 1/{user_sor_iterations} based on {count_of_lhs} LHS rows. Upload HPLC file to fill objectives."
+
+                else:
+                    # SOR Phase: Fill objectives for current row, then generate next row if needed
+                    current_sor_iteration = sys_sor_iterations - 1  # Adjust for 0-based indexing
+
+                    if current_sor_iteration <= user_sor_iterations:
+                        # Fill objectives for current SOR row
+                        updated_df = merge_and_save_final_result(excel_path, object_id, resp)
+
+                        if current_sor_iteration < user_sor_iterations:
+                            # Generate next SOR row based on all previous rows (LHS + completed SOR)
+                            print(f"Generating SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} completed experiments...")
+                            sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
+
+                            # Update final_result with the new SOR row
+                            final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                            collection.update_one(
+                                {"_id": object_id},
+                                {
+                                    "$set": {"final_result": final_result},
+                                    "$inc": {"sor_iterations": 1}
+                                }
+                            )
+
+                            # Save updated Excel with new SOR row
+                            sor_response_new_row.to_excel(excel_path, index=False)
+
+                            message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} objectives filled. Generated SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} rows. Upload HPLC file."
+                        else:
+                            # Last SOR iteration completed - no more rows to generate
+                            collection.update_one(
+                                {"_id": object_id},
+                                {"$set": {"current_phase": "completed"}}
+                            )
+                            message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} completed. All experiments finished!"
                     else:
-                        # Last SOR iteration completed - no more rows to generate
+                        # All SOR iterations completed
+                        message = "All SOR iterations completed. Optimization finished!"
                         collection.update_one(
                             {"_id": object_id},
                             {"$set": {"current_phase": "completed"}}
                         )
-                        message = f"SOR iteration {current_sor_iteration}/{user_sor_iterations} completed. All experiments finished!"
-                else:
-                    # All SOR iterations completed
-                    message = "All SOR iterations completed. Optimization finished!"
-                    collection.update_one(
-                        {"_id": object_id},
-                        {"$set": {"current_phase": "completed"}}
-                    )
+                
+            except Exception as e:
+                print(f"Error in phase processing: {e}")
+                import traceback
+                traceback.print_exc()
+                message = f"Error processing experiment: {e}"
             
-        except Exception as e:
-            print(f"Error in phase processing: {e}")
-            import traceback
-            traceback.print_exc()
-            message = f"Error processing experiment: {e}"
-        
-        # Send message to WebSocket clients
-        for ws, _ in self.websocket_clients:
-            asyncio.run_coroutine_threadsafe(ws.send_text(message), self.loop)
+            # Send message to WebSocket clients
+            for ws, _ in self.websocket_clients:
+                asyncio.run_coroutine_threadsafe(ws.send_text(message), self.loop)
+
+
+# Function to start watcher
+def start_watcher(path, websocket_clients, loop, id):
+    event_handler = WebSocketNotifier(websocket_clients, loop, id)
+    observer = Observer()
+    observer.schedule(event_handler, path=path, recursive=True)
+    observer.start()
+    return observer
+
+@app.websocket("/ws/file-uploads/{id}")
+async def websocket_endpoint(websocket: WebSocket, id: str):
+    global watcher_started
+    await websocket.accept()
+    # Fetch path from database
+    object_id = ObjectId(id)
+    experiment = collection.find_one({"_id": object_id})
+    hplc_path = experiment.get("optimization_target").get("hplcPath")
+    websocket_clients.append((websocket, hplc_path))
+    loop = asyncio.get_event_loop()
+    if not watcher_started:
+        observer = start_watcher(hplc_path, websocket_clients, loop, id)
+        watcher_started = True
+    print(f"WebSocket connected for ID {id} with path: {hplc_path}")
+    try:
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+    finally:
+        websocket_clients.remove((websocket, hplc_path))
+        if not websocket_clients:
+            observer.stop()
+            observer.join()
+            watcher_started = False
+
+# Run server
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
