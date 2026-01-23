@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from summit.domain import Domain, ContinuousVariable
 from typing import List, Dict, Any
-from summit.strategies import TSEMO, Random, SNOBFIT
+from summit.strategies import TSEMO
 from summit.utils.dataset import DataSet
 
 def HPLC_data_read_csv(file_path: str) -> np.ndarray:
@@ -333,25 +333,27 @@ def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
 
 
 def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
-    """Run Summit optimization."""
-    
+    """Run Summit TSEMO optimization only - no random fallbacks."""
+
+    print(f"\n{'='*50}")
+    print(f"TSEMO OPTIMIZATION")
+    print(f"{'='*50}")
     print(f"Starting optimization with {len(lhs_df)} existing rows")
     print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input vars, {len([v for v in domain.variables if v.is_objective])} objectives")
-    
+
     # Prepare DataFrame for Summit - ensure proper column alignment
     domain_var_names = [var.name for var in domain.variables if not var.is_objective]
     domain_obj_names = [var.name for var in domain.variables if var.is_objective]
-    
+
     print(f"Domain input variables: {domain_var_names}")
     print(f"Domain objectives: {domain_obj_names}")
     print(f"Original DataFrame columns: {list(lhs_df.columns)}")
-    
+
     # Create a clean DataFrame with only the columns that match domain variables
     lhs_clean = pd.DataFrame()
-    
+
     # Map input variables
     for var_name in domain_var_names:
-        # Try to find matching column in original DataFrame
         found = False
         for col in lhs_df.columns:
             col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
@@ -360,13 +362,11 @@ def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
                 found = True
                 print(f"Mapped {col} -> {var_name}")
                 break
-        
+
         if not found:
-            print(f"WARNING: Could not find column for variable {var_name}")
-            # If no matching column found, fill with NaN (this shouldn't happen with proper domain building)
-            lhs_clean[var_name] = np.nan
-    
-    # Map objective variables  
+            raise ValueError(f"Could not find column for variable {var_name}")
+
+    # Map objective variables
     for obj_name in domain_obj_names:
         found = False
         for col in lhs_df.columns:
@@ -376,113 +376,62 @@ def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
                 found = True
                 print(f"Mapped objective {col} -> {obj_name}")
                 break
-        
+
         if not found:
-            # For objectives, we might not have data yet
             lhs_clean[obj_name] = np.nan
             print(f"No data for objective {obj_name}, using NaN")
-    
+
     print(f"Clean DataFrame shape: {lhs_clean.shape}")
     print(f"Clean DataFrame columns: {list(lhs_clean.columns)}")
-    
-    # Remove rows where ALL input variables are NaN (these can't be used for optimization)
+
+    # TSEMO requires rows with COMPLETE data (both inputs AND objectives)
     input_vars_df = lhs_clean[domain_var_names]
-    valid_rows = ~input_vars_df.isna().all(axis=1)
+    valid_input_rows = ~input_vars_df.isna().any(axis=1)
+
+    obj_vars_df = lhs_clean[domain_obj_names]
+    valid_obj_rows = ~obj_vars_df.isna().any(axis=1)
+
+    valid_rows = valid_input_rows & valid_obj_rows
     lhs_clean_valid = lhs_clean[valid_rows].copy()
-    
-    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
-    
-    # Ensure we have some valid data
+
+    print(f"Rows with valid inputs: {valid_input_rows.sum()}")
+    print(f"Rows with valid objectives: {valid_obj_rows.sum()}")
+    print(f"Rows with BOTH valid (for TSEMO): {len(lhs_clean_valid)}")
+
     if len(lhs_clean_valid) == 0:
-        print("WARNING: No valid data rows found for optimization - generating random suggestion")
-        # Return a random suggestion based on domain bounds
-        out = pd.DataFrame()
-        for var in domain.variables:
-            if not var.is_objective:
-                # Generate random value within bounds
-                low, high = var.bounds
-                random_val = np.random.uniform(low, high)
-                out[var.name] = [random_val]
-                print(f"Random suggestion for {var.name}: {random_val} (bounds: {low}-{high})")
-        print(f"Generated random DataFrame shape: {out.shape}")
-        return out
-    
+        raise ValueError("No valid data rows found for TSEMO optimization. Need at least one complete experiment (inputs + objectives).")
+
     # Create DataSet for Summit
-    try:
-        print("Creating DataSet...")
-        lhs_ds = DataSet.from_df(lhs_clean_valid)
-        print(f"DataSet created successfully with {len(lhs_ds)} rows")
-    except Exception as e:
-        print(f"Failed to create DataSet: {e}")
-        print("Generating random fallback...")
-        # Fallback to random suggestion
-        out = pd.DataFrame()
-        for var in domain.variables:
-            if not var.is_objective:
-                low, high = var.bounds
-                random_val = np.random.uniform(low, high)
-                out[var.name] = [random_val]
-        return out
-    
-    # Run optimization
-    if nobj > 1:
-        try:
-            print("Trying TSEMO optimization...")
-            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
-            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
-            print("TSEMO optimization successful")
-        except Exception as e:
-            print(f"TSEMO failed with error: {e}")
-            print("Falling back to SNOBFIT...")
-            try:
-                strat = SNOBFIT(domain)
-                out = strat.suggest_experiments(1, lhs_ds)
-                print("SNOBFIT optimization successful")
-            except Exception as e2:
-                print(f"SNOBFIT also failed: {e2}")
-                print("Using random fallback...")
-                # Final fallback to random
-                out = pd.DataFrame()
-                for var in domain.variables:
-                    if not var.is_objective:
-                        low, high = var.bounds
-                        random_val = np.random.uniform(low, high)
-                        out[var.name] = [random_val]
-                print(f"Random fallback generated: {out.to_dict('records')[0] if len(out) > 0 else 'EMPTY'}")
-                return out
-    else:
-        try:
-            print("Using SNOBFIT optimization...")
-            strat = SNOBFIT(domain)
-            out = strat.suggest_experiments(1, lhs_ds)
-            print("SNOBFIT optimization successful")
-        except Exception as e:
-            print(f"SNOBFIT failed: {e}")
-            print("Using random fallback...")
-            # Fallback to random
-            out = pd.DataFrame()
-            for var in domain.variables:
-                if not var.is_objective:
-                    low, high = var.bounds
-                    random_val = np.random.uniform(low, high)
-                    out[var.name] = [random_val]
-            return out
-    
+    print("Creating DataSet...")
+    lhs_ds = DataSet.from_df(lhs_clean_valid)
+    print(f"DataSet created successfully with {len(lhs_ds)} rows")
+
+    # Run TSEMO optimization
+    print(f"\nRunning TSEMO optimization with {nobj} objectives...")
+    print(f"Using {len(lhs_clean_valid)} completed experiments to build model")
+
+    # Configure TSEMO
+    n_spectral = min(4000, max(100, len(lhs_clean_valid) * 100))
+    print(f"TSEMO config: random_rate=0.0, n_spectral_points={n_spectral}")
+
+    strat = TSEMO(domain, random_rate=0.0, n_spectral_points=n_spectral)
+    out = strat.suggest_experiments(1, lhs_ds)
+
+    print("TSEMO optimization successful!")
+
     # Clean up output
     if "strategy" in out.columns:
         out = out.drop(columns=["strategy"])
-    
-    print(f"Final optimization output shape: {out.shape}")
-    print(f"Final optimization output columns: {list(out.columns)}")
-    
+
+    print(f"TSEMO output shape: {out.shape}")
+    print(f"TSEMO output columns: {list(out.columns)}")
+
     # Handle MultiIndex columns if present
     if isinstance(out.columns, pd.MultiIndex):
         print("MultiIndex columns detected, flattening...")
-        # Flatten MultiIndex columns by taking the first level or combining levels
         new_columns = []
         for col in out.columns:
             if isinstance(col, tuple):
-                # Take the first non-empty element from the tuple
                 name = next((str(x) for x in col if str(x).strip() and str(x) != 'nan'), str(col[0]))
                 new_columns.append(name)
             else:
@@ -490,13 +439,14 @@ def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
         out.columns = new_columns
         print(f"Flattened columns: {list(out.columns)}")
     
-    # Show a sample of the actual data
+    # Show TSEMO suggested values
     if len(out) > 0:
-        sample_dict = {}
-        for col in out.columns[:5]:  # Show first 5 columns as sample
-            sample_dict[col] = out[col].iloc[0]
-        print(f"Sample output data: {sample_dict}")
-    
+        print(f"\nTSEMO Suggested Experiment:")
+        for col in out.columns:
+            print(f"  {col}: {out[col].iloc[0]}")
+
+    print(f"{'='*50}\n")
+
     return out
 
 
