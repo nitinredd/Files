@@ -1,352 +1,690 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import utils
-import os
-from datetime import datetime
+from summit.domain import Domain, ContinuousVariable
+from typing import List, Dict, Any
+from summit.strategies import TSEMO, Random, SNOBFIT
+from summit.utils.dataset import DataSet
 
-# Page config
-st.set_page_config(page_title="SOR HPLC Testing", layout="wide")
-
-# Initialize session state
-if 'experiment_data' not in st.session_state:
-    st.session_state.experiment_data = None
-if 'completed' not in st.session_state:
-    st.session_state.completed = 0
-if 'phase' not in st.session_state:
-    st.session_state.phase = 'setup'  # setup, lhs, sor, completed
-if 'objectives' not in st.session_state:
-    st.session_state.objectives = []
-if 'sor_iteration' not in st.session_state:
-    st.session_state.sor_iteration = 0
-if 'num_lhs' not in st.session_state:
-    st.session_state.num_lhs = 0
-
-st.title("🧪 SOR HPLC Processing - Local Testing")
-
-# Sidebar for configuration
-with st.sidebar:
-    st.header("Configuration")
-
-    if st.session_state.phase == 'setup':
-        st.subheader("1️⃣ Upload LHS Data")
-        lhs_file = st.file_uploader("Upload LHS Excel/CSV", type=['xlsx', 'csv'])
-
-        if lhs_file:
-            # Read LHS file
-            if lhs_file.name.endswith('.csv'):
-                lhs_df = pd.read_csv(lhs_file)
-            else:
-                lhs_df = pd.read_excel(lhs_file)
-
-            st.success(f"✅ Loaded {len(lhs_df)} LHS experiments")
-            st.dataframe(lhs_df.head())
-
-            st.subheader("2️⃣ Define Objectives")
-
-            num_objectives = st.number_input("Number of Objectives", min_value=1, max_value=5, value=2)
-
-            objectives = []
-            rtmin_list = []
-            rtmax_list = []
-
-            for i in range(num_objectives):
-                st.markdown(f"**Objective {i+1}**")
-                col1, col2 = st.columns(2)
-                with col1:
-                    obj_name = st.text_input(f"Name", value=f"Obj_{i+1}", key=f"obj_name_{i}")
-                    rtmin = st.number_input(f"RT Min", value=0.0, key=f"rtmin_{i}", format="%.2f")
-                with col2:
-                    maximize = st.selectbox(f"Condition", ["Minimize", "Maximize"], key=f"maximize_{i}")
-                    rtmax = st.number_input(f"RT Max", value=1.0, key=f"rtmax_{i}", format="%.2f")
-
-                objectives.append({
-                    "name": obj_name,
-                    "maximize": maximize == "Maximize"
-                })
-                rtmin_list.append(rtmin)
-                rtmax_list.append(rtmax)
-
-            st.subheader("3️⃣ Internal Standard RT Range")
-            col1, col2 = st.columns(2)
-            with col1:
-                iso_rtmin = st.number_input("ISO RT Min", value=0.0, format="%.2f")
-            with col2:
-                iso_rtmax = st.number_input("ISO RT Max", value=30.0, format="%.2f")
-
-            st.subheader("4️⃣ SOR Configuration")
-            num_sor_iterations = st.number_input("Number of SOR Iterations", min_value=1, max_value=20, value=5)
-
-            if st.button("🚀 Start Experiment"):
-                # Add objective columns to LHS data
-                for obj in objectives:
-                    lhs_df[obj['name']] = ""
-
-                st.session_state.experiment_data = lhs_df
-                st.session_state.objectives = objectives
-                st.session_state.rtmin_list = rtmin_list
-                st.session_state.rtmax_list = rtmax_list
-                st.session_state.iso_rtmin = iso_rtmin
-                st.session_state.iso_rtmax = iso_rtmax
-                st.session_state.num_lhs = len(lhs_df)
-                st.session_state.num_sor_iterations = num_sor_iterations
-                st.session_state.completed = 0
-                st.session_state.phase = 'lhs'
-                st.session_state.sor_iteration = 0
-                st.experimental_rerun()
-
-    else:
-        st.subheader("📊 Experiment Status")
-
-        if st.session_state.phase == 'lhs':
-            st.metric("Phase", "LHS")
-            st.metric("Progress", f"{st.session_state.completed}/{st.session_state.num_lhs}")
-            st.progress(st.session_state.completed / st.session_state.num_lhs)
-        elif st.session_state.phase == 'sor':
-            st.metric("Phase", "SOR")
-            st.metric("Progress", f"{st.session_state.sor_iteration}/{st.session_state.num_sor_iterations}")
-            st.progress(st.session_state.sor_iteration / st.session_state.num_sor_iterations)
-        elif st.session_state.phase == 'completed':
-            st.metric("Phase", "✅ COMPLETED")
-
-        st.markdown("---")
-
-        # Show objectives configuration
-        st.subheader("Objectives Configuration")
-        for i, obj in enumerate(st.session_state.objectives):
-            if i == 0:
-                obj_type = "Yield"
-            else:
-                obj_type = f"Impurity {i}"
-
-            st.text(f"{obj['name']} ({obj_type})")
-            st.text(f"  RT: [{st.session_state.rtmin_list[i]:.2f} - {st.session_state.rtmax_list[i]:.2f}]")
-            st.text(f"  {('Maximize' if obj['maximize'] else 'Minimize')}")
-
-        st.text(f"\nInternal Standard:")
-        st.text(f"  RT: [{st.session_state.iso_rtmin:.2f} - {st.session_state.iso_rtmax:.2f}]")
-
-        st.markdown("---")
-
-        if st.button("🔄 Reset Experiment"):
-            for key in list(st.session_state.keys()):
-                del st.session_state[key]
-            st.experimental_rerun()
-
-# Main content area
-if st.session_state.phase == 'setup':
-    st.info("👈 Please configure your experiment in the sidebar to get started")
-
-    st.markdown("""
-    ### How to use this testing tool:
-
-    1. **Upload LHS Data**: Upload your LHS-generated Excel/CSV file with input variables (flowrates, temperatures, etc.)
-    2. **Define Objectives**:
-       - First objective = Yield (RT range where your product peak appears)
-       - Additional objectives = Impurities (RT ranges for impurity peaks)
-    3. **Set Internal Standard**: Define the RT range for your internal standard peak
-    4. **Set SOR Iterations**: How many SOR experiments to run after LHS phase
-    5. **Click "Start Experiment"** to begin
-    6. **Upload HPLC files** one by one for each experiment
-    7. Watch the table update with objective values in real-time!
-
-    ### Expected HPLC File Format:
-    - CSV file with columns: `RT` and `Area` (or `Peak Area`)
-    - Each row represents one peak with its retention time and area
-    """)
-
-elif st.session_state.phase in ['lhs', 'sor']:
-    col1, col2 = st.columns([2, 1])
-
-    with col1:
-        st.subheader("📊 Current Experiment Data")
-
-        # Display current data
-        if st.session_state.experiment_data is not None:
-            st.dataframe(st.session_state.experiment_data, height=400)
-
-    with col2:
-        st.subheader("📁 Upload HPLC File")
-
-        if st.session_state.phase == 'lhs':
-            current_exp = st.session_state.completed + 1
-            st.info(f"**LHS Experiment {current_exp}/{st.session_state.num_lhs}**")
+def HPLC_data_read_csv(file_path: str) -> np.ndarray:
+    """
+    Reads HPLC data from a CSV file.
+    Expected columns: Sample Name, RT, Area, Peak Area, Signal Name
+    Returns a NumPy array with [Area, RT].
+    """
+    try:
+        data = pd.read_csv(file_path)
+        data_final = pd.DataFrame()
+        
+        # Handle different possible column names for Area
+        if 'Area' in data.columns:
+            data_final['Peak_Area'] = data['Area']
+        elif 'Peak Area' in data.columns:
+            data_final['Peak_Area'] = data['Peak Area']
+        elif 'Peak_Area' in data.columns:
+            data_final['Peak_Area'] = data['Peak_Area']
         else:
-            current_exp = st.session_state.sor_iteration + 1
-            st.info(f"**SOR Iteration {current_exp}/{st.session_state.num_sor_iterations}**")
+            raise ValueError("No Area column found in HPLC data")
+            
+        # Handle RT column
+        if 'RT' in data.columns:
+            data_final['RT'] = data['RT']
+        else:
+            raise ValueError("No RT column found in HPLC data")
+            
+        print(f"HPLC data loaded: {len(data_final)} peaks")
+        print(f"RT range: {data_final['RT'].min():.2f} - {data_final['RT'].max():.2f}")
+        
+        return data_final.to_numpy()
+    except Exception as e:
+        print(f"Error reading HPLC CSV file {file_path}: {e}")
+        return np.array([])
 
-        hplc_file = st.file_uploader(
-            "Upload HPLC CSV file",
-            type=['csv'],
-            key=f"hplc_{st.session_state.completed}_{st.session_state.sor_iteration}"
+
+def impurity_response_csv(data_np: np.ndarray, IminRT: float, ImaxRT: float, areaISO: float) -> float:
+    """
+    Calculates impurity response based on peak area within a given RT range.
+    data_np: NumPy array with [Area, RT]
+    IminRT, ImaxRT: Retention time range for the impurity
+    areaISO: Isocratic peak area for normalization
+    """
+    areaB = 0
+    peaks_found = 0
+    
+    for i in range(data_np.shape[0]):
+        if IminRT <= data_np[i, 1] <= ImaxRT:
+            areaB += data_np[i, 0]
+            peaks_found += 1
+            
+    print(f"Impurity RT range [{IminRT}-{ImaxRT}]: Found {peaks_found} peaks, Total area: {areaB}")
+    
+    if areaISO == 0:
+        print("Warning: Internal standard area is 0, returning 0 for impurity")
+        return 0.0
+        
+    impurity_result = areaB / areaISO
+    return impurity_result
+
+
+def response_HPLC_csv(
+    data_np: np.ndarray,
+    YminRT: float, YmaxRT: float,
+    IminRT_list: List[float], ImaxRT_list: List[float],
+    minRTISO: float, maxRTISO: float,
+    nobj: int
+) -> List[float]:
+    """
+    Computes yield and impurity responses from HPLC data with proper RT filtering.
+    
+    Parameters:
+    - data_np: HPLC data array [Area, RT]
+    - YminRT, YmaxRT: RT range for main product (yield)
+    - IminRT_list, ImaxRT_list: RT ranges for impurities
+    - minRTISO, maxRTISO: RT range for internal standard
+    - nobj: Number of objectives
+    """
+    if data_np.size == 0:
+        print("Empty HPLC data, returning default values")
+        return [float('inf')] * nobj
+
+    print(f"\n=== Processing HPLC Data ===")
+    print(f"Total peaks in file: {data_np.shape[0]}")
+    print(f"Yield RT range: [{YminRT}-{YmaxRT}]")
+    print(f"ISO RT range: [{minRTISO}-{maxRTISO}]")
+    print(f"Impurity RT ranges: {list(zip(IminRT_list, ImaxRT_list))}")
+
+    # Calculate yield area (main product)
+    areaA = 0
+    yield_peaks_found = 0
+    for i in range(data_np.shape[0]):
+        if YminRT <= data_np[i, 1] <= YmaxRT:
+            areaA += data_np[i, 0]
+            yield_peaks_found += 1
+    
+    print(f"Yield: Found {yield_peaks_found} peaks, Total area: {areaA}")
+
+    # Calculate internal standard area
+    areaISO = 0
+    iso_peaks_found = 0
+    for i in range(data_np.shape[0]):
+        if minRTISO <= data_np[i, 1] <= maxRTISO:
+            areaISO += data_np[i, 0]
+            iso_peaks_found += 1
+    
+    print(f"Internal Standard: Found {iso_peaks_found} peaks, Total area: {areaISO}")
+
+    response = []
+    
+    # Yield calculation
+    if areaISO > 0 and areaA > 0:
+        yield_result = areaA / areaISO
+        yield_response = yield_result  # Return actual ratio, not log-transformed
+        print(f"Yield ratio: {yield_result:.4f}")
+    else:
+        yield_response = float('inf')
+        print(f"Warning: Invalid yield calculation (areaA={areaA}, areaISO={areaISO})")
+    
+    response.append(yield_response)
+
+    # Impurities calculation
+    for i in range(nobj - 1):
+        if i < len(IminRT_list) and i < len(ImaxRT_list):
+            impurity_result = impurity_response_csv(data_np, IminRT_list[i], ImaxRT_list[i], areaISO)
+            response.append(impurity_result)
+            print(f"Impurity {i+1} result: {impurity_result:.4f}")
+        else:
+            response.append(0.0)
+            print(f"Impurity {i+1}: No RT range specified, using 0.0")
+
+    print(f"Final response: {response}")
+    return response
+
+
+def monitor_folder_creation1_csv(
+    file_path: str,
+    nobj: List,
+    YminRT: float, YmaxRT: float,
+    IminRT: float, ImaxRT: float,
+    minRTISO: float, maxRTISO: float
+) -> Dict[str, Dict[str, List[float]]]:
+    """
+    Processes a single HPLC CSV file and returns the calculated responses.
+    This function wraps the HPLC data reading and response calculation.
+    filepath = new file path (excel file path)
+    nobj = Objective data objectives names 
+    """
+    data = HPLC_data_read_csv(file_path)
+    response = response_HPLC_csv(data, YminRT, YmaxRT, IminRT, ImaxRT, minRTISO, maxRTISO, nobj)
+    return response
+
+
+def process_hplc_and_fill(filename: str, data_np: np.ndarray, lhs: pd.DataFrame, objectives: list, nobj, hplc_params: dict):
+    """Process HPLC data and update results."""
+    nobj = max(1, len(objectives))
+    # Calculate response
+    resp = response_HPLC_csv(
+        data_np,
+        hplc_params.get("YminRT", 2.0),
+        hplc_params.get("YmaxRT", 4.0),
+        hplc_params.get("IminRT_list", [0.5]),
+        hplc_params.get("ImaxRT_list", [1.0]),
+        hplc_params.get("minRTISO", 10.0),
+        hplc_params.get("maxRTISO", 12.0),
+        nobj
+    )
+
+    return resp
+
+
+def process_uploaded_csv_file(full_path_uploaded_csv,
+                              df,
+                              minRTISO,
+                              maxRTISO,
+                              YminRT,
+                              YmaxRT,
+                              IminRT_list,
+                              ImaxRT_list,
+                              transformed_objectives,
+                              lhs):
+    """
+    Process uploaded HPLC CSV file with proper column selection and RT parameter handling.
+    """
+    print(f"\n=== Processing HPLC File: {full_path_uploaded_csv} ===")
+    print(f"Available columns: {list(df.columns)}")
+    
+    # FIXED: Proper column selection for Area data
+    # Priority: Peak Area > Area > case-insensitive matching
+    area_col = None
+    rt_col = None
+    
+    # Find Area column
+    if 'Peak Area' in df.columns:
+        area_col = 'Peak Area'
+    elif 'Area' in df.columns:
+        area_col = 'Area'
+    else:
+        # Case-insensitive search
+        cols_lower = {c.lower(): c for c in df.columns}
+        if 'peak area' in cols_lower:
+            area_col = cols_lower['peak area']
+        elif 'area' in cols_lower:
+            area_col = cols_lower['area']
+        else:
+            raise ValueError(f"No Area column found. Available: {list(df.columns)}")
+    
+    # Find RT column
+    if 'RT' in df.columns:
+        rt_col = 'RT'
+    else:
+        cols_lower = {c.lower(): c for c in df.columns}
+        if 'rt' in cols_lower:
+            rt_col = cols_lower['rt']
+        else:
+            raise ValueError(f"No RT column found. Available: {list(df.columns)}")
+    
+    print(f"Using columns: Area='{area_col}', RT='{rt_col}'")
+    
+    # Extract data
+    data_np = df[[area_col, rt_col]].to_numpy()
+    print(f"Extracted {data_np.shape[0]} peaks from HPLC data")
+    
+    # Show data summary
+    if len(data_np) > 0:
+        rt_values = data_np[:, 1]
+        area_values = data_np[:, 0]
+        print(f"RT range in data: {rt_values.min():.3f} - {rt_values.max():.3f}")
+        print(f"Area range in data: {area_values.min():.3f} - {area_values.max():.3f}")
+        
+        # Show which peaks fall in each range
+        yield_peaks = sum(1 for rt in rt_values if YminRT <= rt <= YmaxRT)
+        iso_peaks = sum(1 for rt in rt_values if minRTISO <= rt <= maxRTISO)
+        print(f"Peaks in yield range [{YminRT}-{YmaxRT}]: {yield_peaks}")
+        print(f"Peaks in ISO range [{minRTISO}-{maxRTISO}]: {iso_peaks}")
+        
+        for i, (imin, imax) in enumerate(zip(IminRT_list, ImaxRT_list)):
+            imp_peaks = sum(1 for rt in rt_values if imin <= rt <= imax)
+            print(f"Peaks in impurity {i+1} range [{imin}-{imax}]: {imp_peaks}")
+    
+    # Build HPLC parameters dictionary
+    hplc_params = {
+        'YminRT': float(YminRT),
+        'YmaxRT': float(YmaxRT),
+        'minRTISO': float(minRTISO),
+        'maxRTISO': float(maxRTISO),
+        'IminRT_list': [float(x) for x in IminRT_list] if IminRT_list else [],
+        'ImaxRT_list': [float(x) for x in ImaxRT_list] if ImaxRT_list else [],
+    }
+    
+    print(f"Final HPLC Parameters: {hplc_params}")
+    
+    # Calculate response using the corrected function
+    resp = response_HPLC_csv(
+        data_np,
+        hplc_params['YminRT'],
+        hplc_params['YmaxRT'], 
+        hplc_params['IminRT_list'],
+        hplc_params['ImaxRT_list'],
+        hplc_params['minRTISO'],
+        hplc_params['maxRTISO'],
+        len(transformed_objectives)
+    )
+    
+    print(f"Calculated response: {resp}")
+    return resp
+
+
+def build_domain_from_df(df: pd.DataFrame, objectives: List[Dict[str, Any]]):
+    """Build optimization domain from DataFrame."""
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    domain = Domain()
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric columns to build domain.")
+
+    # Get objective column names to exclude them from input variables
+    objective_names = [obj.get("name", "").replace(" ", "_") for obj in objectives]
+
+    # Columns to exclude from optimization (identifiers, row numbers, etc.)
+    excluded_columns = [
+        "experiment", "experiments", "exp", "exp_num", "exp_no",
+        "id", "row", "index", "number", "no", "num", "run", "sample",
+        "sample_id", "sample_no", "sample_num", "iteration"
+    ]
+
+    # Add ALL numeric columns as input variables (except objectives and excluded columns)
+    for col in numeric_cols:
+        sanitized_name = str(col).replace(" ", "_")  # Replace spaces with underscores
+
+        # Skip if this column is an objective
+        if sanitized_name in objective_names:
+            continue
+
+        # Skip if this column is an identifier/excluded column
+        col_lower = str(col).lower().strip()
+        sanitized_lower = sanitized_name.lower()
+        if col_lower in excluded_columns or sanitized_lower in excluded_columns:
+            print(f"Skipping identifier column: {col}")
+            continue
+            
+        # Calculate bounds from existing data
+        col_data = df[col].dropna()  # Remove NaN values for bound calculation
+        if len(col_data) > 0:
+            lb = float(col_data.min())
+            ub = float(col_data.max())
+            if lb == ub:
+                lb -= 1e-6
+                ub += 1e-6
+        else:
+            # Default bounds if no data available
+            lb, ub = 0.0, 1.0
+            
+        domain += ContinuousVariable(name=sanitized_name, description=str(col), bounds=[lb, ub])
+
+    # Add objectives
+    for obj in objectives:
+        obj_name = obj.get("name", "obj").replace(" ", "_")  # Sanitize objective name
+        maximize = bool(obj.get("maximize", False))
+        domain += ContinuousVariable(
+            name=obj_name,
+            description=obj_name,
+            bounds=[0, 100],
+            is_objective=True,
+            maximize=maximize
         )
+    return domain
 
-        if hplc_file:
-            st.success(f"✅ File uploaded: {hplc_file.name}")
 
-            # Show preview of HPLC data
-            with st.expander("📋 HPLC Data Preview"):
-                df_hplc = pd.read_csv(hplc_file)
-                st.dataframe(df_hplc.head(10))
+def run_summit_optimization(domain, lhs_df: pd.DataFrame, nobj: int):
+    """Run Summit optimization."""
+    
+    print(f"Starting optimization with {len(lhs_df)} existing rows")
+    print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input vars, {len([v for v in domain.variables if v.is_objective])} objectives")
+    
+    # Prepare DataFrame for Summit - ensure proper column alignment
+    domain_var_names = [var.name for var in domain.variables if not var.is_objective]
+    domain_obj_names = [var.name for var in domain.variables if var.is_objective]
+    
+    print(f"Domain input variables: {domain_var_names}")
+    print(f"Domain objectives: {domain_obj_names}")
+    print(f"Original DataFrame columns: {list(lhs_df.columns)}")
+    
+    # Create a clean DataFrame with only the columns that match domain variables
+    lhs_clean = pd.DataFrame()
+    
+    # Map input variables
+    for var_name in domain_var_names:
+        # Try to find matching column in original DataFrame
+        found = False
+        for col in lhs_df.columns:
+            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+            if col_clean == var_name or str(col) == var_name:
+                lhs_clean[var_name] = lhs_df[col]
+                found = True
+                print(f"Mapped {col} -> {var_name}")
+                break
+        
+        if not found:
+            print(f"WARNING: Could not find column for variable {var_name}")
+            # If no matching column found, fill with NaN (this shouldn't happen with proper domain building)
+            lhs_clean[var_name] = np.nan
+    
+    # Map objective variables  
+    for obj_name in domain_obj_names:
+        found = False
+        for col in lhs_df.columns:
+            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
+            if col_clean == obj_name or str(col) == obj_name:
+                lhs_clean[obj_name] = lhs_df[col]
+                found = True
+                print(f"Mapped objective {col} -> {obj_name}")
+                break
+        
+        if not found:
+            # For objectives, we might not have data yet
+            lhs_clean[obj_name] = np.nan
+            print(f"No data for objective {obj_name}, using NaN")
+    
+    print(f"Clean DataFrame shape: {lhs_clean.shape}")
+    print(f"Clean DataFrame columns: {list(lhs_clean.columns)}")
+    
+    # Remove rows where ALL input variables are NaN (these can't be used for optimization)
+    input_vars_df = lhs_clean[domain_var_names]
+    valid_rows = ~input_vars_df.isna().all(axis=1)
+    lhs_clean_valid = lhs_clean[valid_rows].copy()
+    
+    print(f"Valid rows for optimization: {len(lhs_clean_valid)}")
+    
+    # Ensure we have some valid data
+    if len(lhs_clean_valid) == 0:
+        print("WARNING: No valid data rows found for optimization - generating random suggestion")
+        # Return a random suggestion based on domain bounds
+        out = pd.DataFrame()
+        for var in domain.variables:
+            if not var.is_objective:
+                # Generate random value within bounds
+                low, high = var.bounds
+                random_val = np.random.uniform(low, high)
+                out[var.name] = [random_val]
+                print(f"Random suggestion for {var.name}: {random_val} (bounds: {low}-{high})")
+        print(f"Generated random DataFrame shape: {out.shape}")
+        return out
+    
+    # Create DataSet for Summit
+    try:
+        print("Creating DataSet...")
+        lhs_ds = DataSet.from_df(lhs_clean_valid)
+        print(f"DataSet created successfully with {len(lhs_ds)} rows")
+    except Exception as e:
+        print(f"Failed to create DataSet: {e}")
+        print("Generating random fallback...")
+        # Fallback to random suggestion
+        out = pd.DataFrame()
+        for var in domain.variables:
+            if not var.is_objective:
+                low, high = var.bounds
+                random_val = np.random.uniform(low, high)
+                out[var.name] = [random_val]
+        return out
+    
+    # Run optimization
+    if nobj > 1:
+        try:
+            print("Trying TSEMO optimization...")
+            strat = TSEMO(domain, random_rate=0.00, n_spectral_points=min(4000, len(lhs_clean_valid) * 100))
+            out = strat.suggest_experiments(1, lhs_ds, use_spectral_sample=True, pop_size=50, iterations=50)
+            print("TSEMO optimization successful")
+        except Exception as e:
+            print(f"TSEMO failed with error: {e}")
+            print("Falling back to SNOBFIT...")
+            try:
+                strat = SNOBFIT(domain)
+                out = strat.suggest_experiments(1, lhs_ds)
+                print("SNOBFIT optimization successful")
+            except Exception as e2:
+                print(f"SNOBFIT also failed: {e2}")
+                print("Using random fallback...")
+                # Final fallback to random
+                out = pd.DataFrame()
+                for var in domain.variables:
+                    if not var.is_objective:
+                        low, high = var.bounds
+                        random_val = np.random.uniform(low, high)
+                        out[var.name] = [random_val]
+                print(f"Random fallback generated: {out.to_dict('records')[0] if len(out) > 0 else 'EMPTY'}")
+                return out
+    else:
+        try:
+            print("Using SNOBFIT optimization...")
+            strat = SNOBFIT(domain)
+            out = strat.suggest_experiments(1, lhs_ds)
+            print("SNOBFIT optimization successful")
+        except Exception as e:
+            print(f"SNOBFIT failed: {e}")
+            print("Using random fallback...")
+            # Fallback to random
+            out = pd.DataFrame()
+            for var in domain.variables:
+                if not var.is_objective:
+                    low, high = var.bounds
+                    random_val = np.random.uniform(low, high)
+                    out[var.name] = [random_val]
+            return out
+    
+    # Clean up output
+    if "strategy" in out.columns:
+        out = out.drop(columns=["strategy"])
+    
+    print(f"Final optimization output shape: {out.shape}")
+    print(f"Final optimization output columns: {list(out.columns)}")
+    
+    # Handle MultiIndex columns if present
+    if isinstance(out.columns, pd.MultiIndex):
+        print("MultiIndex columns detected, flattening...")
+        # Flatten MultiIndex columns by taking the first level or combining levels
+        new_columns = []
+        for col in out.columns:
+            if isinstance(col, tuple):
+                # Take the first non-empty element from the tuple
+                name = next((str(x) for x in col if str(x).strip() and str(x) != 'nan'), str(col[0]))
+                new_columns.append(name)
+            else:
+                new_columns.append(str(col))
+        out.columns = new_columns
+        print(f"Flattened columns: {list(out.columns)}")
+    
+    # Show a sample of the actual data
+    if len(out) > 0:
+        sample_dict = {}
+        for col in out.columns[:5]:  # Show first 5 columns as sample
+            sample_dict[col] = out[col].iloc[0]
+        print(f"Sample output data: {sample_dict}")
+    
+    return out
 
-                if 'RT' in df_hplc.columns:
-                    st.text(f"RT range: {df_hplc['RT'].min():.3f} - {df_hplc['RT'].max():.3f}")
-                if 'Area' in df_hplc.columns or 'Peak Area' in df_hplc.columns:
-                    area_col = 'Area' if 'Area' in df_hplc.columns else 'Peak Area'
-                    st.text(f"Total peaks: {len(df_hplc)}")
 
-            if st.button("🔬 Process HPLC File"):
-                with st.spinner("Processing HPLC data..."):
-                    try:
-                        # Reset file pointer to beginning before reading again
-                        hplc_file.seek(0)
-                        # Read HPLC file
-                        df_hplc = pd.read_csv(hplc_file)
+def suggest_experiments_and_append(num_suggestions: int, objectives: List[Dict[str, Any]], lhs):
+    """
+    Fixed to generate only the specified number of suggestions one at a time.
+    This ensures proper SOR iteration control.
+    """
+    try:
+        print("Building domain...")
+        domain = build_domain_from_df(lhs, objectives)
+        print(f"Domain created successfully")
+        print(f"Domain has {len([v for v in domain.variables if not v.is_objective])} input variables and {len([v for v in domain.variables if v.is_objective])} objectives")
 
-                        # Extract RT parameters
-                        YminRT = st.session_state.rtmin_list[0]
-                        YmaxRT = st.session_state.rtmax_list[0]
-                        IminRT_list = st.session_state.rtmin_list[1:]
-                        ImaxRT_list = st.session_state.rtmax_list[1:]
+        # Print domain details
+        input_vars = [v.name for v in domain.variables if not v.is_objective]
+        obj_vars = [v.name for v in domain.variables if v.is_objective]
+        print(f"Input variables: {input_vars}")
+        print(f"Objective variables: {obj_vars}")
 
-                        # Process HPLC file
-                        resp = utils.process_uploaded_csv_file(
-                            hplc_file.name,
-                            df_hplc,
-                            st.session_state.iso_rtmin,
-                            st.session_state.iso_rtmax,
-                            YminRT,
-                            YmaxRT,
-                            IminRT_list,
-                            ImaxRT_list,
-                            st.session_state.objectives,
-                            st.session_state.experiment_data
-                        )
+    except Exception as e:
+        raise RuntimeError(f"Domain build failed: {e}")
 
-                        st.success("✅ HPLC processing completed!")
+    # FIXED: Only generate ONE suggestion per call, not num_suggestions
+    # This allows proper control of SOR iterations
+    print(f"\n=== Generating 1 suggestion (requested: {num_suggestions}) ===")
 
-                        # Display calculated responses
-                        st.subheader("📈 Calculated Objective Values")
-                        for i, (obj, val) in enumerate(zip(st.session_state.objectives, resp)):
-                            obj_type = "Yield" if i == 0 else f"Impurity {i}"
-                            st.metric(
-                                f"{obj['name']} ({obj_type})",
-                                f"{val:.4f}",
-                                help=f"RT range: [{st.session_state.rtmin_list[i]:.2f} - {st.session_state.rtmax_list[i]:.2f}]"
-                            )
+    try:
+        out = run_summit_optimization(domain, lhs, len(objectives) or 1)
+        print(f"Optimization returned: {type(out)}, shape: {out.shape if hasattr(out, 'shape') else 'N/A'}")
 
-                        # Update experiment data
-                        current_row_idx = st.session_state.completed
-                        for i, obj in enumerate(st.session_state.objectives):
-                            st.session_state.experiment_data.at[current_row_idx, obj['name']] = resp[i]
+        if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
+            print(f"Optimization output shape: {out.shape}")
+            print(f"Optimization output columns: {list(out.columns)}")
 
-                        st.session_state.completed += 1
+            # Convert to dictionary - handle potential MultiIndex columns
+            try:
+                suggested = out.iloc[0].to_dict()
+                print(f"Raw suggestions from optimization: {dict(list(suggested.items())[:5])}...")
+            except Exception as e:
+                print(f"Error converting output to dict: {e}")
+                suggested = {}
+        else:
+            suggested = {}
+            print("WARNING: No suggestions returned from optimization, using empty dict")
 
-                        # Check phase transition
-                        if st.session_state.phase == 'lhs' and st.session_state.completed >= st.session_state.num_lhs:
-                            st.success("🎉 LHS Phase Completed! Moving to SOR Phase...")
+        # Create new row with proper column mapping
+        new_row = {}
+        print("Mapping suggestions to original columns:")
 
-                            # Generate first SOR row
-                            with st.spinner("Generating first SOR experiment..."):
-                                sor_df = utils.generate_multiple_sor_rows(
-                                    1,
-                                    st.session_state.objectives,
-                                    st.session_state.experiment_data
-                                )
-                                st.session_state.experiment_data = sor_df
-                                st.session_state.phase = 'sor'
-                                st.session_state.sor_iteration = 0
+        for col in lhs.columns:
+            # Check if we have a suggestion for this column
+            col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
 
-                            st.balloons()
+            if col_clean in suggested:
+                new_row[col] = suggested[col_clean]
+                print(f"  {col} <- {col_clean} = {suggested[col_clean]}")
+            elif col in suggested:
+                new_row[col] = suggested[col]
+                print(f"  {col} = {suggested[col]}")
+            else:
+                # For objective columns or unmapped columns, use NaN
+                new_row[col] = np.nan
+                print(f"  {col} = NaN (no suggestion)")
 
-                        elif st.session_state.phase == 'sor':
-                            st.session_state.sor_iteration += 1
+        print(f"Final new row: {new_row}")
+        lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+        print(f"Successfully added suggestion, total rows: {len(lhs_updated)}")
 
-                            if st.session_state.sor_iteration < st.session_state.num_sor_iterations:
-                                # Generate next SOR row
-                                with st.spinner(f"Generating SOR iteration {st.session_state.sor_iteration + 1}..."):
-                                    sor_df = utils.generate_multiple_sor_rows(
-                                        1,
-                                        st.session_state.objectives,
-                                        st.session_state.experiment_data
-                                    )
-                                    st.session_state.experiment_data = sor_df
-                            else:
-                                # All SOR iterations completed
-                                st.session_state.phase = 'completed'
-                                st.success("🎉 All experiments completed!")
-                                st.balloons()
+        return lhs_updated
 
-                        st.experimental_rerun()
+    except Exception as e:
+        print(f"ERROR generating suggestion: {e}")
+        import traceback
+        traceback.print_exc()
 
-                    except Exception as e:
-                        st.error(f"❌ Error processing HPLC file: {str(e)}")
-                        import traceback
-                        with st.expander("📋 Error Details"):
-                            st.code(traceback.format_exc())
+        # Create a row with all NaN values as fallback
+        new_row = {c: np.nan for c in lhs.columns}
+        print(f"Using fallback row with all NaN: {new_row}")
+        lhs_updated = pd.concat([lhs, pd.DataFrame([new_row])], ignore_index=True)
+        return lhs_updated
 
-elif st.session_state.phase == 'completed':
-    st.success("🎉 All Experiments Completed!")
 
-    st.subheader("📊 Final Results")
-    st.dataframe(st.session_state.experiment_data, height=600)
+def generate_multiple_sor_rows(num_iterations: int, objectives: List[Dict[str, Any]], lhs):
+    """
+    Generate multiple SOR experiment rows at once (without objectives filled).
+    This is used to pre-generate all SOR iterations upfront.
 
-    # Download results
-    col1, col2 = st.columns(2)
-    with col1:
-        csv = st.session_state.experiment_data.to_csv(index=False)
-        st.download_button(
-            label="📥 Download as CSV",
-            data=csv,
-            file_name=f"sor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
+    Parameters:
+    - num_iterations: Number of SOR rows to generate
+    - objectives: List of objective definitions
+    - lhs: Current DataFrame with LHS data
 
-    with col2:
-        # Convert to Excel bytes
-        from io import BytesIO
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            st.session_state.experiment_data.to_excel(writer, index=False, sheet_name='Results')
-        excel_data = output.getvalue()
+    Returns:
+    - DataFrame with all rows (LHS + generated SOR rows with empty objectives)
+    """
+    print(f"\n=== Generating {num_iterations} SOR rows upfront ===")
 
-        st.download_button(
-            label="📥 Download as Excel",
-            data=excel_data,
-            file_name=f"sor_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    current_df = lhs.copy()
 
-    # Summary statistics
-    st.subheader("📈 Summary Statistics")
+    for i in range(num_iterations):
+        print(f"\nGenerating SOR row {i+1}/{num_iterations}...")
 
-    obj_cols = [obj['name'] for obj in st.session_state.objectives]
-    if obj_cols:
-        summary_df = st.session_state.experiment_data[obj_cols].describe()
-        st.dataframe(summary_df)
+        try:
+            # Build domain from current data
+            domain = build_domain_from_df(current_df, objectives)
 
-        # Show best experiments
-        st.subheader("🏆 Best Results")
-        for obj in st.session_state.objectives:
-            col1, col2 = st.columns(2)
-            with col1:
-                if obj['maximize']:
-                    best_idx = st.session_state.experiment_data[obj['name']].astype(float).idxmax()
-                    best_val = st.session_state.experiment_data[obj['name']].iloc[best_idx]
-                    st.metric(
-                        f"Best {obj['name']} (Maximize)",
-                        f"{best_val:.4f}",
-                        delta=f"Row {best_idx + 1}"
-                    )
+            # Run optimization to get next suggestion
+            out = run_summit_optimization(domain, current_df, len(objectives) or 1)
+
+            if isinstance(out, pd.DataFrame) and out.shape[0] >= 1:
+                suggested = out.iloc[0].to_dict()
+            else:
+                suggested = {}
+                print("WARNING: No suggestions returned, using empty dict")
+
+            # Create new row with proper column mapping
+            new_row = {}
+
+            # Get objective column names to set them as empty
+            objective_names = [obj.get("name", "") for obj in objectives]
+
+            # Identifier columns that should be auto-incremented
+            id_columns = [
+                "experiment", "experiments", "exp", "exp_num", "exp_no",
+                "id", "row", "index", "number", "no", "num", "run", "sample",
+                "sample_id", "sample_no", "sample_num", "iteration"
+            ]
+
+            for col in current_df.columns:
+                col_lower = str(col).lower().strip()
+
+                # Check if this is an objective column
+                if col in objective_names:
+                    # Leave objectives empty for user to fill via HPLC (use NaN for numeric compatibility)
+                    new_row[col] = np.nan
+                    print(f"  {col} = NaN (objective - will be filled by HPLC)")
+                # Check if this is an identifier column - auto-increment it
+                elif col_lower in id_columns:
+                    last_val = current_df[col].dropna().iloc[-1] if len(current_df[col].dropna()) > 0 else 0
+                    new_row[col] = int(last_val) + 1
+                    print(f"  {col} = {new_row[col]} (auto-incremented)")
                 else:
-                    best_idx = st.session_state.experiment_data[obj['name']].astype(float).idxmin()
-                    best_val = st.session_state.experiment_data[obj['name']].iloc[best_idx]
-                    st.metric(
-                        f"Best {obj['name']} (Minimize)",
-                        f"{best_val:.4f}",
-                        delta=f"Row {best_idx + 1}"
-                    )
+                    # Fill input variables from optimization suggestion
+                    col_clean = str(col).replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_")
 
-# Footer
-st.markdown("---")
-st.caption("🧪 SOR HPLC Testing Tool - Local Testing Environment")
+                    if col_clean in suggested:
+                        new_row[col] = suggested[col_clean]
+                        print(f"  {col} <- {col_clean} = {suggested[col_clean]}")
+                    elif col in suggested:
+                        new_row[col] = suggested[col]
+                        print(f"  {col} = {suggested[col]}")
+                    else:
+                        # For unmapped input columns, use NaN
+                        new_row[col] = np.nan
+                        print(f"  {col} = NaN (no suggestion)")
+
+            # Append the new row
+            current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
+            print(f"Added SOR row {i+1}, total rows now: {len(current_df)}")
+
+        except Exception as e:
+            print(f"ERROR generating SOR row {i+1}: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Create a fallback row with NaN objectives and NaN for inputs
+            objective_names = [obj.get("name", "") for obj in objectives]
+            id_columns = [
+                "experiment", "experiments", "exp", "exp_num", "exp_no",
+                "id", "row", "index", "number", "no", "num", "run", "sample",
+                "sample_id", "sample_no", "sample_num", "iteration"
+            ]
+            new_row = {}
+            for col in current_df.columns:
+                col_lower = str(col).lower().strip()
+                if col in objective_names:
+                    new_row[col] = np.nan
+                elif col_lower in id_columns:
+                    last_val = current_df[col].dropna().iloc[-1] if len(current_df[col].dropna()) > 0 else 0
+                    new_row[col] = int(last_val) + 1
+                else:
+                    new_row[col] = np.nan
+
+            current_df = pd.concat([current_df, pd.DataFrame([new_row])], ignore_index=True)
+            print(f"Used fallback row for SOR {i+1}")
+
+    print(f"\n=== Successfully generated {num_iterations} SOR rows ===")
+    print(f"Total rows in DataFrame: {len(current_df)}")
+
+    return current_df
