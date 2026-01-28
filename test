@@ -24,7 +24,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # MongoDB Setup
 try:
-    client = MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=5000)
+    client = MongoClient("mongodb://10.98.4.54:27017", serverSelectionTimeoutMS=5000)
     client.server_info()
     print("✅ MongoDB is reachable")
 except Exception as e:
@@ -34,12 +34,12 @@ db = client["self_optimization_reactions"]
 collection = db["self_optimization_reactions"]
 
 # Redis Setup
-try:
-    redis_client = redis.Redis(host='localhost', port=6379, db=12, decode_responses=True)
-    redis_client.ping()
-    print("✅ Redis is reachable")
-except Exception as e:
-    print("❌ Redis connection failed:", e)
+# try:
+#     redis_client = redis.Redis(host='localhost', port=6379, db=12, decode_responses=True)
+#     redis_client.ping()
+#     print("✅ Redis is reachable")
+# except Exception as e:
+#     print("❌ Redis connection failed:", e)
 
 # FastAPI App Initialization
 app = FastAPI(
@@ -100,6 +100,7 @@ async def login(user_info: dict = Depends(config.check_ldap_auth)):
         "completed": 1,
     }
     result = collection.insert_one(login_record)
+    print(result,'----------')
     return {
         "access_token": access_token,
         "token_type": "Bearer",
@@ -154,31 +155,96 @@ async def update_experiment(id: str, request: Request, user: str = Depends(get_c
         result = collection.update_one({"_id": object_id}, {"$set": {key: value}})
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Experiment not found")
+
         if key == "optimization_target":
             experiment = collection.find_one({"_id": object_id})
             lhs_response_data = experiment.get("lhs_response")
             objectives = value.get("objectives", {}).get("Objectives", [])
             lhs_table = lhs_response_data.get("table") if isinstance(lhs_response_data, dict) else []
+            
             if lhs_table and isinstance(lhs_table, list):
                 input_headers = lhs_table[0]
                 data_rows = lhs_table[1:]
                 merged_headers = input_headers + objectives
-                merged_rows = [row + [""] * len(objectives) for row in data_rows]
+                
+                # ✅ CRITICAL FIX: Convert all data rows to numeric
+                print(f"\n{'='*60}")
+                print("CONVERTING LHS DATA TO NUMERIC")
+                print(f"{'='*60}")
+                print(f"Original data rows: {len(data_rows)}")
+                print(f"Columns per row: {len(data_rows[0]) if data_rows else 0}")
+                
+                numeric_data_rows = []
+                for row_idx, row in enumerate(data_rows):
+                    numeric_row = []
+                    for col_idx, val in enumerate(row):
+                        # Try to convert to float
+                        try:
+                            if val == '' or val is None:
+                                numeric_val = val  # Keep empty strings for objectives
+                            else:
+                                numeric_val = float(val)
+                            numeric_row.append(numeric_val)
+                        except (ValueError, TypeError):
+                            # If conversion fails, keep original value
+                            numeric_row.append(val)
+                            print(f"  WARNING: Could not convert row {row_idx}, col {col_idx}: {val} (type: {type(val).__name__})")
+                    
+                    numeric_data_rows.append(numeric_row)
+                
+                # Show sample conversion
+                if numeric_data_rows:
+                    print(f"\nSample row conversion:")
+                    print(f"  Original: {data_rows[0]}")
+                    print(f"  Numeric:  {numeric_data_rows[0]}")
+                
+                # Add empty strings for objectives
+                merged_rows = [row + [""] * len(objectives) for row in numeric_data_rows]
                 final_result = [merged_headers] + merged_rows
+                
+                print(f"\n✓ Created final_result with {len(merged_rows)} data rows")
+                
+                # Save to Excel with numeric conversion
                 hplc_path = value.get("hplcPath")
                 if hplc_path:
                     excel_path = os.path.join(hplc_path, "optimization.xlsx")
                     try:
+                        # Create DataFrame
+                        df = pd.DataFrame(merged_rows, columns=merged_headers)
+                        
+                        # Convert all columns to numeric (except objectives which are empty strings)
+                        print(f"\nConverting DataFrame columns to numeric before saving to Excel...")
+                        for col in df.columns:
+                            if col not in objectives:  # Don't convert objective columns (they're empty strings)
+                                original_dtype = df[col].dtype
+                                df[col] = pd.to_numeric(df[col], errors='coerce')
+                                new_dtype = df[col].dtype
+                                print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
+                        
+                        # Save to Excel
                         wb = Workbook()
                         ws = wb.active
                         ws.title = "Optimization Result"
-                        for row in final_result:
+                        
+                        # Write headers
+                        ws.append(merged_headers)
+                        
+                        # Write data rows (convert to list to ensure proper Excel formatting)
+                        for row in df.values.tolist():
                             ws.append(row)
+                        
                         wb.save(excel_path)
+                        print(f"✓ Excel file saved to: {excel_path}")
+                        
                     except Exception as e:
-                        raise HTTPException(status_code=500, detail=f"Failed to write Excel file: {str(e)}")
+                        raise HTTPException(status_code=500, detail=f"Failed to writtttttte Excel file: {str(e)}")
+                
                 collection.update_one({"_id": object_id}, {"$set": {"final_result": final_result}})
-        return {"message": "updated successfully"}
+
+
+                return {"message": "updated successfully"}
+
+
     except InvalidId:
         raise HTTPException(status_code=400, detail="Invalid MongoDB ID format")
     except Exception as e:
@@ -211,21 +277,6 @@ async def get_experiment(id: str, user: str = Depends(get_current_user)):
     experiment["_id"] = str(experiment["_id"])
     return {"source": "mongodb", "data": experiment}
 
-# Helper function to check if a value is empty (handles '', NaN, None)
-def is_empty_value(val):
-    if val == '' or val is None:
-        return True
-    # Check for NaN (works for float NaN)
-    try:
-        if pd.isna(val):
-            return True
-    except (TypeError, ValueError):
-        pass
-    # Check string representation of nan
-    if isinstance(val, str) and val.lower() in ('nan', 'none', ''):
-        return True
-    return False
-
 # Function to merge and save final result
 def merge_and_save_final_result(full_path, object_id, response):
     experiment = collection.find_one({"_id": ObjectId(object_id)})
@@ -238,17 +289,12 @@ def merge_and_save_final_result(full_path, object_id, response):
         raise ValueError("final_result must contain enough rows to update")
 
     row = final_result[completed]
-    # Find empty indices - now handles '', NaN, None, and 'nan' string
-    empty_indices = [i for i, val in enumerate(row) if is_empty_value(val)]
-    print(f"Row {completed}: Found {len(empty_indices)} empty cells at indices {empty_indices}")
-    print(f"Row values before update: {row}")
-
+    empty_indices = [i for i, val in enumerate(row) if val == '']
     for i, val in zip(empty_indices[-len(response):], response):
         row[i] = val
     final_result[completed] = row
-    print(f"Row values after update: {row}")
-
     df = pd.DataFrame(final_result[1:], columns=final_result[0])
+    print(df ,"Dataframe before insertions")
     df.to_excel(full_path, index=False)
     collection.update_one(
         {"_id": ObjectId(object_id)},
@@ -282,18 +328,11 @@ class WebSocketNotifier(FileSystemEventHandler):
             raw_objectives = optimization.get("objectives", {})
             
             # CORRECTED: Extract RT parameters properly from UI input
-            # UI provides RTMin and RTMax as arrays where each pair defines a specific RT range:
-            # - RTMin[0], RTMax[0] = Yield RT range 
-            # - RTMin[1], RTMax[1] = First impurity RT range
-            # - RTMin[2], RTMax[2] = Second impurity RT range, etc.
             objectives_rtmin = raw_objectives.get('RTMin', [])
             objectives_rtmax = raw_objectives.get('RTMax', [])
             
             print(f"Raw RT Min from UI: {objectives_rtmin}")
             print(f"Raw RT Max from UI: {objectives_rtmax}")
-            
-            # CORRECTED: RT pairs should be interpreted as compound-specific ranges
-            # Each RTMin[i] pairs with RTMax[i] to define a specific compound's RT range
             
             if len(objectives_rtmin) != len(objectives_rtmax):
                 raise ValueError(f"RTMin and RTMax arrays must have same length: {len(objectives_rtmin)} vs {len(objectives_rtmax)}")
@@ -310,13 +349,6 @@ class WebSocketNotifier(FileSystemEventHandler):
                 if str(objectives_rtmin[i]).strip() != '' and str(objectives_rtmax[i]).strip() != '':
                     IminRT_list.append(float(objectives_rtmin[i]))
                     ImaxRT_list.append(float(objectives_rtmax[i]))
-            
-            # ALTERNATIVE: If your UI means consecutive RT values define ranges
-            # Uncomment this section if RT values are meant to be consecutive boundaries:
-            # YminRT = float(objectives_rtmin[0])
-            # YmaxRT = float(objectives_rtmin[1]) if len(objectives_rtmin) > 1 else float(objectives_rtmax[0])
-            # IminRT_list = [float(objectives_rtmax[0])] if len(objectives_rtmax) > 1 else []
-            # ImaxRT_list = [float(objectives_rtmax[1])] if len(objectives_rtmax) > 1 else []
             
             # Internal Standard RT range from separate UI fields
             minRTISO = float(optimization.get("rtMinIso", 0))
@@ -346,11 +378,7 @@ class WebSocketNotifier(FileSystemEventHandler):
                     if not (max1 <= min2 or max2 <= min1):  # Ranges overlap
                         print(f"WARNING: {name1} [{min1}-{max1}] overlaps with {name2} [{min2}-{max2}]")
             
-            # Transform objectives dynamically
-            lhs = experiment.get('final_result')
-            df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
-            llm_response_with_objective_columns = df_experiment.apply(pd.to_numeric, errors='coerce')
-            
+            # ✅ CRITICAL FIX: Transform objectives BEFORE using it
             transformed_objectives = []
             for i, name in enumerate(raw_objectives.get("Objectives", [])):
                 obj = {
@@ -360,6 +388,49 @@ class WebSocketNotifier(FileSystemEventHandler):
                 if i < len(raw_objectives.get("Property", [])):
                     obj["Property"] = raw_objectives["Property"][i]
                 transformed_objectives.append(obj)
+            
+            print(f"\nTransformed objectives: {transformed_objectives}")
+            
+            # NOW we can use transformed_objectives to prepare the DataFrame
+            lhs = experiment.get('final_result')
+            df_experiment = pd.DataFrame(lhs[1:], columns=lhs[0])
+
+            # ✅ CRITICAL FIX: Convert ALL columns to numeric
+            print(f"\n{'='*60}")
+            print("PREPARING DATAFRAME FOR OPTIMIZATION")
+            print(f"{'='*60}")
+            print(f"Original DataFrame shape: {df_experiment.shape}")
+            print(f"Original DataFrame columns: {list(df_experiment.columns)}")
+            print(f"Original DataFrame dtypes:\n{df_experiment.dtypes}")
+
+            # Get objective names
+            objective_names = [obj.get("name", "") for obj in transformed_objectives]
+            print(f"\nObjective columns: {objective_names}")
+
+            # Convert ALL columns to numeric
+            df_numeric = pd.DataFrame()
+            for col in df_experiment.columns:
+                original_dtype = df_experiment[col].dtype
+                original_sample = df_experiment[col].iloc[0] if len(df_experiment) > 0 else None
+                
+                # Convert to numeric, coerce errors (like empty strings) to NaN
+                df_numeric[col] = pd.to_numeric(df_experiment[col], errors='coerce')
+                
+                new_dtype = df_numeric[col].dtype
+                new_sample = df_numeric[col].iloc[0] if len(df_numeric) > 0 else None
+                non_null_count = df_numeric[col].notna().sum()
+                
+                print(f"  {col:30s}: {original_dtype} -> {new_dtype}")
+                print(f"    Sample: {original_sample} -> {new_sample} ({non_null_count}/{len(df_numeric)} valid)")
+
+            llm_response_with_objective_columns = df_numeric
+
+            print(f"\nConverted DataFrame dtypes:\n{llm_response_with_objective_columns.dtypes}")
+            print(f"\nSample data (first row):")
+            if len(llm_response_with_objective_columns) > 0:
+                for col in llm_response_with_objective_columns.columns:
+                    val = llm_response_with_objective_columns[col].iloc[0]
+                    print(f"  {col:30s}: {val} (type: {type(val).__name__})")
 
             # Read and process the uploaded HPLC CSV file
             try:
@@ -432,9 +503,31 @@ class WebSocketNotifier(FileSystemEventHandler):
                     # Generate FIRST SOR row based on all LHS rows (with optimized inputs, empty objectives)
                     print(f"Generating first SOR row based on {len(updated_df)} completed LHS experiments...")
                     sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
+                    """
+                    sor_response_new_row it has nan values for the objectives for example
+                     [6.3570808872, 1.2454882244000003, 
+                        108.64854311039998, 0.41620423900000003, 1.9194041213000004, 3.5338111200000006, nan, nan // these values are getting generated by 
+                        process_uploaded_csv_file function we need to merge ]
+                    """
+                    print(sor_response_new_row,'-------------------SOR New Row')
+                    final = utils.process_uploaded_csv_file(
+                        full_path_uploaded_csv,
+                        df_hplc,
+                        minRTISO,
+                        maxRTISO,
+                        YminRT,
+                        YmaxRT,
+                        IminRT_list,
+                        ImaxRT_list,
+                        transformed_objectives,
+                        llm_response_with_objective_columns
+                    )
+
 
                     # Update final_result with the first SOR row
                     final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                    print(final_result,'_______________FINAL RESULT')
+
                     collection.update_one(
                         {"_id": object_id},
                         {
@@ -461,8 +554,12 @@ class WebSocketNotifier(FileSystemEventHandler):
                             print(f"Generating SOR iteration {current_sor_iteration + 1}/{user_sor_iterations} based on {len(updated_df)} completed experiments...")
                             sor_response_new_row = utils.generate_multiple_sor_rows(1, transformed_objectives, updated_df)
 
+
+                            print(sor_response_new_row,'-------------------SOR new ROw final')
+
                             # Update final_result with the new SOR row
                             final_result = [sor_response_new_row.columns.tolist()] + sor_response_new_row.values.tolist()
+                            
                             collection.update_one(
                                 {"_id": object_id},
                                 {
@@ -499,7 +596,6 @@ class WebSocketNotifier(FileSystemEventHandler):
             # Send message to WebSocket clients
             for ws, _ in self.websocket_clients:
                 asyncio.run_coroutine_threadsafe(ws.send_text(message), self.loop)
-
 
 # Function to start watcher
 def start_watcher(path, websocket_clients, loop, id):
