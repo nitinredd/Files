@@ -1,1123 +1,3 @@
-#backend
-import json
-import logging
-import re
-from dataclasses import dataclass, field
-from typing import List, Dict, Any
-
-from langchain.schema import HumanMessage, SystemMessage
-
-logger = logging.getLogger(__name__)
-
-TECHNIQUE_MAP = {
-    "characterization": "CHAIN-OF-THOUGHT",
-    "HPLC": "CHAIN-OF-THOUGHT",
-    "impurities": "TREE-OF-THOUGHT",
-    "troubleshooting": "MULTI-MODAL",
-    "documentation": "ROLE-BASED",
-    "SOP": "ROLE-BASED",
-    "method_development": "CHAIN-OF-THOUGHT",
-    "stability": "CHAIN-OF-THOUGHT",
-    "dissolution": "CHAIN-OF-THOUGHT",
-    "general": "CHAIN-OF-THOUGHT",
-}
-
-# ─── Conversational detection ────────────────────────────────────────────────
-
-_CONVERSATIONAL_PATTERNS = [
-    r"^(hello|hi|hey|greetings|howdy|hiya|sup|yo|good\s*(morning|afternoon|evening))\b",
-    r"^(help|test|testing|ping)\s*[!?.]*$",
-    r"(what can you|what do you|how do you|who are you|what is this|how does this|what is prompt|tell me about prompt|explain prompt)",
-    r"^(what|how|tell me about|explain).{0,40}(yourself|this tool|this app|prompt coach)\b",
-]
-
-CONVERSATIONAL_RESPONSE = (
-    "Prompt Coach is active.\n\n"
-    "I reconstruct vague or incomplete queries into precision expert prompts for pharmaceutical "
-    "analytical scientists. I am trained on five analytical science scenarios:\n\n"
-    "1. Molecular Profile Understanding — comprehensive API characterisation from DMF or public sources, "
-    "covering chemical identity, physicochemical properties, solid state attributes, and chromatographic behaviour\n\n"
-    "2. Impurity and Degradant Identification — process impurity and degradant profiling with structural class, "
-    "RP-HPLC retention behaviour, and control strategy recommendations\n\n"
-    "3. Analytical Method Development — HPLC-UV conditions, column chemistry, mobile phase composition, "
-    "gradient design, flow rate, and UV detection wavelength selection\n\n"
-    "4. Chromatographic Troubleshooting — visual chromatogram analysis with ranked root cause assessment, "
-    "corrective actions, and parameter change recommendations\n\n"
-    "5. SOP Documentation — regulatory-ready system suitability templates with acceptance criteria, "
-    "calculations, and results tables aligned with ICH and USP standards\n\n"
-    "Type any analytical science query — rough notes, incomplete thoughts, or precise specifications — "
-    "and I will reconstruct it into a structured, regulatory-aware expert prompt."
-)
-
-
-def _is_conversational(query: str) -> bool:
-    """Detect greetings, meta-questions, and off-topic inputs."""
-    q = query.lower().strip().rstrip("!?.,;: ")
-    words = q.split()
-
-    # Short greetings / meta (1–3 words)
-    if len(words) <= 3:
-        openers = {
-            "hello", "hi", "hey", "greetings", "howdy", "yo", "sup", "hiya",
-            "help", "test", "testing", "ping", "check",
-        }
-        if words and words[0] in openers:
-            return True
-
-    for pattern in _CONVERSATIONAL_PATTERNS:
-        if re.search(pattern, q):
-            return True
-
-    return False
-
-
-# ─── Markdown stripping ──────────────────────────────────────────────────────
-
-def strip_markdown(text: str) -> str:
-    """
-    Remove common markdown formatting artifacts from LLM output.
-    Preserves natural paragraph structure, numbered lists, and hyphen bullets.
-    """
-    # Headers: ## Header → Header (preserve the text)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # Bold: **text** → text
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
-    # Bold: __text__ → text
-    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.DOTALL)
-    # Italic: *text* → text (conservative — avoids stripping % or math *)
-    text = re.sub(r"(?<!\*)\*([^\*\n]{1,200}?)\*(?!\*)", r"\1", text)
-    # Italic: _text_ → text (word-boundary aware)
-    text = re.sub(r"(?<!\w)_([^_\n]{1,200}?)_(?!\w)", r"\1", text)
-    # Em-dash bullets at line start: — item → - item
-    text = re.sub(r"^—\s+", "- ", text, flags=re.MULTILINE)
-    # Horizontal rules
-    text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
-    # Collapse 3+ consecutive newlines → 2
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-# ─── Principle Engine ────────────────────────────────────────────────────────
-
-NO_MARKDOWN_INSTRUCTION = (
-    "Write in clean plain text only. Do not use markdown formatting of any kind: "
-    "no asterisks for bold or italic, no # headers, no em-dashes (—) as list markers, "
-    "no horizontal rules (---). "
-    "Use numbered lists (1. 2. 3.) or hyphen bullets (- ) for structure. "
-    "Use clear heading words followed by a colon rather than markdown headers."
-)
-
-
-@dataclass
-class PrincipleEngine:
-    structural_rules: List[str] = field(default_factory=list)
-    anti_patterns: List[str] = field(default_factory=list)
-    style_constitution: Dict[str, Any] = field(default_factory=dict)
-    intent_mappings: Dict[str, str] = field(default_factory=dict)
-    loaded: bool = False
-
-
-@dataclass
-class IntentObject:
-    domain: str
-    task_type: str
-    primary_intent: str
-    implicit_constraints: List[str]
-    missing_parameters: List[str]
-    unique_payload: Dict[str, Any]
-    confidence_score: float
-
-
-def _strip_json_fences(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
-        text = "\n".join(inner)
-    return text.strip()
-
-
-# ─── Agent ───────────────────────────────────────────────────────────────────
-
-class PromptCoachAgent:
-    def __init__(self, chat_model, sample_prompts: List[Dict]):
-        self.chat_model = chat_model
-        self.sample_prompts = sample_prompts
-        self.principle_engine = PrincipleEngine()
-
-    async def initialize(self):
-        logger.info("Initializing PromptCoachAgent — extracting curriculum from sample prompts...")
-
-        prompts_text = "\n\n".join([
-            f"SCENARIO: {p['scenario']}\nTECHNIQUE: {p['technique']}\nPROMPT:\n{p['prompt']}"
-            for p in self.sample_prompts
-        ])
-
-        extraction_system = (
-            "You are a prompt engineering analyst specializing in pharmaceutical analytical science. "
-            "Extract meta-principles from the sample prompts and return a JSON object:\n"
-            '{\n'
-            '  "structural_rules": ["rule1", ...],\n'
-            '  "anti_patterns": ["anti1", ...],\n'
-            '  "style_constitution": {"register": "...", "precision_level": "...", '
-            '"regulatory_awareness": "...", "domain_vocabulary": ["term1", ...]},\n'
-            '  "intent_mappings": {"characterization": "...", "troubleshooting": "...", '
-            '"documentation": "...", "method_development": "..."}\n'
-            "}\nReturn ONLY the JSON object."
-        )
-
-        extraction_human = (
-            f"Analyze these expert pharmaceutical analytical science prompts:\n\n{prompts_text}\n\n"
-            "Extract structural rules, anti-patterns, style constitution, and intent-to-structure mappings. "
-            "Return ONLY the JSON object."
-        )
-
-        try:
-            response = await self.chat_model.ainvoke([
-                SystemMessage(content=extraction_system),
-                HumanMessage(content=extraction_human),
-            ])
-            content = _strip_json_fences(response.content)
-            data = json.loads(content)
-            self.principle_engine.structural_rules = data.get("structural_rules", [])
-            self.principle_engine.anti_patterns = data.get("anti_patterns", [])
-            self.principle_engine.style_constitution = data.get("style_constitution", {})
-            self.principle_engine.intent_mappings = data.get("intent_mappings", {})
-            self.principle_engine.loaded = True
-            logger.info(
-                f"Principle engine loaded: {len(self.principle_engine.structural_rules)} rules, "
-                f"{len(self.principle_engine.anti_patterns)} anti-patterns"
-            )
-        except Exception as e:
-            logger.error(f"Curriculum extraction failed: {e}. Loading fallback principles.")
-            self._load_fallback_principles()
-
-    def _load_fallback_principles(self):
-        self.principle_engine.structural_rules = [
-            "Begin with a clear role definition: 'Act as [Expert Role]'",
-            "Specify the analytical context: technique, analyte, dosage form",
-            "Define the specific task with clear scope and deliverables",
-            "Include methodological constraints: acceptance criteria, regulatory references (ICH, USP, GMP)",
-            "Specify the output format explicitly: structure, headings, tables, regulatory-ready",
-        ]
-        self.principle_engine.anti_patterns = [
-            "Vague analyte references without chemical or structural context",
-            "Missing dosage form specification for quantitative methods",
-            "Absent acceptance criteria for system suitability or method validation tasks",
-            "Unspecified regulatory context (ICH guideline, USP chapter, GMP standard)",
-            "Undefined output format or reporting structure",
-        ]
-        self.principle_engine.style_constitution = {
-            "register": "Formal pharmaceutical scientific",
-            "precision_level": "High — specific parameters, concentrations, regulatory references",
-            "regulatory_awareness": "ICH guidelines, USP methods, GMP documentation standards",
-            "domain_vocabulary": [
-                "API", "DMF", "HPLC", "RP-HPLC", "USP", "ICH", "RSD",
-                "system suitability", "impurity", "degradant", "tailing factor",
-                "theoretical plates", "isocratic", "gradient", "C18",
-            ],
-        }
-        self.principle_engine.intent_mappings = {
-            "characterization": (
-                "DMF-anchored structured output: Chemical identity and structure, "
-                "Physicochemical properties, Solid state attributes, Chromatographic behaviour"
-            ),
-            "troubleshooting": (
-                "Ranked root cause analysis: Visual Observations, Defect Interpretation, "
-                "Likely Root Causes (ranked), Corrective Actions, Parameters to Change"
-            ),
-            "documentation": (
-                "Regulatory-ready SOP with acceptance criteria, calculations, "
-                "failure handling, and ready-to-use results table"
-            ),
-            "method_development": (
-                "Chromatographic parameter enumeration: column chemistry, mobile phase, "
-                "gradient or isocratic conditions, flow rate, column temperature, "
-                "injection volume, UV detection wavelength"
-            ),
-        }
-        self.principle_engine.loaded = True
-        logger.info("Fallback principles loaded.")
-
-    async def reconstruct(self, query: str) -> Dict[str, Any]:
-        # Conversational / off-topic input — fast path, no LLM call
-        if _is_conversational(query):
-            return {
-                "reconstructed_prompt": CONVERSATIONAL_RESPONSE,
-                "confidence": 1.0,
-                "strategy_used": "CONVERSATIONAL",
-                "technique": "DIRECT",
-                "tokens_estimate": len(CONVERSATIONAL_RESPONSE.split()),
-                "is_conversational": True,
-            }
-
-        intent = await self._extract_intent(query)
-
-        if intent.confidence_score > 0.7:
-            strategy = "PRINCIPLE SYNTHESIS"
-            reconstructed = await self._high_confidence_synthesis(query, intent)
-        elif intent.confidence_score >= 0.4:
-            strategy = "FRACTAL DECOMPOSITION"
-            reconstructed = await self._medium_confidence_synthesis(query, intent)
-        else:
-            strategy = "ANALOGICAL BRIDGING"
-            reconstructed = await self._low_confidence_synthesis(query, intent)
-
-        reconstructed = strip_markdown(reconstructed)
-        technique = TECHNIQUE_MAP.get(intent.domain, "CHAIN-OF-THOUGHT")
-        tokens_estimate = int(len(reconstructed.split()) * 1.35)
-
-        return {
-            "reconstructed_prompt": reconstructed,
-            "confidence": round(intent.confidence_score, 2),
-            "strategy_used": strategy,
-            "technique": technique,
-            "tokens_estimate": tokens_estimate,
-            "is_conversational": False,
-        }
-
-    async def _extract_intent(self, query: str) -> IntentObject:
-        system = (
-            "You are an intent extraction specialist for pharmaceutical analytical science prompts. "
-            "Analyze the user query and extract all signals, returning a JSON object:\n"
-            '{\n'
-            '  "domain": "HPLC|characterization|impurities|dissolution|SOP|stability|method_development|troubleshooting|general",\n'
-            '  "task_type": "identify|quantify|troubleshoot|document|develop|understand",\n'
-            '  "primary_intent": "one sentence description",\n'
-            '  "implicit_constraints": ["constraint1"],\n'
-            '  "missing_parameters": ["missing1"],\n'
-            '  "unique_payload": {"analyte": "...", "technique": "...", "dosage_form": "..."},\n'
-            '  "confidence_score": 0.0\n'
-            "}\n"
-            "Confidence: >0.7 = clear domain and task; 0.4-0.7 = recognisable but incomplete; <0.4 = very vague.\n"
-            "Return ONLY the JSON object."
-        )
-        human = f'Extract intent from: "{query}"'
-
-        try:
-            response = await self.chat_model.ainvoke([
-                SystemMessage(content=system),
-                HumanMessage(content=human),
-            ])
-            content = _strip_json_fences(response.content)
-            data = json.loads(content)
-            return IntentObject(
-                domain=data.get("domain", "general"),
-                task_type=data.get("task_type", "understand"),
-                primary_intent=data.get("primary_intent", query),
-                implicit_constraints=data.get("implicit_constraints", []),
-                missing_parameters=data.get("missing_parameters", []),
-                unique_payload=data.get("unique_payload", {}),
-                confidence_score=float(data.get("confidence_score", 0.5)),
-            )
-        except Exception as e:
-            logger.error(f"Intent extraction failed: {e}")
-            return IntentObject(
-                domain="general",
-                task_type="understand",
-                primary_intent=query,
-                implicit_constraints=[],
-                missing_parameters=[],
-                unique_payload={},
-                confidence_score=0.3,
-            )
-
-    def _base_system(self, extra: str = "") -> str:
-        rules_text = "\n".join(f"- {r}" for r in self.principle_engine.structural_rules)
-        anti_text = "\n".join(f"- {p}" for p in self.principle_engine.anti_patterns)
-        return (
-            "You are Prompt Coach — an autonomous prompt reconstruction engine for pharmaceutical analytical scientists.\n\n"
-            f"STRUCTURAL RULES:\n{rules_text}\n\n"
-            f"ANTI-PATTERNS TO AVOID:\n{anti_text}\n\n"
-            f"FORMATTING RULE: {NO_MARKDOWN_INSTRUCTION}\n\n"
-            "OUTPUT RULE: Return ONLY the reconstructed prompt. No preamble, no explanation, no labels.\n"
-            f"{extra}"
-        )
-
-    async def _high_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
-        mappings_text = "\n".join(
-            f"- {k}: {v}" for k, v in self.principle_engine.intent_mappings.items()
-        )
-        system = self._base_system(
-            f"INTENT-TO-STRUCTURE MAPPINGS:\n{mappings_text}\n\n"
-            "APPROACH: Direct principle-based synthesis. Apply structural rules precisely."
-        )
-        human = (
-            f'Original query: "{query}"\n\n'
-            f"Domain: {intent.domain} | Task: {intent.task_type}\n"
-            f"Intent: {intent.primary_intent}\n"
-            f"Implicit constraints: {', '.join(intent.implicit_constraints) or 'none'}\n"
-            f"Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n"
-            f"Payload: {json.dumps(intent.unique_payload)}\n\n"
-            "Reconstruct into a complete expert pharmaceutical analytical science prompt. "
-            "Return ONLY the prompt."
-        )
-        response = await self.chat_model.ainvoke([
-            SystemMessage(content=system),
-            HumanMessage(content=human),
-        ])
-        return response.content.strip()
-
-    async def _medium_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
-        system = self._base_system(
-            "APPROACH: Fractal decomposition. Resolve each component independently "
-            "(role, context, task, constraints, format) then synthesise into a single expert prompt."
-        )
-        human = (
-            f'Query: "{query}"\n'
-            f"Domain: {intent.domain} | Task: {intent.task_type}\n"
-            f"Intent: {intent.primary_intent}\n"
-            f"Missing: {', '.join(intent.missing_parameters) or 'none'}\n\n"
-            "Decompose and synthesise:\n"
-            "ROLE: appropriate pharmaceutical analytical expert title\n"
-            "CONTEXT: all inferable analytical context (technique, analyte, dosage form)\n"
-            "TASK: specific deliverable with scope\n"
-            "CONSTRAINTS: applicable ICH/USP/GMP standards and acceptance criteria\n"
-            "FORMAT: structured output specification\n\n"
-            "Return ONLY the final synthesised prompt."
-        )
-        response = await self.chat_model.ainvoke([
-            SystemMessage(content=system),
-            HumanMessage(content=human),
-        ])
-        return response.content.strip()
-
-    async def _low_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
-        system = self._base_system(
-            "APPROACH: Shadow Agent activated. Map to the most structurally similar known "
-            "analytical scenario using first-principles reasoning. Make no domain assumptions. "
-            "Build the most useful expert prompt possible from minimal signal.\n\n"
-            "Known scenarios: molecular characterisation, impurity profiling, method development, "
-            "chromatographic troubleshooting, SOP documentation, stability studies, dissolution testing."
-        )
-        human = (
-            f'Vague query: "{query}"\n'
-            f"Best intent read: {intent.primary_intent}\n"
-            f"Domain signal: {intent.domain}\n\n"
-            "Reconstruct into the most useful expert pharmaceutical analytical science prompt possible. "
-            "Return ONLY the prompt."
-        )
-        response = await self.chat_model.ainvoke([
-            SystemMessage(content=system),
-            HumanMessage(content=human),
-        ])
-        return response.content.strip()
-
-######################################
-######################################
-#frontend
-import { useState, useEffect, useRef, useCallback } from 'react'
-import PromptInput from './components/PromptInput'
-import SandDissolve from './components/SandDissolve'
-import ReconstructedPrompt from './components/ReconstructedPrompt'
-import HistorySidebar from './components/HistorySidebar'
-
-// ─── Constants ────────────────────────────────────────────────────────────────
-
-const APP_STATE = {
-  INPUT: 'input',
-  DISSOLVING: 'dissolving',
-  REVEAL: 'reveal',
-}
-
-const API = 'http://localhost:8000'
-
-const STATUS_CYCLE = ['EXTRACTING INTENT', 'MAPPING TO PRINCIPLES', 'SYNTHESISING']
-
-// ─── App ─────────────────────────────────────────────────────────────────────
-
-export default function App() {
-  // ── App state ──────────────────────────────────────────────────────────────
-  const [appState, setAppState] = useState(APP_STATE.INPUT)
-  const [backendStatus, setBackendStatus] = useState('checking')
-  const [bannerDismissed, setBannerDismissed] = useState(false)
-
-  // ── Dissolving state ───────────────────────────────────────────────────────
-  const [dissolveText, setDissolveText] = useState('')
-  const [dissolveRect, setDissolveRect] = useState(null)
-  const [progressPercent, setProgressPercent] = useState(0)
-  const [progressStatus, setProgressStatus] = useState(STATUS_CYCLE[0])
-
-  // ── Reveal state ───────────────────────────────────────────────────────────
-  const [reconstructionData, setReconstructionData] = useState(null)
-  const [reconstructionError, setReconstructionError] = useState(null)
-  const [revealMode, setRevealMode] = useState('fresh') // 'fresh' | 'history'
-
-  // ── History ────────────────────────────────────────────────────────────────
-  const [history, setHistory] = useState([])
-  const [activeHistoryId, setActiveHistoryId] = useState(null)
-
-  // ── Async coordination refs ────────────────────────────────────────────────
-  // Both the sand animation AND the API call must complete before REVEAL.
-  // Whichever finishes second triggers the transition.
-  const apiResultRef = useRef(null)
-  const animDoneRef = useRef(false)
-  const currentInputRef = useRef('')
-  const statusIntervalRef = useRef(null)
-
-  // ── Health check ───────────────────────────────────────────────────────────
-  useEffect(() => {
-    const check = async () => {
-      try {
-        const res = await fetch(`${API}/health`, {
-          signal: AbortSignal.timeout(6000),
-        })
-        setBackendStatus(res.ok ? 'online' : 'offline')
-      } catch {
-        setBackendStatus('offline')
-      }
-    }
-    check()
-  }, [])
-
-  // ── Add to history ─────────────────────────────────────────────────────────
-  const addToHistory = useCallback((data, inputText) => {
-    const id =
-      typeof crypto.randomUUID === 'function'
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-
-    const item = {
-      id,
-      timestamp: new Date(),
-      userInput: inputText,
-      reconstructedPrompt: data.reconstructed_prompt,
-      confidence: data.confidence,
-      strategy: data.strategy_used,
-      technique: data.technique,
-      isConversational: data.is_conversational ?? false,
-    }
-
-    setHistory((prev) => [item, ...prev].slice(0, 50))
-    setActiveHistoryId(id)
-    return id
-  }, [])
-
-  // ── Transition to REVEAL ───────────────────────────────────────────────────
-  const transitionToReveal = useCallback(
-    (data, error) => {
-      if (data) {
-        setReconstructionData(data)
-        addToHistory(data, currentInputRef.current)
-      }
-      if (error) setReconstructionError(error)
-      setRevealMode('fresh')
-      setAppState(APP_STATE.REVEAL)
-    },
-    [addToHistory]
-  )
-
-  // ── Animation completion callback ──────────────────────────────────────────
-  const handleAnimationComplete = useCallback(() => {
-    animDoneRef.current = true
-    if (apiResultRef.current !== null) {
-      const { data, error } = apiResultRef.current
-      transitionToReveal(data, error)
-    }
-  }, [transitionToReveal])
-
-  // ── Main submit handler ────────────────────────────────────────────────────
-  const handleSubmit = useCallback(
-    async (text, rect) => {
-      // Reset coordination
-      apiResultRef.current = null
-      animDoneRef.current = false
-      currentInputRef.current = text
-
-      // Setup dissolving state
-      setDissolveText(text)
-      setDissolveRect(rect)
-      setProgressPercent(0)
-      setProgressStatus(STATUS_CYCLE[0])
-      setReconstructionData(null)
-      setReconstructionError(null)
-      setRevealMode('fresh')
-      setAppState(APP_STATE.DISSOLVING)
-
-      // Animate progress bar: 0 → 85% over 2s (triggers after one paint)
-      requestAnimationFrame(() =>
-        requestAnimationFrame(() => setProgressPercent(85))
-      )
-
-      // Cycle status labels
-      let statusIdx = 0
-      statusIntervalRef.current = setInterval(() => {
-        statusIdx = (statusIdx + 1) % STATUS_CYCLE.length
-        setProgressStatus(STATUS_CYCLE[statusIdx])
-      }, 800)
-
-      try {
-        const sessionId =
-          typeof crypto.randomUUID === 'function'
-            ? crypto.randomUUID()
-            : Math.random().toString(36).slice(2)
-
-        const res = await fetch(`${API}/reconstruct`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ query: text, session_id: sessionId }),
-        })
-
-        clearInterval(statusIntervalRef.current)
-        setProgressPercent(100)
-        setProgressStatus('COMPLETE')
-
-        if (!res.ok) {
-          const msg = `HTTP ${res.status} — reconstruction failed.`
-          apiResultRef.current = { data: null, error: msg }
-          if (animDoneRef.current) transitionToReveal(null, msg)
-          return
-        }
-
-        const data = await res.json()
-        apiResultRef.current = { data, error: null }
-        if (animDoneRef.current) transitionToReveal(data, null)
-      } catch (err) {
-        clearInterval(statusIntervalRef.current)
-        setProgressPercent(100)
-        const msg = err.message || 'Network error — could not reach backend.'
-        apiResultRef.current = { data: null, error: msg }
-        if (animDoneRef.current) transitionToReveal(null, msg)
-      }
-    },
-    [transitionToReveal]
-  )
-
-  // ── History selection ──────────────────────────────────────────────────────
-  const handleHistorySelect = useCallback((item) => {
-    setReconstructionData({
-      reconstructed_prompt: item.reconstructedPrompt,
-      confidence: item.confidence,
-      strategy_used: item.strategy,
-      technique: item.technique,
-      is_conversational: item.isConversational,
-    })
-    setReconstructionError(null)
-    setActiveHistoryId(item.id)
-    setRevealMode('history')
-    setAppState(APP_STATE.REVEAL)
-  }, [])
-
-  // ── History clear ──────────────────────────────────────────────────────────
-  const handleClearHistory = useCallback(() => {
-    setHistory([])
-    setActiveHistoryId(null)
-    if (appState === APP_STATE.REVEAL) {
-      setAppState(APP_STATE.INPUT)
-      setReconstructionData(null)
-      setReconstructionError(null)
-    }
-  }, [appState])
-
-  // ── Reset to INPUT ─────────────────────────────────────────────────────────
-  const handleReset = () => {
-    clearInterval(statusIntervalRef.current)
-    apiResultRef.current = null
-    animDoneRef.current = false
-    currentInputRef.current = ''
-
-    setAppState(APP_STATE.INPUT)
-    setDissolveText('')
-    setDissolveRect(null)
-    setProgressPercent(0)
-    setProgressStatus(STATUS_CYCLE[0])
-    setReconstructionData(null)
-    setReconstructionError(null)
-    setRevealMode('fresh')
-    setActiveHistoryId(null)
-  }
-
-  // ── Render ─────────────────────────────────────────────────────────────────
-  const isInputOrDissolving =
-    appState === APP_STATE.INPUT || appState === APP_STATE.DISSOLVING
-
-  return (
-    <div className="app-root">
-      {/* ── Offline banner ── */}
-      {backendStatus === 'offline' && !bannerDismissed && (
-        <div className="offline-banner" role="alert">
-          <span>⚠ Backend offline — check that uvicorn is running on port 8000</span>
-          <button
-            className="dismiss-btn"
-            onClick={() => setBannerDismissed(true)}
-            aria-label="Dismiss"
-          >
-            ×
-          </button>
-        </div>
-      )}
-
-      {/* ── Header ── */}
-      <header className="app-header">
-        <div className="header-content">
-          <span className="app-name">Prompt Coach</span>
-        </div>
-      </header>
-
-      {/* ── Body: sidebar + main ── */}
-      <div className="app-body">
-        {/* History sidebar — always rendered when backend is ready */}
-        {backendStatus !== 'checking' && (
-          <HistorySidebar
-            history={history}
-            activeId={activeHistoryId}
-            onSelect={handleHistorySelect}
-            onClear={handleClearHistory}
-          />
-        )}
-
-        {/* Main content */}
-        <main className="app-main">
-          {/* Loading screen */}
-          {backendStatus === 'checking' && (
-            <div className="loading-screen" aria-label="Loading">
-              <div className="loading-content">
-                <span className="loading-app-name">Prompt Coach</span>
-                <div className="loading-bar-track">
-                  <div className="loading-bar-fill" />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {backendStatus !== 'checking' && (
-            <>
-              {/* INPUT + DISSOLVING — share the PromptInput card */}
-              <div
-                className={isInputOrDissolving ? 'state-visible' : 'state-hidden'}
-                aria-hidden={!isInputOrDissolving}
-              >
-                <PromptInput
-                  onSubmit={handleSubmit}
-                  isDissolving={appState === APP_STATE.DISSOLVING}
-                  progressPercent={progressPercent}
-                  progressStatus={progressStatus}
-                />
-              </div>
-
-              {/* Sand dissolve canvas overlay */}
-              {appState === APP_STATE.DISSOLVING && (
-                <SandDissolve
-                  text={dissolveText}
-                  sourceRect={dissolveRect}
-                  onComplete={handleAnimationComplete}
-                />
-              )}
-
-              {/* REVEAL */}
-              {appState === APP_STATE.REVEAL && (
-                <div className="reveal-state" aria-live="polite">
-                  <ReconstructedPrompt
-                    data={reconstructionData}
-                    error={reconstructionError}
-                    instant={revealMode === 'history'}
-                  />
-
-                  <div className="reveal-footer">
-                    <button className="new-prompt-btn" onClick={handleReset}>
-                      NEW PROMPT
-                    </button>
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </main>
-      </div>
-    </div>
-  )
-}
-#####################################
-import { useState } from 'react'
-
-// ─── Icons ───────────────────────────────────────────────────────────────────
-
-function HistoryIcon() {
-  return (
-    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
-      <circle cx="11" cy="11" r="8.25" stroke="currentColor" strokeWidth="1.3" />
-      <path d="M11 7.5v3.75l2.5 2.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function TrashIcon() {
-  return (
-    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-      <path d="M2.5 3.5h9M5.5 3.5V2.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 .5.5v1M11 3.5l-.6 7.5a.5.5 0 0 1-.5.5H4.1a.5.5 0 0 1-.5-.5L3 3.5" stroke="currentColor" strokeWidth="1.15" strokeLinecap="round" />
-    </svg>
-  )
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function formatRelativeTime(date) {
-  const diffMs = Date.now() - date.getTime()
-  const mins = Math.floor(diffMs / 60_000)
-  if (mins < 1) return 'just now'
-  if (mins < 60) return `${mins}m ago`
-  const hrs = Math.floor(mins / 60)
-  if (hrs < 24) return `${hrs}h ago`
-  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
-}
-
-function confidenceVariant(score) {
-  if (score >= 0.8) return 'chip-conf-high'
-  if (score >= 0.5) return 'chip-conf-mid'
-  return 'chip-conf-low'
-}
-
-// ─── Component ───────────────────────────────────────────────────────────────
-
-export default function HistorySidebar({ history, activeId, onSelect, onClear }) {
-  const [confirmClear, setConfirmClear] = useState(false)
-
-  const handleClearClick = () => {
-    if (confirmClear) {
-      onClear()
-      setConfirmClear(false)
-    } else {
-      setConfirmClear(true)
-      // Auto-cancel confirm after 3s
-      setTimeout(() => setConfirmClear(false), 3000)
-    }
-  }
-
-  return (
-    <aside className="sidebar" aria-label="Reconstruction history">
-      {/* Header */}
-      <div className="sidebar-header">
-        <span className="sidebar-label">HISTORY</span>
-        {history.length > 0 && (
-          <button
-            className={`sidebar-clear-btn ${confirmClear ? 'sidebar-clear-confirm' : ''}`}
-            onClick={handleClearClick}
-            aria-label={confirmClear ? 'Confirm clear all history' : 'Clear all history'}
-            title={confirmClear ? 'Click again to confirm' : 'Clear all history'}
-          >
-            {confirmClear ? (
-              <span className="sidebar-clear-label">CONFIRM</span>
-            ) : (
-              <TrashIcon />
-            )}
-          </button>
-        )}
-      </div>
-
-      {/* Content */}
-      {history.length === 0 ? (
-        <div className="sidebar-empty">
-          <span className="sidebar-empty-icon">
-            <HistoryIcon />
-          </span>
-          <p className="sidebar-empty-text">
-            Reconstructions will appear here
-          </p>
-        </div>
-      ) : (
-        <ul className="history-list" role="list" aria-label="Past reconstructions">
-          {history.map((item) => (
-            <li key={item.id}>
-              <button
-                className={`history-item${activeId === item.id ? ' history-item-active' : ''}`}
-                onClick={() => onSelect(item)}
-                aria-current={activeId === item.id ? 'true' : undefined}
-                aria-label={`Reconstruction: ${item.userInput}`}
-              >
-                {/* Active indicator bar */}
-                {activeId === item.id && (
-                  <span className="history-active-bar" aria-hidden="true" />
-                )}
-
-                <span className="history-preview">{item.userInput}</span>
-
-                <span className="history-meta">
-                  <span className="history-time">
-                    {formatRelativeTime(item.timestamp)}
-                  </span>
-                  {!item.isConversational && typeof item.confidence === 'number' && (
-                    <span className={`history-conf ${confidenceVariant(item.confidence)}`}>
-                      {Math.round(item.confidence * 100)}%
-                    </span>
-                  )}
-                  {item.isConversational && (
-                    <span className="history-conf chip-conf-info">INFO</span>
-                  )}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
-      )}
-    </aside>
-  )
-}
-########################################
-import { useState, useRef } from 'react'
-
-/**
- * PromptInput — the central input card.
- * Shown during INPUT state and re-used (modified) during DISSOLVING state.
- *
- * Props:
- *   onSubmit(text, rect)  — called with the query text and the textarea's
- *                           DOMRect (used by SandDissolve for particle origin)
- *   isDissolving          — renders the dissolving variant
- *   progressPercent       — 0-100 for the top progress bar
- *   progressStatus        — cycling status label shown below the card
- */
-export default function PromptInput({
-  onSubmit,
-  isDissolving = false,
-  progressPercent = 0,
-  progressStatus = '',
-}) {
-  const [value, setValue] = useState('')
-  const textareaWrapRef = useRef(null)
-
-  const handleSubmit = () => {
-    const trimmed = value.trim()
-    if (!trimmed || isDissolving) return
-    const rect = textareaWrapRef.current?.getBoundingClientRect() ?? null
-    onSubmit(trimmed, rect)
-  }
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSubmit()
-  }
-
-  return (
-    <div className="input-state">
-      {/* Hero */}
-      <div className="hero-area">
-        <h1 className="hero-headline">Your prompt, perfected.</h1>
-        <p className="hero-sub">
-          Designed for Analytical Scientists. Type anything — even rough notes.
-          Prompt Coach reconstructs it into precision.
-        </p>
-      </div>
-
-      {/* Card */}
-      <div className="input-card">
-        {/* Progress bar — visible only when dissolving */}
-        {isDissolving && (
-          <div className="card-progress-bar">
-            <div
-              className="card-progress-fill"
-              style={{
-                width: `${progressPercent}%`,
-                transition:
-                  progressPercent === 0
-                    ? 'none'
-                    : progressPercent >= 100
-                    ? 'width 200ms ease'
-                    : 'width 2000ms ease-out',
-              }}
-            />
-          </div>
-        )}
-
-        {/* Textarea capture zone */}
-        <div ref={textareaWrapRef} className="textarea-wrap">
-          <textarea
-            className="prompt-textarea"
-            placeholder="e.g. check my hplc method for impurities"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onKeyDown={handleKeyDown}
-            disabled={isDissolving}
-            aria-label="Enter your analytical science prompt"
-            spellCheck="false"
-          />
-        </div>
-
-        <div className="card-divider" />
-
-        {/* Footer */}
-        {!isDissolving ? (
-          <div className="card-footer">
-            <span className="card-hint">Ctrl + Enter to reconstruct</span>
-            <button
-              className="reconstruct-btn"
-              onClick={handleSubmit}
-              disabled={!value.trim()}
-            >
-              RECONSTRUCT
-            </button>
-          </div>
-        ) : (
-          <div className="card-footer">
-            <span className="card-hint" style={{ opacity: 0 }}>·</span>
-            <button className="reconstruct-btn loading" disabled>
-              <span className="spinner" />
-              Reconstructing
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* Status text — below card during dissolving */}
-      <div className="status-cycling-wrap" aria-live="polite">
-        {isDissolving && (
-          <span className="status-cycling" key={progressStatus}>
-            {progressStatus}
-          </span>
-        )}
-      </div>
-    </div>
-  )
-}
-###########################################
-import { useState, useEffect, useRef } from 'react'
-
-const TYPEWRITER_MS = 8  // ms per character
-
-// ─── Icons ───────────────────────────────────────────────────────────────────
-
-function CopyIcon() {
-  return (
-    <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
-      <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
-      <path
-        d="M10 5V3.5A1.5 1.5 0 0 0 8.5 2h-5A1.5 1.5 0 0 0 2 3.5v5A1.5 1.5 0 0 0 3.5 10H5"
-        stroke="currentColor"
-        strokeWidth="1.2"
-        strokeLinecap="round"
-      />
-    </svg>
-  )
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function confidenceClass(score) {
-  if (score >= 0.8) return 'meta-confidence-high'
-  if (score >= 0.5) return 'meta-confidence-mid'
-  return 'meta-confidence-low'
-}
-
-// ─── Component ───────────────────────────────────────────────────────────────
-
-/**
- * ReconstructedPrompt — single-panel reveal card.
- *
- * Props:
- *   data           — { reconstructed_prompt, confidence, strategy_used, technique, is_conversational }
- *   error          — error string if reconstruction failed
- *   instant        — skip typewriter; show text immediately (for history replay)
- */
-export default function ReconstructedPrompt({ data, error, instant = false }) {
-  const [displayText, setDisplayText] = useState('')
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef(null)
-
-  const fullText = data?.reconstructed_prompt ?? ''
-  const isConversational = data?.is_conversational ?? false
-
-  // Typewriter animation
-  useEffect(() => {
-    clearInterval(timerRef.current)
-    if (!fullText) { setDisplayText(''); return }
-
-    if (instant) {
-      setDisplayText(fullText)
-      return
-    }
-
-    setDisplayText('')
-    let i = 0
-    timerRef.current = setInterval(() => {
-      i += 1
-      setDisplayText(fullText.slice(0, i))
-      if (i >= fullText.length) clearInterval(timerRef.current)
-    }, TYPEWRITER_MS)
-
-    return () => clearInterval(timerRef.current)
-  }, [fullText, instant])
-
-  const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(fullText)
-    } catch {
-      const el = document.createElement('textarea')
-      el.value = fullText
-      el.style.position = 'fixed'
-      el.style.opacity = '0'
-      document.body.appendChild(el)
-      el.select()
-      document.execCommand('copy')
-      document.body.removeChild(el)
-    }
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
-
-  const confidencePct = data ? Math.round((data.confidence ?? 0) * 100) : null
-  const strategy = data?.strategy_used ?? ''
-  const technique = data?.technique ?? ''
-
-  return (
-    <div className="reveal-panel">
-      {/* ── Header ── */}
-      <div className="reveal-panel-header">
-        <div className="reveal-panel-title">
-          <span className="reveal-panel-label">
-            {isConversational ? 'SYSTEM RESPONSE' : 'RECONSTRUCTED PROMPT'}
-          </span>
-        </div>
-
-        {!error && fullText && !isConversational && (
-          <div className="copy-wrap">
-            {copied && <span className="copy-tooltip">COPIED</span>}
-            <button
-              className="copy-btn"
-              onClick={handleCopy}
-              aria-label="Copy to clipboard"
-            >
-              <CopyIcon />
-            </button>
-          </div>
-        )}
-      </div>
-
-      {/* ── Body ── */}
-      <div className="reveal-panel-body">
-        {error ? (
-          <div className="reveal-error">
-            <span className="reveal-error-label">RECONSTRUCTION FAILED</span>
-            <p className="reveal-error-detail">{error}</p>
-          </div>
-        ) : (
-          <p
-            className={`reveal-text ${isConversational ? 'reveal-text-conversational' : ''}`}
-            aria-live={instant ? undefined : 'polite'}
-          >
-            {displayText}
-            {!instant && displayText.length < fullText.length && fullText.length > 0 && (
-              <span className="typewriter-cursor" aria-hidden="true" />
-            )}
-          </p>
-        )}
-      </div>
-
-      {/* ── Metadata chips — only for analytical reconstructions ── */}
-      {!error && !isConversational && confidencePct !== null && (
-        <div className="reveal-panel-meta">
-          <span className={`meta-chip ${confidenceClass(data.confidence)}`}>
-            {confidencePct}% CONFIDENCE
-          </span>
-          {strategy && (
-            <span className="meta-chip meta-strategy">{strategy}</span>
-          )}
-          {technique && (
-            <span className="meta-chip meta-technique">{technique}</span>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-###############################################
 /* ─── Design Tokens ─────────────────────────────────────────────────────────── */
 :root {
   --bg: #F8F9FC;
@@ -1259,7 +139,49 @@ body {
   overflow: hidden;
 }
 
-/* ─── Sidebar ───────────────────────────────────────────────────────────────── */
+/* ─── Sidebar container + collapse architecture ──────────────────────────────
+ *
+ *  .sidebar-container        — relative wrapper; the toggle button is
+ *                              absolute-positioned here so it stays visible
+ *                              at the seam regardless of open state.
+ *  .sidebar-clip             — the element whose width animates 264→0.
+ *                              overflow:hidden clips the sidebar content.
+ *  .sidebar                  — full-width glass panel; never resizes itself.
+ *  .sidebar-toggle           — pill tab pinned to left:100% of the container,
+ *                              always at the edge between sidebar and main.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+.sidebar-container {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  flex-shrink: 0;
+  z-index: 50;
+}
+
+/* The clipping shell — only this width transitions */
+.sidebar-clip {
+  width: var(--sidebar-w);
+  overflow: hidden;
+  transition: width 280ms cubic-bezier(0.4, 0, 0.2, 1);
+  flex-shrink: 0;
+  display: flex;
+  align-items: stretch;
+}
+.sidebar-clip-collapsed {
+  width: 0;
+}
+
+/* Fade content out slightly faster than the width collapses */
+.sidebar-clip .sidebar {
+  transition: opacity 200ms ease;
+}
+.sidebar-clip-collapsed .sidebar {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* The sidebar panel — always full width, never resizes */
 .sidebar {
   width: var(--sidebar-w);
   flex-shrink: 0;
@@ -1272,7 +194,50 @@ body {
   box-shadow: 2px 0 20px rgba(15, 76, 138, 0.04);
   overflow-y: auto;
   overflow-x: hidden;
-  z-index: 50;
+}
+
+/* ── Toggle pill tab ─────────────────────────────────────────────────────────
+ * Sits exactly at left:100% of .sidebar-container, so it's always visible
+ * at the seam between the (possibly-collapsed) sidebar and main content.
+ * ────────────────────────────────────────────────────────────────────────── */
+.sidebar-toggle {
+  position: absolute;
+  left: 100%;
+  top: 50%;
+  transform: translateY(-50%);
+
+  /* pill geometry */
+  width: 18px;
+  height: 48px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+
+  /* surface */
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 3px 0 14px rgba(15, 76, 138, 0.07), 1px 0 4px rgba(0,0,0,0.04);
+
+  /* content */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  cursor: pointer;
+
+  transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease;
+  z-index: 60;
+}
+.sidebar-toggle:hover {
+  color: var(--primary);
+  background: rgba(255, 255, 255, 1);
+  box-shadow: 4px 0 18px rgba(15, 76, 138, 0.1), 1px 0 6px rgba(0,0,0,0.06);
+}
+.sidebar-toggle:active {
+  color: var(--primary);
+  background: rgba(15, 76, 138, 0.04);
 }
 
 .sidebar-header {
@@ -1855,7 +820,7 @@ body {
 }
 
 @media (max-width: 768px) {
-  .sidebar { display: none; }
+  .sidebar-container { display: none; }
   .app-header { padding: 0 16px; }
   .hero-headline { font-size: 32px; }
   .hero-sub { font-size: 14px; }
@@ -1869,4 +834,517 @@ body {
 @media (max-width: 480px) {
   .hero-headline { font-size: 26px; }
   .reconstruct-btn { padding: 10px 22px; font-size: 10px; }
+}
+########################################################################
+import { useState } from 'react'
+
+// ─── Icons ───────────────────────────────────────────────────────────────────
+
+function HistoryIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+      <circle cx="11" cy="11" r="8.25" stroke="currentColor" strokeWidth="1.3" />
+      <path
+        d="M11 7.5v3.75l2.5 2.5"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path
+        d="M2.5 3.5h9M5.5 3.5V2.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 .5.5v1M11 3.5l-.6 7.5a.5.5 0 0 1-.5.5H4.1a.5.5 0 0 1-.5-.5L3 3.5"
+        stroke="currentColor"
+        strokeWidth="1.15"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+/** Chevron — points left when open (close action), right when closed (open action). */
+function ChevronIcon({ open }) {
+  return (
+    <svg
+      width="7"
+      height="12"
+      viewBox="0 0 7 12"
+      fill="none"
+      aria-hidden="true"
+      style={{
+        transform: open ? 'rotate(0deg)' : 'rotate(180deg)',
+        transition: 'transform 280ms cubic-bezier(0.4, 0, 0.2, 1)',
+        display: 'block',
+      }}
+    >
+      <path
+        d="M5.5 1L1 6l4.5 5"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function formatRelativeTime(date) {
+  const diff = Date.now() - date.getTime()
+  const mins = Math.floor(diff / 60_000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+}
+
+function confidenceVariant(score) {
+  if (score >= 0.8) return 'chip-conf-high'
+  if (score >= 0.5) return 'chip-conf-mid'
+  return 'chip-conf-low'
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+/**
+ * HistorySidebar — collapsible glass panel.
+ *
+ * Props:
+ *   history    — array of history items
+ *   activeId   — id of the currently displayed item
+ *   onSelect   — called with an item when user clicks a history entry
+ *   onClear    — called to clear all history
+ *   isOpen     — sidebar open/closed state (controlled from App)
+ *   onToggle   — toggle callback
+ */
+export default function HistorySidebar({ history, activeId, onSelect, onClear, isOpen, onToggle }) {
+  const [confirmClear, setConfirmClear] = useState(false)
+
+  const handleClearClick = () => {
+    if (confirmClear) {
+      onClear()
+      setConfirmClear(false)
+    } else {
+      setConfirmClear(true)
+      setTimeout(() => setConfirmClear(false), 3000)
+    }
+  }
+
+  return (
+    /*
+     * sidebar-container: relative-positioned flex wrapper.
+     * Its width is driven by sidebar-clip, which animates.
+     * The toggle button is absolute-positioned at left:100%,
+     * so it always sits at the seam — visible whether open or closed.
+     */
+    <div className="sidebar-container">
+      {/* Clipping shell — this width transitions */}
+      <div className={`sidebar-clip${isOpen ? '' : ' sidebar-clip-collapsed'}`}>
+        <aside className="sidebar" aria-label="Reconstruction history">
+          {/* Sticky header */}
+          <div className="sidebar-header">
+            <span className="sidebar-label">HISTORY</span>
+            {history.length > 0 && (
+              <button
+                className={`sidebar-clear-btn${confirmClear ? ' sidebar-clear-confirm' : ''}`}
+                onClick={handleClearClick}
+                aria-label={confirmClear ? 'Confirm clear' : 'Clear history'}
+                title={confirmClear ? 'Click again to confirm' : 'Clear all history'}
+              >
+                {confirmClear ? (
+                  <span className="sidebar-clear-label">CONFIRM</span>
+                ) : (
+                  <TrashIcon />
+                )}
+              </button>
+            )}
+          </div>
+
+          {/* Content */}
+          {history.length === 0 ? (
+            <div className="sidebar-empty">
+              <span className="sidebar-empty-icon">
+                <HistoryIcon />
+              </span>
+              <p className="sidebar-empty-text">Reconstructions will appear here</p>
+            </div>
+          ) : (
+            <ul className="history-list" role="list">
+              {history.map((item) => (
+                <li key={item.id}>
+                  <button
+                    className={`history-item${activeId === item.id ? ' history-item-active' : ''}`}
+                    onClick={() => onSelect(item)}
+                    aria-current={activeId === item.id ? 'true' : undefined}
+                    aria-label={`Load: ${item.userInput}`}
+                  >
+                    {activeId === item.id && (
+                      <span className="history-active-bar" aria-hidden="true" />
+                    )}
+                    <span className="history-preview">{item.userInput}</span>
+                    <span className="history-meta">
+                      <span className="history-time">
+                        {formatRelativeTime(item.timestamp)}
+                      </span>
+                      {!item.isConversational && typeof item.confidence === 'number' && (
+                        <span className={`history-conf ${confidenceVariant(item.confidence)}`}>
+                          {Math.round(item.confidence * 100)}%
+                        </span>
+                      )}
+                      {item.isConversational && (
+                        <span className="history-conf chip-conf-info">INFO</span>
+                      )}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </aside>
+      </div>
+
+      {/* Toggle pill — always at the seam, never clipped */}
+      <button
+        className="sidebar-toggle"
+        onClick={onToggle}
+        aria-label={isOpen ? 'Collapse history sidebar' : 'Expand history sidebar'}
+        aria-expanded={isOpen}
+      >
+        <ChevronIcon open={isOpen} />
+      </button>
+    </div>
+  )
+}
+###################################################
+import { useState, useEffect, useRef, useCallback } from 'react'
+import PromptInput from './components/PromptInput'
+import SandDissolve from './components/SandDissolve'
+import ReconstructedPrompt from './components/ReconstructedPrompt'
+import HistorySidebar from './components/HistorySidebar'
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const APP_STATE = {
+  INPUT: 'input',
+  DISSOLVING: 'dissolving',
+  REVEAL: 'reveal',
+}
+
+const API = 'http://localhost:8000'
+
+const STATUS_CYCLE = ['EXTRACTING INTENT', 'MAPPING TO PRINCIPLES', 'SYNTHESISING']
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // ── App state ──────────────────────────────────────────────────────────────
+  const [appState, setAppState] = useState(APP_STATE.INPUT)
+  const [backendStatus, setBackendStatus] = useState('checking')
+  const [bannerDismissed, setBannerDismissed] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+
+  // ── Dissolving state ───────────────────────────────────────────────────────
+  const [dissolveText, setDissolveText] = useState('')
+  const [dissolveRect, setDissolveRect] = useState(null)
+  const [progressPercent, setProgressPercent] = useState(0)
+  const [progressStatus, setProgressStatus] = useState(STATUS_CYCLE[0])
+
+  // ── Reveal state ───────────────────────────────────────────────────────────
+  const [reconstructionData, setReconstructionData] = useState(null)
+  const [reconstructionError, setReconstructionError] = useState(null)
+  const [revealMode, setRevealMode] = useState('fresh') // 'fresh' | 'history'
+
+  // ── History ────────────────────────────────────────────────────────────────
+  const [history, setHistory] = useState([])
+  const [activeHistoryId, setActiveHistoryId] = useState(null)
+
+  // ── Async coordination refs ────────────────────────────────────────────────
+  // Both the sand animation AND the API call must complete before REVEAL.
+  // Whichever finishes second triggers the transition.
+  const apiResultRef = useRef(null)
+  const animDoneRef = useRef(false)
+  const currentInputRef = useRef('')
+  const statusIntervalRef = useRef(null)
+
+  // ── Health check ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch(`${API}/health`, {
+          signal: AbortSignal.timeout(6000),
+        })
+        setBackendStatus(res.ok ? 'online' : 'offline')
+      } catch {
+        setBackendStatus('offline')
+      }
+    }
+    check()
+  }, [])
+
+  // ── Add to history ─────────────────────────────────────────────────────────
+  const addToHistory = useCallback((data, inputText) => {
+    const id =
+      typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+    const item = {
+      id,
+      timestamp: new Date(),
+      userInput: inputText,
+      reconstructedPrompt: data.reconstructed_prompt,
+      confidence: data.confidence,
+      strategy: data.strategy_used,
+      technique: data.technique,
+      isConversational: data.is_conversational ?? false,
+    }
+
+    setHistory((prev) => [item, ...prev].slice(0, 50))
+    setActiveHistoryId(id)
+    return id
+  }, [])
+
+  // ── Transition to REVEAL ───────────────────────────────────────────────────
+  const transitionToReveal = useCallback(
+    (data, error) => {
+      if (data) {
+        setReconstructionData(data)
+        addToHistory(data, currentInputRef.current)
+      }
+      if (error) setReconstructionError(error)
+      setRevealMode('fresh')
+      setAppState(APP_STATE.REVEAL)
+    },
+    [addToHistory]
+  )
+
+  // ── Animation completion callback ──────────────────────────────────────────
+  const handleAnimationComplete = useCallback(() => {
+    animDoneRef.current = true
+    if (apiResultRef.current !== null) {
+      const { data, error } = apiResultRef.current
+      transitionToReveal(data, error)
+    }
+  }, [transitionToReveal])
+
+  // ── Main submit handler ────────────────────────────────────────────────────
+  const handleSubmit = useCallback(
+    async (text, rect) => {
+      // Reset coordination
+      apiResultRef.current = null
+      animDoneRef.current = false
+      currentInputRef.current = text
+
+      // Setup dissolving state
+      setDissolveText(text)
+      setDissolveRect(rect)
+      setProgressPercent(0)
+      setProgressStatus(STATUS_CYCLE[0])
+      setReconstructionData(null)
+      setReconstructionError(null)
+      setRevealMode('fresh')
+      setAppState(APP_STATE.DISSOLVING)
+
+      // Animate progress bar: 0 → 85% over 2s (triggers after one paint)
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => setProgressPercent(85))
+      )
+
+      // Cycle status labels
+      let statusIdx = 0
+      statusIntervalRef.current = setInterval(() => {
+        statusIdx = (statusIdx + 1) % STATUS_CYCLE.length
+        setProgressStatus(STATUS_CYCLE[statusIdx])
+      }, 800)
+
+      try {
+        const sessionId =
+          typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2)
+
+        const res = await fetch(`${API}/reconstruct`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: text, session_id: sessionId }),
+        })
+
+        clearInterval(statusIntervalRef.current)
+        setProgressPercent(100)
+        setProgressStatus('COMPLETE')
+
+        if (!res.ok) {
+          const msg = `HTTP ${res.status} — reconstruction failed.`
+          apiResultRef.current = { data: null, error: msg }
+          if (animDoneRef.current) transitionToReveal(null, msg)
+          return
+        }
+
+        const data = await res.json()
+        apiResultRef.current = { data, error: null }
+        if (animDoneRef.current) transitionToReveal(data, null)
+      } catch (err) {
+        clearInterval(statusIntervalRef.current)
+        setProgressPercent(100)
+        const msg = err.message || 'Network error — could not reach backend.'
+        apiResultRef.current = { data: null, error: msg }
+        if (animDoneRef.current) transitionToReveal(null, msg)
+      }
+    },
+    [transitionToReveal]
+  )
+
+  // ── History selection ──────────────────────────────────────────────────────
+  const handleHistorySelect = useCallback((item) => {
+    setReconstructionData({
+      reconstructed_prompt: item.reconstructedPrompt,
+      confidence: item.confidence,
+      strategy_used: item.strategy,
+      technique: item.technique,
+      is_conversational: item.isConversational,
+    })
+    setReconstructionError(null)
+    setActiveHistoryId(item.id)
+    setRevealMode('history')
+    setAppState(APP_STATE.REVEAL)
+  }, [])
+
+  // ── History clear ──────────────────────────────────────────────────────────
+  const handleClearHistory = useCallback(() => {
+    setHistory([])
+    setActiveHistoryId(null)
+    if (appState === APP_STATE.REVEAL) {
+      setAppState(APP_STATE.INPUT)
+      setReconstructionData(null)
+      setReconstructionError(null)
+    }
+  }, [appState])
+
+  // ── Reset to INPUT ─────────────────────────────────────────────────────────
+  const handleReset = () => {
+    clearInterval(statusIntervalRef.current)
+    apiResultRef.current = null
+    animDoneRef.current = false
+    currentInputRef.current = ''
+
+    setAppState(APP_STATE.INPUT)
+    setDissolveText('')
+    setDissolveRect(null)
+    setProgressPercent(0)
+    setProgressStatus(STATUS_CYCLE[0])
+    setReconstructionData(null)
+    setReconstructionError(null)
+    setRevealMode('fresh')
+    setActiveHistoryId(null)
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const isInputOrDissolving =
+    appState === APP_STATE.INPUT || appState === APP_STATE.DISSOLVING
+
+  return (
+    <div className="app-root">
+      {/* ── Offline banner ── */}
+      {backendStatus === 'offline' && !bannerDismissed && (
+        <div className="offline-banner" role="alert">
+          <span>⚠ Backend offline — check that uvicorn is running on port 8000</span>
+          <button
+            className="dismiss-btn"
+            onClick={() => setBannerDismissed(true)}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* ── Header ── */}
+      <header className="app-header">
+        <div className="header-content">
+          <span className="app-name">Prompt Coach</span>
+        </div>
+      </header>
+
+      {/* ── Body: sidebar + main ── */}
+      <div className="app-body">
+        {/* History sidebar — always rendered when backend is ready */}
+        {backendStatus !== 'checking' && (
+          <HistorySidebar
+            history={history}
+            activeId={activeHistoryId}
+            onSelect={handleHistorySelect}
+            onClear={handleClearHistory}
+            isOpen={sidebarOpen}
+            onToggle={() => setSidebarOpen((o) => !o)}
+          />
+        )}
+
+        {/* Main content */}
+        <main className="app-main">
+          {/* Loading screen */}
+          {backendStatus === 'checking' && (
+            <div className="loading-screen" aria-label="Loading">
+              <div className="loading-content">
+                <span className="loading-app-name">Prompt Coach</span>
+                <div className="loading-bar-track">
+                  <div className="loading-bar-fill" />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {backendStatus !== 'checking' && (
+            <>
+              {/* INPUT + DISSOLVING — share the PromptInput card */}
+              <div
+                className={isInputOrDissolving ? 'state-visible' : 'state-hidden'}
+                aria-hidden={!isInputOrDissolving}
+              >
+                <PromptInput
+                  onSubmit={handleSubmit}
+                  isDissolving={appState === APP_STATE.DISSOLVING}
+                  progressPercent={progressPercent}
+                  progressStatus={progressStatus}
+                />
+              </div>
+
+              {/* Sand dissolve canvas overlay */}
+              {appState === APP_STATE.DISSOLVING && (
+                <SandDissolve
+                  text={dissolveText}
+                  sourceRect={dissolveRect}
+                  onComplete={handleAnimationComplete}
+                />
+              )}
+
+              {/* REVEAL */}
+              {appState === APP_STATE.REVEAL && (
+                <div className="reveal-state" aria-live="polite">
+                  <ReconstructedPrompt
+                    data={reconstructionData}
+                    error={reconstructionError}
+                    instant={revealMode === 'history'}
+                  />
+
+                  <div className="reveal-footer">
+                    <button className="new-prompt-btn" onClick={handleReset}>
+                      NEW PROMPT
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </main>
+      </div>
+    </div>
+  )
 }
