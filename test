@@ -1,452 +1,2124 @@
-{
-  "name": "Scaleup Predictor Chatbot",
-  "short_name": "SP Chatbot",
-  "description": "Intelligent pharmaceutical scaleup assistant",
-  "start_url": "/",
-  "display": "standalone",
-  "orientation": "portrait",
-  "theme_color": "#6366f1",
-  "background_color": "#f1f5f9",
-  "icons": [
-    {
-      "src": "/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
-      "purpose": "any maskable"
-    }
-  ]
-}
-#####################
-import React, { useState, useRef, useEffect } from 'react'
-import { motion, AnimatePresence } from 'framer-motion'
-import { FiSend } from 'react-icons/fi'
-import Message from './Message'
-import TypingIndicator from './TypingIndicator'
-import { chatRequest, getDownloadUrl } from '../api'
+#backend
+#agent
+import json
+import logging
+from dataclasses import dataclass, field
+from typing import List, Dict, Any
 
-const QUICK_PROMPTS = [
-  { label: 'RMG Capacities', text: 'What are the various Capacities of RMG available in IPDO?' },
-  { label: 'Hot Melt Extrusion', text: 'What is the Make and Model for Hot Melt Extrusion in IPDO?' },
-  { label: 'Sifting Mesh Sizes', text: 'Which all the various mesh sizes available in IPDO for Sifting?' },
-  { label: 'DRL Equipment', text: 'Which all plants do we have Alexenderwerk WP 200 in DRL?' },
+from langchain.schema import HumanMessage, SystemMessage
+
+logger = logging.getLogger(__name__)
+
+TECHNIQUE_MAP = {
+    "characterization": "CHAIN-OF-THOUGHT",
+    "HPLC": "CHAIN-OF-THOUGHT",
+    "impurities": "TREE-OF-THOUGHT",
+    "troubleshooting": "MULTI-MODAL",
+    "documentation": "ROLE-BASED",
+    "SOP": "ROLE-BASED",
+    "method_development": "CHAIN-OF-THOUGHT",
+    "stability": "CHAIN-OF-THOUGHT",
+    "dissolution": "CHAIN-OF-THOUGHT",
+    "general": "CHAIN-OF-THOUGHT",
+}
+
+
+@dataclass
+class PrincipleEngine:
+    structural_rules: List[str] = field(default_factory=list)
+    anti_patterns: List[str] = field(default_factory=list)
+    style_constitution: Dict[str, Any] = field(default_factory=dict)
+    intent_mappings: Dict[str, str] = field(default_factory=dict)
+    loaded: bool = False
+
+
+@dataclass
+class IntentObject:
+    domain: str
+    task_type: str
+    primary_intent: str
+    implicit_constraints: List[str]
+    missing_parameters: List[str]
+    unique_payload: Dict[str, Any]
+    confidence_score: float
+
+
+def _strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        # Remove first line (```json or ```) and last line (```)
+        inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
+        text = "\n".join(inner)
+    return text.strip()
+
+
+class PromptCoachAgent:
+    def __init__(self, chat_model, sample_prompts: List[Dict]):
+        self.chat_model = chat_model
+        self.sample_prompts = sample_prompts
+        self.principle_engine = PrincipleEngine()
+
+    async def initialize(self):
+        """One-time curriculum extraction pass over the sample prompts."""
+        logger.info("Initializing PromptCoachAgent — extracting principles from sample prompts...")
+
+        prompts_text = "\n\n".join([
+            f"SCENARIO: {p['scenario']}\nTECHNIQUE: {p['technique']}\nPROMPT:\n{p['prompt']}"
+            for p in self.sample_prompts
+        ])
+
+        extraction_system = (
+            "You are a prompt engineering analyst specializing in pharmaceutical analytical science. "
+            "Your task is to extract meta-principles from a set of expert-level analytical science prompts. "
+            "Return your analysis as a JSON object with exactly this structure:\n"
+            '{\n'
+            '  "structural_rules": ["rule1", "rule2"],\n'
+            '  "anti_patterns": ["anti_pattern1"],\n'
+            '  "style_constitution": {\n'
+            '    "register": "...",\n'
+            '    "precision_level": "...",\n'
+            '    "regulatory_awareness": "...",\n'
+            '    "domain_vocabulary": ["term1", "term2"]\n'
+            '  },\n'
+            '  "intent_mappings": {\n'
+            '    "characterization": "...",\n'
+            '    "troubleshooting": "...",\n'
+            '    "documentation": "...",\n'
+            '    "method_development": "..."\n'
+            '  }\n'
+            '}\n'
+            "Return ONLY the JSON object, no other text."
+        )
+
+        extraction_human = (
+            f"Analyze these five expert pharmaceutical analytical science prompts and extract the underlying principles:\n\n"
+            f"{prompts_text}\n\n"
+            "Extract:\n"
+            "1. structural_rules: The universal skeleton of excellent analytical science prompts\n"
+            "2. anti_patterns: What good prompts never do\n"
+            "3. style_constitution: Register, precision level, regulatory awareness, and domain vocabulary\n"
+            "4. intent_mappings: How different analytical intents map to output structures\n"
+            "Return ONLY the JSON object."
+        )
+
+        try:
+            response = await self.chat_model.ainvoke([
+                SystemMessage(content=extraction_system),
+                HumanMessage(content=extraction_human),
+            ])
+            content = _strip_json_fences(response.content)
+            data = json.loads(content)
+            self.principle_engine.structural_rules = data.get("structural_rules", [])
+            self.principle_engine.anti_patterns = data.get("anti_patterns", [])
+            self.principle_engine.style_constitution = data.get("style_constitution", {})
+            self.principle_engine.intent_mappings = data.get("intent_mappings", {})
+            self.principle_engine.loaded = True
+            logger.info(
+                f"Principle engine loaded: {len(self.principle_engine.structural_rules)} rules, "
+                f"{len(self.principle_engine.anti_patterns)} anti-patterns"
+            )
+        except Exception as e:
+            logger.error(f"Principle extraction failed: {e}. Loading fallback principles.")
+            self._load_fallback_principles()
+
+    def _load_fallback_principles(self):
+        self.principle_engine.structural_rules = [
+            "Always begin with a role definition: 'Act as [Expert Role]'",
+            "Specify the analytical context: technique, analyte, dosage form",
+            "Define the specific task with clear scope and boundaries",
+            "Include methodological constraints: acceptance criteria, regulatory references (ICH, USP, GMP)",
+            "Specify output format explicitly: headings, bullet points, tables, regulatory-ready",
+        ]
+        self.principle_engine.anti_patterns = [
+            "Vague analyte references without chemical or structural context",
+            "Missing dosage form specification for quantitative methods",
+            "Absent acceptance criteria for system suitability or method validation",
+            "Unspecified regulatory context (ICH guideline, USP chapter, GMP standard)",
+            "Undefined output format or reporting structure",
+        ]
+        self.principle_engine.style_constitution = {
+            "register": "Formal pharmaceutical scientific",
+            "precision_level": "High — specific parameters, concentration ranges, regulatory references",
+            "regulatory_awareness": "ICH guidelines, USP methods, GMP documentation standards",
+            "domain_vocabulary": [
+                "API", "DMF", "HPLC", "RP-HPLC", "USP", "ICH", "RSD",
+                "system suitability", "impurity", "degradant", "tailing factor",
+                "theoretical plates", "isocratic", "gradient", "C18",
+            ],
+        }
+        self.principle_engine.intent_mappings = {
+            "characterization": (
+                "DMF-anchored structured output: Chemical identity & structure → "
+                "Physicochemical properties → Solid state attributes → Chromatographic behaviour"
+            ),
+            "troubleshooting": (
+                "Ranked root cause analysis: Visual Observations → Defect Interpretation → "
+                "Likely Root Causes (Ranked) → Corrective Actions → Parameters to Change"
+            ),
+            "documentation": (
+                "Regulatory-ready SOP template with acceptance criteria, calculations, "
+                "recommended actions for failures, and ready-to-use results table"
+            ),
+            "method_development": (
+                "Chromatographic parameter enumeration: column chemistry → mobile phase → "
+                "gradient/isocratic → flow rate → temperature → injection volume → UV detection"
+            ),
+        }
+        self.principle_engine.loaded = True
+        logger.info("Fallback principles loaded.")
+
+    async def reconstruct(self, query: str) -> Dict[str, Any]:
+        intent = await self._extract_intent(query)
+
+        if intent.confidence_score > 0.7:
+            strategy = "PRINCIPLE_SYNTHESIS"
+            reconstructed = await self._high_confidence_synthesis(query, intent)
+        elif intent.confidence_score >= 0.4:
+            strategy = "FRACTAL_DECOMPOSITION"
+            reconstructed = await self._medium_confidence_synthesis(query, intent)
+        else:
+            strategy = "ANALOGICAL_BRIDGING"
+            reconstructed = await self._low_confidence_synthesis(query, intent)
+
+        technique = TECHNIQUE_MAP.get(intent.domain, "CHAIN-OF-THOUGHT")
+        tokens_estimate = int(len(reconstructed.split()) * 1.35)
+
+        return {
+            "reconstructed_prompt": reconstructed,
+            "confidence": round(intent.confidence_score, 2),
+            "strategy_used": strategy.replace("_", " "),
+            "technique": technique,
+            "tokens_estimate": tokens_estimate,
+        }
+
+    async def _extract_intent(self, query: str) -> IntentObject:
+        system = (
+            "You are an intent extraction specialist for pharmaceutical analytical science prompts. "
+            "Analyze the user's query and extract all signals, returning a JSON object:\n"
+            "{\n"
+            '  "domain": "HPLC|characterization|impurities|dissolution|SOP|stability|method_development|troubleshooting|general",\n'
+            '  "task_type": "identify|quantify|troubleshoot|document|develop|understand",\n'
+            '  "primary_intent": "one sentence description of what the user wants",\n'
+            '  "implicit_constraints": ["constraint1"],\n'
+            '  "missing_parameters": ["missing1"],\n'
+            '  "unique_payload": {"analyte": "...", "technique": "...", "dosage_form": "..."},\n'
+            '  "confidence_score": 0.0\n'
+            "}\n"
+            "Confidence scoring rules:\n"
+            "- >0.7: Clear analytical domain, identifiable task, enough context to reconstruct precisely\n"
+            "- 0.4-0.7: Recognizable domain but missing key parameters\n"
+            "- <0.4: Very vague or ambiguous, requires first-principles reasoning\n"
+            "Return ONLY the JSON object."
+        )
+        human = f'Extract intent from this analytical scientist query: "{query}"'
+
+        try:
+            response = await self.chat_model.ainvoke([
+                SystemMessage(content=system),
+                HumanMessage(content=human),
+            ])
+            content = _strip_json_fences(response.content)
+            data = json.loads(content)
+            return IntentObject(
+                domain=data.get("domain", "general"),
+                task_type=data.get("task_type", "understand"),
+                primary_intent=data.get("primary_intent", query),
+                implicit_constraints=data.get("implicit_constraints", []),
+                missing_parameters=data.get("missing_parameters", []),
+                unique_payload=data.get("unique_payload", {}),
+                confidence_score=float(data.get("confidence_score", 0.5)),
+            )
+        except Exception as e:
+            logger.error(f"Intent extraction failed: {e}")
+            return IntentObject(
+                domain="general",
+                task_type="understand",
+                primary_intent=query,
+                implicit_constraints=[],
+                missing_parameters=[],
+                unique_payload={},
+                confidence_score=0.3,
+            )
+
+    async def _high_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
+        rules_text = "\n".join(f"- {r}" for r in self.principle_engine.structural_rules)
+        anti_text = "\n".join(f"- {p}" for p in self.principle_engine.anti_patterns)
+        mappings_text = json.dumps(self.principle_engine.intent_mappings, indent=2)
+
+        system = (
+            "You are Prompt Coach — an autonomous prompt reconstruction engine for pharmaceutical analytical scientists.\n\n"
+            "INTERNALIZED STRUCTURAL RULES:\n"
+            f"{rules_text}\n\n"
+            "ANTI-PATTERNS TO AVOID:\n"
+            f"{anti_text}\n\n"
+            "INTENT-TO-STRUCTURE MAPPINGS:\n"
+            f"{mappings_text}\n\n"
+            "RECONSTRUCTION RULES:\n"
+            "1. Begin with a role definition: 'Act as [appropriate expert role]'\n"
+            "2. Include all relevant analytical context (analyte, technique, dosage form)\n"
+            "3. Be specific about methodology, acceptance criteria, regulatory references\n"
+            "4. Specify output format explicitly (headings, bullet points, table, regulatory-ready)\n"
+            "5. Do NOT ask clarifying questions — reconstruct based on all available signals\n"
+            "6. Do NOT add explanations or preamble — return ONLY the reconstructed prompt\n"
+            "7. Match the register of expert pharmaceutical analytical prompts exactly"
+        )
+
+        human = (
+            f'Original query: "{query}"\n\n'
+            f"Extracted intent:\n"
+            f"- Domain: {intent.domain}\n"
+            f"- Task type: {intent.task_type}\n"
+            f"- Primary intent: {intent.primary_intent}\n"
+            f"- Implicit constraints: {', '.join(intent.implicit_constraints) or 'none identified'}\n"
+            f"- Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n"
+            f"- Payload: {json.dumps(intent.unique_payload)}\n\n"
+            "Reconstruct into an expert pharmaceutical analytical science prompt. Return ONLY the prompt."
+        )
+
+        response = await self.chat_model.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=human),
+        ])
+        return response.content.strip()
+
+    async def _medium_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
+        system = (
+            "You are Prompt Coach. Use fractal decomposition to reconstruct this analytical science query.\n"
+            "Decompose into atomic components, handle each independently, then synthesize.\n"
+            "Components: ROLE | CONTEXT | TASK | CONSTRAINTS | FORMAT\n"
+            "Return ONLY the final reconstructed prompt — no explanations, no component labels."
+        )
+        human = (
+            f'Query: "{query}"\n'
+            f"Domain: {intent.domain} | Task type: {intent.task_type}\n"
+            f"Intent: {intent.primary_intent}\n"
+            f"Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n\n"
+            "Decomposition:\n"
+            "ROLE: What pharmaceutical analytical expert role fits this domain?\n"
+            "CONTEXT: What analytical context can be inferred from the query?\n"
+            "TASK: What specific analytical task needs to be accomplished?\n"
+            "CONSTRAINTS: What methodological constraints apply (ICH, USP, GMP, acceptance criteria)?\n"
+            "FORMAT: What structured output format is appropriate for this task type?\n\n"
+            "Synthesize into a single expert pharmaceutical analytical science prompt. Return ONLY the prompt."
+        )
+        response = await self.chat_model.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=human),
+        ])
+        return response.content.strip()
+
+    async def _low_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
+        system = (
+            "You are Prompt Coach's Shadow Agent — activated for low-confidence reconstruction.\n\n"
+            "Your approach:\n"
+            "1. Map the vague query to the most structurally similar known analytical scenario\n"
+            "2. Use first-principles reasoning about what an analytical scientist actually needs\n"
+            "3. Make no domain assumptions — reason from the ground up\n"
+            "4. Build the best possible expert prompt given minimal signal\n\n"
+            "Known pharmaceutical analytical scenarios:\n"
+            "- Molecular characterization (DMF-based profile)\n"
+            "- Impurity profiling and degradant identification\n"
+            "- HPLC method development (conditions, column, mobile phase)\n"
+            "- Chromatographic troubleshooting (peak shape, resolution, retention)\n"
+            "- SOP documentation (system suitability, method validation)\n"
+            "- Stability studies (forced degradation, storage conditions)\n"
+            "- Dissolution testing (apparatus, media, acceptance criteria)\n\n"
+            "Return ONLY the reconstructed prompt. Do not explain your reasoning."
+        )
+        human = (
+            f'Vague query: "{query}"\n'
+            f"Best intent read: {intent.primary_intent}\n"
+            f"Domain signal: {intent.domain}\n\n"
+            "Reconstruct into the most useful expert pharmaceutical analytical science prompt possible. "
+            "Return ONLY the prompt."
+        )
+        response = await self.chat_model.ainvoke([
+            SystemMessage(content=system),
+            HumanMessage(content=human),
+        ])
+        return response.content.strip()
+##################################################
+#main
+import json
+import logging
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from langchain_openai import AzureChatOpenAI
+from langchain.embeddings.cache import CacheBackedEmbeddings
+from langchain.storage.file_system import LocalFileStore
+from langchain_openai import AzureOpenAIEmbeddings
+from langchain.schema import HumanMessage
+
+from agent import PromptCoachAgent
+from principles import SAMPLE_PROMPTS
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─── AZURE CONFIGURATION (DO NOT MODIFY STRUCTURE — USER FILLS IN VALUES) ──────
+base_url = ""
+api_version = "2024-02-15-preview"
+api_key = ""
+deployment_name = "GPT4o"
+model_name = "GPT4o"
+
+chat_model = AzureChatOpenAI(
+    azure_deployment=deployment_name,
+    model=model_name,
+    api_version=api_version,
+    api_key=api_key,
+    azure_endpoint=base_url,
+    streaming=True
+)
+
+# Embedding model (same pattern as reference backend)
+file_store = LocalFileStore('langchain-embeddings')
+base = AzureOpenAIEmbeddings(
+    model="text-embedding-ada-002",
+    api_version="2023-07-01-preview",
+    azure_endpoint="",
+    api_key="",
+    azure_deployment="Def_data_qa"
+)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
+    base, file_store, namespace=base.model
+)
+# ─── END AZURE CONFIGURATION ─────────────────────────────────────────────────────
+
+app = FastAPI(title="Prompt Coach API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+agent = PromptCoachAgent(chat_model, SAMPLE_PROMPTS)
+
+
+@app.on_event("startup")
+async def startup_event():
+    await agent.initialize()
+    logger.info("Prompt Coach Agent ready.")
+
+
+# ─── Request models ──────────────────────────────────────────────────────────────
+
+class ReconstructRequest(BaseModel):
+    query: str
+    session_id: str = ""
+
+
+class ChatRequest(BaseModel):
+    reconstructed_prompt: str
+
+
+# ─── Streaming generator ─────────────────────────────────────────────────────────
+
+async def generate(prompt: str):
+    async for chunk in chat_model.astream([HumanMessage(content=prompt)]):
+        token = chunk.content
+        if token:
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    yield f"data: {json.dumps({'done': True})}\n\n"
+
+
+# ─── Endpoints ───────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "principles_loaded": agent.principle_engine.loaded,
+        "sample_count": len(SAMPLE_PROMPTS),
+    }
+
+
+@app.post("/reconstruct")
+async def reconstruct(req: ReconstructRequest):
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+    try:
+        result = await agent.reconstruct(req.query)
+        return result
+    except Exception as e:
+        logger.error(f"Reconstruction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    return StreamingResponse(
+        generate(req.reconstructed_prompt),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+######################################
+#principles
+SAMPLE_PROMPTS = [
+    {
+        "scenario": "Molecular Profile Understanding",
+        "technique": "Chain-of-thought Prompting",
+        "prompt": """Act as Analytical Expert, I have received a new API [API Name] from the Formulations team and I need a comprehensive understanding of the molecule based on the DMF (Drug Master File) if attached or use publicly available scientific sources.
+Provide information in the following structured order: Chemical identity & structure, Physicochemical properties, Solid state attributes, and Chromatographic behaviour. If any data is not available directly from the DMF, identify the missing information, infer what can be reasonably deduced, and recommend how to obtain the missing details (experiments, analytical techniques, or sources). {Attach DMF if available}"""
+    },
+    {
+        "scenario": "Impurity & Degradant Identification",
+        "technique": "Tree-of-thought Prompting",
+        "prompt": """Act as Analytical Scientist. For the given Analyte [Analyte/API], provide a list of known process impurities, and degradation products of [Analyte/API] & for each impurity or degradant, include the following details: origin (route/by-product/stress), structural class, likely retention behavior in RP-HPLC, and control strategy ideas. (Mention Analyte/API details if needed)"""
+    },
+    {
+        "scenario": "Analytical Method Starting Point",
+        "technique": "Chain-of-thought Prompting",
+        "prompt": """Act as Analytical Expert, Provide Brief overview in clean bullet points of common HPLC-UV analytical approaches used to quantify [API/Analyte] in [Dosage Form] based on DMF if attached or use publicly available analytical science principles and typical pharmaceutical assay methods. Summarize Typical chromatographic conditions relevant to this molecule, including preferred column chemistries (C18, phenyl, particle size, dimensions), Mobile phases (buffer, pH, organic solvents, gradient/isocratic), typical flow-rate ranges, column temperature settings, injection-volume considerations, and common UV Detection wavelengths (max). Present the final summary in a clear, concise format suitable for initiating analytical method development. (Attach DMF if available)"""
+    },
+    {
+        "scenario": "HPLC Chromatogram Troubleshooting",
+        "technique": "Multi Modal Prompting",
+        "prompt": """Act as a Pharmaceutical Analytical Expert, a HPLC chromatogram image for the analyte [Analyte/API] has been uploaded for analysis, together with the current method and sample-preparation parameters for [Current Settings]. Based on these inputs, Analyse the chromatogram and provide structured assessment on Visual Observations from Chromatogram Image, Interpretation of Each Defect, Likely Root Causes (Ranked) Corrective Actions for Next Run, Parameters to Change (pH, mobile phase, gradient, flow, injection, sample prep, column). (Format output in clear headings and bullet points) {Attach current settings of the method/procedure} {Attach Chromatogram}"""
+    },
+    {
+        "scenario": "HPLC System Suitability SOP Documentation",
+        "technique": "Role Based Prompting",
+        "prompt": """Act as a Pharmaceutical Analytical Expert, Generate a draft SOP section for HPLC System Suitability for a method analysing [Analyte/API] with clear headings, bullet points & a final template. Enforce the following acceptance criteria for standard solution at concentration of [Concentration]: Retention time repeatability: %RSD < 1.0% (n ≥ 5 injections), Peak area repeatability: %RSD < 2.0% (n ≥ 5 injections), USP Tailing Factor (T): < 1.5 (measured at 5% peak height unless otherwise defined) and Theoretical Plates (N): > 2000 for [Analyte/API] main peak. Provide calculations, recommended actions if criteria fail, and a ready-to-use system suitability results table. Present the final output in a professional, regulatory-ready format appropriate for inclusion in a pharmaceutical quality document."""
+    }
+]
+######################################
+######################################
+#frontend
+#src
+#components
+##promptinput
+import { useState, useRef } from 'react'
+
+const SCENARIOS = [
+  'MOLECULAR PROFILE',
+  'IMPURITIES',
+  'METHOD DEVELOPMENT',
+  'TROUBLESHOOTING',
+  'SOP DOCUMENTATION',
 ]
 
-function cleanText(raw) {
-  if (!raw) return raw
-  return raw
-    .replace(/\*\*(.*?)\*\*/g, '$1')
-    .replace(/\*(.*?)\*/g, '$1')
-    .replace(/^\*+\s*/gm, '')
-    .replace(/\s*\*+$/gm, '')
-}
+/**
+ * PromptInput — shown during INPUT state and reused as the card shell
+ * during DISSOLVING state.
+ *
+ * Props:
+ *   onSubmit(text, rect)  — called when user clicks Reconstruct.
+ *                           rect = sourceRect of the textarea area for the
+ *                           SandDissolve canvas to use as particle origin.
+ *   isDissolving          — when true shows the dissolving UI variation
+ *   progressPercent       — 0-100 for the progress bar fill
+ *   progressStatus        — cycling status text shown below the card
+ */
+export default function PromptInput({
+  onSubmit,
+  isDissolving = false,
+  progressPercent = 0,
+  progressStatus = '',
+}) {
+  const [value, setValue] = useState('')
+  const textareaRef = useRef(null)
+  const textareaWrapRef = useRef(null)
 
-export default function ChatScreen() {
-  const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const scrollRef = useRef(null)
-  const inputRef = useRef(null)
+  const handleSubmit = () => {
+    const trimmed = value.trim()
+    if (!trimmed || isDissolving) return
 
-  useEffect(() => {
-    const t = setTimeout(() => {
-      scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-    }, 120)
-    return () => clearTimeout(t)
-  }, [messages, loading])
-
-  function appendMsg(from, text, extra = {}) {
-    setMessages(prev => [
-      ...prev,
-      { id: crypto.randomUUID?.() ?? String(Date.now()), from, text, ...extra },
-    ])
+    const rect = textareaWrapRef.current?.getBoundingClientRect() ?? null
+    onSubmit(trimmed, rect)
   }
 
-  async function send(promptText) {
-    const q = typeof promptText === 'string' ? promptText.trim() : input.trim()
-    if (!q || loading) return
-    setInput('')
-    appendMsg('user', q)
-    setLoading(true)
-    try {
-      const resp = await chatRequest(q)
-      const ans = cleanText(resp?.response ?? 'No relevant information found.')
-      if (resp?.formula_download) {
-        appendMsg('agent', ans, {
-          downloadUrl: getDownloadUrl(),
-          downloadName: resp.formula_filename ?? 'Formulas.xlsx',
-        })
-      } else {
-        appendMsg('agent', ans)
-      }
-    } catch {
-      appendMsg('agent', 'Something went wrong. Please try again.')
-    } finally {
-      setLoading(false)
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      handleSubmit()
     }
   }
 
-  const isEmpty = messages.length === 0 && !loading
-
   return (
-    <div
-      className="flex flex-col bg-slate-50 overflow-hidden"
-      style={{ height: '100dvh' }}
-    >
-      {/* ── Header ── */}
-      <header
-        className="flex-shrink-0 flex items-center gap-3 px-5 shadow-lg z-10"
-        style={{
-          background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)',
-          paddingTop: 'max(18px, env(safe-area-inset-top))',
-          paddingBottom: '16px',
-        }}
-      >
-        <div className="w-10 h-10 rounded-2xl bg-white/20 backdrop-blur-sm flex items-center justify-center text-white font-bold text-sm flex-shrink-0 shadow-inner">
-          SP
-        </div>
-        <div className="flex-1 min-w-0">
-          <div className="text-white font-semibold text-base leading-tight">Scaleup Predictor</div>
-          <div className="text-white/65 text-xs mt-0.5">Pharmaceutical AI Assistant</div>
-        </div>
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-300 opacity-75" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-green-400" />
-          </span>
-          <span className="text-white/75 text-xs">Online</span>
-        </div>
-      </header>
+    <div className="input-state">
+      {/* Hero */}
+      <div className="hero-area">
+        <h1 className="hero-headline">Your prompt, perfected.</h1>
+        <p className="hero-sub">
+          Designed for Analytical Scientists. Type anything — even rough notes.
+          Prompt Coach reconstructs it into precision.
+        </p>
+      </div>
 
-      {/* ── Messages ── */}
-      <main className="flex-1 overflow-y-auto px-4 py-4">
-
-        {/* Welcome screen — shown when no messages */}
-        <AnimatePresence>
-          {isEmpty && (
-            <motion.div
-              key="welcome"
-              initial={{ opacity: 0, y: 16 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -10 }}
-              transition={{ duration: 0.3 }}
-              className="flex flex-col items-center pt-4 pb-2"
-            >
-              <div
-                className="w-20 h-20 rounded-3xl flex items-center justify-center text-white font-bold text-2xl shadow-xl mb-5"
-                style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }}
-              >
-                SP
-              </div>
-              <h2 className="text-xl font-bold text-slate-800 mb-1">Hello there</h2>
-              <p className="text-sm text-slate-500 text-center px-6 mb-7 leading-relaxed">
-                Ask me anything about pharmaceutical scaleup, formulations, or equipment.
-              </p>
-
-              <div className="w-full space-y-2.5">
-                <p className="text-xs font-semibold text-slate-400 uppercase tracking-widest mb-2 px-1">
-                  Quick questions
-                </p>
-                {QUICK_PROMPTS.map((p, i) => (
-                  <motion.button
-                    key={i}
-                    initial={{ opacity: 0, x: -8 }}
-                    animate={{ opacity: 1, x: 0 }}
-                    transition={{ delay: 0.1 + i * 0.07 }}
-                    whileTap={{ scale: 0.98 }}
-                    onClick={() => send(p.text)}
-                    className="w-full text-left px-4 py-3.5 rounded-2xl bg-white border border-slate-200 shadow-sm active:bg-indigo-50 active:border-indigo-200 transition-colors"
-                  >
-                    <div className="text-xs font-semibold text-indigo-500 mb-0.5">{p.label}</div>
-                    <div className="text-sm text-slate-600 leading-snug">{p.text}</div>
-                  </motion.button>
-                ))}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* Message bubbles */}
-        <div className="space-y-3">
-          <AnimatePresence initial={false}>
-            {messages.map(m => (
-              <Message key={m.id} {...m} />
-            ))}
-          </AnimatePresence>
-          {loading && <TypingIndicator />}
-        </div>
-
-        <div ref={scrollRef} className="h-2" />
-      </main>
-
-      {/* ── Input bar ── */}
-      <footer
-        className="flex-shrink-0 bg-white border-t border-slate-200 px-4 py-3"
-        style={{ paddingBottom: 'max(14px, env(safe-area-inset-bottom))' }}
-      >
-        <div className="flex items-center gap-2">
-          <input
-            ref={inputRef}
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') { e.preventDefault(); send() }
-            }}
-            placeholder="Ask a question…"
-            disabled={loading}
-            className="flex-1 bg-slate-100 rounded-2xl px-4 py-3 text-sm text-slate-800 placeholder-slate-400 outline-none focus:ring-2 focus:ring-indigo-200 transition-shadow disabled:opacity-60"
-          />
-          <motion.button
-            whileTap={{ scale: 0.87 }}
-            onClick={() => send()}
-            disabled={!input.trim() || loading}
-            aria-label="Send"
-            className="w-11 h-11 rounded-2xl flex items-center justify-center text-white shadow-md disabled:opacity-40 flex-shrink-0 transition-opacity"
-            style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }}
-          >
-            <FiSend size={17} style={{ transform: 'rotate(45deg)' }} />
-          </motion.button>
-        </div>
-      </footer>
-    </div>
-  )
-}
-#####################
-import React from 'react'
-import { motion } from 'framer-motion'
-import { FiDownload } from 'react-icons/fi'
-
-export default function Message({ from, text, downloadUrl, downloadName }) {
-  const isUser = from === 'user'
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 10, scale: 0.97 }}
-      animate={{ opacity: 1, y: 0, scale: 1 }}
-      transition={{ duration: 0.2, ease: 'easeOut' }}
-      className={`flex items-end gap-2 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
-    >
-      {/* Bot avatar */}
-      {!isUser && (
+      {/* Card */}
+      <div className="input-card">
+        {/* Progress bar — only visible when dissolving */}
         <div
-          className="w-8 h-8 rounded-2xl flex-shrink-0 flex items-center justify-center text-white text-xs font-bold mb-0.5"
-          style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }}
+          className="card-progress-bar"
+          style={{ display: isDissolving ? 'block' : 'none' }}
         >
-          SP
+          <div
+            className="card-progress-fill"
+            style={{
+              width: `${progressPercent}%`,
+              transition:
+                progressPercent === 0
+                  ? 'none'
+                  : progressPercent >= 100
+                  ? 'width 200ms ease'
+                  : 'width 2000ms ease-out',
+            }}
+          />
+        </div>
+
+        {/* Textarea area — captured by SandDissolve */}
+        <div ref={textareaWrapRef} className="textarea-wrap">
+          <textarea
+            ref={textareaRef}
+            className="prompt-textarea"
+            placeholder="e.g. check my hplc method for impurities"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            disabled={isDissolving}
+            aria-label="Enter your analytical science prompt"
+          />
+        </div>
+
+        <div className="card-divider" />
+
+        {/* Footer */}
+        {!isDissolving ? (
+          <div className="card-footer">
+            <span className="card-hint">Be as vague or specific as you like</span>
+            <button
+              className="reconstruct-btn"
+              onClick={handleSubmit}
+              disabled={!value.trim()}
+              aria-label="Reconstruct prompt"
+            >
+              RECONSTRUCT
+            </button>
+          </div>
+        ) : (
+          <div className="card-footer-dissolving">
+            <span className="reconstructing-label">
+              <span className="spinner" />
+              Reconstructing...
+            </span>
+          </div>
+        )}
+      </div>
+
+      {/* Status cycling — below card during dissolving */}
+      {isDissolving && (
+        <div className="status-cycling-wrap">
+          <span className="status-cycling" key={progressStatus}>
+            {progressStatus}
+          </span>
         </div>
       )}
 
-      {/* Bubble */}
-      <div
-        className={`max-w-[78%] px-4 py-3 text-sm leading-relaxed break-words ${
-          isUser
-            ? 'text-white rounded-3xl rounded-br-sm'
-            : 'bg-white text-slate-800 rounded-3xl rounded-bl-sm shadow-sm border border-slate-100'
-        }`}
-        style={isUser ? { background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' } : {}}
-      >
-        <p className="whitespace-pre-wrap m-0">{text}</p>
+      {/* Scenario chips — only in normal input mode */}
+      {!isDissolving && (
+        <div className="scenario-chips" aria-hidden="true">
+          {SCENARIOS.map((s) => (
+            <span key={s} className="scenario-chip">{s}</span>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+########################################
+#reconstructedprompt
+import { useState, useEffect, useRef } from 'react'
 
-        {downloadUrl && (
+const TYPEWRITER_INTERVAL_MS = 8
+
+function CopyIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+      <path
+        d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
+        stroke="currentColor"
+        strokeWidth="1.2"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
+/**
+ * ReconstructedPrompt — left panel in REVEAL state.
+ * Shows the typewriter-animated reconstructed prompt and metadata chips.
+ *
+ * Props:
+ *   data  — { reconstructed_prompt, confidence, strategy_used, technique }
+ *   error — error message string (if reconstruction failed)
+ */
+export default function ReconstructedPrompt({ data, error }) {
+  const [displayText, setDisplayText] = useState('')
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef(null)
+
+  const fullText = data?.reconstructed_prompt ?? ''
+
+  // Typewriter animation
+  useEffect(() => {
+    if (!fullText) return
+    setDisplayText('')
+    let i = 0
+    timerRef.current = setInterval(() => {
+      i += 1
+      setDisplayText(fullText.slice(0, i))
+      if (i >= fullText.length) clearInterval(timerRef.current)
+    }, TYPEWRITER_INTERVAL_MS)
+    return () => clearInterval(timerRef.current)
+  }, [fullText])
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(fullText)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch {
+      // fallback — execCommand
+      const el = document.createElement('textarea')
+      el.value = fullText
+      document.body.appendChild(el)
+      el.select()
+      document.execCommand('copy')
+      document.body.removeChild(el)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    }
+  }
+
+  const confidencePct = data ? Math.round(data.confidence * 100) : null
+  const strategy = data?.strategy_used ?? ''
+  const technique = data?.technique ?? ''
+
+  return (
+    <div className="panel-left">
+      {/* Header */}
+      <div className="panel-header">
+        <span className="panel-label">Reconstructed Prompt</span>
+        {!error && fullText && (
           <button
-            onClick={() => window.open(downloadUrl, '_blank', 'noopener')}
-            className="mt-3 flex items-center justify-center gap-2 w-full bg-indigo-50 hover:bg-indigo-100 text-indigo-600 font-semibold text-xs rounded-2xl px-3 py-2.5 border border-indigo-100 transition-colors"
+            className="copy-btn"
+            onClick={handleCopy}
+            aria-label="Copy reconstructed prompt"
           >
-            <FiDownload size={13} />
-            {downloadName || 'Download Formulas'}
+            {copied ? (
+              <span className="copy-tooltip">✓ COPIED</span>
+            ) : null}
+            <CopyIcon />
           </button>
         )}
       </div>
-    </motion.div>
+
+      {/* Content */}
+      {error ? (
+        <div className="error-state">
+          <span className="error-label">RECONSTRUCTION FAILED</span>
+          <p className="error-detail">{error}</p>
+        </div>
+      ) : (
+        <p className="reconstructed-text">{displayText}</p>
+      )}
+
+      {/* Metadata chips */}
+      {!error && confidencePct !== null && (
+        <div className="metadata-row">
+          <span className="meta-chip meta-confidence">
+            CONFIDENCE: {confidencePct}%
+          </span>
+          {strategy && (
+            <span className="meta-chip meta-strategy">
+              STRATEGY: {strategy}
+            </span>
+          )}
+          {technique && (
+            <span className="meta-chip meta-technique">
+              TECHNIQUE: {technique}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
   )
 }
-#######################
-import React from 'react'
-import { motion } from 'framer-motion'
+#############################
+#ResponseStream
+import { useState, useEffect, useRef } from 'react'
 
-export default function TypingIndicator() {
+/**
+ * ResponseStream — right panel in REVEAL state.
+ * Streams tokens with per-batch fade-in animation and auto-scrolls.
+ *
+ * Props:
+ *   response    — accumulated response string
+ *   isStreaming — boolean, true while SSE is active
+ */
+export default function ResponseStream({ response, isStreaming }) {
+  const scrollRef = useRef(null)
+  const prevLengthRef = useRef(0)
+  const [batches, setBatches] = useState([])
+
+  // As new tokens arrive, accumulate them into batches for fade-in animation
+  useEffect(() => {
+    if (response.length > prevLengthRef.current) {
+      const newPart = response.slice(prevLengthRef.current)
+      prevLengthRef.current = response.length
+      setBatches((prev) => [...prev, { text: newPart, id: Date.now() + Math.random() }])
+    }
+  }, [response])
+
+  // Reset batches when response is cleared
+  useEffect(() => {
+    if (response === '') {
+      setBatches([])
+      prevLengthRef.current = 0
+    }
+  }, [response])
+
+  // Auto-scroll to bottom as tokens arrive
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+    }
+  }, [batches])
+
+  const isEmpty = batches.length === 0
+
   return (
-    <div className="flex items-end gap-2">
-      <div
-        className="w-8 h-8 rounded-2xl flex-shrink-0 flex items-center justify-center text-white text-xs font-bold"
-        style={{ background: 'linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%)' }}
-      >
-        SP
+    <div className="panel-right">
+      {/* Header */}
+      <div className="panel-header">
+        <span className="panel-label">Model Response</span>
+        <div className="streaming-status">
+          <span className={`streaming-dot ${isStreaming ? 'active' : 'done'}`} />
+          <span className={`streaming-label ${isStreaming ? 'active' : 'done'}`}>
+            {isStreaming ? 'STREAMING' : 'COMPLETE'}
+          </span>
+        </div>
       </div>
-      <div className="bg-white rounded-3xl rounded-bl-sm px-4 py-3.5 shadow-sm border border-slate-100">
-        <div className="flex items-center gap-1">
-          {[0, 1, 2].map(i => (
-            <motion.span
-              key={i}
-              className="block w-2 h-2 rounded-full bg-indigo-400"
-              animate={{ y: [0, -5, 0], opacity: [0.5, 1, 0.5] }}
-              transition={{ duration: 0.75, repeat: Infinity, delay: i * 0.18, ease: 'easeInOut' }}
-            />
+
+      {/* Response area */}
+      <div ref={scrollRef} className="response-scroll">
+        <div className="response-text">
+          {batches.map((batch) => (
+            <span key={batch.id} className="token-batch">
+              {batch.text}
+            </span>
           ))}
+          {isStreaming && !isEmpty && (
+            <span className="cursor-blink" aria-hidden="true" />
+          )}
+          {isEmpty && isStreaming && (
+            <span className="response-waiting">
+              <span className="spinner" style={{ borderColor: 'rgba(14,165,233,0.3)', borderTopColor: 'var(--secondary)', display: 'inline-block' }} />
+            </span>
+          )}
         </div>
       </div>
     </div>
   )
 }
-########################
-import axios from 'axios'
+######################################
+#SandDissolve
+import { useEffect, useRef } from 'react'
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000'
+/**
+ * SandDissolve — canvas-based per-pixel particle physics dissolution.
+ * Renders text on an offscreen canvas, samples pixels, and animates
+ * them as particles swept left-to-right across the full viewport.
+ *
+ * Props:
+ *   text       — the string that was in the textarea
+ *   sourceRect — DOMRect of the textarea area (for particle start positions)
+ *   onComplete — called when all particles have faded out
+ */
+export default function SandDissolve({ text, sourceRect, onComplete }) {
+  const canvasRef = useRef(null)
 
-export async function chatRequest(message) {
-  const resp = await axios.post(`${API_BASE}/chat`, { message }, { timeout: 60000 })
-  return resp.data
-}
+  useEffect(() => {
+    if (!text || !sourceRect) return
 
-export function getDownloadUrl() {
-  return `${API_BASE}/download-formulas`
-}
-#######################3
-import React from 'react'
-import ChatScreen from './components/ChatScreen'
+    let rafId = null
+    let cancelled = false
 
-export default function App() {
-  return <ChatScreen />
+    const init = async () => {
+      // Wait for fonts so canvas text rendering matches the textarea
+      await document.fonts.ready
+      if (cancelled) return
+
+      const canvas = canvasRef.current
+      if (!canvas) return
+
+      canvas.width = window.innerWidth
+      canvas.height = window.innerHeight
+      const ctx = canvas.getContext('2d')
+
+      // ── Render text onto offscreen canvas ──────────────────────────────────
+      const { left, top, width, height } = sourceRect
+      const offW = Math.max(1, Math.floor(width))
+      const offH = Math.max(1, Math.floor(height))
+
+      const offscreen = document.createElement('canvas')
+      offscreen.width = offW
+      offscreen.height = offH
+      const offCtx = offscreen.getContext('2d')
+
+      offCtx.fillStyle = '#FFFFFF'
+      offCtx.fillRect(0, 0, offW, offH)
+
+      offCtx.font = "400 16px 'DM Sans', sans-serif"
+      offCtx.fillStyle = '#0F172A'
+      offCtx.textBaseline = 'top'
+
+      const padding = 0
+      const lineHeight = 26
+      const maxWidth = offW - padding * 2
+      const words = text.split(' ')
+      let line = ''
+      let y = 0
+
+      for (let i = 0; i < words.length; i++) {
+        const testLine = line + (line ? ' ' : '') + words[i]
+        if (offCtx.measureText(testLine).width > maxWidth && line !== '') {
+          offCtx.fillText(line, padding, y)
+          line = words[i]
+          y += lineHeight
+          if (y + lineHeight > offH) break
+        } else {
+          line = testLine
+        }
+      }
+      if (line && y + lineHeight <= offH + lineHeight) {
+        offCtx.fillText(line, padding, y)
+      }
+
+      // ── Sample pixels → build particle array ───────────────────────────────
+      const imgData = offCtx.getImageData(0, 0, offW, offH)
+      const pxData = imgData.data
+      const step = 3
+      const particles = []
+
+      for (let py = 0; py < offH; py += step) {
+        for (let px = 0; px < offW; px += step) {
+          const idx = (py * offW + px) * 4
+          const r = pxData[idx]
+          const g = pxData[idx + 1]
+          const b = pxData[idx + 2]
+          const a = pxData[idx + 3]
+
+          // Skip transparent and near-white (background) pixels
+          if (a < 20) continue
+          if (r > 230 && g > 230 && b > 230) continue
+
+          // Left-to-right staggered delay (0 → 400ms sweep)
+          const delay = (px / offW) * 400
+
+          particles.push({
+            x: left + px,
+            y: top + py,
+            vx: 1.5 + Math.random() * 2.5,
+            vy: -(0.5 + Math.random() * 1.5),
+            opacity: 1,
+            r, g, b,
+            size: 1.5 + Math.random() * 1.5,
+            delay,
+            active: false,
+          })
+        }
+      }
+
+      if (particles.length === 0) {
+        if (!cancelled) onComplete?.()
+        return
+      }
+
+      // ── Animation loop ─────────────────────────────────────────────────────
+      let startTime = null
+
+      const animate = (ts) => {
+        if (cancelled) return
+        if (!startTime) startTime = ts
+        const elapsed = ts - startTime
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+        let anyAlive = false
+
+        for (const p of particles) {
+          if (!p.active) {
+            if (elapsed >= p.delay) {
+              p.active = true
+            } else {
+              // Stationary — draw at original position
+              anyAlive = true
+              ctx.globalAlpha = p.opacity
+              ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`
+              ctx.fillRect(p.x, p.y, p.size, p.size)
+              continue
+            }
+          }
+
+          // Physics
+          p.vx *= 0.97         // air resistance
+          p.vy += 0.12         // gravity
+          p.x += p.vx
+          p.y += p.vy
+          p.opacity -= 0.018
+
+          if (p.opacity > 0) {
+            anyAlive = true
+            ctx.globalAlpha = Math.max(0, p.opacity)
+            ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`
+            ctx.fillRect(p.x, p.y, p.size, p.size)
+          }
+        }
+
+        ctx.globalAlpha = 1
+
+        if (!anyAlive) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height)
+          if (!cancelled) onComplete?.()
+          return
+        }
+
+        rafId = requestAnimationFrame(animate)
+      }
+
+      rafId = requestAnimationFrame(animate)
+    }
+
+    init()
+
+    return () => {
+      cancelled = true
+      if (rafId) cancelAnimationFrame(rafId)
+    }
+  }, [text, sourceRect, onComplete])
+
+  return <canvas ref={canvasRef} className="dissolve-canvas" />
 }
 #####################
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+##styles
+#global
+/* ─── Design Tokens ─────────────────────────────────────────────────────────── */
+:root {
+  --bg: #F8F9FC;
+  --surface: #FFFFFF;
+  --border: #E2E8F0;
+  --border-mid: #CBD5E1;
+  --primary: #0F4C8A;
+  --secondary: #0EA5E9;
+  --success: #059669;
+  --warning: #D97706;
+  --text-primary: #0F172A;
+  --text-secondary: #64748B;
+  --text-muted: #94A3B8;
 
-* {
-  -webkit-tap-highlight-color: transparent;
-  box-sizing: border-box;
+  --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04);
+  --shadow-focused: 0 0 0 3px rgba(14,165,233,0.15), 0 1px 3px rgba(0,0,0,0.08);
+  --shadow-active: 0 4px 24px rgba(15,76,138,0.08), 0 1px 4px rgba(0,0,0,0.06);
+
+  --font-display: 'Syne', sans-serif;
+  --font-mono: 'Space Mono', monospace;
+  --font-body: 'DM Sans', sans-serif;
+
+  --radius: 12px;
+  --radius-sm: 6px;
+  --radius-pill: 8px;
 }
 
-html, body {
+/* ─── Reset & Base ──────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
   margin: 0;
   padding: 0;
-  height: 100%;
-  overscroll-behavior: none;
+}
+
+html {
+  font-size: 16px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-#root {
-  height: 100%;
+body {
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--text-primary);
+  min-height: 100vh;
 }
 
-/* Hide scrollbar while keeping scroll */
-.overflow-y-auto {
-  -ms-overflow-style: none;
-  scrollbar-width: none;
+/* ─── Scrollbars ────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
 }
-.overflow-y-auto::-webkit-scrollbar {
+::-webkit-scrollbar-track {
+  background: #F1F5F9;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* ─── Focus States ──────────────────────────────────────────────────────────── */
+*:focus-visible {
+  outline: 2.5px solid var(--secondary);
+  outline-offset: 2px;
+}
+*:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* ─── App Root ──────────────────────────────────────────────────────────────── */
+.app-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(rgba(15,76,138,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15,76,138,0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+/* ─── Offline Banner ────────────────────────────────────────────────────────── */
+.offline-banner {
+  background: #FFFBEB;
+  border-bottom: 1px solid #FDE68A;
+  color: #92400E;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  padding: 10px 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.dismiss-btn {
+  background: none;
+  border: none;
+  color: #92400E;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0.7;
+  transition: opacity 150ms;
+  flex-shrink: 0;
+}
+.dismiss-btn:hover { opacity: 1; }
+
+/* ─── Header ────────────────────────────────────────────────────────────────── */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  background: rgba(255,255,255,0.95);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+  height: 52px;
+  display: flex;
+  align-items: center;
+  padding: 0 32px;
+  flex-shrink: 0;
+}
+.header-content {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.app-name {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 22px;
+  color: var(--primary);
+  letter-spacing: -0.5px;
+  line-height: 1;
+}
+.status-chip {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--success);
+  letter-spacing: 0.5px;
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  animation: pulse-dot 2.4s ease-in-out infinite;
+  flex-shrink: 0;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+
+/* ─── Main ──────────────────────────────────────────────────────────────────── */
+.app-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* ─── Loading Screen ────────────────────────────────────────────────────────── */
+.loading-screen {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 52px);
+}
+.loading-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+}
+.loading-app-name {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 28px;
+  color: var(--primary);
+  letter-spacing: -0.5px;
+}
+.loading-bar-track {
+  width: 160px;
+  height: 2px;
+  background: var(--border);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.loading-bar-fill {
+  height: 100%;
+  background: var(--secondary);
+  border-radius: 1px;
+  animation: loading-sweep 1.4s ease-in-out infinite;
+}
+@keyframes loading-sweep {
+  0% { width: 0%; margin-left: 0%; }
+  50% { width: 60%; margin-left: 20%; }
+  100% { width: 0%; margin-left: 100%; }
+}
+
+/* ─── State Transitions ─────────────────────────────────────────────────────── */
+.state-visible {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+.state-hidden {
   display: none;
 }
-################################
+
+/* ─── INPUT STATE ───────────────────────────────────────────────────────────── */
+.input-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: calc(100vh - 52px);
+  padding: 40px 24px 60px;
+}
+
+.hero-area {
+  text-align: center;
+  max-width: 720px;
+  margin-bottom: 32px;
+}
+.hero-headline {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 48px;
+  color: var(--text-primary);
+  letter-spacing: -1.5px;
+  line-height: 1.1;
+  margin-bottom: 16px;
+}
+.hero-sub {
+  font-family: var(--font-body);
+  font-weight: 300;
+  font-size: 16px;
+  color: var(--text-secondary);
+  max-width: 560px;
+  margin: 0 auto;
+  line-height: 1.7;
+}
+
+/* ─── Input Card ────────────────────────────────────────────────────────────── */
+.input-card {
+  width: 100%;
+  max-width: 720px;
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-card);
+  border-left: 2px solid var(--primary);
+  overflow: hidden;
+  position: relative;
+  transition: box-shadow 200ms ease;
+}
+.input-card:focus-within {
+  box-shadow: var(--shadow-active);
+}
+
+/* Progress bar (used in dissolving mode) */
+.card-progress-bar {
+  height: 2px;
+  background: var(--border);
+  position: relative;
+  overflow: hidden;
+}
+.card-progress-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background: linear-gradient(90deg, var(--primary), var(--secondary));
+  border-radius: 0 1px 1px 0;
+  transition: width 200ms ease;
+}
+
+.textarea-wrap {
+  padding: 20px 20px 0;
+}
+.prompt-textarea {
+  width: 100%;
+  min-height: 120px;
+  max-height: 300px;
+  border: none;
+  outline: none;
+  resize: vertical;
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: 16px;
+  color: var(--text-primary);
+  line-height: 1.65;
+  background: transparent;
+  caret-color: var(--secondary);
+}
+.prompt-textarea::placeholder {
+  font-style: italic;
+  color: var(--text-muted);
+}
+.prompt-textarea:disabled {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 150ms ease;
+}
+
+.card-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 12px 0 0;
+}
+.card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px 16px;
+  gap: 12px;
+}
+.card-hint {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+
+/* Dissolving footer */
+.card-footer-dissolving {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px 16px;
+  gap: 12px;
+}
+.reconstructing-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-secondary);
+  letter-spacing: 0.3px;
+}
+
+/* ─── Reconstruct Button ────────────────────────────────────────────────────── */
+.reconstruct-btn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 2px;
+  color: #FFFFFF;
+  background: var(--primary);
+  border: none;
+  border-radius: var(--radius-pill);
+  padding: 12px 28px;
+  cursor: pointer;
+  transition: background 200ms ease, box-shadow 200ms ease, transform 100ms ease;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.reconstruct-btn:hover:not(:disabled) {
+  background: var(--secondary);
+  box-shadow: 0 4px 16px rgba(14,165,233,0.3);
+}
+.reconstruct-btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.reconstruct-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+.reconstruct-btn.loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--secondary);
+}
+
+/* ─── Spinner ───────────────────────────────────────────────────────────────── */
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #FFFFFF;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ─── Status Cycling ────────────────────────────────────────────────────────── */
+.status-cycling-wrap {
+  display: flex;
+  justify-content: center;
+  margin-top: 14px;
+  height: 18px;
+}
+.status-cycling {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 1.5px;
+  animation: fadeInOut 0.4s ease;
+}
+@keyframes fadeInOut {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Scenario Chips ────────────────────────────────────────────────────────── */
+.scenario-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  max-width: 720px;
+  margin-top: 20px;
+}
+.scenario-chip {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 10px;
+  background: transparent;
+  cursor: default;
+  transition: background 150ms ease;
+  user-select: none;
+}
+.scenario-chip:hover {
+  background: #F1F5F9;
+}
+
+/* ─── REVEAL STATE ──────────────────────────────────────────────────────────── */
+.reveal-state {
+  display: flex;
+  flex-direction: column;
+  padding: 32px 24px 48px;
+  max-width: 1440px;
+  margin: 0 auto;
+  width: 100%;
+  animation: revealFadeIn 400ms ease-out both;
+}
+@keyframes revealFadeIn {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.reveal-card {
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-active);
+  overflow: hidden;
+}
+
+.reveal-panels {
+  display: grid;
+  grid-template-columns: 1fr 32px 1fr;
+  min-height: 400px;
+}
+
+/* ─── Panel Divider ─────────────────────────────────────────────────────────── */
+.panel-divider {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 40px 0;
+  gap: 0;
+}
+.divider-line {
+  flex: 1;
+  width: 1px;
+  background: var(--border);
+}
+.diamond {
+  color: var(--border-mid);
+  font-size: 10px;
+  padding: 8px 0;
+  flex-shrink: 0;
+}
+
+/* ─── Left Panel (Reconstructed) ────────────────────────────────────────────── */
+.panel-left {
+  padding: 32px;
+  border-left: 2px solid var(--success);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.panel-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-secondary);
+  letter-spacing: 3px;
+  text-transform: uppercase;
+}
+.copy-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--border-mid);
+  padding: 4px;
+  border-radius: 4px;
+  transition: color 150ms ease;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.copy-btn:hover { color: var(--primary); }
+.copy-tooltip {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 0;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: #FFFFFF;
+  background: var(--success);
+  border-radius: 4px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: tooltipFade 0.15s ease;
+}
+@keyframes tooltipFade {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.reconstructed-text {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: 15px;
+  color: var(--text-primary);
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+  flex: 1;
+}
+
+.error-state {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.error-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--warning);
+  letter-spacing: 1px;
+}
+.error-detail {
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.metadata-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.meta-chip {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+.meta-confidence { background: #ECFDF5; color: var(--success); }
+.meta-strategy { background: #EFF6FF; color: var(--primary); }
+.meta-technique { background: #FFF7ED; color: var(--warning); }
+
+/* ─── Right Panel (Response) ────────────────────────────────────────────────── */
+.panel-right {
+  padding: 32px;
+  border-left: 2px solid var(--secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.streaming-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 1px;
+}
+.streaming-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.streaming-dot.active {
+  background: var(--secondary);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+.streaming-dot.done {
+  background: var(--success);
+}
+.streaming-label.active { color: var(--secondary); }
+.streaming-label.done { color: var(--success); }
+
+.response-scroll {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 520px;
+  scroll-behavior: smooth;
+}
+.response-text {
+  font-family: var(--font-body);
+  font-weight: 300;
+  font-size: 15px;
+  color: var(--text-primary);
+  line-height: 1.8;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.token-batch {
+  animation: tokenFadeIn 40ms ease both;
+}
+@keyframes tokenFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.cursor-blink {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--secondary);
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* ─── Reveal Footer ─────────────────────────────────────────────────────────── */
+.reveal-footer {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}
+.new-prompt-btn {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 12px 32px;
+  cursor: pointer;
+  transition: border-color 200ms ease, color 200ms ease;
+}
+.new-prompt-btn:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+/* ─── Sand Dissolve Canvas ──────────────────────────────────────────────────── */
+.dissolve-canvas {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1000;
+}
+
+/* ─── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .app-header { padding: 0 16px; }
+  .hero-headline { font-size: 32px; }
+  .hero-sub { font-size: 14px; }
+  .input-state { padding: 32px 16px 48px; }
+  .reveal-state { padding: 16px 12px 32px; }
+  .reveal-panels {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+  }
+  .panel-divider {
+    flex-direction: row;
+    height: 32px;
+    padding: 0 32px;
+  }
+  .divider-line {
+    flex: 1;
+    width: auto;
+    height: 1px;
+  }
+  .diamond { padding: 0 8px; }
+  .panel-left, .panel-right { padding: 24px 20px; }
+  .card-footer { flex-wrap: wrap; }
+}
+
+@media (max-width: 480px) {
+  .hero-headline { font-size: 26px; }
+  .reconstruct-btn { padding: 10px 20px; font-size: 10px; }
+  .scenario-chips { justify-content: flex-start; }
+}
+##############################
+#app
+import { useState, useEffect, useRef, useCallback } from 'react'
+import PromptInput from './components/PromptInput'
+import SandDissolve from './components/SandDissolve'
+import ReconstructedPrompt from './components/ReconstructedPrompt'
+import ResponseStream from './components/ResponseStream'
+
+const APP_STATE = {
+  INPUT: 'input',
+  DISSOLVING: 'dissolving',
+  REVEAL: 'reveal',
+}
+
+const API = 'http://localhost:8000'
+
+export default function App() {
+  // ── App lifecycle ──────────────────────────────────────────────────────────
+  const [appState, setAppState] = useState(APP_STATE.INPUT)
+  const [backendStatus, setBackendStatus] = useState('checking') // checking | online | offline
+  const [bannerDismissed, setBannerDismissed] = useState(false)
+
+  // ── Dissolving state ───────────────────────────────────────────────────────
+  const [dissolveText, setDissolveText] = useState('')
+  const [dissolveRect, setDissolveRect] = useState(null)
+  const [progressPercent, setProgressPercent] = useState(0)
+  const [progressStatus, setProgressStatus] = useState('EXTRACTING INTENT')
+
+  // ── Reveal state ───────────────────────────────────────────────────────────
+  const [reconstructionData, setReconstructionData] = useState(null)
+  const [reconstructionError, setReconstructionError] = useState(null)
+  const [streamedResponse, setStreamedResponse] = useState('')
+  const [isStreaming, setIsStreaming] = useState(false)
+
+  // ── Sync refs for async coordination ──────────────────────────────────────
+  // We need both the animation AND the API call to finish before revealing.
+  // Whichever completes first sets its ref; the second one triggers the transition.
+  const apiResultRef = useRef(null)     // null = pending, object = done
+  const animDoneRef = useRef(false)
+  const progressTimerRef = useRef(null)
+  const statusIntervalRef = useRef(null)
+
+  // ── Health check on mount ──────────────────────────────────────────────────
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch(`${API}/health`, {
+          signal: AbortSignal.timeout(6000),
+        })
+        setBackendStatus(res.ok ? 'online' : 'offline')
+      } catch {
+        setBackendStatus('offline')
+      }
+    }
+    check()
+  }, [])
+
+  // ── Transition to REVEAL ───────────────────────────────────────────────────
+  const transitionToReveal = useCallback((data, error) => {
+    if (data) setReconstructionData(data)
+    if (error) setReconstructionError(error)
+    setAppState(APP_STATE.REVEAL)
+    if (data?.reconstructed_prompt) {
+      streamResponse(data.reconstructed_prompt)
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Called when sand dissolve animation finishes ───────────────────────────
+  const handleAnimationComplete = useCallback(() => {
+    animDoneRef.current = true
+    // If API already returned, transition now; else wait for API
+    if (apiResultRef.current !== null) {
+      const { data, error } = apiResultRef.current
+      transitionToReveal(data, error)
+    }
+  }, [transitionToReveal])
+
+  // ── Main reconstruct flow ──────────────────────────────────────────────────
+  const handleSubmit = useCallback(async (text, rect) => {
+    // Reset coordination refs
+    apiResultRef.current = null
+    animDoneRef.current = false
+
+    // Set up dissolving state
+    setDissolveText(text)
+    setDissolveRect(rect)
+    setProgressPercent(0)
+    setProgressStatus('EXTRACTING INTENT')
+    setReconstructionData(null)
+    setReconstructionError(null)
+    setStreamedResponse('')
+    setIsStreaming(false)
+    setAppState(APP_STATE.DISSOLVING)
+
+    // Animate progress bar 0 → 85% over ~2s
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => setProgressPercent(85))
+    })
+
+    // Cycle status messages
+    const statuses = ['EXTRACTING INTENT', 'MAPPING TO PRINCIPLES', 'SYNTHESISING']
+    let statusIdx = 0
+    statusIntervalRef.current = setInterval(() => {
+      statusIdx = (statusIdx + 1) % statuses.length
+      setProgressStatus(statuses[statusIdx])
+    }, 800)
+
+    // API call
+    try {
+      const sessionId =
+        typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : Math.random().toString(36).slice(2)
+
+      const res = await fetch(`${API}/reconstruct`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: text, session_id: sessionId }),
+      })
+
+      clearInterval(statusIntervalRef.current)
+      setProgressPercent(100)
+      setProgressStatus('COMPLETE')
+
+      if (!res.ok) {
+        const msg = `HTTP ${res.status} — Reconstruction failed.`
+        apiResultRef.current = { data: null, error: msg }
+        if (animDoneRef.current) transitionToReveal(null, msg)
+        return
+      }
+
+      const data = await res.json()
+      apiResultRef.current = { data, error: null }
+      if (animDoneRef.current) transitionToReveal(data, null)
+    } catch (err) {
+      clearInterval(statusIntervalRef.current)
+      setProgressPercent(100)
+      const msg = err.message || 'Network error — could not reach backend.'
+      apiResultRef.current = { data: null, error: msg }
+      if (animDoneRef.current) transitionToReveal(null, msg)
+    }
+  }, [transitionToReveal])
+
+  // ── SSE streaming via fetch + ReadableStream ───────────────────────────────
+  const streamResponse = async (prompt) => {
+    setIsStreaming(true)
+    setStreamedResponse('')
+    try {
+      const res = await fetch(`${API}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reconstructed_prompt: prompt }),
+      })
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const raw = line.slice(6).trim()
+          if (!raw) continue
+          try {
+            const payload = JSON.parse(raw)
+            if (payload.done) {
+              setIsStreaming(false)
+              return
+            }
+            if (payload.token) {
+              setStreamedResponse((prev) => prev + payload.token)
+            }
+          } catch {
+            // malformed SSE line — skip
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Streaming error:', err)
+    } finally {
+      setIsStreaming(false)
+    }
+  }
+
+  // ── Reset to INPUT state ───────────────────────────────────────────────────
+  const handleReset = () => {
+    clearInterval(statusIntervalRef.current)
+    clearTimeout(progressTimerRef.current)
+    apiResultRef.current = null
+    animDoneRef.current = false
+
+    setAppState(APP_STATE.INPUT)
+    setDissolveText('')
+    setDissolveRect(null)
+    setProgressPercent(0)
+    setProgressStatus('EXTRACTING INTENT')
+    setReconstructionData(null)
+    setReconstructionError(null)
+    setStreamedResponse('')
+    setIsStreaming(false)
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  return (
+    <div className="app-root">
+      {/* ── Offline banner ── */}
+      {backendStatus === 'offline' && !bannerDismissed && (
+        <div className="offline-banner" role="alert">
+          <span>⚠ Backend offline — check that uvicorn is running on port 8000</span>
+          <button
+            className="dismiss-btn"
+            onClick={() => setBannerDismissed(true)}
+            aria-label="Dismiss banner"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* ── Header ── */}
+      <header className="app-header">
+        <div className="header-content">
+          <span className="app-name">Prompt Coach</span>
+          <span className="status-chip" aria-label="System status: ready, 5 prompts learned">
+            <span className="status-dot" />
+            READY · 5 PROMPTS LEARNED
+          </span>
+        </div>
+      </header>
+
+      {/* ── Main content ── */}
+      <main className="app-main">
+        {/* Loading screen while health check is in flight */}
+        {backendStatus === 'checking' && (
+          <div className="loading-screen" aria-label="Loading Prompt Coach">
+            <div className="loading-content">
+              <span className="loading-app-name">Prompt Coach</span>
+              <div className="loading-bar-track">
+                <div className="loading-bar-fill" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {backendStatus !== 'checking' && (
+          <>
+            {/* INPUT + DISSOLVING share the PromptInput card */}
+            <div
+              className={
+                appState === APP_STATE.INPUT || appState === APP_STATE.DISSOLVING
+                  ? 'state-visible'
+                  : 'state-hidden'
+              }
+              aria-hidden={appState === APP_STATE.REVEAL}
+            >
+              <PromptInput
+                onSubmit={handleSubmit}
+                isDissolving={appState === APP_STATE.DISSOLVING}
+                progressPercent={progressPercent}
+                progressStatus={progressStatus}
+              />
+            </div>
+
+            {/* Sand dissolve canvas — rendered on top during DISSOLVING */}
+            {appState === APP_STATE.DISSOLVING && (
+              <SandDissolve
+                text={dissolveText}
+                sourceRect={dissolveRect}
+                onComplete={handleAnimationComplete}
+              />
+            )}
+
+            {/* REVEAL state */}
+            {appState === APP_STATE.REVEAL && (
+              <div className="reveal-state" aria-live="polite">
+                <div className="reveal-card">
+                  <div className="reveal-panels">
+                    {/* Left — reconstructed prompt */}
+                    <ReconstructedPrompt
+                      data={reconstructionData}
+                      error={reconstructionError}
+                    />
+
+                    {/* Divider */}
+                    <div className="panel-divider" aria-hidden="true">
+                      <div className="divider-line" />
+                      <span className="diamond">◆</span>
+                      <div className="divider-line" />
+                    </div>
+
+                    {/* Right — model response */}
+                    <ResponseStream
+                      response={streamedResponse}
+                      isStreaming={isStreaming}
+                    />
+                  </div>
+                </div>
+
+                <div className="reveal-footer">
+                  <button className="new-prompt-btn" onClick={handleReset}>
+                    NEW PROMPT
+                  </button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </main>
+    </div>
+  )
+}
+#############################
+#main
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
-import './index.css'
+import './styles/globals.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
     <App />
   </React.StrictMode>
 )
-#####################
-<!doctype html>
+################################
+#index
+<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-
-    <!-- PWA -->
-    <meta name="theme-color" content="#6366f1" />
-    <link rel="manifest" href="/manifest.json" />
-
-    <!-- iOS PWA -->
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="SP Chatbot" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
-
-    <title>Scaleup Predictor</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Prompt Coach</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Syne:wght@800&family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap"
+      rel="stylesheet"
+    />
   </head>
-  <body class="overscroll-none">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
-#######################3
+#####################
+#package
 {
-  "name": "scp-chatbot-mobile",
+  "name": "prompt-coach",
   "private": true,
-  "version": "1.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite --port 5174 --host",
+    "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview --host"
+    "preview": "vite preview"
   },
   "dependencies": {
-    "axios": "^1.6.0",
-    "framer-motion": "^10.18.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-icons": "^4.12.0"
+    "html2canvas": "^1.4.1"
   },
   "devDependencies": {
-    "@vitejs/plugin-react": "^4.2.1",
-    "autoprefixer": "^10.4.16",
-    "postcss": "^8.4.32",
-    "tailwindcss": "^3.3.6",
-    "vite": "^5.0.8"
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^4.4.0"
   }
 }
-##################3
-module.exports = {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
-  },
-}
-#################3
-/** @type {import('tailwindcss').Config} */
-module.exports = {
-  content: ['./index.html', './src/**/*.{js,jsx}'],
-  theme: {
-    extend: {
-      fontFamily: {
-        sans: ['-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'sans-serif'],
-      },
-    },
-  },
-  plugins: [],
-}
-########################
+#####################
+#vite.config
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
 })
-#############################
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
-
-    <!-- PWA -->
-    <meta name="theme-color" content="#6366f1" />
-    <link rel="manifest" href="/manifest.json" />
-
-    <!-- iOS PWA -->
-    <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <meta name="apple-mobile-web-app-title" content="SP Chatbot" />
-    <link rel="apple-touch-icon" href="/icon.svg" />
-
-    <title>Scaleup Predictor</title>
-  </head>
-  <body class="overscroll-none">
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
