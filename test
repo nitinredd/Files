@@ -1,7 +1,7 @@
 #backend
-#agent
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 
@@ -21,6 +21,91 @@ TECHNIQUE_MAP = {
     "dissolution": "CHAIN-OF-THOUGHT",
     "general": "CHAIN-OF-THOUGHT",
 }
+
+# ─── Conversational detection ────────────────────────────────────────────────
+
+_CONVERSATIONAL_PATTERNS = [
+    r"^(hello|hi|hey|greetings|howdy|hiya|sup|yo|good\s*(morning|afternoon|evening))\b",
+    r"^(help|test|testing|ping)\s*[!?.]*$",
+    r"(what can you|what do you|how do you|who are you|what is this|how does this|what is prompt|tell me about prompt|explain prompt)",
+    r"^(what|how|tell me about|explain).{0,40}(yourself|this tool|this app|prompt coach)\b",
+]
+
+CONVERSATIONAL_RESPONSE = (
+    "Prompt Coach is active.\n\n"
+    "I reconstruct vague or incomplete queries into precision expert prompts for pharmaceutical "
+    "analytical scientists. I am trained on five analytical science scenarios:\n\n"
+    "1. Molecular Profile Understanding — comprehensive API characterisation from DMF or public sources, "
+    "covering chemical identity, physicochemical properties, solid state attributes, and chromatographic behaviour\n\n"
+    "2. Impurity and Degradant Identification — process impurity and degradant profiling with structural class, "
+    "RP-HPLC retention behaviour, and control strategy recommendations\n\n"
+    "3. Analytical Method Development — HPLC-UV conditions, column chemistry, mobile phase composition, "
+    "gradient design, flow rate, and UV detection wavelength selection\n\n"
+    "4. Chromatographic Troubleshooting — visual chromatogram analysis with ranked root cause assessment, "
+    "corrective actions, and parameter change recommendations\n\n"
+    "5. SOP Documentation — regulatory-ready system suitability templates with acceptance criteria, "
+    "calculations, and results tables aligned with ICH and USP standards\n\n"
+    "Type any analytical science query — rough notes, incomplete thoughts, or precise specifications — "
+    "and I will reconstruct it into a structured, regulatory-aware expert prompt."
+)
+
+
+def _is_conversational(query: str) -> bool:
+    """Detect greetings, meta-questions, and off-topic inputs."""
+    q = query.lower().strip().rstrip("!?.,;: ")
+    words = q.split()
+
+    # Short greetings / meta (1–3 words)
+    if len(words) <= 3:
+        openers = {
+            "hello", "hi", "hey", "greetings", "howdy", "yo", "sup", "hiya",
+            "help", "test", "testing", "ping", "check",
+        }
+        if words and words[0] in openers:
+            return True
+
+    for pattern in _CONVERSATIONAL_PATTERNS:
+        if re.search(pattern, q):
+            return True
+
+    return False
+
+
+# ─── Markdown stripping ──────────────────────────────────────────────────────
+
+def strip_markdown(text: str) -> str:
+    """
+    Remove common markdown formatting artifacts from LLM output.
+    Preserves natural paragraph structure, numbered lists, and hyphen bullets.
+    """
+    # Headers: ## Header → Header (preserve the text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # Bold: **text** → text
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
+    # Bold: __text__ → text
+    text = re.sub(r"__(.+?)__", r"\1", text, flags=re.DOTALL)
+    # Italic: *text* → text (conservative — avoids stripping % or math *)
+    text = re.sub(r"(?<!\*)\*([^\*\n]{1,200}?)\*(?!\*)", r"\1", text)
+    # Italic: _text_ → text (word-boundary aware)
+    text = re.sub(r"(?<!\w)_([^_\n]{1,200}?)_(?!\w)", r"\1", text)
+    # Em-dash bullets at line start: — item → - item
+    text = re.sub(r"^—\s+", "- ", text, flags=re.MULTILINE)
+    # Horizontal rules
+    text = re.sub(r"^\s*[-*_]{3,}\s*$", "", text, flags=re.MULTILINE)
+    # Collapse 3+ consecutive newlines → 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ─── Principle Engine ────────────────────────────────────────────────────────
+
+NO_MARKDOWN_INSTRUCTION = (
+    "Write in clean plain text only. Do not use markdown formatting of any kind: "
+    "no asterisks for bold or italic, no # headers, no em-dashes (—) as list markers, "
+    "no horizontal rules (---). "
+    "Use numbered lists (1. 2. 3.) or hyphen bullets (- ) for structure. "
+    "Use clear heading words followed by a colon rather than markdown headers."
+)
 
 
 @dataclass
@@ -47,11 +132,12 @@ def _strip_json_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first line (```json or ```) and last line (```)
         inner = lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
         text = "\n".join(inner)
     return text.strip()
 
+
+# ─── Agent ───────────────────────────────────────────────────────────────────
 
 class PromptCoachAgent:
     def __init__(self, chat_model, sample_prompts: List[Dict]):
@@ -60,8 +146,7 @@ class PromptCoachAgent:
         self.principle_engine = PrincipleEngine()
 
     async def initialize(self):
-        """One-time curriculum extraction pass over the sample prompts."""
-        logger.info("Initializing PromptCoachAgent — extracting principles from sample prompts...")
+        logger.info("Initializing PromptCoachAgent — extracting curriculum from sample prompts...")
 
         prompts_text = "\n\n".join([
             f"SCENARIO: {p['scenario']}\nTECHNIQUE: {p['technique']}\nPROMPT:\n{p['prompt']}"
@@ -70,35 +155,20 @@ class PromptCoachAgent:
 
         extraction_system = (
             "You are a prompt engineering analyst specializing in pharmaceutical analytical science. "
-            "Your task is to extract meta-principles from a set of expert-level analytical science prompts. "
-            "Return your analysis as a JSON object with exactly this structure:\n"
+            "Extract meta-principles from the sample prompts and return a JSON object:\n"
             '{\n'
-            '  "structural_rules": ["rule1", "rule2"],\n'
-            '  "anti_patterns": ["anti_pattern1"],\n'
-            '  "style_constitution": {\n'
-            '    "register": "...",\n'
-            '    "precision_level": "...",\n'
-            '    "regulatory_awareness": "...",\n'
-            '    "domain_vocabulary": ["term1", "term2"]\n'
-            '  },\n'
-            '  "intent_mappings": {\n'
-            '    "characterization": "...",\n'
-            '    "troubleshooting": "...",\n'
-            '    "documentation": "...",\n'
-            '    "method_development": "..."\n'
-            '  }\n'
-            '}\n'
-            "Return ONLY the JSON object, no other text."
+            '  "structural_rules": ["rule1", ...],\n'
+            '  "anti_patterns": ["anti1", ...],\n'
+            '  "style_constitution": {"register": "...", "precision_level": "...", '
+            '"regulatory_awareness": "...", "domain_vocabulary": ["term1", ...]},\n'
+            '  "intent_mappings": {"characterization": "...", "troubleshooting": "...", '
+            '"documentation": "...", "method_development": "..."}\n'
+            "}\nReturn ONLY the JSON object."
         )
 
         extraction_human = (
-            f"Analyze these five expert pharmaceutical analytical science prompts and extract the underlying principles:\n\n"
-            f"{prompts_text}\n\n"
-            "Extract:\n"
-            "1. structural_rules: The universal skeleton of excellent analytical science prompts\n"
-            "2. anti_patterns: What good prompts never do\n"
-            "3. style_constitution: Register, precision level, regulatory awareness, and domain vocabulary\n"
-            "4. intent_mappings: How different analytical intents map to output structures\n"
+            f"Analyze these expert pharmaceutical analytical science prompts:\n\n{prompts_text}\n\n"
+            "Extract structural rules, anti-patterns, style constitution, and intent-to-structure mappings. "
             "Return ONLY the JSON object."
         )
 
@@ -119,27 +189,27 @@ class PromptCoachAgent:
                 f"{len(self.principle_engine.anti_patterns)} anti-patterns"
             )
         except Exception as e:
-            logger.error(f"Principle extraction failed: {e}. Loading fallback principles.")
+            logger.error(f"Curriculum extraction failed: {e}. Loading fallback principles.")
             self._load_fallback_principles()
 
     def _load_fallback_principles(self):
         self.principle_engine.structural_rules = [
-            "Always begin with a role definition: 'Act as [Expert Role]'",
+            "Begin with a clear role definition: 'Act as [Expert Role]'",
             "Specify the analytical context: technique, analyte, dosage form",
-            "Define the specific task with clear scope and boundaries",
+            "Define the specific task with clear scope and deliverables",
             "Include methodological constraints: acceptance criteria, regulatory references (ICH, USP, GMP)",
-            "Specify output format explicitly: headings, bullet points, tables, regulatory-ready",
+            "Specify the output format explicitly: structure, headings, tables, regulatory-ready",
         ]
         self.principle_engine.anti_patterns = [
             "Vague analyte references without chemical or structural context",
             "Missing dosage form specification for quantitative methods",
-            "Absent acceptance criteria for system suitability or method validation",
+            "Absent acceptance criteria for system suitability or method validation tasks",
             "Unspecified regulatory context (ICH guideline, USP chapter, GMP standard)",
             "Undefined output format or reporting structure",
         ]
         self.principle_engine.style_constitution = {
             "register": "Formal pharmaceutical scientific",
-            "precision_level": "High — specific parameters, concentration ranges, regulatory references",
+            "precision_level": "High — specific parameters, concentrations, regulatory references",
             "regulatory_awareness": "ICH guidelines, USP methods, GMP documentation standards",
             "domain_vocabulary": [
                 "API", "DMF", "HPLC", "RP-HPLC", "USP", "ICH", "RSD",
@@ -149,69 +219,80 @@ class PromptCoachAgent:
         }
         self.principle_engine.intent_mappings = {
             "characterization": (
-                "DMF-anchored structured output: Chemical identity & structure → "
-                "Physicochemical properties → Solid state attributes → Chromatographic behaviour"
+                "DMF-anchored structured output: Chemical identity and structure, "
+                "Physicochemical properties, Solid state attributes, Chromatographic behaviour"
             ),
             "troubleshooting": (
-                "Ranked root cause analysis: Visual Observations → Defect Interpretation → "
-                "Likely Root Causes (Ranked) → Corrective Actions → Parameters to Change"
+                "Ranked root cause analysis: Visual Observations, Defect Interpretation, "
+                "Likely Root Causes (ranked), Corrective Actions, Parameters to Change"
             ),
             "documentation": (
-                "Regulatory-ready SOP template with acceptance criteria, calculations, "
-                "recommended actions for failures, and ready-to-use results table"
+                "Regulatory-ready SOP with acceptance criteria, calculations, "
+                "failure handling, and ready-to-use results table"
             ),
             "method_development": (
-                "Chromatographic parameter enumeration: column chemistry → mobile phase → "
-                "gradient/isocratic → flow rate → temperature → injection volume → UV detection"
+                "Chromatographic parameter enumeration: column chemistry, mobile phase, "
+                "gradient or isocratic conditions, flow rate, column temperature, "
+                "injection volume, UV detection wavelength"
             ),
         }
         self.principle_engine.loaded = True
         logger.info("Fallback principles loaded.")
 
     async def reconstruct(self, query: str) -> Dict[str, Any]:
+        # Conversational / off-topic input — fast path, no LLM call
+        if _is_conversational(query):
+            return {
+                "reconstructed_prompt": CONVERSATIONAL_RESPONSE,
+                "confidence": 1.0,
+                "strategy_used": "CONVERSATIONAL",
+                "technique": "DIRECT",
+                "tokens_estimate": len(CONVERSATIONAL_RESPONSE.split()),
+                "is_conversational": True,
+            }
+
         intent = await self._extract_intent(query)
 
         if intent.confidence_score > 0.7:
-            strategy = "PRINCIPLE_SYNTHESIS"
+            strategy = "PRINCIPLE SYNTHESIS"
             reconstructed = await self._high_confidence_synthesis(query, intent)
         elif intent.confidence_score >= 0.4:
-            strategy = "FRACTAL_DECOMPOSITION"
+            strategy = "FRACTAL DECOMPOSITION"
             reconstructed = await self._medium_confidence_synthesis(query, intent)
         else:
-            strategy = "ANALOGICAL_BRIDGING"
+            strategy = "ANALOGICAL BRIDGING"
             reconstructed = await self._low_confidence_synthesis(query, intent)
 
+        reconstructed = strip_markdown(reconstructed)
         technique = TECHNIQUE_MAP.get(intent.domain, "CHAIN-OF-THOUGHT")
         tokens_estimate = int(len(reconstructed.split()) * 1.35)
 
         return {
             "reconstructed_prompt": reconstructed,
             "confidence": round(intent.confidence_score, 2),
-            "strategy_used": strategy.replace("_", " "),
+            "strategy_used": strategy,
             "technique": technique,
             "tokens_estimate": tokens_estimate,
+            "is_conversational": False,
         }
 
     async def _extract_intent(self, query: str) -> IntentObject:
         system = (
             "You are an intent extraction specialist for pharmaceutical analytical science prompts. "
-            "Analyze the user's query and extract all signals, returning a JSON object:\n"
-            "{\n"
+            "Analyze the user query and extract all signals, returning a JSON object:\n"
+            '{\n'
             '  "domain": "HPLC|characterization|impurities|dissolution|SOP|stability|method_development|troubleshooting|general",\n'
             '  "task_type": "identify|quantify|troubleshoot|document|develop|understand",\n'
-            '  "primary_intent": "one sentence description of what the user wants",\n'
+            '  "primary_intent": "one sentence description",\n'
             '  "implicit_constraints": ["constraint1"],\n'
             '  "missing_parameters": ["missing1"],\n'
             '  "unique_payload": {"analyte": "...", "technique": "...", "dosage_form": "..."},\n'
             '  "confidence_score": 0.0\n'
             "}\n"
-            "Confidence scoring rules:\n"
-            "- >0.7: Clear analytical domain, identifiable task, enough context to reconstruct precisely\n"
-            "- 0.4-0.7: Recognizable domain but missing key parameters\n"
-            "- <0.4: Very vague or ambiguous, requires first-principles reasoning\n"
+            "Confidence: >0.7 = clear domain and task; 0.4-0.7 = recognisable but incomplete; <0.4 = very vague.\n"
             "Return ONLY the JSON object."
         )
-        human = f'Extract intent from this analytical scientist query: "{query}"'
+        human = f'Extract intent from: "{query}"'
 
         try:
             response = await self.chat_model.ainvoke([
@@ -241,41 +322,36 @@ class PromptCoachAgent:
                 confidence_score=0.3,
             )
 
-    async def _high_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
+    def _base_system(self, extra: str = "") -> str:
         rules_text = "\n".join(f"- {r}" for r in self.principle_engine.structural_rules)
         anti_text = "\n".join(f"- {p}" for p in self.principle_engine.anti_patterns)
-        mappings_text = json.dumps(self.principle_engine.intent_mappings, indent=2)
-
-        system = (
+        return (
             "You are Prompt Coach — an autonomous prompt reconstruction engine for pharmaceutical analytical scientists.\n\n"
-            "INTERNALIZED STRUCTURAL RULES:\n"
-            f"{rules_text}\n\n"
-            "ANTI-PATTERNS TO AVOID:\n"
-            f"{anti_text}\n\n"
-            "INTENT-TO-STRUCTURE MAPPINGS:\n"
-            f"{mappings_text}\n\n"
-            "RECONSTRUCTION RULES:\n"
-            "1. Begin with a role definition: 'Act as [appropriate expert role]'\n"
-            "2. Include all relevant analytical context (analyte, technique, dosage form)\n"
-            "3. Be specific about methodology, acceptance criteria, regulatory references\n"
-            "4. Specify output format explicitly (headings, bullet points, table, regulatory-ready)\n"
-            "5. Do NOT ask clarifying questions — reconstruct based on all available signals\n"
-            "6. Do NOT add explanations or preamble — return ONLY the reconstructed prompt\n"
-            "7. Match the register of expert pharmaceutical analytical prompts exactly"
+            f"STRUCTURAL RULES:\n{rules_text}\n\n"
+            f"ANTI-PATTERNS TO AVOID:\n{anti_text}\n\n"
+            f"FORMATTING RULE: {NO_MARKDOWN_INSTRUCTION}\n\n"
+            "OUTPUT RULE: Return ONLY the reconstructed prompt. No preamble, no explanation, no labels.\n"
+            f"{extra}"
         )
 
+    async def _high_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
+        mappings_text = "\n".join(
+            f"- {k}: {v}" for k, v in self.principle_engine.intent_mappings.items()
+        )
+        system = self._base_system(
+            f"INTENT-TO-STRUCTURE MAPPINGS:\n{mappings_text}\n\n"
+            "APPROACH: Direct principle-based synthesis. Apply structural rules precisely."
+        )
         human = (
             f'Original query: "{query}"\n\n'
-            f"Extracted intent:\n"
-            f"- Domain: {intent.domain}\n"
-            f"- Task type: {intent.task_type}\n"
-            f"- Primary intent: {intent.primary_intent}\n"
-            f"- Implicit constraints: {', '.join(intent.implicit_constraints) or 'none identified'}\n"
-            f"- Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n"
-            f"- Payload: {json.dumps(intent.unique_payload)}\n\n"
-            "Reconstruct into an expert pharmaceutical analytical science prompt. Return ONLY the prompt."
+            f"Domain: {intent.domain} | Task: {intent.task_type}\n"
+            f"Intent: {intent.primary_intent}\n"
+            f"Implicit constraints: {', '.join(intent.implicit_constraints) or 'none'}\n"
+            f"Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n"
+            f"Payload: {json.dumps(intent.unique_payload)}\n\n"
+            "Reconstruct into a complete expert pharmaceutical analytical science prompt. "
+            "Return ONLY the prompt."
         )
-
         response = await self.chat_model.ainvoke([
             SystemMessage(content=system),
             HumanMessage(content=human),
@@ -283,24 +359,22 @@ class PromptCoachAgent:
         return response.content.strip()
 
     async def _medium_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
-        system = (
-            "You are Prompt Coach. Use fractal decomposition to reconstruct this analytical science query.\n"
-            "Decompose into atomic components, handle each independently, then synthesize.\n"
-            "Components: ROLE | CONTEXT | TASK | CONSTRAINTS | FORMAT\n"
-            "Return ONLY the final reconstructed prompt — no explanations, no component labels."
+        system = self._base_system(
+            "APPROACH: Fractal decomposition. Resolve each component independently "
+            "(role, context, task, constraints, format) then synthesise into a single expert prompt."
         )
         human = (
             f'Query: "{query}"\n'
-            f"Domain: {intent.domain} | Task type: {intent.task_type}\n"
+            f"Domain: {intent.domain} | Task: {intent.task_type}\n"
             f"Intent: {intent.primary_intent}\n"
-            f"Missing parameters: {', '.join(intent.missing_parameters) or 'none'}\n\n"
-            "Decomposition:\n"
-            "ROLE: What pharmaceutical analytical expert role fits this domain?\n"
-            "CONTEXT: What analytical context can be inferred from the query?\n"
-            "TASK: What specific analytical task needs to be accomplished?\n"
-            "CONSTRAINTS: What methodological constraints apply (ICH, USP, GMP, acceptance criteria)?\n"
-            "FORMAT: What structured output format is appropriate for this task type?\n\n"
-            "Synthesize into a single expert pharmaceutical analytical science prompt. Return ONLY the prompt."
+            f"Missing: {', '.join(intent.missing_parameters) or 'none'}\n\n"
+            "Decompose and synthesise:\n"
+            "ROLE: appropriate pharmaceutical analytical expert title\n"
+            "CONTEXT: all inferable analytical context (technique, analyte, dosage form)\n"
+            "TASK: specific deliverable with scope\n"
+            "CONSTRAINTS: applicable ICH/USP/GMP standards and acceptance criteria\n"
+            "FORMAT: structured output specification\n\n"
+            "Return ONLY the final synthesised prompt."
         )
         response = await self.chat_model.ainvoke([
             SystemMessage(content=system),
@@ -309,22 +383,12 @@ class PromptCoachAgent:
         return response.content.strip()
 
     async def _low_confidence_synthesis(self, query: str, intent: IntentObject) -> str:
-        system = (
-            "You are Prompt Coach's Shadow Agent — activated for low-confidence reconstruction.\n\n"
-            "Your approach:\n"
-            "1. Map the vague query to the most structurally similar known analytical scenario\n"
-            "2. Use first-principles reasoning about what an analytical scientist actually needs\n"
-            "3. Make no domain assumptions — reason from the ground up\n"
-            "4. Build the best possible expert prompt given minimal signal\n\n"
-            "Known pharmaceutical analytical scenarios:\n"
-            "- Molecular characterization (DMF-based profile)\n"
-            "- Impurity profiling and degradant identification\n"
-            "- HPLC method development (conditions, column, mobile phase)\n"
-            "- Chromatographic troubleshooting (peak shape, resolution, retention)\n"
-            "- SOP documentation (system suitability, method validation)\n"
-            "- Stability studies (forced degradation, storage conditions)\n"
-            "- Dissolution testing (apparatus, media, acceptance criteria)\n\n"
-            "Return ONLY the reconstructed prompt. Do not explain your reasoning."
+        system = self._base_system(
+            "APPROACH: Shadow Agent activated. Map to the most structurally similar known "
+            "analytical scenario using first-principles reasoning. Make no domain assumptions. "
+            "Build the most useful expert prompt possible from minimal signal.\n\n"
+            "Known scenarios: molecular characterisation, impurity profiling, method development, "
+            "chromatographic troubleshooting, SOP documentation, stability studies, dissolution testing."
         )
         human = (
             f'Vague query: "{query}"\n'
@@ -338,186 +402,469 @@ class PromptCoachAgent:
             HumanMessage(content=human),
         ])
         return response.content.strip()
-##################################################
-#main
-import json
-import logging
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from langchain_openai import AzureChatOpenAI
-from langchain.embeddings.cache import CacheBackedEmbeddings
-from langchain.storage.file_system import LocalFileStore
-from langchain_openai import AzureOpenAIEmbeddings
-from langchain.schema import HumanMessage
-
-from agent import PromptCoachAgent
-from principles import SAMPLE_PROMPTS
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ─── AZURE CONFIGURATION (DO NOT MODIFY STRUCTURE — USER FILLS IN VALUES) ──────
-base_url = ""
-api_version = "2024-02-15-preview"
-api_key = ""
-deployment_name = "GPT4o"
-model_name = "GPT4o"
-
-chat_model = AzureChatOpenAI(
-    azure_deployment=deployment_name,
-    model=model_name,
-    api_version=api_version,
-    api_key=api_key,
-    azure_endpoint=base_url,
-    streaming=True
-)
-
-# Embedding model (same pattern as reference backend)
-file_store = LocalFileStore('langchain-embeddings')
-base = AzureOpenAIEmbeddings(
-    model="text-embedding-ada-002",
-    api_version="2023-07-01-preview",
-    azure_endpoint="",
-    api_key="",
-    azure_deployment="Def_data_qa"
-)
-cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
-    base, file_store, namespace=base.model
-)
-# ─── END AZURE CONFIGURATION ─────────────────────────────────────────────────────
-
-app = FastAPI(title="Prompt Coach API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-agent = PromptCoachAgent(chat_model, SAMPLE_PROMPTS)
-
-
-@app.on_event("startup")
-async def startup_event():
-    await agent.initialize()
-    logger.info("Prompt Coach Agent ready.")
-
-
-# ─── Request models ──────────────────────────────────────────────────────────────
-
-class ReconstructRequest(BaseModel):
-    query: str
-    session_id: str = ""
-
-
-class ChatRequest(BaseModel):
-    reconstructed_prompt: str
-
-
-# ─── Streaming generator ─────────────────────────────────────────────────────────
-
-async def generate(prompt: str):
-    async for chunk in chat_model.astream([HumanMessage(content=prompt)]):
-        token = chunk.content
-        if token:
-            yield f"data: {json.dumps({'token': token})}\n\n"
-    yield f"data: {json.dumps({'done': True})}\n\n"
-
-
-# ─── Endpoints ───────────────────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "principles_loaded": agent.principle_engine.loaded,
-        "sample_count": len(SAMPLE_PROMPTS),
-    }
-
-
-@app.post("/reconstruct")
-async def reconstruct(req: ReconstructRequest):
-    if not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    try:
-        result = await agent.reconstruct(req.query)
-        return result
-    except Exception as e:
-        logger.error(f"Reconstruction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/chat")
-async def chat(req: ChatRequest):
-    return StreamingResponse(
-        generate(req.reconstructed_prompt),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-######################################
-#principles
-SAMPLE_PROMPTS = [
-    {
-        "scenario": "Molecular Profile Understanding",
-        "technique": "Chain-of-thought Prompting",
-        "prompt": """Act as Analytical Expert, I have received a new API [API Name] from the Formulations team and I need a comprehensive understanding of the molecule based on the DMF (Drug Master File) if attached or use publicly available scientific sources.
-Provide information in the following structured order: Chemical identity & structure, Physicochemical properties, Solid state attributes, and Chromatographic behaviour. If any data is not available directly from the DMF, identify the missing information, infer what can be reasonably deduced, and recommend how to obtain the missing details (experiments, analytical techniques, or sources). {Attach DMF if available}"""
-    },
-    {
-        "scenario": "Impurity & Degradant Identification",
-        "technique": "Tree-of-thought Prompting",
-        "prompt": """Act as Analytical Scientist. For the given Analyte [Analyte/API], provide a list of known process impurities, and degradation products of [Analyte/API] & for each impurity or degradant, include the following details: origin (route/by-product/stress), structural class, likely retention behavior in RP-HPLC, and control strategy ideas. (Mention Analyte/API details if needed)"""
-    },
-    {
-        "scenario": "Analytical Method Starting Point",
-        "technique": "Chain-of-thought Prompting",
-        "prompt": """Act as Analytical Expert, Provide Brief overview in clean bullet points of common HPLC-UV analytical approaches used to quantify [API/Analyte] in [Dosage Form] based on DMF if attached or use publicly available analytical science principles and typical pharmaceutical assay methods. Summarize Typical chromatographic conditions relevant to this molecule, including preferred column chemistries (C18, phenyl, particle size, dimensions), Mobile phases (buffer, pH, organic solvents, gradient/isocratic), typical flow-rate ranges, column temperature settings, injection-volume considerations, and common UV Detection wavelengths (max). Present the final summary in a clear, concise format suitable for initiating analytical method development. (Attach DMF if available)"""
-    },
-    {
-        "scenario": "HPLC Chromatogram Troubleshooting",
-        "technique": "Multi Modal Prompting",
-        "prompt": """Act as a Pharmaceutical Analytical Expert, a HPLC chromatogram image for the analyte [Analyte/API] has been uploaded for analysis, together with the current method and sample-preparation parameters for [Current Settings]. Based on these inputs, Analyse the chromatogram and provide structured assessment on Visual Observations from Chromatogram Image, Interpretation of Each Defect, Likely Root Causes (Ranked) Corrective Actions for Next Run, Parameters to Change (pH, mobile phase, gradient, flow, injection, sample prep, column). (Format output in clear headings and bullet points) {Attach current settings of the method/procedure} {Attach Chromatogram}"""
-    },
-    {
-        "scenario": "HPLC System Suitability SOP Documentation",
-        "technique": "Role Based Prompting",
-        "prompt": """Act as a Pharmaceutical Analytical Expert, Generate a draft SOP section for HPLC System Suitability for a method analysing [Analyte/API] with clear headings, bullet points & a final template. Enforce the following acceptance criteria for standard solution at concentration of [Concentration]: Retention time repeatability: %RSD < 1.0% (n ≥ 5 injections), Peak area repeatability: %RSD < 2.0% (n ≥ 5 injections), USP Tailing Factor (T): < 1.5 (measured at 5% peak height unless otherwise defined) and Theoretical Plates (N): > 2000 for [Analyte/API] main peak. Provide calculations, recommended actions if criteria fail, and a ready-to-use system suitability results table. Present the final output in a professional, regulatory-ready format appropriate for inclusion in a pharmaceutical quality document."""
-    }
-]
 ######################################
 ######################################
 #frontend
-#src
-#components
-##promptinput
+import { useState, useEffect, useRef, useCallback } from 'react'
+import PromptInput from './components/PromptInput'
+import SandDissolve from './components/SandDissolve'
+import ReconstructedPrompt from './components/ReconstructedPrompt'
+import HistorySidebar from './components/HistorySidebar'
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const APP_STATE = {
+  INPUT: 'input',
+  DISSOLVING: 'dissolving',
+  REVEAL: 'reveal',
+}
+
+const API = 'http://localhost:8000'
+
+const STATUS_CYCLE = ['EXTRACTING INTENT', 'MAPPING TO PRINCIPLES', 'SYNTHESISING']
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // ── App state ──────────────────────────────────────────────────────────────
+  const [appState, setAppState] = useState(APP_STATE.INPUT)
+  const [backendStatus, setBackendStatus] = useState('checking')
+  const [bannerDismissed, setBannerDismissed] = useState(false)
+
+  // ── Dissolving state ───────────────────────────────────────────────────────
+  const [dissolveText, setDissolveText] = useState('')
+  const [dissolveRect, setDissolveRect] = useState(null)
+  const [progressPercent, setProgressPercent] = useState(0)
+  const [progressStatus, setProgressStatus] = useState(STATUS_CYCLE[0])
+
+  // ── Reveal state ───────────────────────────────────────────────────────────
+  const [reconstructionData, setReconstructionData] = useState(null)
+  const [reconstructionError, setReconstructionError] = useState(null)
+  const [revealMode, setRevealMode] = useState('fresh') // 'fresh' | 'history'
+
+  // ── History ────────────────────────────────────────────────────────────────
+  const [history, setHistory] = useState([])
+  const [activeHistoryId, setActiveHistoryId] = useState(null)
+
+  // ── Async coordination refs ────────────────────────────────────────────────
+  // Both the sand animation AND the API call must complete before REVEAL.
+  // Whichever finishes second triggers the transition.
+  const apiResultRef = useRef(null)
+  const animDoneRef = useRef(false)
+  const currentInputRef = useRef('')
+  const statusIntervalRef = useRef(null)
+
+  // ── Health check ───────────────────────────────────────────────────────────
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch(`${API}/health`, {
+          signal: AbortSignal.timeout(6000),
+        })
+        setBackendStatus(res.ok ? 'online' : 'offline')
+      } catch {
+        setBackendStatus('offline')
+      }
+    }
+    check()
+  }, [])
+
+  // ── Add to history ─────────────────────────────────────────────────────────
+  const addToHistory = useCallback((data, inputText) => {
+    const id =
+      typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+    const item = {
+      id,
+      timestamp: new Date(),
+      userInput: inputText,
+      reconstructedPrompt: data.reconstructed_prompt,
+      confidence: data.confidence,
+      strategy: data.strategy_used,
+      technique: data.technique,
+      isConversational: data.is_conversational ?? false,
+    }
+
+    setHistory((prev) => [item, ...prev].slice(0, 50))
+    setActiveHistoryId(id)
+    return id
+  }, [])
+
+  // ── Transition to REVEAL ───────────────────────────────────────────────────
+  const transitionToReveal = useCallback(
+    (data, error) => {
+      if (data) {
+        setReconstructionData(data)
+        addToHistory(data, currentInputRef.current)
+      }
+      if (error) setReconstructionError(error)
+      setRevealMode('fresh')
+      setAppState(APP_STATE.REVEAL)
+    },
+    [addToHistory]
+  )
+
+  // ── Animation completion callback ──────────────────────────────────────────
+  const handleAnimationComplete = useCallback(() => {
+    animDoneRef.current = true
+    if (apiResultRef.current !== null) {
+      const { data, error } = apiResultRef.current
+      transitionToReveal(data, error)
+    }
+  }, [transitionToReveal])
+
+  // ── Main submit handler ────────────────────────────────────────────────────
+  const handleSubmit = useCallback(
+    async (text, rect) => {
+      // Reset coordination
+      apiResultRef.current = null
+      animDoneRef.current = false
+      currentInputRef.current = text
+
+      // Setup dissolving state
+      setDissolveText(text)
+      setDissolveRect(rect)
+      setProgressPercent(0)
+      setProgressStatus(STATUS_CYCLE[0])
+      setReconstructionData(null)
+      setReconstructionError(null)
+      setRevealMode('fresh')
+      setAppState(APP_STATE.DISSOLVING)
+
+      // Animate progress bar: 0 → 85% over 2s (triggers after one paint)
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => setProgressPercent(85))
+      )
+
+      // Cycle status labels
+      let statusIdx = 0
+      statusIntervalRef.current = setInterval(() => {
+        statusIdx = (statusIdx + 1) % STATUS_CYCLE.length
+        setProgressStatus(STATUS_CYCLE[statusIdx])
+      }, 800)
+
+      try {
+        const sessionId =
+          typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : Math.random().toString(36).slice(2)
+
+        const res = await fetch(`${API}/reconstruct`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: text, session_id: sessionId }),
+        })
+
+        clearInterval(statusIntervalRef.current)
+        setProgressPercent(100)
+        setProgressStatus('COMPLETE')
+
+        if (!res.ok) {
+          const msg = `HTTP ${res.status} — reconstruction failed.`
+          apiResultRef.current = { data: null, error: msg }
+          if (animDoneRef.current) transitionToReveal(null, msg)
+          return
+        }
+
+        const data = await res.json()
+        apiResultRef.current = { data, error: null }
+        if (animDoneRef.current) transitionToReveal(data, null)
+      } catch (err) {
+        clearInterval(statusIntervalRef.current)
+        setProgressPercent(100)
+        const msg = err.message || 'Network error — could not reach backend.'
+        apiResultRef.current = { data: null, error: msg }
+        if (animDoneRef.current) transitionToReveal(null, msg)
+      }
+    },
+    [transitionToReveal]
+  )
+
+  // ── History selection ──────────────────────────────────────────────────────
+  const handleHistorySelect = useCallback((item) => {
+    setReconstructionData({
+      reconstructed_prompt: item.reconstructedPrompt,
+      confidence: item.confidence,
+      strategy_used: item.strategy,
+      technique: item.technique,
+      is_conversational: item.isConversational,
+    })
+    setReconstructionError(null)
+    setActiveHistoryId(item.id)
+    setRevealMode('history')
+    setAppState(APP_STATE.REVEAL)
+  }, [])
+
+  // ── History clear ──────────────────────────────────────────────────────────
+  const handleClearHistory = useCallback(() => {
+    setHistory([])
+    setActiveHistoryId(null)
+    if (appState === APP_STATE.REVEAL) {
+      setAppState(APP_STATE.INPUT)
+      setReconstructionData(null)
+      setReconstructionError(null)
+    }
+  }, [appState])
+
+  // ── Reset to INPUT ─────────────────────────────────────────────────────────
+  const handleReset = () => {
+    clearInterval(statusIntervalRef.current)
+    apiResultRef.current = null
+    animDoneRef.current = false
+    currentInputRef.current = ''
+
+    setAppState(APP_STATE.INPUT)
+    setDissolveText('')
+    setDissolveRect(null)
+    setProgressPercent(0)
+    setProgressStatus(STATUS_CYCLE[0])
+    setReconstructionData(null)
+    setReconstructionError(null)
+    setRevealMode('fresh')
+    setActiveHistoryId(null)
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  const isInputOrDissolving =
+    appState === APP_STATE.INPUT || appState === APP_STATE.DISSOLVING
+
+  return (
+    <div className="app-root">
+      {/* ── Offline banner ── */}
+      {backendStatus === 'offline' && !bannerDismissed && (
+        <div className="offline-banner" role="alert">
+          <span>⚠ Backend offline — check that uvicorn is running on port 8000</span>
+          <button
+            className="dismiss-btn"
+            onClick={() => setBannerDismissed(true)}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* ── Header ── */}
+      <header className="app-header">
+        <div className="header-content">
+          <span className="app-name">Prompt Coach</span>
+        </div>
+      </header>
+
+      {/* ── Body: sidebar + main ── */}
+      <div className="app-body">
+        {/* History sidebar — always rendered when backend is ready */}
+        {backendStatus !== 'checking' && (
+          <HistorySidebar
+            history={history}
+            activeId={activeHistoryId}
+            onSelect={handleHistorySelect}
+            onClear={handleClearHistory}
+          />
+        )}
+
+        {/* Main content */}
+        <main className="app-main">
+          {/* Loading screen */}
+          {backendStatus === 'checking' && (
+            <div className="loading-screen" aria-label="Loading">
+              <div className="loading-content">
+                <span className="loading-app-name">Prompt Coach</span>
+                <div className="loading-bar-track">
+                  <div className="loading-bar-fill" />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {backendStatus !== 'checking' && (
+            <>
+              {/* INPUT + DISSOLVING — share the PromptInput card */}
+              <div
+                className={isInputOrDissolving ? 'state-visible' : 'state-hidden'}
+                aria-hidden={!isInputOrDissolving}
+              >
+                <PromptInput
+                  onSubmit={handleSubmit}
+                  isDissolving={appState === APP_STATE.DISSOLVING}
+                  progressPercent={progressPercent}
+                  progressStatus={progressStatus}
+                />
+              </div>
+
+              {/* Sand dissolve canvas overlay */}
+              {appState === APP_STATE.DISSOLVING && (
+                <SandDissolve
+                  text={dissolveText}
+                  sourceRect={dissolveRect}
+                  onComplete={handleAnimationComplete}
+                />
+              )}
+
+              {/* REVEAL */}
+              {appState === APP_STATE.REVEAL && (
+                <div className="reveal-state" aria-live="polite">
+                  <ReconstructedPrompt
+                    data={reconstructionData}
+                    error={reconstructionError}
+                    instant={revealMode === 'history'}
+                  />
+
+                  <div className="reveal-footer">
+                    <button className="new-prompt-btn" onClick={handleReset}>
+                      NEW PROMPT
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </main>
+      </div>
+    </div>
+  )
+}
+#####################################
+import { useState } from 'react'
+
+// ─── Icons ───────────────────────────────────────────────────────────────────
+
+function HistoryIcon() {
+  return (
+    <svg width="22" height="22" viewBox="0 0 22 22" fill="none" aria-hidden="true">
+      <circle cx="11" cy="11" r="8.25" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M11 7.5v3.75l2.5 2.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path d="M2.5 3.5h9M5.5 3.5V2.5a.5.5 0 0 1 .5-.5h2a.5.5 0 0 1 .5.5v1M11 3.5l-.6 7.5a.5.5 0 0 1-.5.5H4.1a.5.5 0 0 1-.5-.5L3 3.5" stroke="currentColor" strokeWidth="1.15" strokeLinecap="round" />
+    </svg>
+  )
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function formatRelativeTime(date) {
+  const diffMs = Date.now() - date.getTime()
+  const mins = Math.floor(diffMs / 60_000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+}
+
+function confidenceVariant(score) {
+  if (score >= 0.8) return 'chip-conf-high'
+  if (score >= 0.5) return 'chip-conf-mid'
+  return 'chip-conf-low'
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
+export default function HistorySidebar({ history, activeId, onSelect, onClear }) {
+  const [confirmClear, setConfirmClear] = useState(false)
+
+  const handleClearClick = () => {
+    if (confirmClear) {
+      onClear()
+      setConfirmClear(false)
+    } else {
+      setConfirmClear(true)
+      // Auto-cancel confirm after 3s
+      setTimeout(() => setConfirmClear(false), 3000)
+    }
+  }
+
+  return (
+    <aside className="sidebar" aria-label="Reconstruction history">
+      {/* Header */}
+      <div className="sidebar-header">
+        <span className="sidebar-label">HISTORY</span>
+        {history.length > 0 && (
+          <button
+            className={`sidebar-clear-btn ${confirmClear ? 'sidebar-clear-confirm' : ''}`}
+            onClick={handleClearClick}
+            aria-label={confirmClear ? 'Confirm clear all history' : 'Clear all history'}
+            title={confirmClear ? 'Click again to confirm' : 'Clear all history'}
+          >
+            {confirmClear ? (
+              <span className="sidebar-clear-label">CONFIRM</span>
+            ) : (
+              <TrashIcon />
+            )}
+          </button>
+        )}
+      </div>
+
+      {/* Content */}
+      {history.length === 0 ? (
+        <div className="sidebar-empty">
+          <span className="sidebar-empty-icon">
+            <HistoryIcon />
+          </span>
+          <p className="sidebar-empty-text">
+            Reconstructions will appear here
+          </p>
+        </div>
+      ) : (
+        <ul className="history-list" role="list" aria-label="Past reconstructions">
+          {history.map((item) => (
+            <li key={item.id}>
+              <button
+                className={`history-item${activeId === item.id ? ' history-item-active' : ''}`}
+                onClick={() => onSelect(item)}
+                aria-current={activeId === item.id ? 'true' : undefined}
+                aria-label={`Reconstruction: ${item.userInput}`}
+              >
+                {/* Active indicator bar */}
+                {activeId === item.id && (
+                  <span className="history-active-bar" aria-hidden="true" />
+                )}
+
+                <span className="history-preview">{item.userInput}</span>
+
+                <span className="history-meta">
+                  <span className="history-time">
+                    {formatRelativeTime(item.timestamp)}
+                  </span>
+                  {!item.isConversational && typeof item.confidence === 'number' && (
+                    <span className={`history-conf ${confidenceVariant(item.confidence)}`}>
+                      {Math.round(item.confidence * 100)}%
+                    </span>
+                  )}
+                  {item.isConversational && (
+                    <span className="history-conf chip-conf-info">INFO</span>
+                  )}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </aside>
+  )
+}
+########################################
 import { useState, useRef } from 'react'
 
-const SCENARIOS = [
-  'MOLECULAR PROFILE',
-  'IMPURITIES',
-  'METHOD DEVELOPMENT',
-  'TROUBLESHOOTING',
-  'SOP DOCUMENTATION',
-]
-
 /**
- * PromptInput — shown during INPUT state and reused as the card shell
- * during DISSOLVING state.
+ * PromptInput — the central input card.
+ * Shown during INPUT state and re-used (modified) during DISSOLVING state.
  *
  * Props:
- *   onSubmit(text, rect)  — called when user clicks Reconstruct.
- *                           rect = sourceRect of the textarea area for the
- *                           SandDissolve canvas to use as particle origin.
- *   isDissolving          — when true shows the dissolving UI variation
- *   progressPercent       — 0-100 for the progress bar fill
- *   progressStatus        — cycling status text shown below the card
+ *   onSubmit(text, rect)  — called with the query text and the textarea's
+ *                           DOMRect (used by SandDissolve for particle origin)
+ *   isDissolving          — renders the dissolving variant
+ *   progressPercent       — 0-100 for the top progress bar
+ *   progressStatus        — cycling status label shown below the card
  */
 export default function PromptInput({
   onSubmit,
@@ -526,21 +873,17 @@ export default function PromptInput({
   progressStatus = '',
 }) {
   const [value, setValue] = useState('')
-  const textareaRef = useRef(null)
   const textareaWrapRef = useRef(null)
 
   const handleSubmit = () => {
     const trimmed = value.trim()
     if (!trimmed || isDissolving) return
-
     const rect = textareaWrapRef.current?.getBoundingClientRect() ?? null
     onSubmit(trimmed, rect)
   }
 
   const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      handleSubmit()
-    }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) handleSubmit()
   }
 
   return (
@@ -556,29 +899,27 @@ export default function PromptInput({
 
       {/* Card */}
       <div className="input-card">
-        {/* Progress bar — only visible when dissolving */}
-        <div
-          className="card-progress-bar"
-          style={{ display: isDissolving ? 'block' : 'none' }}
-        >
-          <div
-            className="card-progress-fill"
-            style={{
-              width: `${progressPercent}%`,
-              transition:
-                progressPercent === 0
-                  ? 'none'
-                  : progressPercent >= 100
-                  ? 'width 200ms ease'
-                  : 'width 2000ms ease-out',
-            }}
-          />
-        </div>
+        {/* Progress bar — visible only when dissolving */}
+        {isDissolving && (
+          <div className="card-progress-bar">
+            <div
+              className="card-progress-fill"
+              style={{
+                width: `${progressPercent}%`,
+                transition:
+                  progressPercent === 0
+                    ? 'none'
+                    : progressPercent >= 100
+                    ? 'width 200ms ease'
+                    : 'width 2000ms ease-out',
+              }}
+            />
+          </div>
+        )}
 
-        {/* Textarea area — captured by SandDissolve */}
+        {/* Textarea capture zone */}
         <div ref={textareaWrapRef} className="textarea-wrap">
           <textarea
-            ref={textareaRef}
             className="prompt-textarea"
             placeholder="e.g. check my hplc method for impurities"
             value={value}
@@ -586,6 +927,7 @@ export default function PromptInput({
             onKeyDown={handleKeyDown}
             disabled={isDissolving}
             aria-label="Enter your analytical science prompt"
+            spellCheck="false"
           />
         </div>
 
@@ -594,58 +936,50 @@ export default function PromptInput({
         {/* Footer */}
         {!isDissolving ? (
           <div className="card-footer">
-            <span className="card-hint">Be as vague or specific as you like</span>
+            <span className="card-hint">Ctrl + Enter to reconstruct</span>
             <button
               className="reconstruct-btn"
               onClick={handleSubmit}
               disabled={!value.trim()}
-              aria-label="Reconstruct prompt"
             >
               RECONSTRUCT
             </button>
           </div>
         ) : (
-          <div className="card-footer-dissolving">
-            <span className="reconstructing-label">
+          <div className="card-footer">
+            <span className="card-hint" style={{ opacity: 0 }}>·</span>
+            <button className="reconstruct-btn loading" disabled>
               <span className="spinner" />
-              Reconstructing...
-            </span>
+              Reconstructing
+            </button>
           </div>
         )}
       </div>
 
-      {/* Status cycling — below card during dissolving */}
-      {isDissolving && (
-        <div className="status-cycling-wrap">
+      {/* Status text — below card during dissolving */}
+      <div className="status-cycling-wrap" aria-live="polite">
+        {isDissolving && (
           <span className="status-cycling" key={progressStatus}>
             {progressStatus}
           </span>
-        </div>
-      )}
-
-      {/* Scenario chips — only in normal input mode */}
-      {!isDissolving && (
-        <div className="scenario-chips" aria-hidden="true">
-          {SCENARIOS.map((s) => (
-            <span key={s} className="scenario-chip">{s}</span>
-          ))}
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }
-########################################
-#reconstructedprompt
+###########################################
 import { useState, useEffect, useRef } from 'react'
 
-const TYPEWRITER_INTERVAL_MS = 8
+const TYPEWRITER_MS = 8  // ms per character
+
+// ─── Icons ───────────────────────────────────────────────────────────────────
 
 function CopyIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-      <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
+    <svg width="15" height="15" viewBox="0 0 15 15" fill="none" aria-hidden="true">
+      <rect x="5" y="5" width="8.5" height="8.5" rx="1.5" stroke="currentColor" strokeWidth="1.2" />
       <path
-        d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
+        d="M10 5V3.5A1.5 1.5 0 0 0 8.5 2h-5A1.5 1.5 0 0 0 2 3.5v5A1.5 1.5 0 0 0 3.5 10H5"
         stroke="currentColor"
         strokeWidth="1.2"
         strokeLinecap="round"
@@ -654,365 +988,136 @@ function CopyIcon() {
   )
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function confidenceClass(score) {
+  if (score >= 0.8) return 'meta-confidence-high'
+  if (score >= 0.5) return 'meta-confidence-mid'
+  return 'meta-confidence-low'
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
 /**
- * ReconstructedPrompt — left panel in REVEAL state.
- * Shows the typewriter-animated reconstructed prompt and metadata chips.
+ * ReconstructedPrompt — single-panel reveal card.
  *
  * Props:
- *   data  — { reconstructed_prompt, confidence, strategy_used, technique }
- *   error — error message string (if reconstruction failed)
+ *   data           — { reconstructed_prompt, confidence, strategy_used, technique, is_conversational }
+ *   error          — error string if reconstruction failed
+ *   instant        — skip typewriter; show text immediately (for history replay)
  */
-export default function ReconstructedPrompt({ data, error }) {
+export default function ReconstructedPrompt({ data, error, instant = false }) {
   const [displayText, setDisplayText] = useState('')
   const [copied, setCopied] = useState(false)
   const timerRef = useRef(null)
 
   const fullText = data?.reconstructed_prompt ?? ''
+  const isConversational = data?.is_conversational ?? false
 
   // Typewriter animation
   useEffect(() => {
-    if (!fullText) return
+    clearInterval(timerRef.current)
+    if (!fullText) { setDisplayText(''); return }
+
+    if (instant) {
+      setDisplayText(fullText)
+      return
+    }
+
     setDisplayText('')
     let i = 0
     timerRef.current = setInterval(() => {
       i += 1
       setDisplayText(fullText.slice(0, i))
       if (i >= fullText.length) clearInterval(timerRef.current)
-    }, TYPEWRITER_INTERVAL_MS)
+    }, TYPEWRITER_MS)
+
     return () => clearInterval(timerRef.current)
-  }, [fullText])
+  }, [fullText, instant])
 
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(fullText)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
     } catch {
-      // fallback — execCommand
       const el = document.createElement('textarea')
       el.value = fullText
+      el.style.position = 'fixed'
+      el.style.opacity = '0'
       document.body.appendChild(el)
       el.select()
       document.execCommand('copy')
       document.body.removeChild(el)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
     }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
   }
 
-  const confidencePct = data ? Math.round(data.confidence * 100) : null
+  const confidencePct = data ? Math.round((data.confidence ?? 0) * 100) : null
   const strategy = data?.strategy_used ?? ''
   const technique = data?.technique ?? ''
 
   return (
-    <div className="panel-left">
-      {/* Header */}
-      <div className="panel-header">
-        <span className="panel-label">Reconstructed Prompt</span>
-        {!error && fullText && (
-          <button
-            className="copy-btn"
-            onClick={handleCopy}
-            aria-label="Copy reconstructed prompt"
-          >
-            {copied ? (
-              <span className="copy-tooltip">✓ COPIED</span>
-            ) : null}
-            <CopyIcon />
-          </button>
+    <div className="reveal-panel">
+      {/* ── Header ── */}
+      <div className="reveal-panel-header">
+        <div className="reveal-panel-title">
+          <span className="reveal-panel-label">
+            {isConversational ? 'SYSTEM RESPONSE' : 'RECONSTRUCTED PROMPT'}
+          </span>
+        </div>
+
+        {!error && fullText && !isConversational && (
+          <div className="copy-wrap">
+            {copied && <span className="copy-tooltip">COPIED</span>}
+            <button
+              className="copy-btn"
+              onClick={handleCopy}
+              aria-label="Copy to clipboard"
+            >
+              <CopyIcon />
+            </button>
+          </div>
         )}
       </div>
 
-      {/* Content */}
-      {error ? (
-        <div className="error-state">
-          <span className="error-label">RECONSTRUCTION FAILED</span>
-          <p className="error-detail">{error}</p>
-        </div>
-      ) : (
-        <p className="reconstructed-text">{displayText}</p>
-      )}
+      {/* ── Body ── */}
+      <div className="reveal-panel-body">
+        {error ? (
+          <div className="reveal-error">
+            <span className="reveal-error-label">RECONSTRUCTION FAILED</span>
+            <p className="reveal-error-detail">{error}</p>
+          </div>
+        ) : (
+          <p
+            className={`reveal-text ${isConversational ? 'reveal-text-conversational' : ''}`}
+            aria-live={instant ? undefined : 'polite'}
+          >
+            {displayText}
+            {!instant && displayText.length < fullText.length && fullText.length > 0 && (
+              <span className="typewriter-cursor" aria-hidden="true" />
+            )}
+          </p>
+        )}
+      </div>
 
-      {/* Metadata chips */}
-      {!error && confidencePct !== null && (
-        <div className="metadata-row">
-          <span className="meta-chip meta-confidence">
-            CONFIDENCE: {confidencePct}%
+      {/* ── Metadata chips — only for analytical reconstructions ── */}
+      {!error && !isConversational && confidencePct !== null && (
+        <div className="reveal-panel-meta">
+          <span className={`meta-chip ${confidenceClass(data.confidence)}`}>
+            {confidencePct}% CONFIDENCE
           </span>
           {strategy && (
-            <span className="meta-chip meta-strategy">
-              STRATEGY: {strategy}
-            </span>
+            <span className="meta-chip meta-strategy">{strategy}</span>
           )}
           {technique && (
-            <span className="meta-chip meta-technique">
-              TECHNIQUE: {technique}
-            </span>
+            <span className="meta-chip meta-technique">{technique}</span>
           )}
         </div>
       )}
     </div>
   )
 }
-#############################
-#ResponseStream
-import { useState, useEffect, useRef } from 'react'
-
-/**
- * ResponseStream — right panel in REVEAL state.
- * Streams tokens with per-batch fade-in animation and auto-scrolls.
- *
- * Props:
- *   response    — accumulated response string
- *   isStreaming — boolean, true while SSE is active
- */
-export default function ResponseStream({ response, isStreaming }) {
-  const scrollRef = useRef(null)
-  const prevLengthRef = useRef(0)
-  const [batches, setBatches] = useState([])
-
-  // As new tokens arrive, accumulate them into batches for fade-in animation
-  useEffect(() => {
-    if (response.length > prevLengthRef.current) {
-      const newPart = response.slice(prevLengthRef.current)
-      prevLengthRef.current = response.length
-      setBatches((prev) => [...prev, { text: newPart, id: Date.now() + Math.random() }])
-    }
-  }, [response])
-
-  // Reset batches when response is cleared
-  useEffect(() => {
-    if (response === '') {
-      setBatches([])
-      prevLengthRef.current = 0
-    }
-  }, [response])
-
-  // Auto-scroll to bottom as tokens arrive
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight
-    }
-  }, [batches])
-
-  const isEmpty = batches.length === 0
-
-  return (
-    <div className="panel-right">
-      {/* Header */}
-      <div className="panel-header">
-        <span className="panel-label">Model Response</span>
-        <div className="streaming-status">
-          <span className={`streaming-dot ${isStreaming ? 'active' : 'done'}`} />
-          <span className={`streaming-label ${isStreaming ? 'active' : 'done'}`}>
-            {isStreaming ? 'STREAMING' : 'COMPLETE'}
-          </span>
-        </div>
-      </div>
-
-      {/* Response area */}
-      <div ref={scrollRef} className="response-scroll">
-        <div className="response-text">
-          {batches.map((batch) => (
-            <span key={batch.id} className="token-batch">
-              {batch.text}
-            </span>
-          ))}
-          {isStreaming && !isEmpty && (
-            <span className="cursor-blink" aria-hidden="true" />
-          )}
-          {isEmpty && isStreaming && (
-            <span className="response-waiting">
-              <span className="spinner" style={{ borderColor: 'rgba(14,165,233,0.3)', borderTopColor: 'var(--secondary)', display: 'inline-block' }} />
-            </span>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-######################################
-#SandDissolve
-import { useEffect, useRef } from 'react'
-
-/**
- * SandDissolve — canvas-based per-pixel particle physics dissolution.
- * Renders text on an offscreen canvas, samples pixels, and animates
- * them as particles swept left-to-right across the full viewport.
- *
- * Props:
- *   text       — the string that was in the textarea
- *   sourceRect — DOMRect of the textarea area (for particle start positions)
- *   onComplete — called when all particles have faded out
- */
-export default function SandDissolve({ text, sourceRect, onComplete }) {
-  const canvasRef = useRef(null)
-
-  useEffect(() => {
-    if (!text || !sourceRect) return
-
-    let rafId = null
-    let cancelled = false
-
-    const init = async () => {
-      // Wait for fonts so canvas text rendering matches the textarea
-      await document.fonts.ready
-      if (cancelled) return
-
-      const canvas = canvasRef.current
-      if (!canvas) return
-
-      canvas.width = window.innerWidth
-      canvas.height = window.innerHeight
-      const ctx = canvas.getContext('2d')
-
-      // ── Render text onto offscreen canvas ──────────────────────────────────
-      const { left, top, width, height } = sourceRect
-      const offW = Math.max(1, Math.floor(width))
-      const offH = Math.max(1, Math.floor(height))
-
-      const offscreen = document.createElement('canvas')
-      offscreen.width = offW
-      offscreen.height = offH
-      const offCtx = offscreen.getContext('2d')
-
-      offCtx.fillStyle = '#FFFFFF'
-      offCtx.fillRect(0, 0, offW, offH)
-
-      offCtx.font = "400 16px 'DM Sans', sans-serif"
-      offCtx.fillStyle = '#0F172A'
-      offCtx.textBaseline = 'top'
-
-      const padding = 0
-      const lineHeight = 26
-      const maxWidth = offW - padding * 2
-      const words = text.split(' ')
-      let line = ''
-      let y = 0
-
-      for (let i = 0; i < words.length; i++) {
-        const testLine = line + (line ? ' ' : '') + words[i]
-        if (offCtx.measureText(testLine).width > maxWidth && line !== '') {
-          offCtx.fillText(line, padding, y)
-          line = words[i]
-          y += lineHeight
-          if (y + lineHeight > offH) break
-        } else {
-          line = testLine
-        }
-      }
-      if (line && y + lineHeight <= offH + lineHeight) {
-        offCtx.fillText(line, padding, y)
-      }
-
-      // ── Sample pixels → build particle array ───────────────────────────────
-      const imgData = offCtx.getImageData(0, 0, offW, offH)
-      const pxData = imgData.data
-      const step = 3
-      const particles = []
-
-      for (let py = 0; py < offH; py += step) {
-        for (let px = 0; px < offW; px += step) {
-          const idx = (py * offW + px) * 4
-          const r = pxData[idx]
-          const g = pxData[idx + 1]
-          const b = pxData[idx + 2]
-          const a = pxData[idx + 3]
-
-          // Skip transparent and near-white (background) pixels
-          if (a < 20) continue
-          if (r > 230 && g > 230 && b > 230) continue
-
-          // Left-to-right staggered delay (0 → 400ms sweep)
-          const delay = (px / offW) * 400
-
-          particles.push({
-            x: left + px,
-            y: top + py,
-            vx: 1.5 + Math.random() * 2.5,
-            vy: -(0.5 + Math.random() * 1.5),
-            opacity: 1,
-            r, g, b,
-            size: 1.5 + Math.random() * 1.5,
-            delay,
-            active: false,
-          })
-        }
-      }
-
-      if (particles.length === 0) {
-        if (!cancelled) onComplete?.()
-        return
-      }
-
-      // ── Animation loop ─────────────────────────────────────────────────────
-      let startTime = null
-
-      const animate = (ts) => {
-        if (cancelled) return
-        if (!startTime) startTime = ts
-        const elapsed = ts - startTime
-
-        ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-        let anyAlive = false
-
-        for (const p of particles) {
-          if (!p.active) {
-            if (elapsed >= p.delay) {
-              p.active = true
-            } else {
-              // Stationary — draw at original position
-              anyAlive = true
-              ctx.globalAlpha = p.opacity
-              ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`
-              ctx.fillRect(p.x, p.y, p.size, p.size)
-              continue
-            }
-          }
-
-          // Physics
-          p.vx *= 0.97         // air resistance
-          p.vy += 0.12         // gravity
-          p.x += p.vx
-          p.y += p.vy
-          p.opacity -= 0.018
-
-          if (p.opacity > 0) {
-            anyAlive = true
-            ctx.globalAlpha = Math.max(0, p.opacity)
-            ctx.fillStyle = `rgb(${p.r},${p.g},${p.b})`
-            ctx.fillRect(p.x, p.y, p.size, p.size)
-          }
-        }
-
-        ctx.globalAlpha = 1
-
-        if (!anyAlive) {
-          ctx.clearRect(0, 0, canvas.width, canvas.height)
-          if (!cancelled) onComplete?.()
-          return
-        }
-
-        rafId = requestAnimationFrame(animate)
-      }
-
-      rafId = requestAnimationFrame(animate)
-    }
-
-    init()
-
-    return () => {
-      cancelled = true
-      if (rafId) cancelAnimationFrame(rafId)
-    }
-  }, [text, sourceRect, onComplete])
-
-  return <canvas ref={canvasRef} className="dissolve-canvas" />
-}
-#####################
-##styles
-#global
+###############################################
 /* ─── Design Tokens ─────────────────────────────────────────────────────────── */
 :root {
   --bg: #F8F9FC;
@@ -1028,13 +1133,15 @@ export default function SandDissolve({ text, sourceRect, onComplete }) {
   --text-muted: #94A3B8;
 
   --shadow-card: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(0,0,0,0.04);
-  --shadow-focused: 0 0 0 3px rgba(14,165,233,0.15), 0 1px 3px rgba(0,0,0,0.08);
   --shadow-active: 0 4px 24px rgba(15,76,138,0.08), 0 1px 4px rgba(0,0,0,0.06);
+  --shadow-focused: 0 0 0 3px rgba(14,165,233,0.15), 0 1px 3px rgba(0,0,0,0.08);
 
   --font-display: 'Syne', sans-serif;
   --font-mono: 'Space Mono', monospace;
   --font-body: 'DM Sans', sans-serif;
 
+  --header-h: 52px;
+  --sidebar-w: 264px;
   --radius: 12px;
   --radius-sm: 6px;
   --radius-pill: 8px;
@@ -1047,6 +1154,10 @@ export default function SandDissolve({ text, sourceRect, onComplete }) {
   padding: 0;
 }
 
+html, body, #root {
+  height: 100%;
+}
+
 html {
   font-size: 16px;
   -webkit-font-smoothing: antialiased;
@@ -1055,40 +1166,26 @@ html {
 
 body {
   font-family: var(--font-body);
-  background: var(--bg);
   color: var(--text-primary);
-  min-height: 100vh;
+  background: var(--bg);
 }
 
 /* ─── Scrollbars ────────────────────────────────────────────────────────────── */
-::-webkit-scrollbar {
-  width: 5px;
-  height: 5px;
-}
-::-webkit-scrollbar-track {
-  background: #F1F5F9;
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb {
-  background: #CBD5E1;
-  border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #94A3B8;
-}
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: #F1F5F9; border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #94A3B8; }
 
-/* ─── Focus States ──────────────────────────────────────────────────────────── */
+/* ─── Focus ─────────────────────────────────────────────────────────────────── */
 *:focus-visible {
   outline: 2.5px solid var(--secondary);
   outline-offset: 2px;
 }
-*:focus:not(:focus-visible) {
-  outline: none;
-}
+*:focus:not(:focus-visible) { outline: none; }
 
 /* ─── App Root ──────────────────────────────────────────────────────────────── */
 .app-root {
-  min-height: 100vh;
+  height: 100%;
   display: flex;
   flex-direction: column;
   background-color: var(--bg);
@@ -1096,6 +1193,7 @@ body {
     linear-gradient(rgba(15,76,138,0.04) 1px, transparent 1px),
     linear-gradient(90deg, rgba(15,76,138,0.04) 1px, transparent 1px);
   background-size: 48px 48px;
+  overflow: hidden;
 }
 
 /* ─── Offline Banner ────────────────────────────────────────────────────────── */
@@ -1104,13 +1202,15 @@ body {
   border-bottom: 1px solid #FDE68A;
   color: #92400E;
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 10px;
   letter-spacing: 0.3px;
-  padding: 10px 32px;
+  padding: 9px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex-shrink: 0;
+  z-index: 200;
 }
 .dismiss-btn {
   background: none;
@@ -1120,31 +1220,27 @@ body {
   font-size: 18px;
   line-height: 1;
   padding: 0 4px;
-  opacity: 0.7;
+  opacity: 0.6;
   transition: opacity 150ms;
-  flex-shrink: 0;
 }
 .dismiss-btn:hover { opacity: 1; }
 
 /* ─── Header ────────────────────────────────────────────────────────────────── */
 .app-header {
-  position: sticky;
-  top: 0;
-  z-index: 90;
+  height: var(--header-h);
+  flex-shrink: 0;
   background: rgba(255,255,255,0.95);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
-  height: 52px;
   display: flex;
   align-items: center;
-  padding: 0 32px;
-  flex-shrink: 0;
+  padding: 0 28px;
+  z-index: 100;
 }
 .header-content {
   width: 100%;
   display: flex;
   align-items: center;
-  justify-content: space-between;
 }
 .app-name {
   font-family: var(--font-display);
@@ -1154,35 +1250,194 @@ body {
   letter-spacing: -0.5px;
   line-height: 1;
 }
-.status-chip {
+
+/* ─── App Body ──────────────────────────────────────────────────────────────── */
+.app-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* ─── Sidebar ───────────────────────────────────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: rgba(255, 255, 255, 0.82);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-right: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow: 2px 0 20px rgba(15, 76, 138, 0.04);
+  overflow-y: auto;
+  overflow-x: hidden;
+  z-index: 50;
+}
+
+.sidebar-header {
+  padding: 18px 16px 14px;
   display: flex;
   align-items: center;
-  gap: 7px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--success);
-  letter-spacing: 0.5px;
-}
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--success);
-  animation: pulse-dot 2.4s ease-in-out infinite;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(226, 232, 240, 0.7);
   flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  background: rgba(255, 255, 255, 0.9);
+  backdrop-filter: blur(12px);
+  z-index: 1;
 }
-@keyframes pulse-dot {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.5; transform: scale(0.85); }
+.sidebar-label {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  letter-spacing: 3px;
+  color: var(--text-secondary);
 }
+
+.sidebar-clear-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 6px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 150ms ease, background 150ms ease;
+  min-width: 28px;
+  min-height: 24px;
+}
+.sidebar-clear-btn:hover {
+  color: var(--warning);
+  background: #FFF7ED;
+}
+.sidebar-clear-confirm {
+  color: var(--warning);
+  background: #FFF7ED;
+}
+.sidebar-clear-label {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.5px;
+  color: var(--warning);
+}
+
+/* Sidebar empty state */
+.sidebar-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 40px 20px;
+  color: var(--border-mid);
+}
+.sidebar-empty-icon {
+  opacity: 0.6;
+}
+.sidebar-empty-text {
+  font-family: var(--font-body);
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+  line-height: 1.6;
+  max-width: 160px;
+}
+
+/* History list */
+.history-list {
+  list-style: none;
+  padding: 6px 0 16px;
+}
+.history-item {
+  position: relative;
+  width: 100%;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  text-align: left;
+  padding: 10px 14px 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.history-item:hover {
+  background: rgba(15, 76, 138, 0.03);
+}
+.history-item-active {
+  background: rgba(15, 76, 138, 0.05);
+  border-left-color: var(--primary);
+}
+.history-active-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--primary);
+  border-radius: 0 1px 1px 0;
+}
+.history-preview {
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  font-weight: 400;
+  color: var(--text-primary);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.history-item-active .history-preview {
+  color: var(--primary);
+  font-weight: 500;
+}
+.history-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.history-time {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.3px;
+}
+.history-conf {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  letter-spacing: 0.3px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.chip-conf-high { background: #ECFDF5; color: var(--success); }
+.chip-conf-mid  { background: #EFF6FF; color: var(--primary); }
+.chip-conf-low  { background: #FFF7ED; color: var(--warning); }
+.chip-conf-info { background: #F1F5F9; color: var(--text-secondary); }
 
 /* ─── Main ──────────────────────────────────────────────────────────────────── */
 .app-main {
   flex: 1;
+  min-width: 0;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
-  position: relative;
 }
+
+/* ─── State visibility helpers ──────────────────────────────────────────────── */
+.state-visible {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+.state-hidden { display: none; }
 
 /* ─── Loading Screen ────────────────────────────────────────────────────────── */
 .loading-screen {
@@ -1190,7 +1445,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: calc(100vh - 52px);
+  min-height: 100%;
 }
 .loading-content {
   display: flex;
@@ -1201,12 +1456,12 @@ body {
 .loading-app-name {
   font-family: var(--font-display);
   font-weight: 800;
-  font-size: 28px;
+  font-size: 26px;
   color: var(--primary);
   letter-spacing: -0.5px;
 }
 .loading-bar-track {
-  width: 160px;
+  width: 140px;
   height: 2px;
   background: var(--border);
   border-radius: 1px;
@@ -1219,52 +1474,42 @@ body {
   animation: loading-sweep 1.4s ease-in-out infinite;
 }
 @keyframes loading-sweep {
-  0% { width: 0%; margin-left: 0%; }
-  50% { width: 60%; margin-left: 20%; }
-  100% { width: 0%; margin-left: 100%; }
-}
-
-/* ─── State Transitions ─────────────────────────────────────────────────────── */
-.state-visible {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-}
-.state-hidden {
-  display: none;
+  0%   { width: 0%;   margin-left: 0%; }
+  50%  { width: 60%;  margin-left: 20%; }
+  100% { width: 0%;   margin-left: 100%; }
 }
 
 /* ─── INPUT STATE ───────────────────────────────────────────────────────────── */
 .input-state {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  flex: 1;
-  min-height: calc(100vh - 52px);
-  padding: 40px 24px 60px;
+  padding: 40px 32px 64px;
+  min-height: 100%;
 }
 
 .hero-area {
   text-align: center;
-  max-width: 720px;
-  margin-bottom: 32px;
+  max-width: 660px;
+  margin-bottom: 28px;
 }
 .hero-headline {
   font-family: var(--font-display);
   font-weight: 800;
-  font-size: 48px;
+  font-size: 44px;
   color: var(--text-primary);
   letter-spacing: -1.5px;
   line-height: 1.1;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
 }
 .hero-sub {
   font-family: var(--font-body);
   font-weight: 300;
   font-size: 16px;
   color: var(--text-secondary);
-  max-width: 560px;
+  max-width: 520px;
   margin: 0 auto;
   line-height: 1.7;
 }
@@ -1272,20 +1517,19 @@ body {
 /* ─── Input Card ────────────────────────────────────────────────────────────── */
 .input-card {
   width: 100%;
-  max-width: 720px;
+  max-width: 660px;
   background: var(--surface);
   border-radius: var(--radius);
   box-shadow: var(--shadow-card);
   border-left: 2px solid var(--primary);
   overflow: hidden;
-  position: relative;
   transition: box-shadow 200ms ease;
 }
 .input-card:focus-within {
   box-shadow: var(--shadow-active);
 }
 
-/* Progress bar (used in dissolving mode) */
+/* Progress bar */
 .card-progress-bar {
   height: 2px;
   background: var(--border);
@@ -1294,21 +1538,16 @@ body {
 }
 .card-progress-fill {
   position: absolute;
-  top: 0;
-  left: 0;
+  top: 0; left: 0;
   height: 100%;
   background: linear-gradient(90deg, var(--primary), var(--secondary));
-  border-radius: 0 1px 1px 0;
-  transition: width 200ms ease;
 }
 
-.textarea-wrap {
-  padding: 20px 20px 0;
-}
+.textarea-wrap { padding: 20px 20px 0; }
 .prompt-textarea {
   width: 100%;
   min-height: 120px;
-  max-height: 300px;
+  max-height: 280px;
   border: none;
   outline: none;
   resize: vertical;
@@ -1326,14 +1565,13 @@ body {
 }
 .prompt-textarea:disabled {
   opacity: 0;
-  pointer-events: none;
   transition: opacity 150ms ease;
 }
 
 .card-divider {
   height: 1px;
   background: var(--border);
-  margin: 12px 0 0;
+  margin: 14px 0 0;
 }
 .card-footer {
   display: flex;
@@ -1344,26 +1582,8 @@ body {
 }
 .card-hint {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9px;
   color: var(--text-muted);
-  letter-spacing: 0.3px;
-}
-
-/* Dissolving footer */
-.card-footer-dissolving {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 20px 16px;
-  gap: 12px;
-}
-.reconstructing-label {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--text-secondary);
   letter-spacing: 0.3px;
 }
 
@@ -1371,7 +1591,6 @@ body {
 .reconstruct-btn {
   font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 400;
   letter-spacing: 2px;
   color: #FFFFFF;
   background: var(--primary);
@@ -1387,298 +1606,223 @@ body {
   background: var(--secondary);
   box-shadow: 0 4px 16px rgba(14,165,233,0.3);
 }
-.reconstruct-btn:active:not(:disabled) {
-  transform: translateY(1px);
-}
-.reconstruct-btn:disabled {
-  opacity: 0.65;
-  cursor: not-allowed;
-}
+.reconstruct-btn:active:not(:disabled) { transform: translateY(1px); }
+.reconstruct-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 .reconstruct-btn.loading {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   background: var(--secondary);
+  opacity: 1;
+  cursor: default;
 }
 
 /* ─── Spinner ───────────────────────────────────────────────────────────────── */
 .spinner {
-  width: 12px;
-  height: 12px;
-  border: 2px solid rgba(255,255,255,0.3);
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(255,255,255,0.35);
   border-top-color: #FFFFFF;
   border-radius: 50%;
-  animation: spin 0.7s linear infinite;
+  animation: spin 0.65s linear infinite;
   flex-shrink: 0;
 }
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ─── Status Cycling ────────────────────────────────────────────────────────── */
 .status-cycling-wrap {
+  height: 20px;
   display: flex;
+  align-items: center;
   justify-content: center;
   margin-top: 14px;
-  height: 18px;
 }
 .status-cycling {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9px;
   color: var(--text-muted);
-  letter-spacing: 1.5px;
-  animation: fadeInOut 0.4s ease;
+  letter-spacing: 2px;
+  animation: status-appear 0.3s ease both;
 }
-@keyframes fadeInOut {
-  from { opacity: 0; transform: translateY(3px); }
-  to { opacity: 1; transform: translateY(0); }
+@keyframes status-appear {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
-/* ─── Scenario Chips ────────────────────────────────────────────────────────── */
-.scenario-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  justify-content: center;
-  max-width: 720px;
-  margin-top: 20px;
-}
-.scenario-chip {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  color: var(--text-muted);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 4px 10px;
-  background: transparent;
-  cursor: default;
-  transition: background 150ms ease;
-  user-select: none;
-}
-.scenario-chip:hover {
-  background: #F1F5F9;
+/* ─── Sand Dissolve Canvas ──────────────────────────────────────────────────── */
+.dissolve-canvas {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1000;
 }
 
 /* ─── REVEAL STATE ──────────────────────────────────────────────────────────── */
 .reveal-state {
   display: flex;
   flex-direction: column;
-  padding: 32px 24px 48px;
-  max-width: 1440px;
-  margin: 0 auto;
-  width: 100%;
-  animation: revealFadeIn 400ms ease-out both;
+  align-items: center;
+  padding: 40px 36px 56px;
+  animation: reveal-enter 350ms ease-out both;
+  flex: 1;
 }
-@keyframes revealFadeIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to { opacity: 1; transform: translateY(0); }
+@keyframes reveal-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
-.reveal-card {
+/* ─── Reveal Panel ──────────────────────────────────────────────────────────── */
+.reveal-panel {
+  width: 100%;
+  max-width: 820px;
   background: var(--surface);
   border-radius: var(--radius);
+  border-left: 2px solid var(--success);
   box-shadow: var(--shadow-active);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
 
-.reveal-panels {
-  display: grid;
-  grid-template-columns: 1fr 32px 1fr;
-  min-height: 400px;
-}
-
-/* ─── Panel Divider ─────────────────────────────────────────────────────────── */
-.panel-divider {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  padding: 40px 0;
-  gap: 0;
-}
-.divider-line {
-  flex: 1;
-  width: 1px;
-  background: var(--border);
-}
-.diamond {
-  color: var(--border-mid);
-  font-size: 10px;
-  padding: 8px 0;
-  flex-shrink: 0;
-}
-
-/* ─── Left Panel (Reconstructed) ────────────────────────────────────────────── */
-.panel-left {
-  padding: 32px;
-  border-left: 2px solid var(--success);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-width: 0;
-}
-.panel-header {
+.reveal-panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  padding: 20px 28px 0;
   flex-shrink: 0;
 }
-.panel-label {
+.reveal-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.reveal-panel-label {
   font-family: var(--font-mono);
   font-size: 9px;
-  color: var(--text-secondary);
   letter-spacing: 3px;
-  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+/* Copy button */
+.copy-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
 }
 .copy-btn {
   background: none;
   border: none;
   cursor: pointer;
   color: var(--border-mid);
-  padding: 4px;
-  border-radius: 4px;
-  transition: color 150ms ease;
-  position: relative;
+  padding: 6px;
+  border-radius: 6px;
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
+  transition: color 150ms ease, background 150ms ease;
 }
-.copy-btn:hover { color: var(--primary); }
+.copy-btn:hover {
+  color: var(--primary);
+  background: rgba(15,76,138,0.06);
+}
 .copy-tooltip {
   position: absolute;
   bottom: calc(100% + 6px);
   right: 0;
   font-family: var(--font-mono);
-  font-size: 9px;
+  font-size: 8px;
+  letter-spacing: 0.5px;
   color: #FFFFFF;
   background: var(--success);
   border-radius: 4px;
   padding: 3px 8px;
   white-space: nowrap;
   pointer-events: none;
-  animation: tooltipFade 0.15s ease;
+  animation: tooltip-appear 0.15s ease both;
 }
-@keyframes tooltipFade {
-  from { opacity: 0; transform: translateY(3px); }
-  to { opacity: 1; transform: translateY(0); }
+@keyframes tooltip-appear {
+  from { opacity: 0; transform: translateY(2px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
-.reconstructed-text {
+/* Panel body — the actual reconstructed text */
+.reveal-panel-body {
+  padding: 20px 28px 24px;
+  flex: 1;
+}
+.reveal-text {
   font-family: var(--font-body);
   font-weight: 400;
-  font-size: 15px;
-  color: var(--text-primary);
-  line-height: 1.75;
-  white-space: pre-wrap;
-  word-break: break-word;
-  flex: 1;
-}
-
-.error-state {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.error-label {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--warning);
-  letter-spacing: 1px;
-}
-.error-detail {
-  font-family: var(--font-body);
-  font-size: 13px;
-  color: var(--text-secondary);
-  line-height: 1.6;
-}
-
-.metadata-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.meta-chip {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 0.5px;
-  padding: 3px 8px;
-  border-radius: 4px;
-}
-.meta-confidence { background: #ECFDF5; color: var(--success); }
-.meta-strategy { background: #EFF6FF; color: var(--primary); }
-.meta-technique { background: #FFF7ED; color: var(--warning); }
-
-/* ─── Right Panel (Response) ────────────────────────────────────────────────── */
-.panel-right {
-  padding: 32px;
-  border-left: 2px solid var(--secondary);
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-width: 0;
-}
-.streaming-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: 1px;
-}
-.streaming-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.streaming-dot.active {
-  background: var(--secondary);
-  animation: pulse-dot 1.2s ease-in-out infinite;
-}
-.streaming-dot.done {
-  background: var(--success);
-}
-.streaming-label.active { color: var(--secondary); }
-.streaming-label.done { color: var(--success); }
-
-.response-scroll {
-  flex: 1;
-  overflow-y: auto;
-  max-height: 520px;
-  scroll-behavior: smooth;
-}
-.response-text {
-  font-family: var(--font-body);
-  font-weight: 300;
   font-size: 15px;
   color: var(--text-primary);
   line-height: 1.8;
   white-space: pre-wrap;
   word-break: break-word;
 }
-.token-batch {
-  animation: tokenFadeIn 40ms ease both;
+.reveal-text-conversational {
+  font-weight: 300;
+  color: var(--text-secondary);
+  font-size: 14px;
+  line-height: 1.85;
 }
-@keyframes tokenFadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-.cursor-blink {
+
+/* Typewriter cursor */
+.typewriter-cursor {
   display: inline-block;
   width: 2px;
-  height: 1em;
+  height: 0.95em;
   background: var(--secondary);
   margin-left: 2px;
   vertical-align: text-bottom;
-  animation: blink 1s step-end infinite;
+  border-radius: 1px;
+  animation: cursor-blink 1s step-end infinite;
 }
-@keyframes blink {
+@keyframes cursor-blink {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+  50%       { opacity: 0; }
 }
+
+/* Error state */
+.reveal-error {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.reveal-error-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--warning);
+}
+.reveal-error-detail {
+  font-family: var(--font-body);
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+/* Metadata chips */
+.reveal-panel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 14px 28px 22px;
+  flex-shrink: 0;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+.meta-chip {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  letter-spacing: 0.5px;
+  padding: 3px 9px;
+  border-radius: 4px;
+}
+.meta-confidence-high { background: #ECFDF5; color: var(--success); }
+.meta-confidence-mid  { background: #EFF6FF; color: var(--primary); }
+.meta-confidence-low  { background: #FFF7ED; color: var(--warning); }
+.meta-strategy        { background: #EFF6FF; color: var(--primary); }
+.meta-technique       { background: #FFF7ED; color: var(--warning); }
 
 /* ─── Reveal Footer ─────────────────────────────────────────────────────────── */
 .reveal-footer {
@@ -1694,7 +1838,7 @@ body {
   background: transparent;
   border: 1.5px solid var(--border);
   border-radius: var(--radius-pill);
-  padding: 12px 32px;
+  padding: 11px 32px;
   cursor: pointer;
   transition: border-color 200ms ease, color 200ms ease;
 }
@@ -1703,422 +1847,26 @@ body {
   color: var(--primary);
 }
 
-/* ─── Sand Dissolve Canvas ──────────────────────────────────────────────────── */
-.dissolve-canvas {
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  z-index: 1000;
+/* ─── Responsive ────────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .sidebar { width: 220px; }
+  :root { --sidebar-w: 220px; }
+  .reveal-state { padding: 28px 24px 48px; }
 }
 
-/* ─── Responsive ────────────────────────────────────────────────────────────── */
 @media (max-width: 768px) {
+  .sidebar { display: none; }
   .app-header { padding: 0 16px; }
   .hero-headline { font-size: 32px; }
   .hero-sub { font-size: 14px; }
   .input-state { padding: 32px 16px 48px; }
-  .reveal-state { padding: 16px 12px 32px; }
-  .reveal-panels {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto auto auto;
-  }
-  .panel-divider {
-    flex-direction: row;
-    height: 32px;
-    padding: 0 32px;
-  }
-  .divider-line {
-    flex: 1;
-    width: auto;
-    height: 1px;
-  }
-  .diamond { padding: 0 8px; }
-  .panel-left, .panel-right { padding: 24px 20px; }
-  .card-footer { flex-wrap: wrap; }
+  .reveal-state { padding: 20px 16px 40px; }
+  .reveal-panel-header,
+  .reveal-panel-body,
+  .reveal-panel-meta { padding-left: 20px; padding-right: 20px; }
 }
 
 @media (max-width: 480px) {
   .hero-headline { font-size: 26px; }
-  .reconstruct-btn { padding: 10px 20px; font-size: 10px; }
-  .scenario-chips { justify-content: flex-start; }
+  .reconstruct-btn { padding: 10px 22px; font-size: 10px; }
 }
-##############################
-#app
-import { useState, useEffect, useRef, useCallback } from 'react'
-import PromptInput from './components/PromptInput'
-import SandDissolve from './components/SandDissolve'
-import ReconstructedPrompt from './components/ReconstructedPrompt'
-import ResponseStream from './components/ResponseStream'
-
-const APP_STATE = {
-  INPUT: 'input',
-  DISSOLVING: 'dissolving',
-  REVEAL: 'reveal',
-}
-
-const API = 'http://localhost:8000'
-
-export default function App() {
-  // ── App lifecycle ──────────────────────────────────────────────────────────
-  const [appState, setAppState] = useState(APP_STATE.INPUT)
-  const [backendStatus, setBackendStatus] = useState('checking') // checking | online | offline
-  const [bannerDismissed, setBannerDismissed] = useState(false)
-
-  // ── Dissolving state ───────────────────────────────────────────────────────
-  const [dissolveText, setDissolveText] = useState('')
-  const [dissolveRect, setDissolveRect] = useState(null)
-  const [progressPercent, setProgressPercent] = useState(0)
-  const [progressStatus, setProgressStatus] = useState('EXTRACTING INTENT')
-
-  // ── Reveal state ───────────────────────────────────────────────────────────
-  const [reconstructionData, setReconstructionData] = useState(null)
-  const [reconstructionError, setReconstructionError] = useState(null)
-  const [streamedResponse, setStreamedResponse] = useState('')
-  const [isStreaming, setIsStreaming] = useState(false)
-
-  // ── Sync refs for async coordination ──────────────────────────────────────
-  // We need both the animation AND the API call to finish before revealing.
-  // Whichever completes first sets its ref; the second one triggers the transition.
-  const apiResultRef = useRef(null)     // null = pending, object = done
-  const animDoneRef = useRef(false)
-  const progressTimerRef = useRef(null)
-  const statusIntervalRef = useRef(null)
-
-  // ── Health check on mount ──────────────────────────────────────────────────
-  useEffect(() => {
-    const check = async () => {
-      try {
-        const res = await fetch(`${API}/health`, {
-          signal: AbortSignal.timeout(6000),
-        })
-        setBackendStatus(res.ok ? 'online' : 'offline')
-      } catch {
-        setBackendStatus('offline')
-      }
-    }
-    check()
-  }, [])
-
-  // ── Transition to REVEAL ───────────────────────────────────────────────────
-  const transitionToReveal = useCallback((data, error) => {
-    if (data) setReconstructionData(data)
-    if (error) setReconstructionError(error)
-    setAppState(APP_STATE.REVEAL)
-    if (data?.reconstructed_prompt) {
-      streamResponse(data.reconstructed_prompt)
-    }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Called when sand dissolve animation finishes ───────────────────────────
-  const handleAnimationComplete = useCallback(() => {
-    animDoneRef.current = true
-    // If API already returned, transition now; else wait for API
-    if (apiResultRef.current !== null) {
-      const { data, error } = apiResultRef.current
-      transitionToReveal(data, error)
-    }
-  }, [transitionToReveal])
-
-  // ── Main reconstruct flow ──────────────────────────────────────────────────
-  const handleSubmit = useCallback(async (text, rect) => {
-    // Reset coordination refs
-    apiResultRef.current = null
-    animDoneRef.current = false
-
-    // Set up dissolving state
-    setDissolveText(text)
-    setDissolveRect(rect)
-    setProgressPercent(0)
-    setProgressStatus('EXTRACTING INTENT')
-    setReconstructionData(null)
-    setReconstructionError(null)
-    setStreamedResponse('')
-    setIsStreaming(false)
-    setAppState(APP_STATE.DISSOLVING)
-
-    // Animate progress bar 0 → 85% over ~2s
-    requestAnimationFrame(() => {
-      requestAnimationFrame(() => setProgressPercent(85))
-    })
-
-    // Cycle status messages
-    const statuses = ['EXTRACTING INTENT', 'MAPPING TO PRINCIPLES', 'SYNTHESISING']
-    let statusIdx = 0
-    statusIntervalRef.current = setInterval(() => {
-      statusIdx = (statusIdx + 1) % statuses.length
-      setProgressStatus(statuses[statusIdx])
-    }, 800)
-
-    // API call
-    try {
-      const sessionId =
-        typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : Math.random().toString(36).slice(2)
-
-      const res = await fetch(`${API}/reconstruct`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: text, session_id: sessionId }),
-      })
-
-      clearInterval(statusIntervalRef.current)
-      setProgressPercent(100)
-      setProgressStatus('COMPLETE')
-
-      if (!res.ok) {
-        const msg = `HTTP ${res.status} — Reconstruction failed.`
-        apiResultRef.current = { data: null, error: msg }
-        if (animDoneRef.current) transitionToReveal(null, msg)
-        return
-      }
-
-      const data = await res.json()
-      apiResultRef.current = { data, error: null }
-      if (animDoneRef.current) transitionToReveal(data, null)
-    } catch (err) {
-      clearInterval(statusIntervalRef.current)
-      setProgressPercent(100)
-      const msg = err.message || 'Network error — could not reach backend.'
-      apiResultRef.current = { data: null, error: msg }
-      if (animDoneRef.current) transitionToReveal(null, msg)
-    }
-  }, [transitionToReveal])
-
-  // ── SSE streaming via fetch + ReadableStream ───────────────────────────────
-  const streamResponse = async (prompt) => {
-    setIsStreaming(true)
-    setStreamedResponse('')
-    try {
-      const res = await fetch(`${API}/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reconstructed_prompt: prompt }),
-      })
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        buffer += decoder.decode(value, { stream: true })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          const raw = line.slice(6).trim()
-          if (!raw) continue
-          try {
-            const payload = JSON.parse(raw)
-            if (payload.done) {
-              setIsStreaming(false)
-              return
-            }
-            if (payload.token) {
-              setStreamedResponse((prev) => prev + payload.token)
-            }
-          } catch {
-            // malformed SSE line — skip
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Streaming error:', err)
-    } finally {
-      setIsStreaming(false)
-    }
-  }
-
-  // ── Reset to INPUT state ───────────────────────────────────────────────────
-  const handleReset = () => {
-    clearInterval(statusIntervalRef.current)
-    clearTimeout(progressTimerRef.current)
-    apiResultRef.current = null
-    animDoneRef.current = false
-
-    setAppState(APP_STATE.INPUT)
-    setDissolveText('')
-    setDissolveRect(null)
-    setProgressPercent(0)
-    setProgressStatus('EXTRACTING INTENT')
-    setReconstructionData(null)
-    setReconstructionError(null)
-    setStreamedResponse('')
-    setIsStreaming(false)
-  }
-
-  // ── Render ─────────────────────────────────────────────────────────────────
-  return (
-    <div className="app-root">
-      {/* ── Offline banner ── */}
-      {backendStatus === 'offline' && !bannerDismissed && (
-        <div className="offline-banner" role="alert">
-          <span>⚠ Backend offline — check that uvicorn is running on port 8000</span>
-          <button
-            className="dismiss-btn"
-            onClick={() => setBannerDismissed(true)}
-            aria-label="Dismiss banner"
-          >
-            ×
-          </button>
-        </div>
-      )}
-
-      {/* ── Header ── */}
-      <header className="app-header">
-        <div className="header-content">
-          <span className="app-name">Prompt Coach</span>
-          <span className="status-chip" aria-label="System status: ready, 5 prompts learned">
-            <span className="status-dot" />
-            READY · 5 PROMPTS LEARNED
-          </span>
-        </div>
-      </header>
-
-      {/* ── Main content ── */}
-      <main className="app-main">
-        {/* Loading screen while health check is in flight */}
-        {backendStatus === 'checking' && (
-          <div className="loading-screen" aria-label="Loading Prompt Coach">
-            <div className="loading-content">
-              <span className="loading-app-name">Prompt Coach</span>
-              <div className="loading-bar-track">
-                <div className="loading-bar-fill" />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {backendStatus !== 'checking' && (
-          <>
-            {/* INPUT + DISSOLVING share the PromptInput card */}
-            <div
-              className={
-                appState === APP_STATE.INPUT || appState === APP_STATE.DISSOLVING
-                  ? 'state-visible'
-                  : 'state-hidden'
-              }
-              aria-hidden={appState === APP_STATE.REVEAL}
-            >
-              <PromptInput
-                onSubmit={handleSubmit}
-                isDissolving={appState === APP_STATE.DISSOLVING}
-                progressPercent={progressPercent}
-                progressStatus={progressStatus}
-              />
-            </div>
-
-            {/* Sand dissolve canvas — rendered on top during DISSOLVING */}
-            {appState === APP_STATE.DISSOLVING && (
-              <SandDissolve
-                text={dissolveText}
-                sourceRect={dissolveRect}
-                onComplete={handleAnimationComplete}
-              />
-            )}
-
-            {/* REVEAL state */}
-            {appState === APP_STATE.REVEAL && (
-              <div className="reveal-state" aria-live="polite">
-                <div className="reveal-card">
-                  <div className="reveal-panels">
-                    {/* Left — reconstructed prompt */}
-                    <ReconstructedPrompt
-                      data={reconstructionData}
-                      error={reconstructionError}
-                    />
-
-                    {/* Divider */}
-                    <div className="panel-divider" aria-hidden="true">
-                      <div className="divider-line" />
-                      <span className="diamond">◆</span>
-                      <div className="divider-line" />
-                    </div>
-
-                    {/* Right — model response */}
-                    <ResponseStream
-                      response={streamedResponse}
-                      isStreaming={isStreaming}
-                    />
-                  </div>
-                </div>
-
-                <div className="reveal-footer">
-                  <button className="new-prompt-btn" onClick={handleReset}>
-                    NEW PROMPT
-                  </button>
-                </div>
-              </div>
-            )}
-          </>
-        )}
-      </main>
-    </div>
-  )
-}
-#############################
-#main
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import App from './App'
-import './styles/globals.css'
-
-ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <App />
-  </React.StrictMode>
-)
-################################
-#index
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Prompt Coach</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Syne:wght@800&family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500&display=swap"
-      rel="stylesheet"
-    />
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
-</html>
-#####################
-#package
-{
-  "name": "prompt-coach",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "html2canvas": "^1.4.1"
-  },
-  "devDependencies": {
-    "@vitejs/plugin-react": "^4.0.0",
-    "vite": "^4.4.0"
-  }
-}
-#####################
-#vite.config
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-export default defineConfig({
-  plugins: [react()],
-})
