@@ -1,11 +1,1466 @@
-Add-Type -AssemblyName System.Windows.Forms
+"""
+Analytical AI Expert — Single File Version
+Pharmaceutical HPLC Knowledge System — Zero-Hallucination Architecture
 
-$endTime = (Get-Date).AddHours(10)
+All components in one file:
+  config / SQLite / cost tracker / PDF extraction / chunking /
+  Neo4j / concept extraction / embedder / FAISS / retriever /
+  query decomposer / answer generator / NLI verifier /
+  verification firewall / all UI pages / main app
+"""
 
-while ((Get-Date) -lt $endTime) {
-    $pos = [System.Windows.Forms.Cursor]::Position
-    [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($pos.X + 1, $pos.Y)
-    Start-Sleep -Seconds 30
-    [System.Windows.Forms.Cursor]::Position = $pos
-    Start-Sleep -Seconds 30
+# ═══════════════════════════════════════════════════════════════
+# IMPORTS
+# ═══════════════════════════════════════════════════════════════
+import streamlit as st
+
+st.set_page_config(
+    page_title="Analytical AI Expert",
+    page_icon="⚗️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+import re
+import json
+import pickle
+import hashlib
+import sqlite3
+import datetime
+import tempfile
+import logging
+import numpy as np
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple, Optional, Callable
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+PDF_DIR = DATA_DIR / "pdfs"
+FAISS_DIR = DATA_DIR / "faiss_index"
+SQLITE_DIR = DATA_DIR / "sqlite"
+EMBEDDINGS_DIR = DATA_DIR / "embeddings"
+INGESTION_LOG_PATH = DATA_DIR / "ingestion_log.json"
+SQLITE_DB_PATH = SQLITE_DIR / "corpus.db"
+
+for _d in [PDF_DIR, FAISS_DIR, SQLITE_DIR, EMBEDDINGS_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
+
+# Model paths
+PHI4_MODEL_PATH = r"C:\Users\nitin\Downloads\microsoft_Phi-4-mini-instruct-Q4_K_M.gguf"
+BGE_MODEL_ID = "BAAI/bge-m3"
+NLI_MODEL_ID = "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
+
+# Phi-4-mini — CRITICAL: n_gpu_layers=0. Intel Iris Xe GPU offload is SLOWER than CPU.
+PHI4_N_CTX = 2048
+PHI4_N_THREADS = 4
+PHI4_N_GPU_LAYERS = 0
+PHI4_USE_MMAP = True
+PHI4_USE_MLOCK = False
+PHI4_MAX_TOKENS = 600
+PHI4_TEMPERATURE = 0.0
+
+# Embedding — batch_size=2 prevents OOM on 16GB shared RAM
+EMBEDDING_BATCH_SIZE = 2
+EMBEDDING_MAX_LENGTH = 512
+
+# Retrieval
+RETRIEVAL_TOP_K = 10
+
+# NLI thresholds
+ENTAILMENT_THRESHOLD = 0.5
+CONTRADICTION_THRESHOLD = 0.5
+
+# Neo4j
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+NEO4J_PASSWORD = "password"   # Update to match your Neo4j Desktop password
+
+# Azure OpenAI — fill in for Hybrid mode (SLM mode works without these)
+AZURE_OPENAI_API_KEY = ""
+AZURE_OPENAI_ENDPOINT = ""
+AZURE_OPENAI_DEPLOYMENT = "GPT4o"
+AZURE_OPENAI_API_VERSION = "2024-02-15-preview"
+
+# Cost tracking
+COST_PER_GPT4O_CALL_INR = 8.0
+COPILOT_BASELINE_MONTHLY_INR = 57500
+
+# FAISS paths
+FAISS_INDEX_PATH = FAISS_DIR / "index.faiss"
+FAISS_META_PATH = FAISS_DIR / "meta.pkl"
+
+
+# ═══════════════════════════════════════════════════════════════
+# SQLITE — GROUND TRUTH PARAGRAPH STORE
+# ═══════════════════════════════════════════════════════════════
+
+def _db_conn():
+    conn = sqlite3.connect(str(SQLITE_DB_PATH))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def initialize_db():
+    with _db_conn() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS paragraphs (
+                paragraph_id TEXT PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                doc_path TEXT NOT NULL,
+                page_num INTEGER NOT NULL,
+                para_idx INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                token_estimate INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                doc_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                page_count INTEGER,
+                paragraph_count INTEGER,
+                indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS claim_cache (
+                cache_key TEXT PRIMARY KEY,
+                verdict TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_para_doc ON paragraphs(doc_id)")
+        conn.commit()
+
+
+def db_store_paragraph(para) -> bool:
+    try:
+        with _db_conn() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO paragraphs
+                (paragraph_id, doc_id, doc_path, page_num, para_idx, text, token_estimate)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (para.paragraph_id, para.doc_id, para.doc_path,
+                  para.page_num, para.para_idx, para.text, para.token_estimate))
+            conn.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to store paragraph {para.paragraph_id}: {e}")
+        return False
+
+
+def db_get_paragraph(paragraph_id: str) -> Optional[Dict]:
+    """Tier 1 verification check. Returns None if paragraph_id not in corpus."""
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM paragraphs WHERE paragraph_id = ?", (paragraph_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def db_get_all_paragraphs() -> List[Dict]:
+    with _db_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM paragraphs ORDER BY doc_id, page_num, para_idx"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def db_get_corpus_stats() -> Dict:
+    with _db_conn() as conn:
+        para_count = conn.execute("SELECT COUNT(*) FROM paragraphs").fetchone()[0]
+        doc_count = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        docs = conn.execute(
+            "SELECT doc_id, filename, page_count, paragraph_count, indexed_at FROM documents"
+        ).fetchall()
+        return {
+            "paragraph_count": para_count,
+            "document_count": doc_count,
+            "documents": [dict(d) for d in docs]
+        }
+
+
+def db_store_document(doc_id: str, filename: str, page_count: int, paragraph_count: int):
+    with _db_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO documents (doc_id, filename, page_count, paragraph_count)
+            VALUES (?, ?, ?, ?)
+        """, (doc_id, filename, page_count, paragraph_count))
+        conn.commit()
+
+
+def db_get_cached_claim(cache_key: str) -> Optional[Dict]:
+    with _db_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM claim_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def db_cache_claim(cache_key: str, verdict: str, confidence: float):
+    with _db_conn() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO claim_cache (cache_key, verdict, confidence)
+            VALUES (?, ?, ?)
+        """, (cache_key, verdict, confidence))
+        conn.commit()
+
+
+# ── Ingestion log (resume support) ────────────────────────────
+def load_ingestion_log() -> Dict:
+    if not INGESTION_LOG_PATH.exists():
+        return {}
+    with open(INGESTION_LOG_PATH) as f:
+        return json.load(f)
+
+
+def save_ingestion_log(log: Dict):
+    with open(INGESTION_LOG_PATH, "w") as f:
+        json.dump(log, f, indent=2, default=str)
+
+
+def mark_document_ingested(doc_id: str, filename: str, pages: int, paragraphs: int):
+    log = load_ingestion_log()
+    log[doc_id] = {
+        "filename": filename, "pages": pages, "paragraphs": paragraphs,
+        "status": "complete", "timestamp": str(datetime.datetime.now())
+    }
+    save_ingestion_log(log)
+
+
+def is_document_ingested(doc_id: str) -> bool:
+    return load_ingestion_log().get(doc_id, {}).get("status") == "complete"
+
+
+# ═══════════════════════════════════════════════════════════════
+# COST TRACKER
+# ═══════════════════════════════════════════════════════════════
+
+def initialize_cost_tracker():
+    if "cost_tracker" not in st.session_state:
+        st.session_state.cost_tracker = {
+            "total_queries": 0, "slm_queries": 0, "hybrid_queries": 0,
+            "total_cost_inr": 0.0, "gpt4o_calls": 0
+        }
+
+
+def log_query_cost(mode: str, gpt4o_calls: int = 0):
+    initialize_cost_tracker()
+    t = st.session_state.cost_tracker
+    t["total_queries"] += 1
+    if mode == "slm":
+        t["slm_queries"] += 1
+    else:
+        t["hybrid_queries"] += 1
+        t["gpt4o_calls"] += gpt4o_calls
+        t["total_cost_inr"] += gpt4o_calls * COST_PER_GPT4O_CALL_INR
+
+
+def get_monthly_projection() -> Dict:
+    initialize_cost_tracker()
+    t = st.session_state.cost_tracker
+    avg_cost = t["total_cost_inr"] / max(t["hybrid_queries"], 1)
+    queries_per_month = max(t["total_queries"], 1) * 30
+    hybrid_monthly = avg_cost * queries_per_month + 2000
+    slm_monthly = 1500
+    return {
+        "slm_monthly": slm_monthly,
+        "hybrid_monthly": hybrid_monthly,
+        "copilot_monthly": COPILOT_BASELINE_MONTHLY_INR,
+        "slm_savings_pct": round((1 - slm_monthly / COPILOT_BASELINE_MONTHLY_INR) * 100),
+        "hybrid_savings_pct": round((1 - hybrid_monthly / COPILOT_BASELINE_MONTHLY_INR) * 100)
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# MODEL LOADERS — @st.cache_resource: load once, never reload
+# ═══════════════════════════════════════════════════════════════
+
+@st.cache_resource(show_spinner="Loading Phi-4-mini generation model...")
+def load_phi4():
+    from llama_cpp import Llama
+    return Llama(
+        model_path=str(PHI4_MODEL_PATH),
+        n_ctx=PHI4_N_CTX,
+        n_threads=PHI4_N_THREADS,
+        n_gpu_layers=PHI4_N_GPU_LAYERS,   # MUST be 0 — Intel Iris Xe is slower than CPU
+        use_mmap=PHI4_USE_MMAP,
+        use_mlock=PHI4_USE_MLOCK,
+        verbose=False
+    )
+
+
+@st.cache_resource(show_spinner="Loading BGE-M3 embedding model...")
+def load_embedder_model():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(BGE_MODEL_ID, device="cpu")
+
+
+@st.cache_resource(show_spinner="Loading DeBERTa NLI verifier...")
+def load_nli_model():
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder(NLI_MODEL_ID, device="cpu")
+
+
+# ═══════════════════════════════════════════════════════════════
+# PDF EXTRACTION
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class RawPage:
+    doc_id: str
+    doc_path: str
+    page_num: int
+    text: str
+    word_count: int = field(init=False)
+
+    def __post_init__(self):
+        self.word_count = len(self.text.split())
+
+
+def extract_pdf(pdf_path: Path) -> List[RawPage]:
+    import fitz
+    pages = []
+    doc_id = pdf_path.stem
+    try:
+        doc = fitz.open(str(pdf_path))
+        for page_num in range(doc.page_count):
+            text = doc[page_num].get_text("text").strip()
+            if len(text) < 100:
+                continue
+            pages.append(RawPage(doc_id=doc_id, doc_path=str(pdf_path),
+                                 page_num=page_num + 1, text=text))
+        doc.close()
+        logger.info(f"Extracted {len(pages)} non-empty pages from {pdf_path.name}")
+    except Exception as e:
+        logger.error(f"Failed to extract {pdf_path.name}: {e}")
+        raise
+    return pages
+
+
+# ═══════════════════════════════════════════════════════════════
+# CHUNKER
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class Paragraph:
+    paragraph_id: str
+    doc_id: str
+    doc_path: str
+    page_num: int
+    para_idx: int
+    text: str
+    token_estimate: int
+
+
+def chunk_page(page: RawPage, target_tokens: int = 350) -> List[Paragraph]:
+    raw_paras = [p.strip() for p in re.split(r'\n\s*\n', page.text) if p.strip()]
+    merged, buffer = [], ""
+    for para in raw_paras:
+        if len(buffer.split()) + len(para.split()) < int(target_tokens * 0.6):
+            buffer = (buffer + " " + para).strip()
+        else:
+            if buffer:
+                merged.append(buffer)
+            buffer = para
+    if buffer:
+        merged.append(buffer)
+
+    paragraphs = []
+    for idx, text in enumerate(merged):
+        if len(text.split()) < 20:
+            continue
+        paragraphs.append(Paragraph(
+            paragraph_id=f"{page.doc_id}_p{page.page_num}_para{idx}",
+            doc_id=page.doc_id, doc_path=page.doc_path,
+            page_num=page.page_num, para_idx=idx, text=text,
+            token_estimate=int(len(text.split()) * 1.3)
+        ))
+    return paragraphs
+
+
+def chunk_document(pages: List[RawPage]) -> List[Paragraph]:
+    all_paragraphs = []
+    for page in pages:
+        all_paragraphs.extend(chunk_page(page))
+    return all_paragraphs
+
+
+# ═══════════════════════════════════════════════════════════════
+# NEO4J CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class Neo4jClient:
+    def __init__(self):
+        self.driver = None
+        try:
+            from neo4j import GraphDatabase
+            self.driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+            self.driver.verify_connectivity()
+            logger.info("Neo4j connected")
+        except Exception as e:
+            logger.warning(f"Neo4j unavailable: {e}. Graph features disabled.")
+
+    @property
+    def is_connected(self) -> bool:
+        return self.driver is not None
+
+    def create_schema(self):
+        if not self.is_connected:
+            return
+        with self.driver.session() as s:
+            s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Paragraph) REQUIRE p.paragraph_id IS UNIQUE")
+            s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.doc_id IS UNIQUE")
+            s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Concept) REQUIRE c.name IS UNIQUE")
+            s.run("CREATE INDEX IF NOT EXISTS FOR (c:Concept) ON (c.category)")
+
+    def store_paragraph(self, paragraph_id: str, doc_id: str, page_num: int, text_preview: str):
+        if not self.is_connected:
+            return
+        with self.driver.session() as s:
+            s.run("""
+                MERGE (d:Document {doc_id: $doc_id})
+                MERGE (p:Paragraph {paragraph_id: $paragraph_id})
+                SET p.page_num = $page_num, p.text_preview = $text_preview
+                MERGE (d)-[:CONTAINS]->(p)
+            """, doc_id=doc_id, paragraph_id=paragraph_id,
+                page_num=page_num, text_preview=text_preview[:200])
+
+    def store_concepts(self, paragraph_id: str, concepts: List[Dict], relationships: List[Dict]):
+        if not self.is_connected or not concepts:
+            return
+        with self.driver.session() as s:
+            for concept in concepts:
+                s.run("""
+                    MERGE (c:Concept {name: $name})
+                    SET c.category = $category
+                    WITH c
+                    MATCH (p:Paragraph {paragraph_id: $paragraph_id})
+                    MERGE (p)-[:MENTIONS]->(c)
+                """, name=concept["name"], category=concept.get("category", "unknown"),
+                    paragraph_id=paragraph_id)
+            for rel in relationships:
+                s.run("""
+                    MERGE (c1:Concept {name: $from_name})
+                    MERGE (c2:Concept {name: $to_name})
+                    MERGE (c1)-[:RELATES_TO {relation: $relation}]->(c2)
+                """, from_name=rel["from"], to_name=rel["to"],
+                    relation=rel.get("relation", "RELATED"))
+
+    def get_related_paragraphs(self, paragraph_ids: List[str]) -> List[str]:
+        """2-hop concept traversal: direct neighbours + related-concept neighbours."""
+        if not self.is_connected or not paragraph_ids:
+            return []
+        with self.driver.session() as s:
+            r1 = s.run("""
+                MATCH (p:Paragraph)-[:MENTIONS]->(c:Concept)<-[:MENTIONS]-(rel:Paragraph)
+                WHERE p.paragraph_id IN $ids AND NOT rel.paragraph_id IN $ids
+                RETURN DISTINCT rel.paragraph_id AS para_id LIMIT 10
+            """, ids=paragraph_ids)
+            direct = [r["para_id"] for r in r1]
+
+            r2 = s.run("""
+                MATCH (p:Paragraph)-[:MENTIONS]->(c:Concept)-[:RELATES_TO]->(c2:Concept)
+                      <-[:MENTIONS]-(rel:Paragraph)
+                WHERE p.paragraph_id IN $ids AND NOT rel.paragraph_id IN $ids
+                RETURN DISTINCT rel.paragraph_id AS para_id LIMIT 10
+            """, ids=paragraph_ids)
+            indirect = [r["para_id"] for r in r2]
+
+        return list(dict.fromkeys(direct + indirect))[:15]
+
+    def get_graph_stats(self) -> Dict:
+        if not self.is_connected:
+            return {}
+        with self.driver.session() as s:
+            return {
+                "documents": s.run("MATCH (d:Document) RETURN count(d) AS n").single()["n"],
+                "paragraphs": s.run("MATCH (p:Paragraph) RETURN count(p) AS n").single()["n"],
+                "concepts": s.run("MATCH (c:Concept) RETURN count(c) AS n").single()["n"],
+                "relationships": s.run("MATCH ()-[r:RELATES_TO]->() RETURN count(r) AS n").single()["n"],
+            }
+
+    def get_graph_data(self) -> Dict:
+        if not self.is_connected:
+            return {"nodes": [], "edges": []}
+        with self.driver.session() as s:
+            result = s.run("""
+                MATCH (d:Document)-[:CONTAINS]->(p:Paragraph)
+                RETURN d.doc_id AS document, count(p) AS paragraph_count
+            """)
+            return {"nodes": [dict(r) for r in result], "edges": []}
+
+    def close(self):
+        if self.driver:
+            self.driver.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# CONCEPT EXTRACTOR (Phi-4-mini)
+# ═══════════════════════════════════════════════════════════════
+
+_CONCEPT_PROMPT = """You are an HPLC analytical chemistry concept extractor.
+Extract all HPLC-relevant concepts from the paragraph and their relationships.
+
+Respond ONLY with valid JSON:
+{
+  "concepts": [
+    {"name": "Van Deemter equation", "category": "equation"},
+    {"name": "plate height", "category": "parameter"}
+  ],
+  "relationships": [
+    {"from": "Van Deemter equation", "relation": "DESCRIBES", "to": "plate height"}
+  ]
 }
+
+Categories: equation / parameter / technique / equipment / compound / phenomenon / method
+If no HPLC concepts found, return: {"concepts": [], "relationships": []}
+No preamble. Only JSON."""
+
+
+def extract_concepts(llm, paragraph_text: str) -> Dict:
+    """Falls back to empty on any failure — ingestion must not crash."""
+    try:
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _CONCEPT_PROMPT},
+                {"role": "user", "content": f"Extract concepts from:\n\n{paragraph_text[:800]}"}
+            ],
+            max_tokens=300, temperature=0.05,
+            response_format={"type": "json_object"}
+        )
+        parsed = json.loads(response["choices"][0]["message"]["content"])
+        return {"concepts": parsed.get("concepts", []),
+                "relationships": parsed.get("relationships", [])}
+    except Exception as e:
+        logger.warning(f"Concept extraction failed: {e}")
+        return {"concepts": [], "relationships": []}
+
+
+# ═══════════════════════════════════════════════════════════════
+# EMBEDDER
+# ═══════════════════════════════════════════════════════════════
+
+class Embedder:
+    def __init__(self, model):
+        self.model = model
+
+    def embed_paragraphs(self, texts: List[str], show_progress: bool = True) -> np.ndarray:
+        return self.model.encode(
+            texts, batch_size=EMBEDDING_BATCH_SIZE, max_length=EMBEDDING_MAX_LENGTH,
+            show_progress_bar=show_progress, normalize_embeddings=True, convert_to_numpy=True
+        )
+
+    def embed_query(self, query: str) -> np.ndarray:
+        return self.model.encode(
+            [query], batch_size=1, normalize_embeddings=True, convert_to_numpy=True
+        )[0]
+
+
+# ═══════════════════════════════════════════════════════════════
+# FAISS STORE
+# ═══════════════════════════════════════════════════════════════
+
+class FAISSStore:
+    def __init__(self):
+        self.index = None
+        self.paragraph_ids: List[str] = []
+        self.dimension = 1024  # BGE-M3 output dimension
+
+    def build(self, embeddings: np.ndarray, paragraph_ids: List[str]):
+        import faiss
+        self.paragraph_ids = paragraph_ids
+        self.index = faiss.IndexFlatIP(self.dimension)
+        self.index.add(embeddings.astype(np.float32))
+        faiss.write_index(self.index, str(FAISS_INDEX_PATH))
+        with open(FAISS_META_PATH, "wb") as f:
+            pickle.dump(self.paragraph_ids, f)
+        logger.info(f"FAISS index built: {self.index.ntotal} vectors")
+
+    def load(self) -> bool:
+        import faiss
+        if not FAISS_INDEX_PATH.exists() or not FAISS_META_PATH.exists():
+            return False
+        self.index = faiss.read_index(str(FAISS_INDEX_PATH))
+        with open(FAISS_META_PATH, "rb") as f:
+            self.paragraph_ids = pickle.load(f)
+        logger.info(f"FAISS index loaded: {self.index.ntotal} vectors")
+        return True
+
+    def search(self, query_embedding: np.ndarray, top_k: int = RETRIEVAL_TOP_K) -> List[Tuple[str, float]]:
+        if self.index is None or self.index.ntotal == 0:
+            return []
+        scores, indices = self.index.search(
+            query_embedding.reshape(1, -1).astype(np.float32), top_k
+        )
+        return [
+            (self.paragraph_ids[idx], float(score))
+            for score, idx in zip(scores[0], indices[0])
+            if 0 <= idx < len(self.paragraph_ids)
+        ]
+
+    @property
+    def total_vectors(self) -> int:
+        return self.index.ntotal if self.index else 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# RETRIEVER — PIKE-RAG (FAISS + Neo4j 2-hop)
+# ═══════════════════════════════════════════════════════════════
+
+class Retriever:
+    def __init__(self, embedder: Embedder, faiss_store: FAISSStore, neo4j: Neo4jClient):
+        self.embedder = embedder
+        self.faiss_store = faiss_store
+        self.neo4j = neo4j
+
+    def retrieve(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> List[Dict]:
+        query_emb = self.embedder.embed_query(query)
+        faiss_results = self.faiss_store.search(query_emb, top_k=top_k)
+        if not faiss_results:
+            return []
+
+        faiss_ids = [r[0] for r in faiss_results]
+        faiss_scores = {r[0]: r[1] for r in faiss_results}
+
+        graph_ids = []
+        if self.neo4j.is_connected:
+            graph_ids = self.neo4j.get_related_paragraphs(faiss_ids[:5])
+
+        all_ids = faiss_ids + [g for g in graph_ids if g not in faiss_ids]
+        paragraphs = []
+        for para_id in all_ids[:top_k]:
+            para = db_get_paragraph(para_id)
+            if para:
+                para["relevance_score"] = faiss_scores.get(para_id, 0.0)
+                para["source"] = "faiss" if para_id in faiss_scores else "graph"
+                paragraphs.append(para)
+
+        paragraphs.sort(key=lambda x: x["relevance_score"], reverse=True)
+        return paragraphs
+
+
+# ═══════════════════════════════════════════════════════════════
+# QUERY DECOMPOSER — PIKE-RAG
+# ═══════════════════════════════════════════════════════════════
+
+_DECOMPOSE_PROMPT = """You are an expert HPLC analytical chemistry assistant.
+Decompose the question into 2-4 atomic sub-questions covering all aspects of the full answer.
+Each sub-question must target one specific retrievable fact from HPLC textbooks.
+
+Respond ONLY with valid JSON:
+{"sub_questions": ["question 1", "question 2", "question 3"]}
+
+No preamble. Only JSON."""
+
+
+def decompose_query(llm, query: str) -> List[str]:
+    try:
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _DECOMPOSE_PROMPT},
+                {"role": "user", "content": f"Decompose: {query}"}
+            ],
+            max_tokens=200, temperature=0.05,
+            response_format={"type": "json_object"}
+        )
+        parsed = json.loads(response["choices"][0]["message"]["content"])
+        sub_questions = parsed.get("sub_questions", [query])
+        return sub_questions if sub_questions else [query]
+    except Exception as e:
+        logger.warning(f"Decomposition failed: {e}. Using original query.")
+        return [query]
+
+
+# ═══════════════════════════════════════════════════════════════
+# ANSWER GENERATOR (SLM + Azure hybrid)
+# ═══════════════════════════════════════════════════════════════
+
+_GENERATION_PROMPT = """You are Analytical AI Expert, a precise HPLC pharmaceutical knowledge assistant.
+
+Given a question and numbered reference paragraphs from HPLC textbooks:
+- Answer using ONLY information from the provided paragraphs
+- Every factual claim MUST cite a specific paragraph ID from context
+- Do NOT invent anything not present in the paragraphs
+- If evidence is insufficient, say so explicitly
+- Be precise -- audience is pharmaceutical analytical chemistry professionals
+
+Respond ONLY with valid JSON:
+{
+  "answer_text": "Complete technical answer in clear prose",
+  "claims": [
+    {
+      "claim": "One specific factual statement",
+      "source_paragraph_id": "exact_paragraph_id_from_context",
+      "reasoning": "Why this paragraph supports this claim"
+    }
+  ]
+}"""
+
+
+def _build_context(paragraphs: List[Dict]) -> str:
+    parts = []
+    for i, para in enumerate(paragraphs):
+        label = "[graph-expanded]" if para.get("source") == "graph" else ""
+        parts.append(
+            f"[PARAGRAPH {i+1}] {label}\n"
+            f"ID: {para['paragraph_id']}\n"
+            f"Source: {para['doc_id']}, Page {para['page_num']}\n"
+            f"Text: {para['text']}\n"
+        )
+    return "\n".join(parts)
+
+
+def generate_answer(llm, query: str, paragraphs: List[Dict], mode: str = "slm") -> Dict:
+    if not paragraphs:
+        return {"answer_text": "No relevant paragraphs found in corpus.", "claims": []}
+
+    user_message = f"Question: {query}\n\nReference Paragraphs:\n{_build_context(paragraphs[:15])}"
+
+    if mode == "hybrid":
+        return _generate_azure(user_message)
+    return _generate_local(llm, user_message)
+
+
+def _generate_local(llm, user_message: str) -> Dict:
+    try:
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _GENERATION_PROMPT},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=PHI4_MAX_TOKENS, temperature=PHI4_TEMPERATURE,
+            response_format={"type": "json_object"}
+        )
+        parsed = json.loads(response["choices"][0]["message"]["content"])
+        return {"answer_text": parsed.get("answer_text", ""), "claims": parsed.get("claims", [])}
+    except Exception as e:
+        logger.error(f"Local generation error: {e}")
+        return {"answer_text": f"Generation error: {str(e)}", "claims": []}
+
+
+def _generate_azure(user_message: str) -> Dict:
+    try:
+        from openai import AzureOpenAI
+        client = AzureOpenAI(
+            api_key=AZURE_OPENAI_API_KEY, azure_endpoint=AZURE_OPENAI_ENDPOINT,
+            api_version=AZURE_OPENAI_API_VERSION
+        )
+        response = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
+            messages=[
+                {"role": "system", "content": _GENERATION_PROMPT},
+                {"role": "user", "content": user_message}
+            ],
+            max_tokens=800, temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        parsed = json.loads(response.choices[0].message.content)
+        return {"answer_text": parsed.get("answer_text", ""), "claims": parsed.get("claims", [])}
+    except Exception as e:
+        logger.error(f"Azure generation error: {e}")
+        return {"answer_text": f"Azure error: {str(e)}", "claims": []}
+
+
+# ═══════════════════════════════════════════════════════════════
+# NLI VERIFIER — DeBERTa-v3-large
+# ═══════════════════════════════════════════════════════════════
+
+_NLI_LABELS = ["contradiction", "entailment", "neutral"]
+
+
+def nli_verify(nli_model, claim: str, source_paragraph: str) -> Dict:
+    """
+    CRITICAL: input order is (source_paragraph, claim) = (premise, hypothesis).
+    Reversing this silently inverts all verification results.
+    """
+    cache_key = hashlib.md5(f"{claim}|||{source_paragraph}".encode()).hexdigest()
+    cached = db_get_cached_claim(cache_key)
+    if cached:
+        return {"verdict": cached["verdict"], "confidence": cached["confidence"],
+                "scores": {}, "cached": True}
+
+    scores = nli_model.predict([(source_paragraph, claim)])
+    scores_dict = {_NLI_LABELS[i]: float(scores[i]) for i in range(3)}
+    max_label = max(scores_dict, key=scores_dict.get)
+    max_score = scores_dict[max_label]
+
+    if max_label == "entailment" and max_score >= ENTAILMENT_THRESHOLD:
+        verdict = "entailed"
+    elif max_label == "contradiction" and max_score >= CONTRADICTION_THRESHOLD:
+        verdict = "contradicted"
+    else:
+        verdict = "neutral"
+
+    db_cache_claim(cache_key, verdict, max_score)
+    return {"verdict": verdict, "confidence": max_score, "scores": scores_dict, "cached": False}
+
+
+# ═══════════════════════════════════════════════════════════════
+# 3-TIER VERIFICATION FIREWALL
+# ═══════════════════════════════════════════════════════════════
+
+class VerificationResult:
+    def __init__(self, claim: Dict, tier_reached: int, verdict: str,
+                 confidence: float, source_text: str = "", reason: str = ""):
+        self.claim_text = claim.get("claim", "")
+        self.source_paragraph_id = claim.get("source_paragraph_id", "")
+        self.tier_reached = tier_reached
+        self.verdict = verdict
+        self.nli_verdict = ""
+        self.confidence = confidence
+        self.source_text = source_text
+        self.reason = reason
+
+
+def verify_claim(nli_model, claim: Dict) -> VerificationResult:
+    paragraph_id = claim.get("source_paragraph_id", "")
+    claim_text = claim.get("claim", "")
+
+    # Tier 1: existence check
+    paragraph = db_get_paragraph(paragraph_id)
+    if paragraph is None:
+        return VerificationResult(
+            claim, tier_reached=1, verdict="rejected", confidence=0.0,
+            reason=f"Paragraph ID '{paragraph_id}' not found in corpus"
+        )
+
+    source_text = paragraph["text"]
+
+    # Tier 2: NLI entailment check
+    nli_result = nli_verify(nli_model, claim_text, source_text)
+    nli_verdict = nli_result["verdict"]
+    confidence = nli_result["confidence"]
+
+    if nli_verdict in ("contradicted", "neutral"):
+        label = "CONTRADICTED" if nli_verdict == "contradicted" else "NOT SUPPORTED"
+        result = VerificationResult(
+            claim, tier_reached=2, verdict="rejected", confidence=confidence,
+            source_text=source_text,
+            reason=f"Claim is {label} by source paragraph ({confidence:.1%} confidence)"
+        )
+        result.nli_verdict = nli_verdict
+        return result
+
+    # Tier 3: passed
+    result = VerificationResult(
+        claim, tier_reached=3, verdict="verified", confidence=confidence,
+        source_text=source_text, reason=f"Entailed with {confidence:.1%} confidence"
+    )
+    result.nli_verdict = nli_verdict
+    return result
+
+
+def verify_all_claims(nli_model, claims: List[Dict]) -> List[VerificationResult]:
+    return [verify_claim(nli_model, c) for c in claims]
+
+
+def assemble_response(answer_text: str, claims: List[Dict],
+                      verification_results: List[VerificationResult]) -> Dict:
+    verified = [r for r in verification_results if r.verdict == "verified"]
+    rejected = [r for r in verification_results if r.verdict == "rejected"]
+
+    if len(verified) == 0 and len(claims) > 0:
+        return {
+            "type": "refusal", "answer": None,
+            "message": (
+                "I cannot verify any claims from this query against the available textbooks. "
+                "The retrieved paragraphs do not sufficiently support a complete answer."
+            ),
+            "verified_claims": [], "rejected_claims": verification_results
+        }
+
+    return {
+        "type": "answer", "answer": answer_text,
+        "verified_claims": verified, "rejected_claims": rejected,
+        "verification_ratio": f"{len(verified)}/{len(claims)} claims verified"
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# INGESTION PIPELINE
+# ═══════════════════════════════════════════════════════════════
+
+def ingest_pdf(pdf_path: Path, embedder: Embedder, faiss_store: FAISSStore,
+               neo4j: Neo4jClient, llm, progress_callback: Optional[Callable] = None) -> Dict:
+    """
+    Full pipeline: PDF -> SQLite -> Neo4j concepts -> FAISS index.
+    Resumable: skips already-ingested documents automatically.
+    progress_callback(step: str, pct: float, detail: str)
+    """
+    def progress(step, pct, detail=""):
+        if progress_callback:
+            progress_callback(step, pct, detail)
+        logger.info(f"[{pct:.0%}] {step} {detail}")
+
+    doc_id = pdf_path.stem
+
+    if is_document_ingested(doc_id):
+        return {"success": True, "skipped": True, "filename": pdf_path.name}
+
+    progress("Extracting PDF text...", 0.05)
+    pages = extract_pdf(pdf_path)
+    if not pages:
+        return {"success": False, "error": "No text extracted from PDF"}
+    progress("PDF extraction complete", 0.10, f"-> {len(pages)} pages")
+
+    progress("Chunking into paragraphs...", 0.15)
+    paragraphs = chunk_document(pages)
+    if not paragraphs:
+        return {"success": False, "error": "No paragraphs generated"}
+    progress("Chunking complete", 0.20, f"-> {len(paragraphs)} paragraphs from {len(pages)} pages")
+
+    progress("Storing paragraphs in database...", 0.22)
+    stored_count = sum(1 for p in paragraphs if db_store_paragraph(p))
+    progress("Database storage complete", 0.30, f"-> {stored_count}/{len(paragraphs)} stored")
+
+    if neo4j.is_connected:
+        progress("Creating graph nodes...", 0.32)
+        for para in paragraphs:
+            neo4j.store_paragraph(para.paragraph_id, para.doc_id, para.page_num, para.text[:200])
+
+    progress("Extracting HPLC concepts with Phi-4-mini...", 0.35,
+             f"-> 0/{len(paragraphs)} processed")
+    total_concepts, total_relationships = 0, 0
+
+    for i, para in enumerate(paragraphs):
+        result = extract_concepts(llm, para.text)
+        concepts = result.get("concepts", [])
+        relationships = result.get("relationships", [])
+        if neo4j.is_connected and concepts:
+            neo4j.store_concepts(para.paragraph_id, concepts, relationships)
+            total_concepts += len(concepts)
+            total_relationships += len(relationships)
+
+        if (i + 1) % 10 == 0 or (i + 1) == len(paragraphs):
+            pct = 0.35 + 0.40 * (i + 1) / len(paragraphs)
+            progress("Extracting HPLC concepts...", pct,
+                     f"-> {i+1}/{len(paragraphs)} | {total_concepts} concepts | {total_relationships} relationships")
+
+    progress("Concept extraction complete", 0.75,
+             f"-> {total_concepts} concepts, {total_relationships} relationships")
+
+    progress("Building FAISS vector index...", 0.80)
+    all_paras = db_get_all_paragraphs()
+    if all_paras:
+        texts = [p["text"] for p in all_paras]
+        ids = [p["paragraph_id"] for p in all_paras]
+        embeddings = embedder.embed_paragraphs(texts, show_progress=False)
+        faiss_store.build(embeddings, ids)
+    progress("FAISS index built", 0.95, f"-> {faiss_store.total_vectors} vectors indexed")
+
+    db_store_document(doc_id, pdf_path.name, len(pages), stored_count)
+    mark_document_ingested(doc_id, pdf_path.name, len(pages), stored_count)
+
+    progress("Ingestion complete!", 1.0,
+             f"-> {stored_count} paragraphs | {total_concepts} concepts | ready for queries")
+
+    return {
+        "success": True, "skipped": False, "filename": pdf_path.name,
+        "pages": len(pages), "paragraphs": stored_count,
+        "concepts": total_concepts, "relationships": total_relationships
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — CHAT PAGE
+# ═══════════════════════════════════════════════════════════════
+
+def process_query(query: str) -> Dict:
+    llm = st.session_state.phi4
+    embedder = Embedder(st.session_state.embedder)
+    retriever = Retriever(embedder, st.session_state.faiss_store, st.session_state.neo4j)
+    nli_model = st.session_state.nli
+    mode = st.session_state.mode
+
+    with st.status("Processing query...", expanded=True) as status:
+        st.write("Decomposing query into sub-questions...")
+        sub_questions = decompose_query(llm, query)
+        st.write(f"Generated {len(sub_questions)} sub-questions")
+
+        st.write("Retrieving paragraphs (FAISS + Neo4j concept graph)...")
+        all_paragraphs, seen_ids = [], set()
+        for sq in sub_questions:
+            for p in retriever.retrieve(sq, top_k=8):
+                if p["paragraph_id"] not in seen_ids:
+                    all_paragraphs.append(p)
+                    seen_ids.add(p["paragraph_id"])
+        all_paragraphs = all_paragraphs[:15]
+
+        faiss_count = sum(1 for p in all_paragraphs if p.get("source") == "faiss")
+        graph_count = sum(1 for p in all_paragraphs if p.get("source") == "graph")
+        st.write(f"{len(all_paragraphs)} paragraphs retrieved ({faiss_count} semantic + {graph_count} graph-expanded)")
+
+        if not all_paragraphs:
+            status.update(label="No relevant paragraphs found", state="error")
+            return {
+                "type": "refusal", "answer": None,
+                "message": "No relevant paragraphs found. Please ensure documents are ingested.",
+                "verified_claims": [], "rejected_claims": []
+            }
+
+        st.write(f"Generating answer ({mode.upper()} mode)...")
+        generated = generate_answer(llm, query, all_paragraphs, mode=mode)
+        st.write(f"Answer generated with {len(generated['claims'])} claims")
+
+        st.write(f"Verifying {len(generated['claims'])} claims through 3-tier firewall...")
+        verification_results = verify_all_claims(nli_model, generated["claims"])
+        response = assemble_response(generated["answer_text"], generated["claims"], verification_results)
+
+        verified_count = len(response.get("verified_claims", []))
+        status.update(
+            label=f"Complete -- {verified_count}/{len(generated['claims'])} claims verified",
+            state="complete"
+        )
+
+    log_query_cost(mode, gpt4o_calls=2 if mode == "hybrid" else 0)
+    return response
+
+
+def _render_verification_report(response: Dict):
+    verified = response.get("verified_claims", [])
+    rejected = response.get("rejected_claims", [])
+    total = len(verified) + len(rejected)
+    if total == 0:
+        return
+    with st.expander(f"Verification Report -- {len(verified)}/{total} claims verified"):
+        if verified:
+            st.markdown("**Verified Claims**")
+            for r in verified:
+                st.success(
+                    f"**{r.claim_text}**\n\n"
+                    f"Confidence: {r.confidence:.1%} | Source: `{r.source_paragraph_id}`"
+                )
+                if r.source_text:
+                    st.caption(f"{r.source_text[:300]}...")
+        if rejected:
+            st.markdown("**Rejected Claims**")
+            for r in rejected:
+                st.error(f"**{r.claim_text}**\n\nTier {r.tier_reached} rejection: {r.reason}")
+
+
+def render_chat_page():
+    st.title("HPLC Knowledge Query")
+    st.caption("Verified answers with paragraph-level citations from indexed textbooks")
+
+    if not st.session_state.faiss_store or st.session_state.faiss_store.total_vectors == 0:
+        st.info("No documents indexed yet. Go to **Ingest Documents** to upload your HPLC textbooks.")
+        return
+
+    if st.session_state.mode == "slm":
+        st.success("SLM Only Mode -- 100% local inference, Rs.0 per query")
+    else:
+        st.warning("Hybrid Mode -- GPT-4o via Azure OpenAI")
+
+    for msg in st.session_state.chat_history:
+        if msg["role"] == "user":
+            with st.chat_message("user"):
+                st.write(msg["content"])
+        else:
+            with st.chat_message("assistant", avatar="⚗️"):
+                response = msg["response"]
+                if response["type"] == "refusal":
+                    st.warning(f"**Insufficient Evidence**\n\n{response['message']}")
+                else:
+                    st.write(response["answer"])
+                    if response.get("verification_ratio"):
+                        st.caption(f"Verification: {response['verification_ratio']}")
+                    _render_verification_report(response)
+
+    query = st.chat_input("Ask about HPLC methods, column efficiency, gradient optimization...")
+    if query:
+        st.session_state.chat_history.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.write(query)
+        with st.chat_message("assistant", avatar="⚗️"):
+            response = process_query(query)
+            if response["type"] == "refusal":
+                st.warning(f"**Insufficient Evidence**\n\n{response['message']}")
+            else:
+                st.write(response["answer"])
+                if response.get("verification_ratio"):
+                    st.caption(f"Verification: {response['verification_ratio']}")
+                _render_verification_report(response)
+        st.session_state.chat_history.append({"role": "assistant", "response": response})
+
+    if not st.session_state.chat_history:
+        st.divider()
+        st.subheader("Try a sample query")
+        samples = [
+            "What is the Van Deemter equation?",
+            "How does column temperature affect peak resolution?",
+            "Explain gradient elution in reversed-phase HPLC",
+            "What causes peak tailing and how to prevent it?"
+        ]
+        cols = st.columns(2)
+        for i, s in enumerate(samples):
+            with cols[i % 2]:
+                if st.button(s, use_container_width=True):
+                    st.session_state.chat_history.append({"role": "user", "content": s})
+                    st.rerun()
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — INGESTION PAGE
+# ═══════════════════════════════════════════════════════════════
+
+def render_ingestion_page():
+    st.title("Document Ingestion")
+    st.caption("Upload HPLC textbooks -- everything runs automatically")
+
+    st.info(
+        "**What happens automatically after you click Start Ingestion:**\n\n"
+        "1. PDF text extraction (PyMuPDF)\n"
+        "2. Paragraph chunking with unique IDs\n"
+        "3. SQLite storage (paragraph text + metadata)\n"
+        "4. Phi-4-mini concept extraction -> Neo4j graph\n"
+        "5. BGE-M3 embedding -> FAISS vector index\n\n"
+        "Already-ingested documents are skipped automatically on restart."
+    )
+
+    log = load_ingestion_log()
+    if log:
+        st.subheader(f"Previously Ingested -- {len(log)} documents")
+        for doc_id, info in log.items():
+            c1, c2, c3, c4, c5 = st.columns([3, 1, 1, 1, 1])
+            c1.write(info['filename'])
+            c2.write(f"{info['pages']} pages")
+            c3.write(f"{info['paragraphs']:,} paragraphs")
+            c4.write(info.get('timestamp', '')[:10])
+            c5.success("Done")
+        st.divider()
+
+    st.subheader("Upload New Documents")
+    uploaded_files = st.file_uploader("Select PDF files", type=["pdf"], accept_multiple_files=True)
+
+    if uploaded_files:
+        st.write(f"**{len(uploaded_files)} file(s) selected**")
+        for f in uploaded_files:
+            st.caption(f"- {f.name}")
+
+        if st.button("Start Ingestion", type="primary"):
+            embedder = Embedder(st.session_state.embedder)
+            overall_bar = st.progress(0, text="Overall progress")
+            results_container = st.container()
+
+            for file_idx, uploaded_file in enumerate(uploaded_files):
+                with results_container:
+                    st.markdown(f"**Processing: {uploaded_file.name}**")
+                    file_bar = st.progress(0)
+                    step_text = st.empty()
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(uploaded_file.read())
+                    tmp_path = Path(tmp.name)
+
+                def make_callback(fb, st_):
+                    def callback(step, pct, detail=""):
+                        fb.progress(min(pct, 1.0))
+                        st_.caption(f"{step} {detail}")
+                    return callback
+
+                result = ingest_pdf(
+                    tmp_path,
+                    embedder=embedder,
+                    faiss_store=st.session_state.faiss_store,
+                    neo4j=st.session_state.neo4j,
+                    llm=st.session_state.phi4,
+                    progress_callback=make_callback(file_bar, step_text)
+                )
+                tmp_path.unlink(missing_ok=True)
+
+                with results_container:
+                    if result.get("skipped"):
+                        st.info(f"{result['filename']} -- already ingested, skipped")
+                    elif result["success"]:
+                        st.success(
+                            f"**{result['filename']}** complete\n\n"
+                            f"- {result['pages']} pages extracted\n"
+                            f"- {result['paragraphs']:,} paragraphs stored\n"
+                            f"- {result['concepts']:,} HPLC concepts extracted\n"
+                            f"- {result['relationships']:,} concept relationships built"
+                        )
+                    else:
+                        st.error(f"{result['filename']} -- {result.get('error', 'Unknown error')}")
+
+                overall_bar.progress(
+                    (file_idx + 1) / len(uploaded_files),
+                    text=f"{file_idx + 1}/{len(uploaded_files)} documents processed"
+                )
+
+            st.balloons()
+            st.rerun()
+
+    st.divider()
+    st.subheader("Corpus Statistics")
+    stats = db_get_corpus_stats()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Documents", stats["document_count"])
+    c2.metric("Paragraphs", f"{stats['paragraph_count']:,}")
+    vectors = st.session_state.faiss_store.total_vectors if st.session_state.faiss_store else 0
+    c3.metric("FAISS Vectors", f"{vectors:,}")
+    if st.session_state.neo4j and st.session_state.neo4j.is_connected:
+        gs = st.session_state.neo4j.get_graph_stats()
+        c4.metric("Graph Concepts", f"{gs.get('concepts', 0):,}")
+    else:
+        c4.metric("Neo4j", "Not connected")
+
+    if stats["documents"]:
+        import pandas as pd
+        st.subheader("Document Breakdown")
+        df = pd.DataFrame(stats["documents"])
+        st.dataframe(
+            df[["filename", "page_count", "paragraph_count", "indexed_at"]],
+            use_container_width=True, hide_index=True
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — KNOWLEDGE GRAPH PAGE
+# ═══════════════════════════════════════════════════════════════
+
+def render_graph_page():
+    st.title("Knowledge Graph")
+    st.caption("HPLC concept relationships extracted from indexed documents")
+
+    if not st.session_state.neo4j or not st.session_state.neo4j.is_connected:
+        st.warning("Neo4j is not connected.")
+        st.info(
+            "To enable the knowledge graph:\n\n"
+            "1. Install Neo4j Desktop from https://neo4j.com/download/\n"
+            "2. Create a new database and click Start\n"
+            "3. Update NEO4J_PASSWORD at the top of this file\n"
+            "4. Restart the app"
+        )
+        st.caption("Expected connection: bolt://localhost:7687")
+        return
+
+    stats = st.session_state.neo4j.get_graph_stats()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Documents", stats.get("documents", 0))
+    c2.metric("Paragraphs", stats.get("paragraphs", 0))
+    c3.metric("Concepts", stats.get("concepts", 0))
+    c4.metric("Relationships", stats.get("relationships", 0))
+
+    st.divider()
+    graph_data = st.session_state.neo4j.get_graph_data()
+    if not graph_data["nodes"]:
+        st.info("Graph is empty -- ingest documents first.")
+        return
+
+    import pandas as pd
+    st.subheader("Document Index")
+    st.dataframe(pd.DataFrame(graph_data["nodes"]), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.subheader("About the Knowledge Graph")
+    st.markdown(
+        "The concept graph enables **multi-hop reasoning** beyond keyword and vector search:\n\n"
+        "- Phi-4-mini extracts HPLC concepts from every paragraph during ingestion\n"
+        "- Concepts and relationships are stored in Neo4j\n"
+        "- At query time, retrieval traverses two hops:\n"
+        "  1. Direct: paragraphs sharing concepts with top FAISS results\n"
+        "  2. Indirect: paragraphs mentioning concepts related to those concepts\n"
+        "- This surfaces relevant paragraphs that keyword/vector search would never find"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI — ANALYTICS PAGE
+# ═══════════════════════════════════════════════════════════════
+
+def render_analytics_page():
+    import pandas as pd
+    import altair as alt
+
+    st.title("Cost Analytics")
+    st.caption("ROI comparison: Copilot Studio vs Analytical AI Expert")
+
+    proj = get_monthly_projection()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Copilot Studio (Baseline)", f"Rs.{proj['copilot_monthly']:,}/month",
+              help="Client's current monthly spend")
+    c2.metric("Hybrid Mode", f"Rs.{proj['hybrid_monthly']:,.0f}/month",
+              delta=f"-{proj['hybrid_savings_pct']}% savings")
+    c3.metric("SLM Only Mode", f"Rs.{proj['slm_monthly']:,}/month",
+              delta=f"-{proj['slm_savings_pct']}% savings")
+
+    chart = alt.Chart(pd.DataFrame({
+        "Solution": ["Copilot Studio", "Hybrid Mode", "SLM Only"],
+        "Monthly Cost (Rs.)": [proj["copilot_monthly"], proj["hybrid_monthly"], proj["slm_monthly"]]
+    })).mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+        x=alt.X("Solution:N", sort=None),
+        y=alt.Y("Monthly Cost (Rs.):Q"),
+        color=alt.Color("Solution:N", scale=alt.Scale(
+            domain=["Copilot Studio", "Hybrid Mode", "SLM Only"],
+            range=["#FF4B4B", "#FFA500", "#00CC44"]
+        ))
+    ).properties(title="Monthly Cost Comparison (Rs. INR)")
+    st.altair_chart(chart, use_container_width=True)
+
+    st.divider()
+    st.subheader("ROI Calculator")
+    current_spend = st.number_input("Your current monthly spend (Rs.)",
+                                    min_value=0, value=57500, step=1000)
+    c1, c2 = st.columns(2)
+    c1.metric("Annual Savings -- SLM Only",
+              f"Rs.{(current_spend - proj['slm_monthly']) * 12:,.0f}")
+    c2.metric("Annual Savings -- Hybrid",
+              f"Rs.{(current_spend - proj['hybrid_monthly']) * 12:,.0f}")
+
+    st.divider()
+    if st.session_state.get("cost_tracker"):
+        st.subheader("This Session")
+        t = st.session_state.cost_tracker
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Queries", t["total_queries"])
+        c2.metric("SLM Queries", t["slm_queries"])
+        c3.metric("Hybrid Queries", t["hybrid_queries"])
+        c4.metric("Session Cost", f"Rs.{t['total_cost_inr']:.2f}")
+
+    st.divider()
+    st.subheader("Architecture Advantage")
+    st.markdown(
+        "| Feature | Copilot Studio | Analytical AI Expert |\n"
+        "|---------|---------------|---------------------|\n"
+        "| Retrieval | Keyword/vector | PIKE-RAG + Neo4j multi-hop |\n"
+        "| Hallucination control | None | 3-tier NLI firewall |\n"
+        "| Concept understanding | Flat | HPLC knowledge graph |\n"
+        "| Data sovereignty | Microsoft cloud | 100% local |\n"
+        f"| Cost (SLM mode) | Rs.57,500/month | Rs.1,500/month |\n"
+        f"| Cost (Hybrid mode) | Rs.57,500/month | ~Rs.{int(proj['hybrid_monthly']):,}/month |"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════
+# MAIN APP
+# ═══════════════════════════════════════════════════════════════
+
+def initialize_session_state():
+    defaults = {
+        "mode": "slm", "current_page": "chat", "chat_history": [],
+        "models_loaded": False, "phi4": None, "embedder": None,
+        "nli": None, "faiss_store": None, "neo4j": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+def load_infrastructure():
+    if st.session_state.models_loaded:
+        return
+    initialize_db()
+    initialize_cost_tracker()
+    st.session_state.phi4 = load_phi4()
+    st.session_state.embedder = load_embedder_model()
+    st.session_state.nli = load_nli_model()
+    faiss_store = FAISSStore()
+    faiss_store.load()
+    st.session_state.faiss_store = faiss_store
+    neo4j = Neo4jClient()
+    neo4j.create_schema()
+    st.session_state.neo4j = neo4j
+    st.session_state.models_loaded = True
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.title("Analytical AI Expert")
+        st.caption("HPLC Knowledge System v1.0")
+        st.divider()
+
+        st.subheader("Inference Mode")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("SLM Only",
+                         type="primary" if st.session_state.mode == "slm" else "secondary",
+                         use_container_width=True):
+                st.session_state.mode = "slm"
+                st.rerun()
+        with c2:
+            if st.button("Hybrid",
+                         type="primary" if st.session_state.mode == "hybrid" else "secondary",
+                         use_container_width=True):
+                st.session_state.mode = "hybrid"
+                st.rerun()
+
+        if st.session_state.mode == "slm":
+            st.success("SLM Only -- Rs.0 per query")
+        else:
+            st.warning("Hybrid -- GPT-4o via Azure")
+
+        st.divider()
+        st.subheader("Model Status")
+        if st.session_state.get("models_loaded"):
+            st.success("All models loaded")
+            st.caption("- Phi-4-mini (Generation)")
+            st.caption("- BGE-M3 (Embedding)")
+            st.caption("- DeBERTa-v3-large (Verification)")
+        else:
+            st.warning("Loading models...")
+
+        neo4j = st.session_state.get("neo4j")
+        if neo4j:
+            if neo4j.is_connected:
+                st.success("Neo4j connected")
+            else:
+                st.warning("Neo4j offline (graph features disabled)")
+
+        st.divider()
+        stats = db_get_corpus_stats()
+        st.subheader("Corpus Index")
+        st.metric("Documents", stats["document_count"])
+        st.metric("Paragraphs", f"{stats['paragraph_count']:,}")
+        if neo4j and neo4j.is_connected:
+            gs = neo4j.get_graph_stats()
+            st.metric("Concepts", f"{gs.get('concepts', 0):,}")
+            st.metric("Relationships", f"{gs.get('relationships', 0):,}")
+
+        st.divider()
+        st.subheader("Navigation")
+        for page_id, label in [
+            ("chat", "Chat"), ("ingest", "Ingest Documents"),
+            ("graph", "Knowledge Graph"), ("analytics", "Cost Analytics")
+        ]:
+            if st.button(label, use_container_width=True,
+                         type="primary" if st.session_state.current_page == page_id else "secondary"):
+                st.session_state.current_page = page_id
+                st.rerun()
+
+        if st.session_state.get("cost_tracker"):
+            st.divider()
+            t = st.session_state.cost_tracker
+            st.metric("Session Cost", f"Rs.{t['total_cost_inr']:.2f}")
+            st.caption(f"{t['total_queries']} queries - {t['gpt4o_calls']} API calls")
+
+
+def main():
+    initialize_session_state()
+    load_infrastructure()
+    render_sidebar()
+
+    page = st.session_state.current_page
+    if page == "chat":
+        render_chat_page()
+    elif page == "ingest":
+        render_ingestion_page()
+    elif page == "graph":
+        render_graph_page()
+    elif page == "analytics":
+        render_analytics_page()
+
+
+if __name__ == "__main__":
+    main()
