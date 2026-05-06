@@ -1,1 +1,1111 @@
-We require a Google Cloud Platform VM with the following specifications for the Analytical AI Expert application. The machine type should be N1 with 8 vCPUs and 30GB RAM, running Ubuntu 22.04 LTS in the asia-south1 (Mumbai) region. The boot disk should be an SSD Persistent Disk of 200GB. In addition to the standard machine configuration, we require an NVIDIA T4 GPU (16GB VRAM) to be attached to this VM — this is mandatory for the application to meet its response time requirements and cannot be substituted with CPU-only compute. The environment is non-production for the pilot phase. Network should be a non-shared VPC with a public static IP assigned. The VM will be active during business hours (8 hours per day, 5 days a week) with the flexibility to scale to 24x7 if required post-pilot. Snapshots are required with a 7-day retention period. This is a Non-GXP workload. We also require a GCP Storage Bucket in asia-south1 with an expected data size of 20GB for storing the document corpus — bucket name to be confirmed as analytical-ai-expert-pdfs under the project analytical-ai-expert. Please confirm the GPU attachment separately as it may require a quota increase request on the GCP project before provisioning.​​​​​​​​​​​​​​​​
+#!/usr/bin/env python3
+"""
+Elemental Impurities Risk Assessment Report Generator
+Dr. Reddy's IPDO – TSR Automation (ICH Q3D R2)
+Powered by Claude claude-opus-4-6 via Vertex AI
+"""
+
+import os, sys, json, logging, time, copy
+from io import BytesIO
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime
+
+import streamlit as st
+import pandas as pd
+import openpyxl
+
+import google.auth
+from vertexai.preview.generative_models import (
+    GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
+)
+
+from docx import Document
+from docx.shared import Pt, Inches, RGBColor, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VERTEX AI / CLAUDE SETUP  (exactly as in your sample code)
+# ──────────────────────────────────────────────────────────────────────────────
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+credentials, project_id = google.auth.default()
+model = GenerativeModel("claude-opus-4-6")
+
+SAFETY_CONFIG = [
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                  threshold=HarmBlockThreshold.BLOCK_NONE),
+]
+
+def call_claude(prompt: str, max_retries: int = 3) -> str:
+    """Call Claude claude-opus-4-6 via Vertex AI with retry logic."""
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(
+                [prompt],
+                safety_settings=SAFETY_CONFIG
+            )
+            if hasattr(response, "text") and response.text:
+                return response.text
+        except Exception as e:
+            logger.warning(f"Claude call attempt {attempt+1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise RuntimeError("Claude API call failed after max retries.")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PRODUCT-LEVEL CONSTANTS  (backend hardcoded for this product)
+# ──────────────────────────────────────────────────────────────────────────────
+PRODUCT = {
+    "title":        "Elemental Impurities Risk Assessment According to ICH Q3D (R2) for "
+                    "Esomeprazole Magnesium for Delayed Release Oral Suspension",
+    "doc_no":       "TSR-SOM-01-00066",
+    "product_name": "Esomeprazole Magnesium for Delayed Release Oral Suspension",
+    "dosage_form":  "Sachet",
+    "version":      "5.0, CURRENT",
+    "strength":     "10 mg, 20 mg, 40 mg",
+    "department":   "FR&D",
+    "market":       "USA",
+    "protocol":     "NA",
+    "sop_format":   "FORM-IPDO-GRD-0060(2.0)",
+    "max_daily_dose": "240 mg per day",
+}
+
+TOC = [
+    (1, "Abstract",                                      3),
+    (2, "Objective",                                     3),
+    (3, "Details of the study location / testing location", 3),
+    (4, "Background",                                    3),
+    (5, "Drug product elemental impurity risk assessment", 5),
+    (6, "Summary & Conclusion",                          17),
+    (7, "Reference",                                     19),
+    (8, "List of Annexures",                             19),
+    (9, "Revision History",                              19),
+]
+
+STATIC = {
+    "abstract": (
+        "This technical summary report provides the background to demonstration of Theoretical "
+        "elemental assessment in (a) Drug Substance, (b) Excipients, (c) Manufacturing Equipment, "
+        "(d) Container Closure System and (e) Utilities (e.g. Purified Water) used in manufacturing "
+        "of esomeprazole Magnesium for Delayed Release Oral Suspension 10 mg, 20 mg and 40 mg in "
+        "accordance to the requirements set forth in ICH Q3D (R2) Elemental Impurity."
+    ),
+    "objective": (
+        "To prepare the elemental assessment report for Esomeprazole Magnesium for Delayed Release "
+        "Oral Suspension 10 mg, 20 mg and 40 mg."
+    ),
+    "study_location": "NA",
+    "background_drug_product": (
+        "The Quantitative and Qualitative Composition of Esomeprazole Magnesium for Delayed Release "
+        "Oral Suspension 10 mg, 20 mg and 40 mg. Drug product contains active pellets (lubricated "
+        "pellets) and inactive granules. Active pellets are dose proportional for 10 mg, 20 mg and "
+        "40 mg. Inactive granules having same quantitative and qualitative composition for 10 mg, "
+        "20 mg and 40 mg."
+    ),
+    "sources_intro": (
+        "Each of the above sources can contribute elemental impurities to the drug product, through "
+        "any individual or combination of potential sources shown above. All the above sources need "
+        "to be considered while determining the overall contribution of elemental impurities to the "
+        "drug product, and can also have hazardous effect on the patients and therefore, they have "
+        "to be monitored/controlled during the entire manufacturing process.\n\n"
+        "Of the five main categories of potential sources of elemental impurities (Drug Substance, "
+        "excipients, manufacturing equipment, utilities (purified Water) and the container closure "
+        "system), the components with greatest potential for transfer of elemental impurities to the "
+        "finished product Esomeprazole Magnesium for Delayed Release Oral Suspension 10 mg, 20 mg "
+        "and 40 mg are the drug substance and excipients being used in drug product.\n\n"
+        "In accordance with the ICH Q3D (R2) Guideline Class 1 elements Arsenic (As), Cadmium (Cd), "
+        "Mercury (Hg) and Lead (Pb) as well as the Class 2a elements Cobalt (Co), Nickel (Ni), and "
+        "Vanadium (V) require risk evaluation across all potential sources of elemental impurities "
+        "and routes of administration and are therefore included in the present risk assessment."
+    ),
+    "drug_substance": (
+        "a) Potential elemental impurities derived from drug substance (Esomeprazole Magnesium Trihydrate):\n"
+        "The drug substance manufacturer has declared that no elements (Class 1, 2A, 2B and 3) or "
+        "metal catalysts have been used in the manufacturing process of Esomeprazole Magnesium "
+        "Trihydrate. The elemental impurity declaration for Esomeprazole Magnesium Trihydrate "
+        "provided by supplier is provided as Annexure-1."
+    ),
+    "excipient_intro": (
+        "b) Potential elemental impurities derived from excipients\n"
+        "ICH Q3D (R2). The drug substance manufacturer has declared that no elements (Class 1, 2A, "
+        "2B and 3) or metal catalysts have been used in the manufacturing process of Esomeprazole "
+        "Magnesium Trihydrate. The elemental impurity declaration for Esomeprazole Magnesium "
+        "Trihydrate provided by supplier is provided as Annexure-1.\n"
+        "In order to assess the potential for the inclusion of elemental impurities from the "
+        "excipients used in the drug product (see Table # 1), the vendors and manufacturers of the "
+        "excipients were contacted to obtain information on their knowledge of potential elemental "
+        "impurities in the excipients provided. Following excipient declarations are obtained for "
+        "individual excipients and are included in the annexure of the present risk assessment."
+    ),
+    "dextrose_note": (
+        "For Dextrose Anhydrous Elemental Impurities are controlled within ICH Q3D (R2), Option-1 "
+        "Oral Limit by vendor however elemental Impurity levels for Class 1(Pb, As, Cd and Hg) and "
+        "class 2A (Co, V and Ni) (excessing 30% PDE values due to higher dose of Input Excipient "
+        "i.e Dextrose Anhydrous (16.878gm)\nhence Confirmatory Testing will be done on Exhibit "
+        "batches and control strategy will be decided accordingly.\n\n"
+        "The elemental impurities from the solvents i.e. Dehydrated alcohol and purified water are "
+        "not considered for theoretical assessment, as these will not appear in final product except "
+        "in traces.\n\n"
+        "c) Potential elemental impurities derived from manufacturing equipment\n"
+        "While manufacturing equipment presents a potential source of elemental impurities during "
+        "the production of drug substance and drug product, the current quality system of drug "
+        "substance and drug product manufacturer has been designed to minimize and control any "
+        "potential contribution from the manufacturing equipment."
+    ),
+    "manufacturing": (
+        "The typical manufacturing equipment used to produce drug substance and drug product "
+        "consists exclusively of stainless steel (SS316L) suitable for oral products. Based on the "
+        "declaration from drug substance manufacturer on the presence of elemental impurity, the "
+        "possibility of potential contribution from products.\n\n"
+        "The manufacturing process of Esomeprazole Magnesium for Delayed Release Oral Suspension "
+        "10 mg, 20 mg and 40 mg includes Seal coating, Drug loading, Sub coating, Enteric coating, "
+        "Sifting, Lubrication, milling, granulation, drying, blending and sachet filling. During "
+        "the manufacturing process, the drug product would be in contact with Sifter, Fluidized bed "
+        "Equipment, bin blender, and capsule filling machine & its accessories. Stainless 316L is "
+        "the most commonly used material of construction for drug product manufacturing equipment. "
+        "Nickel, molybdenum, chromium are key elements in 316L stainless-steel alloy. In general, "
+        "GMP's including equipment compatibility assessment and qualification are adequate to ensure "
+        "that significant levels of elemental impurities are not leached from the manufacturing "
+        "equipment into the drug product. Moreover, given that the drug product manufacturing is at "
+        "ambient conditions and wear may lead to abrasion, but appropriate GMP measures such as "
+        "visual inspection for integrity of the manufacturing equipment ensures that no appreciable "
+        "amount of elemental impurities is carried over into the drug product. Therefore, no "
+        "additional consideration is required with respect to potential contributions of elemental "
+        "impurities from the drug product manufacturing equipment.\n\n"
+        "contact of drug product with the manufacturing equipment components is not in an aggressive "
+        "or intense manner, any probability of leaching of elemental impurities from the "
+        "manufacturing equipment contact parts is very minimal. Therefore, no additional "
+        "consideration is required with respect to potential contributions of elemental impurities "
+        "from the drug product manufacturing equipment."
+    ),
+    "container_closure": (
+        "d) Potential elemental impurities derived from container closure system\n"
+        "contributions of elemental impurities from the drug product manufacturing equipment.\n"
+        "For orally administered drug products no further elements included in the ICH Q3D (R2) "
+        "classification scheme require risk evaluation except for elements which are intentionally "
+        "added as catalysts or reagents during the manufacturing process."
+    ),
+    "utilities": (
+        "e) Potential elemental impurities derived from utilities (purified water):\n"
+        "From the scientific understanding and the published literature (Jenke et al. 2015) of "
+        "likely interactions between solid dosage forms and packaging materials the probability of "
+        "elemental leaching from packaging components into solid dosage forms is minimal. Also as "
+        "stated in the ICH Q3D (R2) guideline it is recognized that the probability of elements "
+        "leaching is minimal and therefore does not require further consideration in the risk "
+        "assessment.\n\n"
+        "Water is used as a processing aid and it will be found in traces in the final product. "
+        "Hence the probability of elemental leaching is minimal and does not require further "
+        "consideration in the risk assessment.\n\n"
+        "As per above, the theoretical evaluation for the daily contribution of the total mass of "
+        "elemental impurities in the drug product for all the 24 elements is presented below in Table."
+    ),
+    "control_strategy": (
+        "f) Control strategy:\n"
+        "Risk assessment of possible elemental impurities in drug product was carried out by "
+        "evaluating the possible source of elemental impurities, review and evaluation of the "
+        "available literatures, vendor information and data, the assessment is further done to "
+        "compare the predicted levels of elemental impurities in the drug product with the control "
+        "levels for potentially identified elemental impurities as per ICH Q3D (R2), additionally "
+        "elemental impurities identified in drug product would be compared against the control "
+        "levels and accordingly if the monitoring of the elemental impurities required in drug "
+        "product or not will be decided."
+    ),
+    "reference": "NA",
+}
+
+# Hardcoded MDD tables (clinical data – fixed for this product)
+MDD_TABLE3_ROWS = [
+    ["GERD/ Ulcers/ H. pylori", "40mg", "1 X 40mg Packet"],
+    ["Hypersecretory/ZES",       "240mg", "6 X 40mg Packets"],
+    ["",                         "240mg", "2 X 20mg Packets"],
+]
+
+MDD_TABLE4_12_17 = [
+    # (Indication, MDD, No/Strength)
+    ["GERD/ Ulcers/ H. pylori", "20mg", "1 X 20mg Packet\n2 X 10mg Packets"],
+    ["",                         "40mg", "2 X 20mg Packets\n1 X 40mg Packet\n4 X 10mg Packets"],
+]
+
+MDD_TABLE4_1_11 = [
+    # (Weight, MDD, No/Strength)
+    ["Weight < 20 kg", "10mg", "4 X 2.5mg Packets\n1 X 10mg Packet\n2 X 5mg Packets"],
+    ["Weight ≥ 20 kg", "20mg", "2 X 10mg Packets\n1 X 20mg Packet\n4 X 5mg Packets"],
+]
+
+# Annexure list (ingredient → vendor) – used for Table 8
+ANNEXURE_LIST = [
+    ("Esomeprazole Magnesium Trihydrate",               "Dr. Reddy's (CTO-3)"),
+    ("Sugar Spheres (50-60 mesh)",                      "M. B Sugar spheres & Pharmaceuticals"),
+    ("Hypromellose 5 cps (Methocel ES Premium)",        "Dupont"),
+    ("Magneslic Stearate (Vegetable Anti-tacking agent)","Dupont"),
+    ("Talc",                                            "Vertellus Performance materials"),
+    ("Triethyl citrate",                                "IMIFABI, (LLC)"),
+    ("Methacrylic acid copolymer dis:Functional coating polymer", "Croda"),
+    ("Purified water",                                  "Ashland Aquaion Functional Ingredients"),
+    ("Simethicone",                                     "Peter Greven"),
+    ("Hydroxypropyl Cellulose (Klucel EF)",             "Evonik Industries AG"),
+    ("Polysorbate 80",                                  "Kern Biosciences"),
+    ("Glyceryl monostearate",                           "Roquette"),
+    ("Xanthan Gum (Xantural 11K)",                      "CP KELCO U.S. Inc."),
+    ("Citric Acid Anhydrous",                           "Merck"),
+    ("Crospovidone",                                    "BASF SE"),
+    ("Yellow Iron Oxide",                               "Venator"),
+]
+
+REVISION_HISTORY = [
+    ("TSR-SOM-01-00066, 1.0", "New Document"),
+    ("TSR-SOM-01-00066, 2.0", "Formula revised and calculation for elemental content revised"),
+    ("TSR-SOM-01-00066, 3.0", "Formula and Calculation for elemental content revised based on pilot bio outcome."),
+    ("TSR-SOM-01-00066, 4.0", "Calculation for elemental content revised based on updated excipient vendor declaration."),
+    ("TSR-SOM-01-00066, 5.0", "Formula with 32.5% enteric coating and Calculation change respectively."),
+]
+
+# Fishbone image path (store in assets/ folder alongside app.py)
+FISHBONE_IMAGE = Path(__file__).parent / "assets" / "fishbone_diagram.png"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLAUDE-POWERED ANNEXURE EXTRACTION
+# ──────────────────────────────────────────────────────────────────────────────
+
+def extract_annexure_data(annexure_json: dict, annexure_number: int) -> dict:
+    """
+    Given a Document-AI JSON for one annexure, use Claude to extract structured
+    elemental impurity declaration data.
+    """
+    prompt = f"""
+You are a pharmaceutical regulatory data extraction specialist.
+
+Below is a JSON file produced by Document AI, representing an elemental impurity 
+declaration form from a pharmaceutical excipient or drug substance supplier 
+(Annexure {annexure_number} of a Dr. Reddy's ICH Q3D risk assessment).
+
+Extract ALL information into this exact JSON schema. Do not add commentary.
+Return ONLY the JSON object.
+
+{{
+  "annexure_number": {annexure_number},
+  "supplier_name": "",
+  "material_name": "",
+  "source_type": "Plant/Mineral/Synthetic/Mineral derived/Plant derived/Fermentation derived",
+  "date_filled": "",
+  "elements": [
+    {{
+      "name": "",
+      "symbol": "",
+      "class": "1/2A/2B/3",
+      "intentionally_added": "Yes/No",
+      "expected_concentration": "",
+      "analytical_method": "",
+      "observed_level_range": "",
+      "frequency_of_testing": "",
+      "listed_in_coa": "Yes/No",
+      "comments": ""
+    }}
+  ]
+}}
+
+Document AI JSON:
+{json.dumps(annexure_json, indent=2)[:12000]}
+"""
+    try:
+        raw = call_claude(prompt)
+        # Extract JSON from response
+        start = raw.find("{")
+        end   = raw.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(raw[start:end])
+    except Exception as e:
+        logger.error(f"Annexure {annexure_number} extraction failed: {e}")
+    return {"annexure_number": annexure_number, "supplier_name": "N/A",
+            "material_name": "N/A", "elements": []}
+
+
+def generate_observations_and_conclusion(summary: dict) -> Tuple[str, str]:
+    """
+    Ask Claude to write the Observation + Conclusion text based on calculation summary.
+    Returns (observation_text, conclusion_text).
+    """
+    prompt = f"""
+You are writing the Observations and Conclusion section of a Dr. Reddy's IPDO 
+Elemental Impurities Risk Assessment Technical Summary Report following ICH Q3D (R2).
+
+Product: Esomeprazole Magnesium for Delayed Release Oral Suspension 10/20/40 mg
+Max Daily Dose: 240 mg/day (6 sachets of 40 mg, worst case)
+
+Summary of theoretical elemental impurity calculations:
+{json.dumps(summary, indent=2)}
+
+Write two clearly labeled sections:
+
+OBSERVATION:
+- Note about daily intake basis (240 mg/day = 6 sachets of 40 mg, worst case)
+- Whether any source had potential to transfer EI
+- Whether calculated daily exposures were ≤30% of PDE (Option 2b compliance)
+- Drug product compliance statement with ICH Q3D R2 Option 2b
+
+CONCLUSION:
+- Overall compliance statement (Option 2b)
+- Any elements crossing 30% PDE requiring confirmatory testing (mention Class 1 and 2A 
+  for Dextrose Anhydrous 16.878 gm dose) 
+- Confirmatory testing plan on Exhibit batches
+
+Keep the tone formal and consistent with regulatory pharmaceutical writing.
+Return plain text only (no markdown, no JSON).
+"""
+    raw = call_claude(prompt)
+    # Split at "CONCLUSION:"
+    obs, conc = "", ""
+    if "CONCLUSION:" in raw.upper():
+        idx = raw.upper().index("CONCLUSION:")
+        obs  = raw[:idx].replace("OBSERVATION:", "").strip()
+        conc = raw[idx:].replace("CONCLUSION:", "").strip()
+    else:
+        obs = raw.strip()
+    return obs, conc
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# EXCEL PARSER
+# ──────────────────────────────────────────────────────────────────────────────
+
+def parse_excel(excel_bytes: bytes) -> dict:
+    """
+    Parse the uploaded Excel file.
+    Returns a dict with keys:
+      composition  – list of rows for Table 1
+      class1_2a    – rows for Table 5
+      class2b      – rows for Table 6
+      class3       – rows for Table 7
+    
+    Expected sheet layout (configure SHEET_NAMES below to match your file):
+    """
+    COMPOSITION_SHEET = "Composition"   # Sheet tab name – adjust if different
+    CALC_SHEET        = "Calculations"  # Sheet with Tables 5-7  – adjust if needed
+
+    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
+    result = {
+        "composition": [],
+        "class1_2a":   [],
+        "class2b":     [],
+        "class3":      [],
+        "raw_sheets":  wb.sheetnames,
+    }
+
+    # ── Composition Table ──────────────────────────────────────────────────
+    if COMPOSITION_SHEET in wb.sheetnames:
+        ws = wb[COMPOSITION_SHEET]
+        rows = list(ws.iter_rows(values_only=True))
+        # Skip header row, collect non-empty rows
+        for row in rows[1:]:
+            if any(c is not None for c in row):
+                result["composition"].append([str(c) if c is not None else "" for c in row])
+    else:
+        # Try first sheet as fallback
+        ws = wb.worksheets[0]
+        rows = list(ws.iter_rows(values_only=True))
+        for row in rows[1:]:
+            if any(c is not None for c in row):
+                result["composition"].append([str(c) if c is not None else "" for c in row])
+
+    # ── Calculation Tables ────────────────────────────────────────────────
+    for sheet_name, key in [("Class1_2A", "class1_2a"),
+                              ("Class2B",   "class2b"),
+                              ("Class3",    "class3")]:
+        if sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
+            result[key] = [[str(c) if c is not None else "" for c in row]
+                           for row in rows if any(c is not None for c in row)]
+
+    wb.close()
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DOCX HELPER UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
+
+def set_cell_border(cell, **kwargs):
+    """Apply borders to a table cell."""
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcBorders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        attrs = kwargs.get(edge, {"val": "single", "sz": "4", "color": "000000"})
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"),   attrs.get("val",   "single"))
+        el.set(qn("w:sz"),    attrs.get("sz",    "4"))
+        el.set(qn("w:color"), attrs.get("color", "000000"))
+        tcBorders.append(el)
+    tcPr.append(tcBorders)
+
+
+def shade_cell(cell, fill_hex: str):
+    """Apply background colour to a table cell."""
+    tc   = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd  = OxmlElement("w:shd")
+    shd.set(qn("w:val"),   "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"),  fill_hex)
+    tcPr.append(shd)
+
+
+def bold_run(paragraph, text: str, size_pt: float = 9):
+    run = paragraph.add_run(text)
+    run.bold = True
+    run.font.size = Pt(size_pt)
+    return run
+
+
+def normal_run(paragraph, text: str, size_pt: float = 9):
+    run = paragraph.add_run(text)
+    run.bold = False
+    run.font.size = Pt(size_pt)
+    return run
+
+
+def add_page_header(doc: Document):
+    """
+    Build the IPDO standard two-row header that appears on every page.
+    (Implemented as a table in the actual header section.)
+    """
+    section = doc.sections[0]
+    header  = section.header
+    header.is_linked_to_previous = False
+
+    # Clear existing
+    for p in header.paragraphs:
+        p.clear()
+
+    # Outer table: IPDO | Title | Dr. Reddy's
+    tbl = header.add_table(rows=1, cols=3, width=Inches(7.5))
+    tbl.style = "Table Grid"
+
+    left_cell   = tbl.cell(0, 0)
+    center_cell = tbl.cell(0, 1)
+    right_cell  = tbl.cell(0, 2)
+
+    left_cell.width   = Inches(1.2)
+    center_cell.width = Inches(4.6)
+    right_cell.width  = Inches(1.7)
+
+    left_cell.paragraphs[0].add_run("IPDO").bold = True
+    left_cell.paragraphs[0].runs[0].font.size = Pt(9)
+
+    cp = center_cell.paragraphs[0]
+    cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = cp.add_run("Technical Summary Report")
+    run.bold = True; run.font.size = Pt(9)
+
+    rp = right_cell.paragraphs[0]
+    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    run = rp.add_run("Dr. Reddy's")
+    run.bold = True; run.font.size = Pt(9)
+
+    # Row 2: document info table
+    info_tbl = header.add_table(rows=1, cols=6, width=Inches(7.5))
+    info_tbl.style = "Table Grid"
+    labels = ["Title", "Document No:", "Product Name:", "Dosage Form:", "Version:", ""]
+    values = [
+        PRODUCT["title"], PRODUCT["doc_no"], PRODUCT["product_name"],
+        PRODUCT["dosage_form"], PRODUCT["version"], ""
+    ]
+    for i, (lbl, val) in enumerate(zip(labels, values)):
+        cell = info_tbl.cell(0, i)
+        p = cell.paragraphs[0]
+        r = p.add_run(f"{lbl}\n{val}")
+        r.font.size = Pt(7)
+
+    header.add_paragraph()  # spacing
+
+
+def add_page_footer(doc: Document):
+    """Standard IPDO footer: left blank | Page X of Y | right blank."""
+    section = doc.sections[0]
+    footer  = section.footer
+    footer.is_linked_to_previous = False
+
+    for p in footer.paragraphs:
+        p.clear()
+
+    fp = footer.paragraphs[0]
+    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    fp.add_run(f"Page ").font.size = Pt(8)
+    # Add PAGE field
+    fld = OxmlElement("w:fldChar")
+    fld.set(qn("w:fldCharType"), "begin")
+    fp.runs[-1]._r.append(fld)
+    instrText = OxmlElement("w:instrText")
+    instrText.text = " PAGE "
+    r = OxmlElement("w:r")
+    r.append(instrText)
+    fp._p.append(r)
+    fld2 = OxmlElement("w:fldChar")
+    fld2.set(qn("w:fldCharType"), "end")
+    r2 = OxmlElement("w:r"); r2.append(fld2)
+    fp._p.append(r2)
+    run = fp.add_run(" of ")
+    run.font.size = Pt(8)
+    # Add NUMPAGES field
+    fld3 = OxmlElement("w:fldChar")
+    fld3.set(qn("w:fldCharType"), "begin")
+    fp.runs[-1]._r.append(fld3)
+    instrText2 = OxmlElement("w:instrText")
+    instrText2.text = " NUMPAGES "
+    r3 = OxmlElement("w:r"); r3.append(instrText2)
+    fp._p.append(r3)
+    fld4 = OxmlElement("w:fldChar")
+    fld4.set(qn("w:fldCharType"), "end")
+    r4 = OxmlElement("w:r"); r4.append(fld4)
+    fp._p.append(r4)
+
+
+def add_section_heading(doc: Document, number: int, title: str):
+    p = doc.add_paragraph()
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after  = Pt(4)
+    bold_run(p, f"{number}. {title}", size_pt=10)
+
+
+def add_body_paragraph(doc: Document, text: str, size_pt: float = 9):
+    for para_text in text.split("\n\n"):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(4)
+        normal_run(p, para_text.strip(), size_pt=size_pt)
+
+
+def make_standard_table(doc: Document, headers: List[str],
+                         rows: List[List[str]],
+                         col_widths: List[float] = None,
+                         header_fill: str = "D9D9D9") -> None:
+    """
+    Create a bordered table with shaded header row.
+    col_widths in inches; defaults to equal widths.
+    """
+    total_w = 7.5
+    if col_widths is None:
+        col_widths = [total_w / len(headers)] * len(headers)
+
+    tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
+    tbl.style = "Table Grid"
+    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+    # Header row
+    hdr = tbl.rows[0]
+    for i, (h, w) in enumerate(zip(headers, col_widths)):
+        cell = hdr.cells[i]
+        cell.width = Inches(w)
+        shade_cell(cell, header_fill)
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        bold_run(p, str(h), size_pt=8)
+        set_cell_border(cell)
+
+    # Data rows
+    for r_idx, row in enumerate(rows):
+        tr = tbl.rows[r_idx + 1]
+        for c_idx, val in enumerate(row):
+            cell = tr.cells[c_idx]
+            cell.width = Inches(col_widths[c_idx] if c_idx < len(col_widths) else 1.0)
+            p = cell.paragraphs[0]
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            normal_run(p, str(val), size_pt=8)
+            set_cell_border(cell)
+
+    doc.add_paragraph()  # spacing after table
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# REPORT SECTION BUILDERS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_title_page(doc: Document):
+    """Page 1 – SOP-style title page."""
+    # Outer frame table
+    tbl = doc.add_table(rows=1, cols=1)
+    tbl.style = "Table Grid"
+    cell = tbl.cell(0, 0)
+    cell.width = Inches(7.5)
+
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    bold_run(p, PRODUCT["title"] + "\n\n", size_pt=11)
+    normal_run(p,
+        f"SOP Format Number\n{PRODUCT['sop_format']}\n\n"
+        f"Strength: {PRODUCT['strength']}\n"
+        f"Department: {PRODUCT['department']}\n"
+        f"Market: {PRODUCT['market']}\n"
+        f"Protocol: {PRODUCT['protocol']}", size_pt=9)
+
+    doc.add_page_break()
+
+
+def build_toc(doc: Document):
+    """Page 2 – Table of Contents."""
+    add_section_heading(doc, 0, "TABLE OF CONTENTS")
+    toc_rows = [(str(s), t, str(pg)) for s, t, pg in TOC]
+    make_standard_table(doc,
+        headers=["S. No.", "Title", "Page#"],
+        rows=toc_rows,
+        col_widths=[0.7, 5.8, 1.0])
+    doc.add_page_break()
+
+
+def build_abstract_section(doc: Document):
+    """Sections 1–4: Abstract, Objective, Study Location, Background."""
+    add_section_heading(doc, 1, "Abstract")
+    add_body_paragraph(doc, STATIC["abstract"])
+
+    add_section_heading(doc, 2, "Objective")
+    add_body_paragraph(doc, STATIC["objective"])
+
+    add_section_heading(doc, 3, "Details of the study location / testing location")
+    add_body_paragraph(doc, STATIC["study_location"])
+
+    add_section_heading(doc, 4, "Background:")
+    p = doc.add_paragraph()
+    normal_run(p, "Route of administration: ", size_pt=9); bold_run(p, "Oral", size_pt=9)
+    p2 = doc.add_paragraph()
+    normal_run(p2, "Dosage form: ", size_pt=9); bold_run(p2, "Delayed Release Oral Suspension", size_pt=9)
+    p3 = doc.add_paragraph()
+    normal_run(p3, "Maximum Daily Dose: ", size_pt=9); bold_run(p3, PRODUCT["max_daily_dose"], size_pt=9)
+    add_body_paragraph(doc, STATIC["background_drug_product"])
+    doc.add_page_break()
+
+
+def build_composition_table(doc: Document, excel_data: dict):
+    """Section 5 start – Table 1: Quantitative & Qualitative Composition."""
+    add_section_heading(doc, 5, "Drug product elemental impurity risk assessment")
+
+    p = doc.add_paragraph()
+    normal_run(p,
+        "same quantitative and qualitative composition for 10 mg, 20 mg and 40 mg.\n"
+        "Table 1: Quantitative and Qualitative Composition", size_pt=9)
+
+    comp = excel_data.get("composition", [])
+    if comp:
+        # Try to detect header row vs data rows
+        headers = ["Name of Ingredient", "Compendial Status e", "40 mg\nmg/unit", "20 mg\nmg/unit", "10 mg\nmg/unit"]
+        # Limit to 5 columns
+        rows = [[r[i] if i < len(r) else "" for i in range(5)] for r in comp]
+        make_standard_table(doc,
+            headers=headers,
+            rows=rows,
+            col_widths=[2.8, 1.2, 1.0, 1.0, 1.0])
+    else:
+        add_body_paragraph(doc, "[Composition table – upload Excel to populate]")
+
+    doc.add_page_break()
+
+
+def build_fishbone_diagram(doc: Document):
+    """Insert fishbone diagram (Figure 1) – same image every report."""
+    p = doc.add_paragraph()
+    normal_run(p,
+        "Figure 1: Potential sources of elemental impurities in Esomeprazole Magnesium "
+        "for Delayed Release Oral Suspension  10 mg, 20 mg, 40 mg", size_pt=9)
+
+    if FISHBONE_IMAGE.exists():
+        doc.add_picture(str(FISHBONE_IMAGE), width=Inches(6.5))
+        last_p = doc.paragraphs[-1]
+        last_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        p2 = doc.add_paragraph()
+        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        bold_run(p2, "[FISHBONE DIAGRAM – place fishbone_diagram.png in assets/ folder]", size_pt=10)
+
+    doc.add_paragraph()
+    doc.add_page_break()
+
+
+def build_sources_and_excipient_section(doc: Document, annexure_data: List[dict]):
+    """Sources text + Table 2 (excipient annexure mapping)."""
+    add_body_paragraph(doc, STATIC["sources_intro"])
+    add_body_paragraph(doc, STATIC["drug_substance"])
+    add_body_paragraph(doc, STATIC["excipient_intro"])
+
+    # Table 2 – details of annexures
+    p = doc.add_paragraph()
+    bold_run(p, "Table No.2 Details of Annexures", size_pt=9)
+
+    tbl2_rows = []
+    for idx, (ingredient, vendor) in enumerate(ANNEXURE_LIST, start=1):
+        tbl2_rows.append([ingredient, f"Annexure {idx}"])
+
+    make_standard_table(doc,
+        headers=["Name of Excipient", "Annexure"],
+        rows=tbl2_rows,
+        col_widths=[5.5, 2.0])
+
+    add_body_paragraph(doc, STATIC["dextrose_note"])
+    doc.add_page_break()
+
+
+def build_manufacturing_section(doc: Document):
+    add_body_paragraph(doc, STATIC["manufacturing"])
+    add_body_paragraph(doc, STATIC["container_closure"])
+    add_body_paragraph(doc, STATIC["utilities"])
+    add_body_paragraph(doc, STATIC["control_strategy"])
+    doc.add_page_break()
+
+
+def build_mdd_tables(doc: Document):
+    """Tables 3 & 4 – MDD clinical data."""
+    p = doc.add_paragraph()
+    bold_run(p, "Table No.3 MDD clinical data of esomeprazole.", size_pt=9)
+    make_standard_table(doc,
+        headers=["Indication", "MDD", "No. & Strength of Packets"],
+        rows=MDD_TABLE3_ROWS,
+        col_widths=[2.5, 1.5, 3.5])
+
+    p2 = doc.add_paragraph()
+    bold_run(p2, "Table No.4 MDD clinical data as per age group of esomeprazole", size_pt=9)
+
+    # 12–17 y/o sub-table
+    p3 = doc.add_paragraph()
+    normal_run(p3, "12 to 17 y/o  |  Weight ≥ 20 kg", size_pt=9)
+    make_standard_table(doc,
+        headers=["Indication", "MDD", "No. & Strength of Packets"],
+        rows=MDD_TABLE4_12_17,
+        col_widths=[2.5, 1.5, 3.5])
+
+    # 1–11 y/o sub-table
+    p4 = doc.add_paragraph()
+    normal_run(p4, "1 to 11 y/o", size_pt=9)
+    make_standard_table(doc,
+        headers=["Weight", "MDD", "No. & Strength of Packets"],
+        rows=MDD_TABLE4_1_11,
+        col_widths=[2.5, 1.5, 3.5])
+
+    doc.add_page_break()
+
+
+def build_calculation_tables(doc: Document, excel_data: dict):
+    """Tables 5, 6, 7 – Theoretical EI Assessment (Class 1/2A, 2B, 3)."""
+
+    for table_num, key, class_label, class_desc in [
+        (5, "class1_2a", "Class 1 and Class 2A",
+         "Pb, As, Cd, Hg (Class 1) and Co, V, Ni (Class 2A)"),
+        (6, "class2b",   "Class 2B",
+         "Pd, Se, Tl, Au, Ir, Os, Rh, Ru, Ag, Pt"),
+        (7, "class3",    "Class 3",
+         "Li, Sb, Ba, Cr, Cu, Mg, Sn, Mo"),
+    ]:
+        p = doc.add_paragraph()
+        bold_run(p,
+            f"Table {table_num}: Theoretical Elemental Impurity Assessment ({class_label}) - "
+            f"Evaluation of Daily Contribution of the Total Mass of Elemental Impurities in the "
+            f"Esomeprazole Magnesium for Delayed Release Oral Suspension\n"
+            f"Elements: {class_desc}", size_pt=9)
+
+        rows = excel_data.get(key, [])
+        if rows and len(rows) > 1:
+            # First row = headers, rest = data
+            headers = rows[0]
+            data    = rows[1:]
+            # Compute equal col widths
+            n_cols = len(headers)
+            col_w  = [7.5 / n_cols] * n_cols
+            col_w[0] = 2.0  # ingredient name column wider
+            remaining = (7.5 - 2.0) / max(n_cols - 1, 1)
+            col_w = [2.0] + [remaining] * (n_cols - 1)
+            make_standard_table(doc, headers=headers, rows=data, col_widths=col_w)
+        else:
+            add_body_paragraph(doc,
+                f"[Table {table_num} – upload Excel with sheet '{key.upper()}' to populate]")
+
+    doc.add_page_break()
+
+
+def build_observations(doc: Document, obs_text: str, conc_text: str):
+    add_section_heading(doc, 6, "Summary & Conclusion")
+
+    p = doc.add_paragraph()
+    bold_run(p, "Observation:", size_pt=9)
+    add_body_paragraph(doc, obs_text or (
+        "1. The assessment examined the sources of elemental impurities and no source had the "
+        "potential to transfer elemental impurities into the drug product.\n\n"
+        "2. Elemental impurity risk assessment identified no contributory sources. Calculated "
+        "daily exposures were >30% of PDE (oral route) using %PDE = (Daily Exposure/PDE) × 100, "
+        "with calculations documented. The drug product complies with ICH Q3D (R2), Option-2b "
+        "for elemental impurities."
+    ))
+
+    p2 = doc.add_paragraph()
+    bold_run(p2, "Conclusion:", size_pt=9)
+    add_body_paragraph(doc, conc_text or (
+        "Based on the documented calculations and risk assessment, the potential contribution of "
+        "elemental impurities to the final drug product is adequately assessed.\n\n"
+        "Drug products meets ICH Q3D (R2), Option 2b. However elemental impurity levels for "
+        "Class 1 (Pb, As, Cd and Hg) and class 2A (Co, V and Ni) crossing 30% PDE values due "
+        "to higher dose of Input Excipient i.e Dextrose Anhydrous (16.878gm), hence Confirmatory "
+        "Testing will be done on Exhibit batches and control strategy will be decided accordingly."
+    ))
+    doc.add_page_break()
+
+
+def build_annexure_list(doc: Document):
+    """Table 8 – List of Annexures."""
+    add_section_heading(doc, 8, "List of annexures")
+    p = doc.add_paragraph()
+    bold_run(p, "Table No: 8 List of annexures", size_pt=9)
+
+    rows = [(ingr, vend, f"Annexure {i+1}")
+            for i, (ingr, vend) in enumerate(ANNEXURE_LIST)]
+    make_standard_table(doc,
+        headers=["Name of Ingredient", "Vendor", "Title of Annexure"],
+        rows=rows,
+        col_widths=[2.8, 2.7, 2.0])
+
+    p2 = doc.add_paragraph()
+    normal_run(p2,
+        "Note: For Annexures refer ELN experiment Number: SOM-6-40-M-NBI-30", size_pt=8)
+    doc.add_page_break()
+
+
+def build_revision_history(doc: Document):
+    add_section_heading(doc, 9, "Revision history:")
+    make_standard_table(doc,
+        headers=["Document and Version Number", "Brief details of changes"],
+        rows=[[v, c] for v, c in REVISION_HISTORY],
+        col_widths=[3.5, 4.0])
+    doc.add_page_break()
+
+
+def build_signature_page(doc: Document):
+    """Electronic Signatures block."""
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    bold_run(p, "ELECTRONIC SIGNATURES", size_pt=10)
+
+    # Info table
+    info_rows = [
+        ["Title", PRODUCT["title"]],
+        ["Document No", PRODUCT["doc_no"]],
+        ["Version",     PRODUCT["version"]],
+    ]
+    make_standard_table(doc, headers=["Field", "Value"],
+                        rows=info_rows, col_widths=[2.5, 5.0])
+
+    # Signature table
+    sig_rows = [
+        ["Prepared by R&D",  "", "", ""],
+        ["Reviewed by R&D",  "", "", ""],
+        ["Approved by DQA",  "", "", ""],
+    ]
+    make_standard_table(doc,
+        headers=["Intention", "Employee ID", "User Name", "Date (IST)"],
+        rows=sig_rows,
+        col_widths=[2.5, 1.5, 2.0, 1.5])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MASTER REPORT ORCHESTRATOR
+# ──────────────────────────────────────────────────────────────────────────────
+
+def generate_report(annexure_data: List[dict],
+                    excel_data: dict,
+                    obs_text: str,
+                    conc_text: str) -> BytesIO:
+    doc = Document()
+
+    # Page setup: A4, 1-inch margins
+    for section in doc.sections:
+        section.page_width  = Inches(8.5)
+        section.page_height = Inches(11)
+        section.left_margin   = Inches(0.75)
+        section.right_margin  = Inches(0.75)
+        section.top_margin    = Inches(1.2)
+        section.bottom_margin = Inches(0.75)
+
+    # Default paragraph style
+    style = doc.styles["Normal"]
+    style.font.name  = "Arial"
+    style.font.size  = Pt(9)
+
+    add_page_header(doc)
+    add_page_footer(doc)
+
+    # Build all sections
+    build_title_page(doc)
+    build_toc(doc)
+    build_abstract_section(doc)
+    build_composition_table(doc, excel_data)
+    build_fishbone_diagram(doc)
+    build_sources_and_excipient_section(doc, annexure_data)
+    build_manufacturing_section(doc)
+    build_mdd_tables(doc)
+    build_calculation_tables(doc, excel_data)
+    build_observations(doc, obs_text, conc_text)
+    build_annexure_list(doc)
+    build_revision_history(doc)
+    build_signature_page(doc)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STREAMLIT UI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    st.title("Elemental Impurities Risk Assessment – Report Generator")
+    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Powered by Claude claude-opus-4-6 via Vertex AI")
+
+    st.markdown("---")
+
+    # ── File Uploads ──────────────────────────────────────────────────────────
+    st.header("1. Upload Inputs")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        annexure_files = st.file_uploader(
+            "Upload Annexure JSON files (1–16)",
+            type=["json"],
+            accept_multiple_files=True,
+            help="Upload the Document-AI JSON files for each excipient/DS annexure."
+        )
+    with col2:
+        excel_file = st.file_uploader(
+            "Upload Excel file (Composition + Calculation Tables)",
+            type=["xlsx", "xls"],
+            help="Sheet names expected: 'Composition', 'Class1_2A', 'Class2B', 'Class3'"
+        )
+
+    # ── Optional: Custom Obs/Conclusion ───────────────────────────────────────
+    st.header("2. Options")
+    auto_gen = st.checkbox(
+        "Auto-generate Observations & Conclusion using Claude (recommended)",
+        value=True
+    )
+    custom_obs  = ""
+    custom_conc = ""
+    if not auto_gen:
+        custom_obs  = st.text_area("Custom Observation text", height=150)
+        custom_conc = st.text_area("Custom Conclusion text", height=150)
+
+    # ── Generate ──────────────────────────────────────────────────────────────
+    st.header("3. Generate Report")
+    if st.button("🚀 Generate Report", type="primary"):
+
+        if not annexure_files:
+            st.warning("Please upload at least one annexure JSON file.")
+            return
+        if not excel_file:
+            st.warning("Please upload the Excel file.")
+            return
+
+        progress = st.progress(0)
+        status   = st.empty()
+
+        # Step 1: Parse Excel
+        status.info("Parsing Excel data…")
+        try:
+            excel_data = parse_excel(excel_file.getvalue())
+            st.success(f"Excel parsed. Sheets found: {excel_data['raw_sheets']}")
+        except Exception as e:
+            st.error(f"Excel parsing failed: {e}")
+            logger.exception("Excel error")
+            excel_data = {"composition": [], "class1_2a": [], "class2b": [], "class3": []}
+        progress.progress(10)
+
+        # Step 2: Process Annexure JSONs with Claude
+        status.info(f"Processing {len(annexure_files)} annexure(s) with Claude…")
+        annexure_data = []
+        for i, af in enumerate(annexure_files):
+            try:
+                raw_json = json.loads(af.read().decode("utf-8"))
+                ann_num  = i + 1
+                ann_result = extract_annexure_data(raw_json, ann_num)
+                annexure_data.append(ann_result)
+                st.write(f"  ✅ Annexure {ann_num}: {ann_result.get('material_name', 'N/A')} "
+                         f"({ann_result.get('supplier_name', 'N/A')})")
+            except Exception as e:
+                st.warning(f"  ⚠️ Annexure {i+1} could not be fully processed: {e}")
+                annexure_data.append({"annexure_number": i+1, "error": str(e)})
+            progress.progress(10 + int(70 * (i + 1) / len(annexure_files)))
+
+        # Step 3: Generate Obs/Conclusion
+        obs_text  = custom_obs
+        conc_text = custom_conc
+        if auto_gen:
+            status.info("Generating Observations & Conclusion with Claude…")
+            try:
+                summary = {
+                    "annexure_count": len(annexure_data),
+                    "materials": [a.get("material_name") for a in annexure_data],
+                    "excel_sheets": excel_data.get("raw_sheets", []),
+                }
+                obs_text, conc_text = generate_observations_and_conclusion(summary)
+                st.success("Observations & Conclusion generated.")
+            except Exception as e:
+                st.warning(f"Auto-generation failed ({e}); using default text.")
+        progress.progress(85)
+
+        # Step 4: Build DOCX
+        status.info("Building the Word document…")
+        try:
+            report_buf = generate_report(annexure_data, excel_data, obs_text, conc_text)
+            progress.progress(100)
+            status.success("✅ Report generated successfully!")
+
+            fname = f"TSR-SOM-01-00066_v5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            st.download_button(
+                label="📄 Download Report (DOCX)",
+                data=report_buf.getvalue(),
+                file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        except Exception as e:
+            st.error(f"Document generation failed: {e}")
+            logger.exception("DOCX error")
+
+    # ── Instructions ──────────────────────────────────────────────────────────
+    with st.expander("ℹ️ File Format Requirements & Setup"):
+        st.markdown("""
+**Annexure JSON Files**
+- One JSON file per annexure (Document AI output)
+- Upload in order: Annexure 1 first, Annexure 16 last
+- Claude will extract supplier, material, and element-level data automatically
+
+**Excel File – Required Sheet Names**
+
+| Sheet Name | Contents |
+|---|---|
+| `Composition` | Table 1 – rows: ingredients; cols: Name, Compendial Status, 40mg, 20mg, 10mg |
+| `Class1_2A` | Table 5 – Class 1 + 2A element calculation data |
+| `Class2B` | Table 6 – Class 2B element calculation data |
+| `Class3` | Table 7 – Class 3 element calculation data |
+
+**Fishbone Diagram**
+- Place your fishbone diagram image at: `assets/fishbone_diagram.png`
+- It will be automatically inserted on the correct page of every report
+
+**Credentials**
+- Ensure `datascience-254609-genai.json` is in the same directory as `app.py`
+        """)
+
+
+if __name__ == "__main__":
+    main()
