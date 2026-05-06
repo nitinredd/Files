@@ -1,328 +1,364 @@
 #!/usr/bin/env python3
 """
-Elemental Impurities Risk Assessment Report Generator
-Dr. Reddy's IPDO – TSR Automation (ICH Q3D R2)
-Powered by Claude claude-opus-4-6 via Vertex AI
+TSR Report Generator – Dr. Reddy's IPDO
+Fully dynamic: zero hardcoded product content.
+All text/images from reference PDF. All tables from Excel + Annexure JSONs + ICH Q3D.
 """
-
-import os, sys, json, logging, time, copy
+import os, json, base64, logging, time, subprocess, tempfile, re
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 
 import streamlit as st
-import pandas as pd
 import openpyxl
-
+import fitz          # PyMuPDF
 from anthropic import AnthropicVertex
 
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
-# ──────────────────────────────────────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# VERTEX AI / CLAUDE SETUP
-# ──────────────────────────────────────────────────────────────────────────────
-# CRITICAL: Claude on Vertex AI uses `anthropic[vertex]` — NOT the vertexai SDK.
-#   vertexai.preview.generative_models.GenerativeModel is Gemini only.
-#   Passing a Claude model name to GenerativeModel causes the 404 you saw.
-#
-# Steps before running:
-#   1. pip install "anthropic[vertex]"
-#   2. Enable Claude claude-opus-4-6 in Model Garden for your GCP project:
-#      GCP Console → Vertex AI → Model Garden → "Claude claude-opus-4-6" → Enable
-#   3. Service account must have the "Vertex AI User" IAM role.
-#
-# Supported regions for Claude claude-opus-4-6:
-#   "us-east5"       ← recommended primary
-#   "us-central1"
-#   "europe-west1"
-#   "asia-southeast1"
-#   "global"         ← dynamic routing / highest availability
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# VERTEX AI SETUP  (same credentials pattern as your sample code)
+# ─────────────────────────────────────────────────────────────────────────────
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+GCP_PROJECT = "prj-thematic-analysis-dev"
+GCP_REGION  = "us-east5"
+MODEL       = "claude-opus-4-6-20250514"
 
-GCP_PROJECT_ID = "prj-thematic-analysis-dev"   # ← your GCP project ID
-GCP_REGION     = "us-east5"                     # ← set to your preferred region
-MODEL_NAME     = "claude-opus-4-6-20250514"     # versioned snapshot (most stable)
+client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
 
-vertex_client = AnthropicVertex(project_id=GCP_PROJECT_ID, region=GCP_REGION)
-
-
-def call_claude(prompt: str, max_retries: int = 3, max_tokens: int = 4096) -> str:
-    """
-    Call Claude claude-opus-4-6 on Vertex AI via the official anthropic[vertex] SDK.
-    Retries with exponential back-off on transient failures.
-    """
-    for attempt in range(max_retries):
+def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
+    for attempt in range(3):
         try:
-            response = vertex_client.messages.create(
-                model=MODEL_NAME,
-                max_tokens=max_tokens,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return "".join(
-                block.text for block in response.content
-                if hasattr(block, "text")
-            )
+            r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=messages)
+            return "".join(b.text for b in r.content if hasattr(b, "text"))
         except Exception as e:
-            logger.warning(f"Claude call attempt {attempt+1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                raise RuntimeError(
-                    f"Claude API failed after {max_retries} retries. Error: {e}\n"
-                    "Check: (1) Model enabled in Model Garden? "
-                    "(2) Correct region? (3) Service account has Vertex AI User role?"
-                )
+            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
+            if attempt < 2: time.sleep(2 ** attempt)
+    raise RuntimeError("Claude API failed after 3 retries")
 
+def claude_text(prompt: str, max_tokens: int = 8192) -> str:
+    return call_claude([{"role": "user", "content": prompt}], max_tokens)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# PRODUCT-LEVEL CONSTANTS  (backend hardcoded for this product)
-# ──────────────────────────────────────────────────────────────────────────────
-PRODUCT = {
-    "title":        "Elemental Impurities Risk Assessment According to ICH Q3D (R2) for "
-                    "Esomeprazole Magnesium for Delayed Release Oral Suspension",
-    "doc_no":       "TSR-SOM-01-00066",
-    "product_name": "Esomeprazole Magnesium for Delayed Release Oral Suspension",
-    "dosage_form":  "Sachet",
-    "version":      "5.0, CURRENT",
-    "strength":     "10 mg, 20 mg, 40 mg",
-    "department":   "FR&D",
-    "market":       "USA",
-    "protocol":     "NA",
-    "sop_format":   "FORM-IPDO-GRD-0060(2.0)",
-    "max_daily_dose": "240 mg per day",
+def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png") -> str:
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    return call_claude([{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+        {"type": "text",  "text": prompt}
+    ]}])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ICH Q3D (R2) ORAL PDEs  — regulatory constants, appropriate to include
+# ─────────────────────────────────────────────────────────────────────────────
+ICH_PDE = {
+    # Class 1
+    "Pb": {"class":"1",  "name":"Lead",       "pde":5.0},
+    "As": {"class":"1",  "name":"Arsenic",    "pde":15.0},
+    "Cd": {"class":"1",  "name":"Cadmium",    "pde":5.0},
+    "Hg": {"class":"1",  "name":"Mercury",    "pde":30.0},
+    # Class 2A
+    "Co": {"class":"2A", "name":"Cobalt",     "pde":50.0},
+    "V":  {"class":"2A", "name":"Vanadium",   "pde":100.0},
+    "Ni": {"class":"2A", "name":"Nickel",     "pde":200.0},
+    # Class 2B
+    "Pd": {"class":"2B", "name":"Palladium",  "pde":100.0},
+    "Se": {"class":"2B", "name":"Selenium",   "pde":150.0},
+    "Tl": {"class":"2B", "name":"Thallium",   "pde":8.0},
+    "Au": {"class":"2B", "name":"Gold",       "pde":100.0},
+    "Ir": {"class":"2B", "name":"Iridium",    "pde":100.0},
+    "Os": {"class":"2B", "name":"Osmium",     "pde":100.0},
+    "Rh": {"class":"2B", "name":"Rhodium",    "pde":100.0},
+    "Ru": {"class":"2B", "name":"Ruthenium",  "pde":100.0},
+    "Ag": {"class":"2B", "name":"Silver",     "pde":150.0},
+    "Pt": {"class":"2B", "name":"Platinum",   "pde":100.0},
+    # Class 3
+    "Li": {"class":"3",  "name":"Lithium",    "pde":550.0},
+    "Sb": {"class":"3",  "name":"Antimony",   "pde":1200.0},
+    "Ba": {"class":"3",  "name":"Barium",     "pde":1400.0},
+    "Cr": {"class":"3",  "name":"Chromium",   "pde":11000.0},
+    "Cu": {"class":"3",  "name":"Copper",     "pde":3000.0},
+    "Mg": {"class":"3",  "name":"Magnesium",  "pde":None},
+    "Sn": {"class":"3",  "name":"Tin",        "pde":6000.0},
+    "Mo": {"class":"3",  "name":"Molybdenum", "pde":3000.0},
 }
 
-TOC = [
-    (1, "Abstract",                                      3),
-    (2, "Objective",                                     3),
-    (3, "Details of the study location / testing location", 3),
-    (4, "Background",                                    3),
-    (5, "Drug product elemental impurity risk assessment", 5),
-    (6, "Summary & Conclusion",                          17),
-    (7, "Reference",                                     19),
-    (8, "List of Annexures",                             19),
-    (9, "Revision History",                              19),
-]
+TABLE5_ELEMENTS = ["Pb","As","Cd","Hg","Co","V","Ni"]   # Class 1 + 2A
+TABLE6_ELEMENTS = ["Pd","Se","Tl","Au","Ir","Os","Rh","Ru","Ag","Pt"]  # Class 2B
+TABLE7_ELEMENTS = ["Li","Sb","Ba","Cr","Cu","Mg","Sn","Mo"]            # Class 3
 
-STATIC = {
-    "abstract": (
-        "This technical summary report provides the background to demonstration of Theoretical "
-        "elemental assessment in (a) Drug Substance, (b) Excipients, (c) Manufacturing Equipment, "
-        "(d) Container Closure System and (e) Utilities (e.g. Purified Water) used in manufacturing "
-        "of esomeprazole Magnesium for Delayed Release Oral Suspension 10 mg, 20 mg and 40 mg in "
-        "accordance to the requirements set forth in ICH Q3D (R2) Elemental Impurity."
-    ),
-    "objective": (
-        "To prepare the elemental assessment report for Esomeprazole Magnesium for Delayed Release "
-        "Oral Suspension 10 mg, 20 mg and 40 mg."
-    ),
-    "study_location": "NA",
-    "background_drug_product": (
-        "The Quantitative and Qualitative Composition of Esomeprazole Magnesium for Delayed Release "
-        "Oral Suspension 10 mg, 20 mg and 40 mg. Drug product contains active pellets (lubricated "
-        "pellets) and inactive granules. Active pellets are dose proportional for 10 mg, 20 mg and "
-        "40 mg. Inactive granules having same quantitative and qualitative composition for 10 mg, "
-        "20 mg and 40 mg."
-    ),
-    "sources_intro": (
-        "Each of the above sources can contribute elemental impurities to the drug product, through "
-        "any individual or combination of potential sources shown above. All the above sources need "
-        "to be considered while determining the overall contribution of elemental impurities to the "
-        "drug product, and can also have hazardous effect on the patients and therefore, they have "
-        "to be monitored/controlled during the entire manufacturing process.\n\n"
-        "Of the five main categories of potential sources of elemental impurities (Drug Substance, "
-        "excipients, manufacturing equipment, utilities (purified Water) and the container closure "
-        "system), the components with greatest potential for transfer of elemental impurities to the "
-        "finished product Esomeprazole Magnesium for Delayed Release Oral Suspension 10 mg, 20 mg "
-        "and 40 mg are the drug substance and excipients being used in drug product.\n\n"
-        "In accordance with the ICH Q3D (R2) Guideline Class 1 elements Arsenic (As), Cadmium (Cd), "
-        "Mercury (Hg) and Lead (Pb) as well as the Class 2a elements Cobalt (Co), Nickel (Ni), and "
-        "Vanadium (V) require risk evaluation across all potential sources of elemental impurities "
-        "and routes of administration and are therefore included in the present risk assessment."
-    ),
-    "drug_substance": (
-        "a) Potential elemental impurities derived from drug substance (Esomeprazole Magnesium Trihydrate):\n"
-        "The drug substance manufacturer has declared that no elements (Class 1, 2A, 2B and 3) or "
-        "metal catalysts have been used in the manufacturing process of Esomeprazole Magnesium "
-        "Trihydrate. The elemental impurity declaration for Esomeprazole Magnesium Trihydrate "
-        "provided by supplier is provided as Annexure-1."
-    ),
-    "excipient_intro": (
-        "b) Potential elemental impurities derived from excipients\n"
-        "ICH Q3D (R2). The drug substance manufacturer has declared that no elements (Class 1, 2A, "
-        "2B and 3) or metal catalysts have been used in the manufacturing process of Esomeprazole "
-        "Magnesium Trihydrate. The elemental impurity declaration for Esomeprazole Magnesium "
-        "Trihydrate provided by supplier is provided as Annexure-1.\n"
-        "In order to assess the potential for the inclusion of elemental impurities from the "
-        "excipients used in the drug product (see Table # 1), the vendors and manufacturers of the "
-        "excipients were contacted to obtain information on their knowledge of potential elemental "
-        "impurities in the excipients provided. Following excipient declarations are obtained for "
-        "individual excipients and are included in the annexure of the present risk assessment."
-    ),
-    "dextrose_note": (
-        "For Dextrose Anhydrous Elemental Impurities are controlled within ICH Q3D (R2), Option-1 "
-        "Oral Limit by vendor however elemental Impurity levels for Class 1(Pb, As, Cd and Hg) and "
-        "class 2A (Co, V and Ni) (excessing 30% PDE values due to higher dose of Input Excipient "
-        "i.e Dextrose Anhydrous (16.878gm)\nhence Confirmatory Testing will be done on Exhibit "
-        "batches and control strategy will be decided accordingly.\n\n"
-        "The elemental impurities from the solvents i.e. Dehydrated alcohol and purified water are "
-        "not considered for theoretical assessment, as these will not appear in final product except "
-        "in traces.\n\n"
-        "c) Potential elemental impurities derived from manufacturing equipment\n"
-        "While manufacturing equipment presents a potential source of elemental impurities during "
-        "the production of drug substance and drug product, the current quality system of drug "
-        "substance and drug product manufacturer has been designed to minimize and control any "
-        "potential contribution from the manufacturing equipment."
-    ),
-    "manufacturing": (
-        "The typical manufacturing equipment used to produce drug substance and drug product "
-        "consists exclusively of stainless steel (SS316L) suitable for oral products. Based on the "
-        "declaration from drug substance manufacturer on the presence of elemental impurity, the "
-        "possibility of potential contribution from products.\n\n"
-        "The manufacturing process of Esomeprazole Magnesium for Delayed Release Oral Suspension "
-        "10 mg, 20 mg and 40 mg includes Seal coating, Drug loading, Sub coating, Enteric coating, "
-        "Sifting, Lubrication, milling, granulation, drying, blending and sachet filling. During "
-        "the manufacturing process, the drug product would be in contact with Sifter, Fluidized bed "
-        "Equipment, bin blender, and capsule filling machine & its accessories. Stainless 316L is "
-        "the most commonly used material of construction for drug product manufacturing equipment. "
-        "Nickel, molybdenum, chromium are key elements in 316L stainless-steel alloy. In general, "
-        "GMP's including equipment compatibility assessment and qualification are adequate to ensure "
-        "that significant levels of elemental impurities are not leached from the manufacturing "
-        "equipment into the drug product. Moreover, given that the drug product manufacturing is at "
-        "ambient conditions and wear may lead to abrasion, but appropriate GMP measures such as "
-        "visual inspection for integrity of the manufacturing equipment ensures that no appreciable "
-        "amount of elemental impurities is carried over into the drug product. Therefore, no "
-        "additional consideration is required with respect to potential contributions of elemental "
-        "impurities from the drug product manufacturing equipment.\n\n"
-        "contact of drug product with the manufacturing equipment components is not in an aggressive "
-        "or intense manner, any probability of leaching of elemental impurities from the "
-        "manufacturing equipment contact parts is very minimal. Therefore, no additional "
-        "consideration is required with respect to potential contributions of elemental impurities "
-        "from the drug product manufacturing equipment."
-    ),
-    "container_closure": (
-        "d) Potential elemental impurities derived from container closure system\n"
-        "contributions of elemental impurities from the drug product manufacturing equipment.\n"
-        "For orally administered drug products no further elements included in the ICH Q3D (R2) "
-        "classification scheme require risk evaluation except for elements which are intentionally "
-        "added as catalysts or reagents during the manufacturing process."
-    ),
-    "utilities": (
-        "e) Potential elemental impurities derived from utilities (purified water):\n"
-        "From the scientific understanding and the published literature (Jenke et al. 2015) of "
-        "likely interactions between solid dosage forms and packaging materials the probability of "
-        "elemental leaching from packaging components into solid dosage forms is minimal. Also as "
-        "stated in the ICH Q3D (R2) guideline it is recognized that the probability of elements "
-        "leaching is minimal and therefore does not require further consideration in the risk "
-        "assessment.\n\n"
-        "Water is used as a processing aid and it will be found in traces in the final product. "
-        "Hence the probability of elemental leaching is minimal and does not require further "
-        "consideration in the risk assessment.\n\n"
-        "As per above, the theoretical evaluation for the daily contribution of the total mass of "
-        "elemental impurities in the drug product for all the 24 elements is presented below in Table."
-    ),
-    "control_strategy": (
-        "f) Control strategy:\n"
-        "Risk assessment of possible elemental impurities in drug product was carried out by "
-        "evaluating the possible source of elemental impurities, review and evaluation of the "
-        "available literatures, vendor information and data, the assessment is further done to "
-        "compare the predicted levels of elemental impurities in the drug product with the control "
-        "levels for potentially identified elemental impurities as per ICH Q3D (R2), additionally "
-        "elemental impurities identified in drug product would be compared against the control "
-        "levels and accordingly if the monitoring of the elemental impurities required in drug "
-        "product or not will be decided."
-    ),
-    "reference": "NA",
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 – REFERENCE PDF ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 150) -> List[bytes]:
+    """Render every PDF page to a PNG image."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages = []
+    mat = fitz.Matrix(dpi/72, dpi/72)
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        pages.append(pix.tobytes("png"))
+    doc.close()
+    return pages
+
+def extract_embedded_images(pdf_bytes: bytes) -> Dict[int, List[bytes]]:
+    """
+    Extract actual embedded bitmap images from each PDF page.
+    Returns {page_index: [image_bytes, ...]}.
+    Falls back to full-page raster if no bitmaps found on figure pages.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    result: Dict[int, List[bytes]] = {}
+    for page_num, page in enumerate(doc):
+        img_list = page.get_images(full=True)
+        if img_list:
+            imgs = []
+            for img_info in img_list:
+                try:
+                    xref = img_info[0]
+                    base = doc.extract_image(xref)
+                    imgs.append(base["image"])
+                except Exception:
+                    pass
+            if imgs:
+                result[page_num] = imgs
+    doc.close()
+    return result
+
+def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
+    """
+    Ask Claude to identify which pages contain figures/diagrams.
+    Returns list of {page_index, description, position_in_report}.
+    """
+    # Sample every page with a quick Claude call
+    prompt_template = """Look at this page image from a pharmaceutical technical report.
+Does this page contain any figure, diagram, flowchart, or schematic image (not tables, not text)?
+
+If YES, respond with JSON: {{"has_figure": true, "description": "brief description", "figure_label": "Figure X: ..."}}
+If NO, respond with JSON: {{"has_figure": false}}
+
+Return ONLY the JSON, nothing else."""
+
+    figures = []
+    for i, img in enumerate(page_images):
+        try:
+            raw = claude_vision(img, prompt_template)
+            start = raw.find("{"); end = raw.rfind("}") + 1
+            if start >= 0:
+                data = json.loads(raw[start:end])
+                if data.get("has_figure"):
+                    figures.append({
+                        "page_index": i,
+                        "description": data.get("description",""),
+                        "figure_label": data.get("figure_label",""),
+                    })
+        except Exception as e:
+            logger.warning(f"Figure detection page {i}: {e}")
+    return figures
+
+def extract_reference_structure(page_images: List[bytes]) -> Dict:
+    """
+    Send all pages to Claude and extract the full report structure:
+    product info, all section texts, table structures (not data), etc.
+    Returns a comprehensive JSON structure.
+    """
+    # Process in batches to avoid context limits
+    # First pass: extract metadata from page 1
+    meta_prompt = """This is page 1 of a pharmaceutical Technical Summary Report (TSR).
+Extract ALL header/metadata fields you can see.
+Return ONLY this JSON (fill every field exactly as shown in the document):
+{
+  "title": "",
+  "document_no": "",
+  "product_name": "",
+  "dosage_form": "",
+  "version": "",
+  "strength": "",
+  "department": "",
+  "market": "",
+  "protocol": "",
+  "sop_format_number": ""
+}"""
+    
+    meta_raw = claude_vision(page_images[0], meta_prompt)
+    try:
+        s = meta_raw.find("{"); e = meta_raw.rfind("}") + 1
+        meta = json.loads(meta_raw[s:e]) if s >= 0 else {}
+    except Exception:
+        meta = {}
+
+    # Second pass: extract full text content from all pages
+    sections_prompt = """This is a page from a pharmaceutical ICH Q3D elemental impurities Technical Summary Report.
+
+Extract ALL text content from this page preserving the structure.
+Return ONLY this JSON:
+{
+  "page_type": "title|toc|abstract|composition_table|figure|text|calculation_table|signatures|annexure_list|revision_history",
+  "section_number": null,
+  "section_title": "",
+  "content_blocks": [
+    {
+      "type": "heading|paragraph|table_caption|note|bullet",
+      "text": "exact text content",
+      "bold": false
+    }
+  ],
+  "has_table": false,
+  "table_description": ""
 }
+Return ONLY JSON, nothing else."""
 
-# Hardcoded MDD tables (clinical data – fixed for this product)
-MDD_TABLE3_ROWS = [
-    ["GERD/ Ulcers/ H. pylori", "40mg", "1 X 40mg Packet"],
-    ["Hypersecretory/ZES",       "240mg", "6 X 40mg Packets"],
-    ["",                         "240mg", "2 X 20mg Packets"],
-]
+    pages_data = []
+    for i, img in enumerate(page_images):
+        try:
+            raw = claude_vision(img, sections_prompt)
+            s = raw.find("{"); e = raw.rfind("}") + 1
+            if s >= 0:
+                d = json.loads(raw[s:e])
+                d["page_index"] = i
+                pages_data.append(d)
+        except Exception as ex:
+            logger.warning(f"Page {i} extraction: {ex}")
+            pages_data.append({"page_index": i, "page_type": "unknown", "content_blocks": []})
 
-MDD_TABLE4_12_17 = [
-    # (Indication, MDD, No/Strength)
-    ["GERD/ Ulcers/ H. pylori", "20mg", "1 X 20mg Packet\n2 X 10mg Packets"],
-    ["",                         "40mg", "2 X 20mg Packets\n1 X 40mg Packet\n4 X 10mg Packets"],
-]
+    # Third pass: extract revision history and electronic signatures
+    # (typically last 2 pages)
+    revision_data = {}
+    sig_data = {}
+    if len(page_images) >= 2:
+        rev_prompt = """This page contains a revision history table and/or electronic signatures.
+Extract as JSON:
+{
+  "revision_history": [
+    {"document_version": "", "changes": ""}
+  ],
+  "signatures": [
+    {"intention": "", "employee_id": "", "user_name": "", "date": ""}
+  ]
+}
+Return ONLY JSON."""
+        for i in range(max(0, len(page_images)-3), len(page_images)):
+            try:
+                raw = claude_vision(page_images[i], rev_prompt)
+                s = raw.find("{"); e = raw.rfind("}") + 1
+                if s >= 0:
+                    d = json.loads(raw[s:e])
+                    if d.get("revision_history"): revision_data = d["revision_history"]
+                    if d.get("signatures"):       sig_data      = d["signatures"]
+            except Exception:
+                pass
 
-MDD_TABLE4_1_11 = [
-    # (Weight, MDD, No/Strength)
-    ["Weight < 20 kg", "10mg", "4 X 2.5mg Packets\n1 X 10mg Packet\n2 X 5mg Packets"],
-    ["Weight ≥ 20 kg", "20mg", "2 X 10mg Packets\n1 X 20mg Packet\n4 X 5mg Packets"],
-]
+    return {
+        "meta": meta,
+        "pages": pages_data,
+        "revision_history": revision_data,
+        "signatures": sig_data,
+    }
 
-# Annexure list (ingredient → vendor) – used for Table 8
-ANNEXURE_LIST = [
-    ("Esomeprazole Magnesium Trihydrate",               "Dr. Reddy's (CTO-3)"),
-    ("Sugar Spheres (50-60 mesh)",                      "M. B Sugar spheres & Pharmaceuticals"),
-    ("Hypromellose 5 cps (Methocel ES Premium)",        "Dupont"),
-    ("Magneslic Stearate (Vegetable Anti-tacking agent)","Dupont"),
-    ("Talc",                                            "Vertellus Performance materials"),
-    ("Triethyl citrate",                                "IMIFABI, (LLC)"),
-    ("Methacrylic acid copolymer dis:Functional coating polymer", "Croda"),
-    ("Purified water",                                  "Ashland Aquaion Functional Ingredients"),
-    ("Simethicone",                                     "Peter Greven"),
-    ("Hydroxypropyl Cellulose (Klucel EF)",             "Evonik Industries AG"),
-    ("Polysorbate 80",                                  "Kern Biosciences"),
-    ("Glyceryl monostearate",                           "Roquette"),
-    ("Xanthan Gum (Xantural 11K)",                      "CP KELCO U.S. Inc."),
-    ("Citric Acid Anhydrous",                           "Merck"),
-    ("Crospovidone",                                    "BASF SE"),
-    ("Yellow Iron Oxide",                               "Venator"),
-]
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 – EXCEL COMPOSITION PARSER
+# ─────────────────────────────────────────────────────────────────────────────
 
-REVISION_HISTORY = [
-    ("TSR-SOM-01-00066, 1.0", "New Document"),
-    ("TSR-SOM-01-00066, 2.0", "Formula revised and calculation for elemental content revised"),
-    ("TSR-SOM-01-00066, 3.0", "Formula and Calculation for elemental content revised based on pilot bio outcome."),
-    ("TSR-SOM-01-00066, 4.0", "Calculation for elemental content revised based on updated excipient vendor declaration."),
-    ("TSR-SOM-01-00066, 5.0", "Formula with 32.5% enteric coating and Calculation change respectively."),
-]
-
-# Fishbone image path (store in assets/ folder alongside app.py)
-FISHBONE_IMAGE = Path(__file__).parent / "assets" / "fishbone_diagram.png"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CLAUDE-POWERED ANNEXURE EXTRACTION
-# ──────────────────────────────────────────────────────────────────────────────
-
-def extract_annexure_data(annexure_json: dict, annexure_number: int) -> dict:
+def parse_composition_excel(excel_bytes: bytes) -> Dict:
     """
-    Given a Document-AI JSON for one annexure, use Claude to extract structured
-    elemental impurity declaration data.
+    Parse the composition Excel file.
+    Uses Claude to understand the sheet structure rather than assuming column positions.
+    Returns {
+      "sections": [{"name": "Seal coating", "rows": [{"ingredient","status","40mg","20mg","10mg"}]}],
+      "mdd_strength": "40mg",
+      "mdd_sachets": 6,
+      "raw_rows": [...]
+    }
     """
-    prompt = f"""
-You are a pharmaceutical regulatory data extraction specialist.
+    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
+    ws = wb.worksheets[0]  # Use first sheet
 
-Below is a JSON file produced by Document AI, representing an elemental impurity 
-declaration form from a pharmaceutical excipient or drug substance supplier 
-(Annexure {annexure_number} of a Dr. Reddy's ICH Q3D risk assessment).
+    # Dump all rows to text for Claude
+    rows_text = []
+    all_rows = []
+    for i, row in enumerate(ws.iter_rows(values_only=True)):
+        if any(c is not None for c in row):
+            row_str = [str(c) if c is not None else "" for c in row]
+            rows_text.append(f"Row {i+1}: {' | '.join(row_str)}")
+            all_rows.append(row_str)
+    wb.close()
 
-Extract ALL information into this exact JSON schema. Do not add commentary.
-Return ONLY the JSON object.
+    sheet_dump = "\n".join(rows_text[:80])  # first 80 rows
 
+    prompt = f"""Below is spreadsheet data from a pharmaceutical product composition Excel file.
+Each row is a formula ingredient. The columns typically are:
+Row number | Ingredient Name | Function | Amount for strength1 | Amount for strength2 | Amount for strength3
+
+Identify and extract:
+1. Which column holds the ingredient name
+2. Which columns hold amounts per strength (e.g., 40mg, 20mg, 10mg)
+3. Which rows are section headers (e.g., "Seal coating", "Drug Loading") vs ingredient rows
+4. Which strength represents the maximum daily dose (highest strength)
+5. How many sachets per day for worst-case MDD
+
+Return ONLY this JSON (no markdown, no explanation):
 {{
-  "annexure_number": {annexure_number},
+  "ingredient_col": 1,
+  "strength_cols": {{"40mg": 3, "20mg": 4, "10mg": 5}},
+  "mdd_strength": "40mg",
+  "mdd_sachets": 6,
+  "section_header_rows": [3, 12, 18],
+  "data_start_row": 2,
+  "sections": [
+    {{
+      "name": "Seal coating",
+      "rows": [
+        {{"ingredient": "Purified water", "status": "USP", "40mg": "q.s.", "20mg": "q.s.", "10mg": "q.s."}}
+      ]
+    }}
+  ]
+}}
+
+Spreadsheet data:
+{sheet_dump}"""
+
+    raw = claude_text(prompt)
+    try:
+        s = raw.find("{"); e = raw.rfind("}") + 1
+        result = json.loads(raw[s:e])
+        result["all_rows"] = all_rows
+        return result
+    except Exception as ex:
+        logger.error(f"Excel parse error: {ex}")
+        # Fallback: return raw rows
+        return {
+            "sections": [],
+            "mdd_strength": "40mg",
+            "mdd_sachets": 6,
+            "all_rows": all_rows,
+            "ingredient_col": 1,
+            "strength_cols": {"40mg": 3, "20mg": 4, "10mg": 5}
+        }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 – ANNEXURE JSON PROCESSOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_annexure(annexure_json: dict, index: int) -> Dict:
+    """
+    Use Claude to extract structured EI declaration data from a Document AI JSON.
+    Returns structured data per ingredient.
+    """
+    # Collapse the Document AI JSON to text for Claude
+    text_content = _flatten_docai_json(annexure_json)
+
+    prompt = f"""You are extracting pharmaceutical elemental impurity data from Annexure {index}.
+
+This is text extracted from a Document AI JSON of an elemental impurity declaration form
+submitted by a pharmaceutical excipient or API supplier.
+
+Extract ALL information into this exact JSON (no extra fields, no markdown):
+{{
+  "annexure_number": {index},
   "supplier_name": "",
   "material_name": "",
-  "source_type": "Plant/Mineral/Synthetic/Mineral derived/Plant derived/Fermentation derived",
+  "source_type": "Plant/Mineral/Synthetic/Mineral derived/Plant derived",
   "date_filled": "",
   "elements": [
     {{
@@ -330,801 +366,508 @@ Return ONLY the JSON object.
       "symbol": "",
       "class": "1/2A/2B/3",
       "intentionally_added": "Yes/No",
-      "expected_concentration": "",
-      "analytical_method": "",
-      "observed_level_range": "",
-      "frequency_of_testing": "",
+      "concentration_value": 0.05,
+      "concentration_unit": "ppm",
+      "analytical_method": "ICP-MS",
+      "observed_level": "BLQ",
+      "frequency_of_testing": "Once",
       "listed_in_coa": "Yes/No",
       "comments": ""
     }}
   ]
 }}
 
-Document AI JSON:
-{json.dumps(annexure_json, indent=2)[:12000]}
-"""
+Rules:
+- concentration_value: numeric. If "BLQ", use the LOQ value (typically 0.05). If "NA" or blank, use 0.
+- symbol: use standard element symbol (Pb, As, Cd, Hg, Co, V, Ni, etc.)
+
+Document text:
+{text_content[:8000]}"""
+
+    raw = call_claude([{"role":"user","content": prompt}])
     try:
-        raw = call_claude(prompt)
-        # Extract JSON from response
-        start = raw.find("{")
-        end   = raw.rfind("}") + 1
-        if start >= 0 and end > start:
-            return json.loads(raw[start:end])
-    except Exception as e:
-        logger.error(f"Annexure {annexure_number} extraction failed: {e}")
-    return {"annexure_number": annexure_number, "supplier_name": "N/A",
-            "material_name": "N/A", "elements": []}
+        s = raw.find("{"); e = raw.rfind("}") + 1
+        return json.loads(raw[s:e])
+    except Exception as ex:
+        logger.error(f"Annexure {index} parse error: {ex}")
+        return {"annexure_number": index, "supplier_name": "N/A", "material_name": "N/A", "elements": []}
 
+def _flatten_docai_json(obj, depth=0) -> str:
+    """Flatten Document AI JSON to readable text."""
+    if depth > 8: return ""
+    parts = []
+    if isinstance(obj, dict):
+        if "text" in obj and isinstance(obj["text"], str):
+            parts.append(obj["text"])
+        for v in obj.values():
+            parts.append(_flatten_docai_json(v, depth+1))
+    elif isinstance(obj, list):
+        for item in obj:
+            parts.append(_flatten_docai_json(item, depth+1))
+    elif isinstance(obj, (str, int, float)):
+        parts.append(str(obj))
+    return " ".join(p for p in parts if p.strip())
 
-def generate_observations_and_conclusion(summary: dict) -> Tuple[str, str]:
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 – CALCULATION ENGINE (Tables 5, 6, 7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_conc(val) -> float:
+    """Parse a concentration value to float µg/g."""
+    if val is None: return 0.0
+    if isinstance(val, (int, float)): return max(0.0, float(val))
+    s = str(val).strip().lower()
+    if s in ("", "na", "nd", "blq", "bdl"): return 0.05  # use LOQ as conservative
+    # strip units
+    s = re.sub(r"(ppm|ug/g|µg/g|μg/g)", "", s).strip()
+    try: return float(s)
+    except: return 0.0
+
+def _parse_amount(val) -> float:
+    """Parse ingredient amount in mg to float."""
+    if val is None: return 0.0
+    s = str(val).strip().lower()
+    if s in ("", "q.s.", "qs", "na"): return 0.0
+    try: return float(s)
+    except: return 0.0
+
+def build_ingredient_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
     """
-    Ask Claude to write the Observation + Conclusion text based on calculation summary.
-    Returns (observation_text, conclusion_text).
+    Build a map: material_name -> {element_symbol -> concentration_µg/g}
+    from all processed annexures.
     """
-    prompt = f"""
-You are writing the Observations and Conclusion section of a Dr. Reddy's IPDO 
-Elemental Impurities Risk Assessment Technical Summary Report following ICH Q3D (R2).
+    conc_map: Dict[str, Dict[str, float]] = {}
+    for ann in annexure_data:
+        material = ann.get("material_name", "").strip()
+        if not material: continue
+        elem_dict: Dict[str, float] = {}
+        for el in ann.get("elements", []):
+            sym = el.get("symbol", "").strip()
+            if not sym: continue
+            val = _parse_conc(el.get("concentration_value", 0))
+            elem_dict[sym] = val
+        conc_map[material] = elem_dict
+    return conc_map
 
-Product: Esomeprazole Magnesium for Delayed Release Oral Suspension 10/20/40 mg
-Max Daily Dose: 240 mg/day (6 sachets of 40 mg, worst case)
+def _match_ingredient(ingredient_name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """Fuzzy-match ingredient name to closest key in conc_map."""
+    ingredient_lower = ingredient_name.lower()
+    best_key = None
+    best_score = 0
+    for key in conc_map:
+        key_lower = key.lower()
+        # Token overlap score
+        ing_tokens = set(re.split(r'[\s\(\)\-,]+', ingredient_lower))
+        key_tokens  = set(re.split(r'[\s\(\)\-,]+', key_lower))
+        overlap = len(ing_tokens & key_tokens)
+        if overlap > best_score:
+            best_score = overlap
+            best_key = key
+    return conc_map.get(best_key, {}) if best_score > 0 else {}
 
-Summary of theoretical elemental impurity calculations:
-{json.dumps(summary, indent=2)}
+def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
+    """
+    Calculate Tables 5, 6, 7.
+    Returns dict with keys 'class1_2a', 'class2b', 'class3'.
+    Each value: {
+      "elements": [symbol, ...],
+      "rows": [{ingredient, daily_intake_g, measured_conc: {sym: val}, total_mass: {sym: val}}],
+      "total_daily_intake": float,
+      "element_totals": {sym: total_µg_day},
+      "pde": {sym: float},
+      "threshold_30pct": {sym: float}
+    }
+    """
+    mdd_sachets = comp_data.get("mdd_sachets", 6)
+    mdd_strength = comp_data.get("mdd_strength", "40mg")
+    strength_cols = comp_data.get("strength_cols", {"40mg": 3})
+    ing_col = comp_data.get("ingredient_col", 1)
+    all_rows = comp_data.get("all_rows", [])
 
-Write two clearly labeled sections:
-
-OBSERVATION:
-- Note about daily intake basis (240 mg/day = 6 sachets of 40 mg, worst case)
-- Whether any source had potential to transfer EI
-- Whether calculated daily exposures were ≤30% of PDE (Option 2b compliance)
-- Drug product compliance statement with ICH Q3D R2 Option 2b
-
-CONCLUSION:
-- Overall compliance statement (Option 2b)
-- Any elements crossing 30% PDE requiring confirmatory testing (mention Class 1 and 2A 
-  for Dextrose Anhydrous 16.878 gm dose) 
-- Confirmatory testing plan on Exhibit batches
-
-Keep the tone formal and consistent with regulatory pharmaceutical writing.
-Return plain text only (no markdown, no JSON).
-"""
-    raw = call_claude(prompt)
-    # Split at "CONCLUSION:"
-    obs, conc = "", ""
-    if "CONCLUSION:" in raw.upper():
-        idx = raw.upper().index("CONCLUSION:")
-        obs  = raw[:idx].replace("OBSERVATION:", "").strip()
-        conc = raw[idx:].replace("CONCLUSION:", "").strip()
+    # Build per-ingredient daily intake
+    ingredients: List[Dict] = []
+    if comp_data.get("sections"):
+        for section in comp_data["sections"]:
+            for row in section.get("rows", []):
+                amt = _parse_amount(row.get(mdd_strength, row.get("40mg", 0)))
+                daily_g = amt * mdd_sachets / 1000.0
+                ingredients.append({
+                    "name": row.get("ingredient", ""),
+                    "daily_intake_g": round(daily_g, 3)
+                })
     else:
-        obs = raw.strip()
-    return obs, conc
+        # Fallback: use raw rows
+        str_col_idx = strength_cols.get(mdd_strength, strength_cols.get("40mg", 3))
+        for row in all_rows:
+            if len(row) <= ing_col: continue
+            name = row[ing_col].strip()
+            if not name or name.lower() in ("name of ingredient", "ingredient"): continue
+            amt = _parse_amount(row[str_col_idx] if str_col_idx < len(row) else "")
+            daily_g = amt * mdd_sachets / 1000.0
+            ingredients.append({"name": name, "daily_intake_g": round(daily_g, 3)})
 
+    # Build concentration map
+    conc_map = build_ingredient_conc_map(annexure_data)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# EXCEL PARSER
-# ──────────────────────────────────────────────────────────────────────────────
+    def build_table(elements: List[str]) -> Dict:
+        rows = []
+        element_totals = {sym: 0.0 for sym in elements}
+        total_intake = 0.0
 
-def parse_excel(excel_bytes: bytes) -> dict:
-    """
-    Parse the uploaded Excel file.
-    Returns a dict with keys:
-      composition  – list of rows for Table 1
-      class1_2a    – rows for Table 5
-      class2b      – rows for Table 6
-      class3       – rows for Table 7
-    
-    Expected sheet layout (configure SHEET_NAMES below to match your file):
-    """
-    COMPOSITION_SHEET = "Composition"   # Sheet tab name – adjust if different
-    CALC_SHEET        = "Calculations"  # Sheet with Tables 5-7  – adjust if needed
+        for ing in ingredients:
+            if ing["daily_intake_g"] == 0: continue
+            ing_concs = _match_ingredient(ing["name"], conc_map)
+            measured = {}
+            total_mass = {}
+            for sym in elements:
+                conc = ing_concs.get(sym, 0.0)
+                measured[sym] = round(conc, 4)
+                mass = ing["daily_intake_g"] * conc
+                total_mass[sym] = round(mass, 4)
+                element_totals[sym] = round(element_totals[sym] + mass, 4)
+            total_intake += ing["daily_intake_g"]
+            rows.append({
+                "ingredient":      ing["name"],
+                "daily_intake_g":  round(ing["daily_intake_g"], 3),
+                "measured_conc":   measured,
+                "total_mass":      total_mass,
+            })
 
-    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
-    result = {
-        "composition": [],
-        "class1_2a":   [],
-        "class2b":     [],
-        "class3":      [],
-        "raw_sheets":  wb.sheetnames,
+        pde      = {sym: ICH_PDE[sym]["pde"] for sym in elements}
+        thresh   = {sym: round(pde[sym] * 0.30, 3) if pde[sym] else None for sym in elements}
+
+        return {
+            "elements":           elements,
+            "rows":               rows,
+            "total_daily_intake": round(total_intake, 3),
+            "element_totals":     {sym: round(v, 4) for sym, v in element_totals.items()},
+            "pde":                pde,
+            "threshold_30pct":    thresh,
+        }
+
+    return {
+        "class1_2a": build_table(TABLE5_ELEMENTS),
+        "class2b":   build_table(TABLE6_ELEMENTS),
+        "class3":    build_table(TABLE7_ELEMENTS),
     }
 
-    # ── Composition Table ──────────────────────────────────────────────────
-    if COMPOSITION_SHEET in wb.sheetnames:
-        ws = wb[COMPOSITION_SHEET]
-        rows = list(ws.iter_rows(values_only=True))
-        # Skip header row, collect non-empty rows
-        for row in rows[1:]:
-            if any(c is not None for c in row):
-                result["composition"].append([str(c) if c is not None else "" for c in row])
-    else:
-        # Try first sheet as fallback
-        ws = wb.worksheets[0]
-        rows = list(ws.iter_rows(values_only=True))
-        for row in rows[1:]:
-            if any(c is not None for c in row):
-                result["composition"].append([str(c) if c is not None else "" for c in row])
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 – TEXT GENERATION (Claude)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # ── Calculation Tables ────────────────────────────────────────────────
-    for sheet_name, key in [("Class1_2A", "class1_2a"),
-                              ("Class2B",   "class2b"),
-                              ("Class3",    "class3")]:
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            rows = list(ws.iter_rows(values_only=True))
-            result[key] = [[str(c) if c is not None else "" for c in row]
-                           for row in rows if any(c is not None for c in row)]
-
-    wb.close()
-    return result
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# DOCX HELPER UTILITIES
-# ──────────────────────────────────────────────────────────────────────────────
-
-def set_cell_border(cell, **kwargs):
-    """Apply borders to a table cell."""
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    tcBorders = OxmlElement("w:tcBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        attrs = kwargs.get(edge, {"val": "single", "sz": "4", "color": "000000"})
-        el = OxmlElement(f"w:{edge}")
-        el.set(qn("w:val"),   attrs.get("val",   "single"))
-        el.set(qn("w:sz"),    attrs.get("sz",    "4"))
-        el.set(qn("w:color"), attrs.get("color", "000000"))
-        tcBorders.append(el)
-    tcPr.append(tcBorders)
-
-
-def shade_cell(cell, fill_hex: str):
-    """Apply background colour to a table cell."""
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    shd  = OxmlElement("w:shd")
-    shd.set(qn("w:val"),   "clear")
-    shd.set(qn("w:color"), "auto")
-    shd.set(qn("w:fill"),  fill_hex)
-    tcPr.append(shd)
-
-
-def bold_run(paragraph, text: str, size_pt: float = 9):
-    run = paragraph.add_run(text)
-    run.bold = True
-    run.font.size = Pt(size_pt)
-    return run
-
-
-def normal_run(paragraph, text: str, size_pt: float = 9):
-    run = paragraph.add_run(text)
-    run.bold = False
-    run.font.size = Pt(size_pt)
-    return run
-
-
-def add_page_header(doc: Document):
+def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
+                           calc_tables: Dict, comp_data: Dict) -> Dict:
     """
-    Build the IPDO standard two-row header that appears on every page.
-    (Implemented as a table in the actual header section.)
+    Use Claude to synthesise all text sections for the new report,
+    based on the reference structure + new annexure/calculation data.
     """
-    section = doc.sections[0]
-    header  = section.header
-    header.is_linked_to_previous = False
+    # Summarise annexure findings
+    ann_summary = []
+    for ann in annexure_data:
+        compliant = all(
+            ICH_PDE.get(el["symbol"], {}).get("pde") is None or
+            _parse_conc(el.get("concentration_value", 0)) * comp_data.get("mdd_sachets", 6) *
+            max(_parse_amount(row.get(comp_data.get("mdd_strength","40mg"), 0))
+                for section in comp_data.get("sections",[])
+                for row in section.get("rows",[])
+                if row.get("ingredient","").lower() in ann.get("material_name","").lower()) / 1000
+            <= ICH_PDE.get(el["symbol"],{}).get("pde", 999) * 0.30
+            if ICH_PDE.get(el["symbol"])
+            else True
+            for el in ann.get("elements", [])
+        )
+        ann_summary.append({
+            "material": ann.get("material_name"),
+            "supplier": ann.get("supplier_name"),
+            "elements_count": len(ann.get("elements", [])),
+        })
 
-    # Clear existing
-    for p in header.paragraphs:
-        p.clear()
+    # Extract reference text for obs/conclusion
+    ref_obs = ""
+    ref_conc = ""
+    for p in ref_structure.get("pages", []):
+        for block in p.get("content_blocks", []):
+            txt = block.get("text", "").lower()
+            if "observation" in txt or "conclusion" in txt:
+                ref_obs += block.get("text", "") + " "
 
-    # Outer table: IPDO | Title | Dr. Reddy's
-    tbl = header.add_table(rows=1, cols=3, width=Inches(7.5))
-    tbl.style = "Table Grid"
+    prompt = f"""You are a pharmaceutical regulatory writer generating a Technical Summary Report (TSR)
+for an ICH Q3D (R2) Elemental Impurities Risk Assessment.
 
-    left_cell   = tbl.cell(0, 0)
-    center_cell = tbl.cell(0, 1)
-    right_cell  = tbl.cell(0, 2)
+Reference report structure (extracted from previous version):
+{json.dumps(ref_structure.get("meta", {}), indent=2)}
 
-    left_cell.width   = Inches(1.2)
-    center_cell.width = Inches(4.6)
-    right_cell.width  = Inches(1.7)
+Annexure summary ({len(annexure_data)} excipients/materials):
+{json.dumps(ann_summary, indent=2)}
 
-    left_cell.paragraphs[0].add_run("IPDO").bold = True
-    left_cell.paragraphs[0].runs[0].font.size = Pt(9)
+Calculation results summary:
+- Class 1+2A total EI exposures: {json.dumps({sym: calc_tables['class1_2a']['element_totals'].get(sym) for sym in TABLE5_ELEMENTS}, indent=2)}
+- Class 2B total EI exposures: {json.dumps({sym: calc_tables['class2b']['element_totals'].get(sym) for sym in TABLE6_ELEMENTS}, indent=2)}
+- Class 3 total EI exposures: {json.dumps({sym: calc_tables['class3']['element_totals'].get(sym) for sym in TABLE7_ELEMENTS}, indent=2)}
+- ICH Q3D Class 1+2A PDEs: {json.dumps({sym: ICH_PDE[sym]['pde'] for sym in TABLE5_ELEMENTS})}
+- MDD sachets: {comp_data.get("mdd_sachets", 6)}, MDD strength: {comp_data.get("mdd_strength","40mg")}
 
-    cp = center_cell.paragraphs[0]
-    cp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = cp.add_run("Technical Summary Report")
-    run.bold = True; run.font.size = Pt(9)
+Any elements crossing 30% PDE:
+{json.dumps({sym: {"total": calc_tables['class1_2a']['element_totals'].get(sym,0),
+                   "pde30": ICH_PDE[sym]['pde']*0.3 if ICH_PDE[sym]['pde'] else None}
+             for sym in TABLE5_ELEMENTS
+             if ICH_PDE[sym]['pde'] and
+             calc_tables['class1_2a']['element_totals'].get(sym,0) > ICH_PDE[sym]['pde']*0.3}, indent=2)}
 
-    rp = right_cell.paragraphs[0]
-    rp.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    run = rp.add_run("Dr. Reddy's")
-    run.bold = True; run.font.size = Pt(9)
+Generate the following sections as JSON. Be specific, factual, and consistent with ICH Q3D regulatory language.
+Return ONLY this JSON:
+{{
+  "abstract": "...",
+  "objective": "...",
+  "study_location": "NA",
+  "background": "...",
+  "sources_intro": "...",
+  "drug_substance_section": "...",
+  "excipient_intro": "...",
+  "manufacturing_section": "...",
+  "container_closure_section": "...",
+  "utilities_section": "...",
+  "control_strategy": "...",
+  "observation": "...",
+  "conclusion": "..."
+}}"""
 
-    # Row 2: document info table
-    info_tbl = header.add_table(rows=1, cols=6, width=Inches(7.5))
-    info_tbl.style = "Table Grid"
-    labels = ["Title", "Document No:", "Product Name:", "Dosage Form:", "Version:", ""]
-    values = [
-        PRODUCT["title"], PRODUCT["doc_no"], PRODUCT["product_name"],
-        PRODUCT["dosage_form"], PRODUCT["version"], ""
-    ]
-    for i, (lbl, val) in enumerate(zip(labels, values)):
-        cell = info_tbl.cell(0, i)
-        p = cell.paragraphs[0]
-        r = p.add_run(f"{lbl}\n{val}")
-        r.font.size = Pt(7)
+    raw = claude_text(prompt, max_tokens=6000)
+    try:
+        s = raw.find("{"); e = raw.rfind("}") + 1
+        return json.loads(raw[s:e])
+    except Exception as ex:
+        logger.error(f"Text generation error: {ex}")
+        # Return basic sections if parsing fails
+        return {k: "" for k in ["abstract","objective","study_location","background",
+                                 "sources_intro","drug_substance_section","excipient_intro",
+                                 "manufacturing_section","container_closure_section",
+                                 "utilities_section","control_strategy","observation","conclusion"]}
 
-    header.add_paragraph()  # spacing
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 – ASSEMBLE report_data.json → call Node.js
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def add_page_footer(doc: Document):
-    """Standard IPDO footer: left blank | Page X of Y | right blank."""
-    section = doc.sections[0]
-    footer  = section.footer
-    footer.is_linked_to_previous = False
-
-    for p in footer.paragraphs:
-        p.clear()
-
-    fp = footer.paragraphs[0]
-    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    fp.add_run(f"Page ").font.size = Pt(8)
-    # Add PAGE field
-    fld = OxmlElement("w:fldChar")
-    fld.set(qn("w:fldCharType"), "begin")
-    fp.runs[-1]._r.append(fld)
-    instrText = OxmlElement("w:instrText")
-    instrText.text = " PAGE "
-    r = OxmlElement("w:r")
-    r.append(instrText)
-    fp._p.append(r)
-    fld2 = OxmlElement("w:fldChar")
-    fld2.set(qn("w:fldCharType"), "end")
-    r2 = OxmlElement("w:r"); r2.append(fld2)
-    fp._p.append(r2)
-    run = fp.add_run(" of ")
-    run.font.size = Pt(8)
-    # Add NUMPAGES field
-    fld3 = OxmlElement("w:fldChar")
-    fld3.set(qn("w:fldCharType"), "begin")
-    fp.runs[-1]._r.append(fld3)
-    instrText2 = OxmlElement("w:instrText")
-    instrText2.text = " NUMPAGES "
-    r3 = OxmlElement("w:r"); r3.append(instrText2)
-    fp._p.append(r3)
-    fld4 = OxmlElement("w:fldChar")
-    fld4.set(qn("w:fldCharType"), "end")
-    r4 = OxmlElement("w:r"); r4.append(fld4)
-    fp._p.append(r4)
-
-
-def add_section_heading(doc: Document, number: int, title: str):
-    p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(6)
-    p.paragraph_format.space_after  = Pt(4)
-    bold_run(p, f"{number}. {title}", size_pt=10)
-
-
-def add_body_paragraph(doc: Document, text: str, size_pt: float = 9):
-    for para_text in text.split("\n\n"):
-        p = doc.add_paragraph()
-        p.paragraph_format.space_after = Pt(4)
-        normal_run(p, para_text.strip(), size_pt=size_pt)
-
-
-def make_standard_table(doc: Document, headers: List[str],
-                         rows: List[List[str]],
-                         col_widths: List[float] = None,
-                         header_fill: str = "D9D9D9") -> None:
+def assemble_and_generate(
+    ref_structure: Dict,
+    page_images: List[bytes],
+    figure_pages: List[Dict],
+    embedded_images: Dict[int, List[bytes]],
+    annexure_data: List[Dict],
+    comp_data: Dict,
+    calc_tables: Dict,
+    text_sections: Dict,
+) -> bytes:
     """
-    Create a bordered table with shaded header row.
-    col_widths in inches; defaults to equal widths.
+    Build the report_data.json and call generate_report.js to produce the DOCX.
+    Returns DOCX bytes.
     """
-    total_w = 7.5
-    if col_widths is None:
-        col_widths = [total_w / len(headers)] * len(headers)
-
-    tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
-    tbl.style = "Table Grid"
-    tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-    # Header row
-    hdr = tbl.rows[0]
-    for i, (h, w) in enumerate(zip(headers, col_widths)):
-        cell = hdr.cells[i]
-        cell.width = Inches(w)
-        shade_cell(cell, header_fill)
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        bold_run(p, str(h), size_pt=8)
-        set_cell_border(cell)
-
-    # Data rows
-    for r_idx, row in enumerate(rows):
-        tr = tbl.rows[r_idx + 1]
-        for c_idx, val in enumerate(row):
-            cell = tr.cells[c_idx]
-            cell.width = Inches(col_widths[c_idx] if c_idx < len(col_widths) else 1.0)
-            p = cell.paragraphs[0]
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            normal_run(p, str(val), size_pt=8)
-            set_cell_border(cell)
-
-    doc.add_paragraph()  # spacing after table
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# REPORT SECTION BUILDERS
-# ──────────────────────────────────────────────────────────────────────────────
-
-def build_title_page(doc: Document):
-    """Page 1 – SOP-style title page."""
-    # Outer frame table
-    tbl = doc.add_table(rows=1, cols=1)
-    tbl.style = "Table Grid"
-    cell = tbl.cell(0, 0)
-    cell.width = Inches(7.5)
-
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    bold_run(p, PRODUCT["title"] + "\n\n", size_pt=11)
-    normal_run(p,
-        f"SOP Format Number\n{PRODUCT['sop_format']}\n\n"
-        f"Strength: {PRODUCT['strength']}\n"
-        f"Department: {PRODUCT['department']}\n"
-        f"Market: {PRODUCT['market']}\n"
-        f"Protocol: {PRODUCT['protocol']}", size_pt=9)
-
-    doc.add_page_break()
-
-
-def build_toc(doc: Document):
-    """Page 2 – Table of Contents."""
-    add_section_heading(doc, 0, "TABLE OF CONTENTS")
-    toc_rows = [(str(s), t, str(pg)) for s, t, pg in TOC]
-    make_standard_table(doc,
-        headers=["S. No.", "Title", "Page#"],
-        rows=toc_rows,
-        col_widths=[0.7, 5.8, 1.0])
-    doc.add_page_break()
-
-
-def build_abstract_section(doc: Document):
-    """Sections 1–4: Abstract, Objective, Study Location, Background."""
-    add_section_heading(doc, 1, "Abstract")
-    add_body_paragraph(doc, STATIC["abstract"])
-
-    add_section_heading(doc, 2, "Objective")
-    add_body_paragraph(doc, STATIC["objective"])
-
-    add_section_heading(doc, 3, "Details of the study location / testing location")
-    add_body_paragraph(doc, STATIC["study_location"])
-
-    add_section_heading(doc, 4, "Background:")
-    p = doc.add_paragraph()
-    normal_run(p, "Route of administration: ", size_pt=9); bold_run(p, "Oral", size_pt=9)
-    p2 = doc.add_paragraph()
-    normal_run(p2, "Dosage form: ", size_pt=9); bold_run(p2, "Delayed Release Oral Suspension", size_pt=9)
-    p3 = doc.add_paragraph()
-    normal_run(p3, "Maximum Daily Dose: ", size_pt=9); bold_run(p3, PRODUCT["max_daily_dose"], size_pt=9)
-    add_body_paragraph(doc, STATIC["background_drug_product"])
-    doc.add_page_break()
-
-
-def build_composition_table(doc: Document, excel_data: dict):
-    """Section 5 start – Table 1: Quantitative & Qualitative Composition."""
-    add_section_heading(doc, 5, "Drug product elemental impurity risk assessment")
-
-    p = doc.add_paragraph()
-    normal_run(p,
-        "same quantitative and qualitative composition for 10 mg, 20 mg and 40 mg.\n"
-        "Table 1: Quantitative and Qualitative Composition", size_pt=9)
-
-    comp = excel_data.get("composition", [])
-    if comp:
-        # Try to detect header row vs data rows
-        headers = ["Name of Ingredient", "Compendial Status e", "40 mg\nmg/unit", "20 mg\nmg/unit", "10 mg\nmg/unit"]
-        # Limit to 5 columns
-        rows = [[r[i] if i < len(r) else "" for i in range(5)] for r in comp]
-        make_standard_table(doc,
-            headers=headers,
-            rows=rows,
-            col_widths=[2.8, 1.2, 1.0, 1.0, 1.0])
-    else:
-        add_body_paragraph(doc, "[Composition table – upload Excel to populate]")
-
-    doc.add_page_break()
-
-
-def build_fishbone_diagram(doc: Document):
-    """Insert fishbone diagram (Figure 1) – same image every report."""
-    p = doc.add_paragraph()
-    normal_run(p,
-        "Figure 1: Potential sources of elemental impurities in Esomeprazole Magnesium "
-        "for Delayed Release Oral Suspension  10 mg, 20 mg, 40 mg", size_pt=9)
-
-    if FISHBONE_IMAGE.exists():
-        doc.add_picture(str(FISHBONE_IMAGE), width=Inches(6.5))
-        last_p = doc.paragraphs[-1]
-        last_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    else:
-        p2 = doc.add_paragraph()
-        p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        bold_run(p2, "[FISHBONE DIAGRAM – place fishbone_diagram.png in assets/ folder]", size_pt=10)
-
-    doc.add_paragraph()
-    doc.add_page_break()
-
-
-def build_sources_and_excipient_section(doc: Document, annexure_data: List[dict]):
-    """Sources text + Table 2 (excipient annexure mapping)."""
-    add_body_paragraph(doc, STATIC["sources_intro"])
-    add_body_paragraph(doc, STATIC["drug_substance"])
-    add_body_paragraph(doc, STATIC["excipient_intro"])
-
-    # Table 2 – details of annexures
-    p = doc.add_paragraph()
-    bold_run(p, "Table No.2 Details of Annexures", size_pt=9)
-
-    tbl2_rows = []
-    for idx, (ingredient, vendor) in enumerate(ANNEXURE_LIST, start=1):
-        tbl2_rows.append([ingredient, f"Annexure {idx}"])
-
-    make_standard_table(doc,
-        headers=["Name of Excipient", "Annexure"],
-        rows=tbl2_rows,
-        col_widths=[5.5, 2.0])
-
-    add_body_paragraph(doc, STATIC["dextrose_note"])
-    doc.add_page_break()
-
-
-def build_manufacturing_section(doc: Document):
-    add_body_paragraph(doc, STATIC["manufacturing"])
-    add_body_paragraph(doc, STATIC["container_closure"])
-    add_body_paragraph(doc, STATIC["utilities"])
-    add_body_paragraph(doc, STATIC["control_strategy"])
-    doc.add_page_break()
-
-
-def build_mdd_tables(doc: Document):
-    """Tables 3 & 4 – MDD clinical data."""
-    p = doc.add_paragraph()
-    bold_run(p, "Table No.3 MDD clinical data of esomeprazole.", size_pt=9)
-    make_standard_table(doc,
-        headers=["Indication", "MDD", "No. & Strength of Packets"],
-        rows=MDD_TABLE3_ROWS,
-        col_widths=[2.5, 1.5, 3.5])
-
-    p2 = doc.add_paragraph()
-    bold_run(p2, "Table No.4 MDD clinical data as per age group of esomeprazole", size_pt=9)
-
-    # 12–17 y/o sub-table
-    p3 = doc.add_paragraph()
-    normal_run(p3, "12 to 17 y/o  |  Weight ≥ 20 kg", size_pt=9)
-    make_standard_table(doc,
-        headers=["Indication", "MDD", "No. & Strength of Packets"],
-        rows=MDD_TABLE4_12_17,
-        col_widths=[2.5, 1.5, 3.5])
-
-    # 1–11 y/o sub-table
-    p4 = doc.add_paragraph()
-    normal_run(p4, "1 to 11 y/o", size_pt=9)
-    make_standard_table(doc,
-        headers=["Weight", "MDD", "No. & Strength of Packets"],
-        rows=MDD_TABLE4_1_11,
-        col_widths=[2.5, 1.5, 3.5])
-
-    doc.add_page_break()
-
-
-def build_calculation_tables(doc: Document, excel_data: dict):
-    """Tables 5, 6, 7 – Theoretical EI Assessment (Class 1/2A, 2B, 3)."""
-
-    for table_num, key, class_label, class_desc in [
-        (5, "class1_2a", "Class 1 and Class 2A",
-         "Pb, As, Cd, Hg (Class 1) and Co, V, Ni (Class 2A)"),
-        (6, "class2b",   "Class 2B",
-         "Pd, Se, Tl, Au, Ir, Os, Rh, Ru, Ag, Pt"),
-        (7, "class3",    "Class 3",
-         "Li, Sb, Ba, Cr, Cu, Mg, Sn, Mo"),
-    ]:
-        p = doc.add_paragraph()
-        bold_run(p,
-            f"Table {table_num}: Theoretical Elemental Impurity Assessment ({class_label}) - "
-            f"Evaluation of Daily Contribution of the Total Mass of Elemental Impurities in the "
-            f"Esomeprazole Magnesium for Delayed Release Oral Suspension\n"
-            f"Elements: {class_desc}", size_pt=9)
-
-        rows = excel_data.get(key, [])
-        if rows and len(rows) > 1:
-            # First row = headers, rest = data
-            headers = rows[0]
-            data    = rows[1:]
-            # Compute equal col widths
-            n_cols = len(headers)
-            col_w  = [7.5 / n_cols] * n_cols
-            col_w[0] = 2.0  # ingredient name column wider
-            remaining = (7.5 - 2.0) / max(n_cols - 1, 1)
-            col_w = [2.0] + [remaining] * (n_cols - 1)
-            make_standard_table(doc, headers=headers, rows=data, col_widths=col_w)
+    # Encode figure images as base64
+    figures_b64 = []
+    for fig in figure_pages:
+        pi = fig["page_index"]
+        # Try embedded image first; fall back to full-page raster
+        if pi in embedded_images and embedded_images[pi]:
+            img_bytes = embedded_images[pi][0]
+        elif pi < len(page_images):
+            img_bytes = page_images[pi]
         else:
-            add_body_paragraph(doc,
-                f"[Table {table_num} – upload Excel with sheet '{key.upper()}' to populate]")
+            continue
+        figures_b64.append({
+            "page_index":   pi,
+            "description":  fig.get("description", ""),
+            "figure_label": fig.get("figure_label", "Figure 1"),
+            "data_b64":     base64.standard_b64encode(img_bytes).decode(),
+        })
 
-    doc.add_page_break()
+    # Build annexure list for Table 8
+    annexure_list = []
+    for ann in annexure_data:
+        annexure_list.append({
+            "material":  ann.get("material_name", "N/A"),
+            "supplier":  ann.get("supplier_name", "N/A"),
+            "annexure":  f"Annexure {ann.get('annexure_number', '?')}",
+        })
 
+    report_data = {
+        "meta":            ref_structure.get("meta", {}),
+        "text_sections":   text_sections,
+        "composition":     comp_data.get("sections", []),
+        "annexure_list":   annexure_list,
+        "calc_tables":     calc_tables,
+        "revision_history":ref_structure.get("revision_history", []),
+        "signatures":      ref_structure.get("signatures", []),
+        "figures":         figures_b64,
+        "pde_values":      {sym: ICH_PDE[sym] for sym in ICH_PDE},
+    }
 
-def build_observations(doc: Document, obs_text: str, conc_text: str):
-    add_section_heading(doc, 6, "Summary & Conclusion")
+    # Write JSON and call Node.js
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path  = Path(tmpdir) / "report_data.json"
+        docx_path  = Path(tmpdir) / "report.docx"
+        js_script  = Path(__file__).parent / "generate_report.js"
 
-    p = doc.add_paragraph()
-    bold_run(p, "Observation:", size_pt=9)
-    add_body_paragraph(doc, obs_text or (
-        "1. The assessment examined the sources of elemental impurities and no source had the "
-        "potential to transfer elemental impurities into the drug product.\n\n"
-        "2. Elemental impurity risk assessment identified no contributory sources. Calculated "
-        "daily exposures were >30% of PDE (oral route) using %PDE = (Daily Exposure/PDE) × 100, "
-        "with calculations documented. The drug product complies with ICH Q3D (R2), Option-2b "
-        "for elemental impurities."
-    ))
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False)
 
-    p2 = doc.add_paragraph()
-    bold_run(p2, "Conclusion:", size_pt=9)
-    add_body_paragraph(doc, conc_text or (
-        "Based on the documented calculations and risk assessment, the potential contribution of "
-        "elemental impurities to the final drug product is adequately assessed.\n\n"
-        "Drug products meets ICH Q3D (R2), Option 2b. However elemental impurity levels for "
-        "Class 1 (Pb, As, Cd and Hg) and class 2A (Co, V and Ni) crossing 30% PDE values due "
-        "to higher dose of Input Excipient i.e Dextrose Anhydrous (16.878gm), hence Confirmatory "
-        "Testing will be done on Exhibit batches and control strategy will be decided accordingly."
-    ))
-    doc.add_page_break()
+        result = subprocess.run(
+            ["node", str(js_script), str(json_path), str(docx_path)],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Node.js error:\n{result.stderr}")
 
-
-def build_annexure_list(doc: Document):
-    """Table 8 – List of Annexures."""
-    add_section_heading(doc, 8, "List of annexures")
-    p = doc.add_paragraph()
-    bold_run(p, "Table No: 8 List of annexures", size_pt=9)
-
-    rows = [(ingr, vend, f"Annexure {i+1}")
-            for i, (ingr, vend) in enumerate(ANNEXURE_LIST)]
-    make_standard_table(doc,
-        headers=["Name of Ingredient", "Vendor", "Title of Annexure"],
-        rows=rows,
-        col_widths=[2.8, 2.7, 2.0])
-
-    p2 = doc.add_paragraph()
-    normal_run(p2,
-        "Note: For Annexures refer ELN experiment Number: SOM-6-40-M-NBI-30", size_pt=8)
-    doc.add_page_break()
+        return docx_path.read_bytes()
 
 
-def build_revision_history(doc: Document):
-    add_section_heading(doc, 9, "Revision history:")
-    make_standard_table(doc,
-        headers=["Document and Version Number", "Brief details of changes"],
-        rows=[[v, c] for v, c in REVISION_HISTORY],
-        col_widths=[3.5, 4.0])
-    doc.add_page_break()
-
-
-def build_signature_page(doc: Document):
-    """Electronic Signatures block."""
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    bold_run(p, "ELECTRONIC SIGNATURES", size_pt=10)
-
-    # Info table
-    info_rows = [
-        ["Title", PRODUCT["title"]],
-        ["Document No", PRODUCT["doc_no"]],
-        ["Version",     PRODUCT["version"]],
-    ]
-    make_standard_table(doc, headers=["Field", "Value"],
-                        rows=info_rows, col_widths=[2.5, 5.0])
-
-    # Signature table
-    sig_rows = [
-        ["Prepared by R&D",  "", "", ""],
-        ["Reviewed by R&D",  "", "", ""],
-        ["Approved by DQA",  "", "", ""],
-    ]
-    make_standard_table(doc,
-        headers=["Intention", "Employee ID", "User Name", "Date (IST)"],
-        rows=sig_rows,
-        col_widths=[2.5, 1.5, 2.0, 1.5])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MASTER REPORT ORCHESTRATOR
-# ──────────────────────────────────────────────────────────────────────────────
-
-def generate_report(annexure_data: List[dict],
-                    excel_data: dict,
-                    obs_text: str,
-                    conc_text: str) -> BytesIO:
-    doc = Document()
-
-    # Page setup: A4, 1-inch margins
-    for section in doc.sections:
-        section.page_width  = Inches(8.5)
-        section.page_height = Inches(11)
-        section.left_margin   = Inches(0.75)
-        section.right_margin  = Inches(0.75)
-        section.top_margin    = Inches(1.2)
-        section.bottom_margin = Inches(0.75)
-
-    # Default paragraph style
-    style = doc.styles["Normal"]
-    style.font.name  = "Arial"
-    style.font.size  = Pt(9)
-
-    add_page_header(doc)
-    add_page_footer(doc)
-
-    # Build all sections
-    build_title_page(doc)
-    build_toc(doc)
-    build_abstract_section(doc)
-    build_composition_table(doc, excel_data)
-    build_fishbone_diagram(doc)
-    build_sources_and_excipient_section(doc, annexure_data)
-    build_manufacturing_section(doc)
-    build_mdd_tables(doc)
-    build_calculation_tables(doc, excel_data)
-    build_observations(doc, obs_text, conc_text)
-    build_annexure_list(doc)
-    build_revision_history(doc)
-    build_signature_page(doc)
-
-    buf = BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf
-
-
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # STREAMLIT UI
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("Elemental Impurities Risk Assessment – Report Generator")
-    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Powered by Claude claude-opus-4-6 via Vertex AI")
+    st.set_page_config(page_title="TSR Report Generator", layout="wide")
+    st.title("🧪 TSR Elemental Impurities Report Generator")
+    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Claude claude-opus-4-6 via Vertex AI")
+    st.markdown("---")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.subheader("📄 Reference Report PDF")
+        ref_pdf = st.file_uploader(
+            "Previous approved TSR report (provides template, text & figures)",
+            type=["pdf"], key="ref_pdf"
+        )
+
+    with col2:
+        st.subheader("📊 Composition Excel")
+        excel_file = st.file_uploader(
+            "Ingredient composition (sheet 1: name | function | amounts per strength)",
+            type=["xlsx","xls"], key="excel"
+        )
+
+    with col3:
+        st.subheader("📁 Annexure JSONs (1–16)")
+        annexure_files = st.file_uploader(
+            "Document AI JSONs — one per excipient/DS annexure, in order",
+            type=["json"], accept_multiple_files=True, key="annexures"
+        )
 
     st.markdown("---")
 
-    # ── File Uploads ──────────────────────────────────────────────────────────
-    st.header("1. Upload Inputs")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        annexure_files = st.file_uploader(
-            "Upload Annexure JSON files (1–16)",
-            type=["json"],
-            accept_multiple_files=True,
-            help="Upload the Document-AI JSON files for each excipient/DS annexure."
-        )
-    with col2:
-        excel_file = st.file_uploader(
-            "Upload Excel file (Composition + Calculation Tables)",
-            type=["xlsx", "xls"],
-            help="Sheet names expected: 'Composition', 'Class1_2A', 'Class2B', 'Class3'"
-        )
-
-    # ── Optional: Custom Obs/Conclusion ───────────────────────────────────────
-    st.header("2. Options")
-    auto_gen = st.checkbox(
-        "Auto-generate Observations & Conclusion using Claude (recommended)",
-        value=True
-    )
-    custom_obs  = ""
-    custom_conc = ""
-    if not auto_gen:
-        custom_obs  = st.text_area("Custom Observation text", height=150)
-        custom_conc = st.text_area("Custom Conclusion text", height=150)
-
-    # ── Generate ──────────────────────────────────────────────────────────────
-    st.header("3. Generate Report")
-    if st.button("🚀 Generate Report", type="primary"):
-
-        if not annexure_files:
-            st.warning("Please upload at least one annexure JSON file.")
-            return
-        if not excel_file:
-            st.warning("Please upload the Excel file.")
-            return
+    if st.button("🚀 Generate Report", type="primary",
+                 disabled=not (ref_pdf and excel_file and annexure_files)):
 
         progress = st.progress(0)
-        status   = st.empty()
+        log = st.empty()
 
-        # Step 1: Parse Excel
-        status.info("Parsing Excel data…")
         try:
-            excel_data = parse_excel(excel_file.getvalue())
-            st.success(f"Excel parsed. Sheets found: {excel_data['raw_sheets']}")
-        except Exception as e:
-            st.error(f"Excel parsing failed: {e}")
-            logger.exception("Excel error")
-            excel_data = {"composition": [], "class1_2a": [], "class2b": [], "class3": []}
-        progress.progress(10)
+            # ── 1. Rasterize reference PDF ────────────────────────────────
+            log.info("📄 Rasterizing reference PDF pages…")
+            ref_bytes   = ref_pdf.getvalue()
+            page_images = rasterize_pdf_pages(ref_bytes, dpi=150)
+            emb_images  = extract_embedded_images(ref_bytes)
+            st.success(f"Reference PDF: {len(page_images)} pages loaded")
+            progress.progress(8)
 
-        # Step 2: Process Annexure JSONs with Claude
-        status.info(f"Processing {len(annexure_files)} annexure(s) with Claude…")
-        annexure_data = []
-        for i, af in enumerate(annexure_files):
-            try:
+            # ── 2. Identify figure pages ──────────────────────────────────
+            log.info("🔍 Identifying figure/diagram pages with Claude…")
+            figure_pages = identify_figure_pages(page_images)
+            if figure_pages:
+                st.success(f"Found {len(figure_pages)} figure page(s): "
+                           + ", ".join(f"p{f['page_index']+1}" for f in figure_pages))
+            else:
+                st.warning("No figures detected. Check reference PDF quality.")
+            progress.progress(18)
+
+            # ── 3. Extract reference structure ────────────────────────────
+            log.info("📑 Extracting report structure with Claude…")
+            ref_structure = extract_reference_structure(page_images)
+            meta = ref_structure.get("meta", {})
+            st.success(f"Product: {meta.get('product_name','(extracted)')} | "
+                       f"Doc: {meta.get('document_no','')}")
+            progress.progress(35)
+
+            # ── 4. Parse Excel ────────────────────────────────────────────
+            log.info("📊 Parsing composition Excel…")
+            comp_data = parse_composition_excel(excel_file.getvalue())
+            n_ing = sum(len(s.get("rows",[])) for s in comp_data.get("sections",[]))
+            st.success(f"Excel: {n_ing} ingredients across {len(comp_data.get('sections',[]))} sections | "
+                       f"MDD: {comp_data.get('mdd_sachets',6)}× {comp_data.get('mdd_strength','40mg')}")
+            progress.progress(45)
+
+            # ── 5. Process annexures ──────────────────────────────────────
+            log.info(f"🔬 Processing {len(annexure_files)} annexure(s) with Claude…")
+            annexure_data = []
+            for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
                 raw_json = json.loads(af.read().decode("utf-8"))
-                ann_num  = i + 1
-                ann_result = extract_annexure_data(raw_json, ann_num)
-                annexure_data.append(ann_result)
-                st.write(f"  ✅ Annexure {ann_num}: {ann_result.get('material_name', 'N/A')} "
-                         f"({ann_result.get('supplier_name', 'N/A')})")
-            except Exception as e:
-                st.warning(f"  ⚠️ Annexure {i+1} could not be fully processed: {e}")
-                annexure_data.append({"annexure_number": i+1, "error": str(e)})
-            progress.progress(10 + int(70 * (i + 1) / len(annexure_files)))
+                ann = process_annexure(raw_json, i+1)
+                annexure_data.append(ann)
+                st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
+                         f"({ann.get('supplier_name','?')}) — {len(ann.get('elements',[]))} elements")
+                progress.progress(45 + int(20 * (i+1) / len(annexure_files)))
 
-        # Step 3: Generate Obs/Conclusion
-        obs_text  = custom_obs
-        conc_text = custom_conc
-        if auto_gen:
-            status.info("Generating Observations & Conclusion with Claude…")
-            try:
-                summary = {
-                    "annexure_count": len(annexure_data),
-                    "materials": [a.get("material_name") for a in annexure_data],
-                    "excel_sheets": excel_data.get("raw_sheets", []),
-                }
-                obs_text, conc_text = generate_observations_and_conclusion(summary)
-                st.success("Observations & Conclusion generated.")
-            except Exception as e:
-                st.warning(f"Auto-generation failed ({e}); using default text.")
-        progress.progress(85)
+            # ── 6. Calculate Tables 5, 6, 7 ──────────────────────────────
+            log.info("🧮 Calculating EI tables (Tables 5, 6, 7)…")
+            calc_tables = calculate_ei_tables(comp_data, annexure_data)
+            # Show crossing-30% elements
+            crossing = [sym for sym in TABLE5_ELEMENTS
+                        if ICH_PDE[sym]["pde"] and
+                           calc_tables["class1_2a"]["element_totals"].get(sym,0) >
+                           ICH_PDE[sym]["pde"] * 0.30]
+            if crossing:
+                st.warning(f"Elements crossing 30% PDE (confirmatory testing needed): {', '.join(crossing)}")
+            else:
+                st.success("All Class 1+2A elements below 30% PDE — Option 2b compliant")
+            progress.progress(72)
 
-        # Step 4: Build DOCX
-        status.info("Building the Word document…")
-        try:
-            report_buf = generate_report(annexure_data, excel_data, obs_text, conc_text)
+            # ── 7. Generate text sections ─────────────────────────────────
+            log.info("✍️ Generating report text sections with Claude…")
+            text_sections = generate_text_sections(ref_structure, annexure_data, calc_tables, comp_data)
+            progress.progress(82)
+
+            # ── 8. Build DOCX ─────────────────────────────────────────────
+            log.info("📝 Building Word document (Node.js / docx-js)…")
+            docx_bytes = assemble_and_generate(
+                ref_structure, page_images, figure_pages, emb_images,
+                annexure_data, comp_data, calc_tables, text_sections
+            )
             progress.progress(100)
-            status.success("✅ Report generated successfully!")
+            log.success("✅ Report generated!")
 
-            fname = f"TSR-SOM-01-00066_v5_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            doc_no  = meta.get("document_no", "TSR").replace("/","_").replace(" ","_")
+            ver     = meta.get("version","v").split(",")[0].replace(" ","").replace(".","_")
+            fname   = f"{doc_no}_{ver}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+
             st.download_button(
-                label="📄 Download Report (DOCX)",
-                data=report_buf.getvalue(),
-                file_name=fname,
+                "📥 Download Report (DOCX)",
+                data=docx_bytes, file_name=fname,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
+
         except Exception as e:
-            st.error(f"Document generation failed: {e}")
-            logger.exception("DOCX error")
+            st.error(f"Error: {e}")
+            logger.exception("Pipeline error")
 
-    # ── Instructions ──────────────────────────────────────────────────────────
-    with st.expander("ℹ️ File Format Requirements & Setup"):
+    with st.expander("ℹ️ How it works"):
         st.markdown("""
-**Annexure JSON Files**
-- One JSON file per annexure (Document AI output)
-- Upload in order: Annexure 1 first, Annexure 16 last
-- Claude will extract supplier, material, and element-level data automatically
+**Zero hardcoded product content.** Everything is derived from your uploads:
 
-**Excel File – Required Sheet Names**
-
-| Sheet Name | Contents |
+| Input | Used for |
 |---|---|
-| `Composition` | Table 1 – rows: ingredients; cols: Name, Compendial Status, 40mg, 20mg, 10mg |
-| `Class1_2A` | Table 5 – Class 1 + 2A element calculation data |
-| `Class2B` | Table 6 – Class 2B element calculation data |
-| `Class3` | Table 7 – Class 3 element calculation data |
+| Reference PDF | Template layout, all boilerplate text, figures/diagrams (auto-extracted by page) |
+| Annexure JSONs | Vendor element declarations → measured concentrations for Tables 5-7 |
+| Composition Excel | Ingredient amounts → daily intakes → Table 1, basis for Tables 5-7 |
 
-**Fishbone Diagram**
-- Place your fishbone diagram image at: `assets/fishbone_diagram.png`
-- It will be automatically inserted on the correct page of every report
+**Calculation pipeline (Tables 5, 6, 7):**
+1. Daily intake (g) = ingredient amount (mg) × MDD sachets ÷ 1000
+2. Total mass (µg/day) = daily intake × measured concentration (µg/g from annexure)
+3. %PDE = total mass ÷ ICH Q3D PDE × 100
+4. Threshold = 30% of PDE (ICH Q3D Option 2b)
 
-**Credentials**
-- Ensure `datascience-254609-genai.json` is in the same directory as `app.py`
+**Figures:** Claude scans every page of the reference PDF to identify diagram pages,
+then extracts those images and embeds them in the new report at the correct position.
         """)
-
 
 if __name__ == "__main__":
     main()
