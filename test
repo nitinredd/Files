@@ -15,10 +15,7 @@ import streamlit as st
 import pandas as pd
 import openpyxl
 
-import google.auth
-from vertexai.preview.generative_models import (
-    GenerativeModel, HarmCategory, HarmBlockThreshold, SafetySetting
-)
+from anthropic import AnthropicVertex
 
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor, Cm
@@ -34,38 +31,60 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# VERTEX AI / CLAUDE SETUP  (exactly as in your sample code)
+# VERTEX AI / CLAUDE SETUP
+# ──────────────────────────────────────────────────────────────────────────────
+# CRITICAL: Claude on Vertex AI uses `anthropic[vertex]` — NOT the vertexai SDK.
+#   vertexai.preview.generative_models.GenerativeModel is Gemini only.
+#   Passing a Claude model name to GenerativeModel causes the 404 you saw.
+#
+# Steps before running:
+#   1. pip install "anthropic[vertex]"
+#   2. Enable Claude claude-opus-4-6 in Model Garden for your GCP project:
+#      GCP Console → Vertex AI → Model Garden → "Claude claude-opus-4-6" → Enable
+#   3. Service account must have the "Vertex AI User" IAM role.
+#
+# Supported regions for Claude claude-opus-4-6:
+#   "us-east5"       ← recommended primary
+#   "us-central1"
+#   "europe-west1"
+#   "asia-southeast1"
+#   "global"         ← dynamic routing / highest availability
 # ──────────────────────────────────────────────────────────────────────────────
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
-credentials, project_id = google.auth.default()
-model = GenerativeModel("claude-opus-4-6")
 
-SAFETY_CONFIG = [
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                  threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-                  threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                  threshold=HarmBlockThreshold.BLOCK_NONE),
-    SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                  threshold=HarmBlockThreshold.BLOCK_NONE),
-]
+GCP_PROJECT_ID = "prj-thematic-analysis-dev"   # ← your GCP project ID
+GCP_REGION     = "us-east5"                     # ← set to your preferred region
+MODEL_NAME     = "claude-opus-4-6-20250514"     # versioned snapshot (most stable)
 
-def call_claude(prompt: str, max_retries: int = 3) -> str:
-    """Call Claude claude-opus-4-6 via Vertex AI with retry logic."""
+vertex_client = AnthropicVertex(project_id=GCP_PROJECT_ID, region=GCP_REGION)
+
+
+def call_claude(prompt: str, max_retries: int = 3, max_tokens: int = 4096) -> str:
+    """
+    Call Claude claude-opus-4-6 on Vertex AI via the official anthropic[vertex] SDK.
+    Retries with exponential back-off on transient failures.
+    """
     for attempt in range(max_retries):
         try:
-            response = model.generate_content(
-                [prompt],
-                safety_settings=SAFETY_CONFIG
+            response = vertex_client.messages.create(
+                model=MODEL_NAME,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
             )
-            if hasattr(response, "text") and response.text:
-                return response.text
+            return "".join(
+                block.text for block in response.content
+                if hasattr(block, "text")
+            )
         except Exception as e:
             logger.warning(f"Claude call attempt {attempt+1} failed: {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
-    raise RuntimeError("Claude API call failed after max retries.")
+            else:
+                raise RuntimeError(
+                    f"Claude API failed after {max_retries} retries. Error: {e}\n"
+                    "Check: (1) Model enabled in Model Garden? "
+                    "(2) Correct region? (3) Service account has Vertex AI User role?"
+                )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
