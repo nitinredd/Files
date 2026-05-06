@@ -1,1763 +1,711 @@
-#!/usr/bin/env python3
-"""
-TSR Report Generator – Dr. Reddy's IPDO
-Fully dynamic: zero hardcoded product content.
-All text/images from reference PDF. All tables from Excel + Annexure JSONs + ICH Q3D.
-"""
-import os, json, base64, logging, time, subprocess, tempfile, re
-from io import BytesIO
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+/**
+ * generate_report.js
+ * Produces a pixel-perfect TSR DOCX matching Dr. Reddy's IPDO format.
+ * Called by app.py:  node generate_report.js <report_data.json> <output.docx>
+ */
+"use strict";
+const fs   = require("fs");
+const path = require("path");
+const {
+  Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
+  ImageRun, Header, Footer, AlignmentType, BorderStyle, WidthType,
+  ShadingType, VerticalAlign, PageNumber, PageBreak, HeadingLevel,
+} = require("docx");
 
-import streamlit as st
-import openpyxl
-import fitz          # PyMuPDF
-from anthropic import AnthropicVertex
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANTS – document geometry & colours (formatting only, not product content)
+// ─────────────────────────────────────────────────────────────────────────────
+const PAGE_W   = 12240;  // 8.5 in × 1440 dxa
+const PAGE_H   = 15840;  // 11 in
+const MARGIN   = 720;    // 0.5 in
+const CONTENT_W = PAGE_W - 2 * MARGIN;   // 11040 dxa ≈ 7.67 in
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+const CLR = {
+  HEADER_DARK:  "1F3864",   // dark navy – IPDO header band
+  HEADER_LIGHT: "D6DCE4",   // light blue-grey – sub-header rows
+  ROW_SECTION:  "BDD7EE",   // blue section header rows (composition table)
+  ROW_ALT:      "FFFFFF",   // white data rows
+  BORDER:       "000000",   // black borders
+  RED_BOLD:     "FF0000",   // threshold exceeded marker
+};
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VERTEX AI SETUP  (same credentials pattern as your sample code)
-# ─────────────────────────────────────────────────────────────────────────────
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
-GCP_PROJECT = "prj-thematic-analysis-dev"
-GCP_REGION  = "us-east5"
-MODEL       = "claude-opus-4-6-20250514"
+const FONT  = "Arial";
+const FONT_SM   = 14;   // 7pt in half-points
+const FONT_BODY = 16;   // 8pt
+const FONT_MD   = 18;   // 9pt
+const FONT_LG   = 20;   // 10pt
 
-client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILITY HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+const border = (sz = 4, color = CLR.BORDER) => ({ style: BorderStyle.SINGLE, size: sz, color });
+const allBorders = (sz = 4) => ({
+  top: border(sz), bottom: border(sz), left: border(sz), right: border(sz),
+  insideHorizontal: border(sz), insideVertical: border(sz),
+});
+const noBorder = () => ({
+  top: border(0, "FFFFFF"), bottom: border(0, "FFFFFF"),
+  left: border(0, "FFFFFF"), right: border(0, "FFFFFF"),
+});
+const shading = (fill) => ({ fill, type: ShadingType.CLEAR, color: "auto" });
+const cellMargins = () => ({ top: 40, bottom: 40, left: 80, right: 80 });
 
-def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
-    for attempt in range(3):
-        try:
-            r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=messages)
-            return "".join(b.text for b in r.content if hasattr(b, "text"))
-        except Exception as e:
-            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
-            if attempt < 2: time.sleep(2 ** attempt)
-    raise RuntimeError("Claude API failed after 3 retries")
-
-def claude_text(prompt: str, max_tokens: int = 8192) -> str:
-    return call_claude([{"role": "user", "content": prompt}], max_tokens)
-
-def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png") -> str:
-    b64 = base64.standard_b64encode(image_bytes).decode()
-    return call_claude([{"role": "user", "content": [
-        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-        {"type": "text",  "text": prompt}
-    ]}])
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ICH Q3D (R2) ORAL PDEs  — regulatory constants, appropriate to include
-# ─────────────────────────────────────────────────────────────────────────────
-ICH_PDE = {
-    # Class 1
-    "Pb": {"class":"1",  "name":"Lead",       "pde":5.0},
-    "As": {"class":"1",  "name":"Arsenic",    "pde":15.0},
-    "Cd": {"class":"1",  "name":"Cadmium",    "pde":5.0},
-    "Hg": {"class":"1",  "name":"Mercury",    "pde":30.0},
-    # Class 2A
-    "Co": {"class":"2A", "name":"Cobalt",     "pde":50.0},
-    "V":  {"class":"2A", "name":"Vanadium",   "pde":100.0},
-    "Ni": {"class":"2A", "name":"Nickel",     "pde":200.0},
-    # Class 2B
-    "Pd": {"class":"2B", "name":"Palladium",  "pde":100.0},
-    "Se": {"class":"2B", "name":"Selenium",   "pde":150.0},
-    "Tl": {"class":"2B", "name":"Thallium",   "pde":8.0},
-    "Au": {"class":"2B", "name":"Gold",       "pde":100.0},
-    "Ir": {"class":"2B", "name":"Iridium",    "pde":100.0},
-    "Os": {"class":"2B", "name":"Osmium",     "pde":100.0},
-    "Rh": {"class":"2B", "name":"Rhodium",    "pde":100.0},
-    "Ru": {"class":"2B", "name":"Ruthenium",  "pde":100.0},
-    "Ag": {"class":"2B", "name":"Silver",     "pde":150.0},
-    "Pt": {"class":"2B", "name":"Platinum",   "pde":100.0},
-    # Class 3
-    "Li": {"class":"3",  "name":"Lithium",    "pde":550.0},
-    "Sb": {"class":"3",  "name":"Antimony",   "pde":1200.0},
-    "Ba": {"class":"3",  "name":"Barium",     "pde":1400.0},
-    "Cr": {"class":"3",  "name":"Chromium",   "pde":11000.0},
-    "Cu": {"class":"3",  "name":"Copper",     "pde":3000.0},
-    "Mg": {"class":"3",  "name":"Magnesium",  "pde":None},
-    "Sn": {"class":"3",  "name":"Tin",        "pde":6000.0},
-    "Mo": {"class":"3",  "name":"Molybdenum", "pde":3000.0},
+function tc(text, opts = {}) {
+  const { bold = false, size = FONT_BODY, align = AlignmentType.CENTER,
+          fill = null, colSpan = 1, w = 0, color = "000000" } = opts;
+  return new TableCell({
+    columnSpan: colSpan,
+    width: w ? { size: w, type: WidthType.DXA } : undefined,
+    borders: allBorders(),
+    shading: fill ? shading(fill) : undefined,
+    margins: cellMargins(),
+    verticalAlign: VerticalAlign.CENTER,
+    children: [new Paragraph({
+      alignment: align,
+      spacing: { before: 0, after: 0 },
+      children: [new TextRun({ text: String(text), bold, size, font: FONT, color })]
+    })]
+  });
 }
 
-TABLE5_ELEMENTS = ["Pb","As","Cd","Hg","Co","V","Ni"]   # Class 1 + 2A
-TABLE6_ELEMENTS = ["Pd","Se","Tl","Au","Ir","Os","Rh","Ru","Ag","Pt"]  # Class 2B
-TABLE7_ELEMENTS = ["Li","Sb","Ba","Cr","Cu","Mg","Sn","Mo"]            # Class 3
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 – REFERENCE PDF ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 150) -> List[bytes]:
-    """Render every PDF page to a PNG image."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        pages.append(pix.tobytes("png"))
-    doc.close()
-    return pages
-
-def extract_embedded_images(pdf_bytes: bytes) -> Dict[int, List[bytes]]:
-    """
-    Extract actual embedded bitmap images from each PDF page.
-    Returns {page_index: [image_bytes, ...]}.
-    Falls back to full-page raster if no bitmaps found on figure pages.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    result: Dict[int, List[bytes]] = {}
-    for page_num, page in enumerate(doc):
-        img_list = page.get_images(full=True)
-        if img_list:
-            imgs = []
-            for img_info in img_list:
-                try:
-                    xref = img_info[0]
-                    base = doc.extract_image(xref)
-                    imgs.append(base["image"])
-                except Exception:
-                    pass
-            if imgs:
-                result[page_num] = imgs
-    doc.close()
-    return result
-
-def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
-    """
-    Ask Claude to identify which pages contain figures/diagrams.
-    Returns list of {page_index, description, position_in_report}.
-    """
-    # Sample every page with a quick Claude call
-    prompt_template = """Look at this page image from a pharmaceutical technical report.
-Does this page contain any figure, diagram, flowchart, or schematic image (not tables, not text)?
-
-If YES, respond with JSON: {{"has_figure": true, "description": "brief description", "figure_label": "Figure X: ..."}}
-If NO, respond with JSON: {{"has_figure": false}}
-
-Return ONLY the JSON, nothing else."""
-
-    figures = []
-    for i, img in enumerate(page_images):
-        try:
-            raw = claude_vision(img, prompt_template)
-            start = raw.find("{"); end = raw.rfind("}") + 1
-            if start >= 0:
-                data = json.loads(raw[start:end])
-                if data.get("has_figure"):
-                    figures.append({
-                        "page_index": i,
-                        "description": data.get("description",""),
-                        "figure_label": data.get("figure_label",""),
-                    })
-        except Exception as e:
-            logger.warning(f"Figure detection page {i}: {e}")
-    return figures
-
-def extract_reference_structure(page_images: List[bytes]) -> Dict:
-    """
-    Send all pages to Claude and extract the full report structure:
-    product info, all section texts, table structures (not data), etc.
-    Returns a comprehensive JSON structure.
-    """
-    # Process in batches to avoid context limits
-    # First pass: extract metadata from page 1
-    meta_prompt = """This is page 1 of a pharmaceutical Technical Summary Report (TSR).
-Extract ALL header/metadata fields you can see.
-Return ONLY this JSON (fill every field exactly as shown in the document):
-{
-  "title": "",
-  "document_no": "",
-  "product_name": "",
-  "dosage_form": "",
-  "version": "",
-  "strength": "",
-  "department": "",
-  "market": "",
-  "protocol": "",
-  "sop_format_number": ""
-}"""
-    
-    meta_raw = claude_vision(page_images[0], meta_prompt)
-    try:
-        s = meta_raw.find("{"); e = meta_raw.rfind("}") + 1
-        meta = json.loads(meta_raw[s:e]) if s >= 0 else {}
-    except Exception:
-        meta = {}
-
-    # Second pass: extract full text content from all pages
-    sections_prompt = """This is a page from a pharmaceutical ICH Q3D elemental impurities Technical Summary Report.
-
-Extract ALL text content from this page preserving the structure.
-Return ONLY this JSON:
-{
-  "page_type": "title|toc|abstract|composition_table|figure|text|calculation_table|signatures|annexure_list|revision_history",
-  "section_number": null,
-  "section_title": "",
-  "content_blocks": [
-    {
-      "type": "heading|paragraph|table_caption|note|bullet",
-      "text": "exact text content",
-      "bold": false
-    }
-  ],
-  "has_table": false,
-  "table_description": ""
+function emptyCell(fill = null) {
+  return new TableCell({
+    borders: allBorders(),
+    shading: fill ? shading(fill) : undefined,
+    margins: cellMargins(),
+    children: [new Paragraph({ children: [new TextRun("")] })]
+  });
 }
-Return ONLY JSON, nothing else."""
 
-    pages_data = []
-    for i, img in enumerate(page_images):
-        try:
-            raw = claude_vision(img, sections_prompt)
-            s = raw.find("{"); e = raw.rfind("}") + 1
-            if s >= 0:
-                d = json.loads(raw[s:e])
-                d["page_index"] = i
-                pages_data.append(d)
-        except Exception as ex:
-            logger.warning(f"Page {i} extraction: {ex}")
-            pages_data.append({"page_index": i, "page_type": "unknown", "content_blocks": []})
-
-    # Third pass: extract revision history and electronic signatures
-    # (typically last 2 pages)
-    revision_data = {}
-    sig_data = {}
-    if len(page_images) >= 2:
-        rev_prompt = """This page contains a revision history table and/or electronic signatures.
-Extract as JSON:
-{
-  "revision_history": [
-    {"document_version": "", "changes": ""}
-  ],
-  "signatures": [
-    {"intention": "", "employee_id": "", "user_name": "", "date": ""}
-  ]
+function para(text, opts = {}) {
+  const { bold = false, size = FONT_BODY, align = AlignmentType.LEFT,
+          before = 40, after = 40 } = opts;
+  const runs = [];
+  if (Array.isArray(text)) {
+    text.forEach(seg => runs.push(new TextRun({
+      text: seg.text, bold: seg.bold || false, size: seg.size || FONT_BODY, font: FONT
+    })));
+  } else {
+    runs.push(new TextRun({ text: String(text), bold, size, font: FONT }));
+  }
+  return new Paragraph({
+    alignment: align,
+    spacing: { before, after },
+    children: runs,
+  });
 }
-Return ONLY JSON."""
-        for i in range(max(0, len(page_images)-3), len(page_images)):
-            try:
-                raw = claude_vision(page_images[i], rev_prompt)
-                s = raw.find("{"); e = raw.rfind("}") + 1
-                if s >= 0:
-                    d = json.loads(raw[s:e])
-                    if d.get("revision_history"): revision_data = d["revision_history"]
-                    if d.get("signatures"):       sig_data      = d["signatures"]
-            except Exception:
-                pass
 
-    return {
-        "meta": meta,
-        "pages": pages_data,
-        "revision_history": revision_data,
-        "signatures": sig_data,
-    }
+function heading(text, level = 1) {
+  return para(text, { bold: true, size: level === 1 ? FONT_LG : FONT_MD });
+}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 – EXCEL COMPOSITION PARSER
-# ─────────────────────────────────────────────────────────────────────────────
+function pageBreak() {
+  return new Paragraph({ children: [new PageBreak()] });
+}
 
-def parse_composition_excel(excel_bytes: bytes) -> Dict:
-    """
-    Parse the composition Excel file.
-    Uses Claude to understand the sheet structure rather than assuming column positions.
-    Returns {
-      "sections": [{"name": "Seal coating", "rows": [{"ingredient","status","40mg","20mg","10mg"}]}],
-      "mdd_strength": "40mg",
-      "mdd_sachets": 6,
-      "raw_rows": [...]
-    }
-    """
-    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
-    ws = wb.worksheets[0]  # Use first sheet
+function fmt(val, decimals = 4) {
+  if (val === null || val === undefined || val === "") return "";
+  const n = parseFloat(val);
+  return isNaN(n) ? String(val) : n.toFixed(decimals);
+}
 
-    # Dump all rows to text for Claude
-    rows_text = []
-    all_rows = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if any(c is not None for c in row):
-            row_str = [str(c) if c is not None else "" for c in row]
-            rows_text.append(f"Row {i+1}: {' | '.join(row_str)}")
-            all_rows.append(row_str)
-    wb.close()
+// ─────────────────────────────────────────────────────────────────────────────
+// PAGE HEADER (IPDO standard – appears on every page)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildPageHeader(meta) {
+  const { title = "", document_no = "", product_name = "",
+          dosage_form = "", version = "", strength = "",
+          department = "", market = "", protocol = "" } = meta;
 
-    sheet_dump = "\n".join(rows_text[:80])  # first 80 rows
+  // Row 1: IPDO | Technical Summary Report | Dr. Reddy's
+  const row1 = new TableRow({ children: [
+    tc("IPDO", { bold: true, size: FONT_MD, align: AlignmentType.LEFT,
+                 fill: CLR.HEADER_DARK, w: 1440 }),
+    tc("Technical Summary Report",
+       { bold: true, size: FONT_MD, align: AlignmentType.CENTER,
+         fill: CLR.HEADER_DARK, colSpan: 3 }),
+    tc("Dr. Reddy's", { bold: true, size: FONT_MD, align: AlignmentType.RIGHT,
+                        fill: CLR.HEADER_DARK, w: 1800 }),
+  ]});
 
-    prompt = f"""Below is spreadsheet data from a pharmaceutical product composition Excel file.
-Each row is a formula ingredient. The columns typically are:
-Row number | Ingredient Name | Function | Amount for strength1 | Amount for strength2 | Amount for strength3
-
-Identify and extract:
-1. Which column holds the ingredient name
-2. Which columns hold amounts per strength (e.g., 40mg, 20mg, 10mg)
-3. Which rows are section headers (e.g., "Seal coating", "Drug Loading") vs ingredient rows
-4. Which strength represents the maximum daily dose (highest strength)
-5. How many sachets per day for worst-case MDD
-
-Return ONLY this JSON (no markdown, no explanation):
-{{
-  "ingredient_col": 1,
-  "strength_cols": {{"40mg": 3, "20mg": 4, "10mg": 5}},
-  "mdd_strength": "40mg",
-  "mdd_sachets": 6,
-  "section_header_rows": [3, 12, 18],
-  "data_start_row": 2,
-  "sections": [
-    {{
-      "name": "Seal coating",
-      "rows": [
-        {{"ingredient": "Purified water", "status": "USP", "40mg": "q.s.", "20mg": "q.s.", "10mg": "q.s."}}
+  // Row 2: Title spanning left columns, right side: dept / strength / market
+  const row2 = new TableRow({ children: [
+    new TableCell({
+      columnSpan: 3,
+      borders: allBorders(4),
+      shading: shading("FFFFFF"),
+      margins: cellMargins(),
+      children: [para([
+        { text: "Title: ", bold: true, size: FONT_SM },
+        { text: title, bold: false, size: FONT_SM }
+      ])]
+    }),
+    new TableCell({
+      borders: allBorders(4),
+      shading: shading("FFFFFF"),
+      margins: cellMargins(),
+      children: [
+        para([{ text: "Department: ", bold: true, size: FONT_SM },
+              { text: department, size: FONT_SM }]),
+        para([{ text: "Strength: ",   bold: true, size: FONT_SM },
+              { text: strength,        size: FONT_SM }]),
+        para([{ text: "Market: ",     bold: true, size: FONT_SM },
+              { text: market,          size: FONT_SM }]),
+        para([{ text: "Protocol: ",   bold: true, size: FONT_SM },
+              { text: protocol,        size: FONT_SM }]),
       ]
-    }}
-  ]
-}}
-
-Spreadsheet data:
-{sheet_dump}"""
-
-    raw = claude_text(prompt)
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        if s < 0 or e <= s:
-            raise ValueError("No JSON found in Claude response")
-        result = json.loads(raw[s:e])
-        result["all_rows"] = all_rows
-        # Ensure numeric types for key fields
-        result["mdd_sachets"]    = int(result.get("mdd_sachets", 6)   or 6)
-        result["ingredient_col"] = int(result.get("ingredient_col", 1) or 1)
-        result["mdd_strength"]   = str(result.get("mdd_strength", "40mg") or "40mg")
-        # Ensure sections is a list
-        if not isinstance(result.get("sections"), list):
-            result["sections"] = []
-        return result
-    except Exception as ex:
-        logger.error(f"Excel parse failed ({ex}), using raw-row fallback")
-        # Fallback: treat every non-blank row as an ingredient
-        fallback_rows = []
-        for row in all_rows[1:]:   # skip header
-            if len(row) > 3 and row[1].strip():
-                fallback_rows.append({
-                    "ingredient": row[1],
-                    "status":     row[2] if len(row) > 2 else "",
-                    "40mg":       row[3] if len(row) > 3 else "0",
-                    "20mg":       row[4] if len(row) > 4 else "0",
-                    "10mg":       row[5] if len(row) > 5 else "0",
-                })
-        return {
-            "sections":      [{"name": "Composition", "rows": fallback_rows}],
-            "mdd_strength":  "40mg",
-            "mdd_sachets":   6,
-            "all_rows":      all_rows,
-            "ingredient_col": 1,
-            "strength_cols": {"40mg": 3, "20mg": 4, "10mg": 5},
-        }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 – ANNEXURE JSON PROCESSOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_annexure(annexure_json: dict, index: int) -> Dict:
-    """
-    Use Claude to extract structured EI declaration data from a Document AI JSON.
-    Returns structured data per ingredient.
-    """
-    # Collapse the Document AI JSON to text for Claude
-    text_content = _flatten_docai_json(annexure_json)
-
-    prompt = f"""You are extracting pharmaceutical elemental impurity data from Annexure {index}.
-
-This is text extracted from a Document AI JSON of an elemental impurity declaration form
-submitted by a pharmaceutical excipient or API supplier.
-
-Extract ALL information into this exact JSON (no extra fields, no markdown):
-{{
-  "annexure_number": {index},
-  "supplier_name": "",
-  "material_name": "",
-  "source_type": "Plant/Mineral/Synthetic/Mineral derived/Plant derived",
-  "date_filled": "",
-  "elements": [
-    {{
-      "name": "",
-      "symbol": "",
-      "class": "1/2A/2B/3",
-      "intentionally_added": "Yes/No",
-      "concentration_value": 0.05,
-      "concentration_unit": "ppm",
-      "analytical_method": "ICP-MS",
-      "observed_level": "BLQ",
-      "frequency_of_testing": "Once",
-      "listed_in_coa": "Yes/No",
-      "comments": ""
-    }}
-  ]
-}}
-
-Rules:
-- concentration_value: numeric. If "BLQ", use the LOQ value (typically 0.05). If "NA" or blank, use 0.
-- symbol: use standard element symbol (Pb, As, Cd, Hg, Co, V, Ni, etc.)
-
-Document text:
-{text_content[:8000]}"""
-
-    raw = call_claude([{"role":"user","content": prompt}])
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        return json.loads(raw[s:e])
-    except Exception as ex:
-        logger.error(f"Annexure {index} parse error: {ex}")
-        return {"annexure_number": index, "supplier_name": "N/A",
-                "material_name": "N/A", "elements": [],
-                "source_type": "N/A", "date_filled": ""}
-
-def _flatten_docai_json(obj, depth=0) -> str:
-    """Flatten Document AI JSON to readable text."""
-    if depth > 8: return ""
-    parts = []
-    if isinstance(obj, dict):
-        if "text" in obj and isinstance(obj["text"], str):
-            parts.append(obj["text"])
-        for v in obj.values():
-            parts.append(_flatten_docai_json(v, depth+1))
-    elif isinstance(obj, list):
-        for item in obj:
-            parts.append(_flatten_docai_json(item, depth+1))
-    elif isinstance(obj, (str, int, float)):
-        parts.append(str(obj))
-    return " ".join(p for p in parts if p.strip())
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 – CALCULATION ENGINE (Tables 5, 6, 7)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_conc(val) -> float:
-    """Parse a concentration value to float µg/g."""
-    if val is None: return 0.0
-    if isinstance(val, (int, float)): return max(0.0, float(val))
-    s = str(val).strip().lower()
-    if s in ("", "na", "nd", "blq", "bdl", "none", "null"): return 0.05  # use LOQ conservatively
-    # strip common units and text
-    s = re.sub(r"(ppm|ug/g|<|>)", "", s).replace(" ", "")
-    try:
-        return max(0.0, float(s))
-    except (ValueError, TypeError):
-        return 0.05  # unknown value → use LOQ as conservative default
-
-def _parse_amount(val) -> float:
-    """Parse ingredient amount in mg to float."""
-    if val is None: return 0.0
-    s = str(val).strip().lower()
-    if s in ("", "q.s.", "qs", "na"): return 0.0
-    try: return float(s)
-    except: return 0.0
-
-def build_ingredient_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
-    """
-    Build a map: material_name -> {element_symbol -> concentration_µg/g}
-    from all processed annexures.
-    """
-    conc_map: Dict[str, Dict[str, float]] = {}
-    for ann in annexure_data:
-        material = ann.get("material_name", "").strip()
-        if not material: continue
-        elem_dict: Dict[str, float] = {}
-        for el in ann.get("elements", []):
-            sym = el.get("symbol", "").strip()
-            if not sym: continue
-            val = _parse_conc(el.get("concentration_value", 0))
-            elem_dict[sym] = val
-        conc_map[material] = elem_dict
-    return conc_map
-
-def _match_ingredient(ingredient_name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """Fuzzy-match ingredient name to closest key in conc_map. Never raises."""
-    if not conc_map or not ingredient_name:
-        return {}
-    ingredient_lower = ingredient_name.lower().strip()
-    best_key = None
-    best_score = 0
-    for key in conc_map:
-        if not key:
-            continue
-        key_lower = key.lower().strip()
-        # Token overlap score
-        ing_tokens = set(t for t in re.split(r'[\s\(\)\-,]+', ingredient_lower) if t)
-        key_tokens  = set(t for t in re.split(r'[\s\(\)\-,]+', key_lower)  if t)
-        if not ing_tokens or not key_tokens:
-            continue
-        overlap = len(ing_tokens & key_tokens)
-        if overlap > best_score:
-            best_score = overlap
-            best_key = key
-    return conc_map.get(best_key, {}) if best_score > 0 else {}
-
-def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
-    """
-    Calculate Tables 5, 6, 7.
-    Returns dict with keys 'class1_2a', 'class2b', 'class3'.
-    Each value: {
-      "elements": [symbol, ...],
-      "rows": [{ingredient, daily_intake_g, measured_conc: {sym: val}, total_mass: {sym: val}}],
-      "total_daily_intake": float,
-      "element_totals": {sym: total_µg_day},
-      "pde": {sym: float},
-      "threshold_30pct": {sym: float}
-    }
-    """
-    mdd_sachets = comp_data.get("mdd_sachets", 6)
-    mdd_strength = comp_data.get("mdd_strength", "40mg")
-    strength_cols = comp_data.get("strength_cols", {"40mg": 3})
-    ing_col = comp_data.get("ingredient_col", 1)
-    all_rows = comp_data.get("all_rows", [])
-
-    # Build per-ingredient daily intake
-    ingredients: List[Dict] = []
-    if comp_data.get("sections"):
-        for section in comp_data["sections"]:
-            for row in section.get("rows", []):
-                amt = _parse_amount(row.get(mdd_strength, row.get("40mg", 0)))
-                daily_g = amt * mdd_sachets / 1000.0
-                ingredients.append({
-                    "name": row.get("ingredient", ""),
-                    "daily_intake_g": round(daily_g, 3)
-                })
-    else:
-        # Fallback: use raw rows
-        str_col_idx = strength_cols.get(mdd_strength, strength_cols.get("40mg", 3))
-        for row in all_rows:
-            if len(row) <= ing_col: continue
-            name = row[ing_col].strip()
-            if not name or name.lower() in ("name of ingredient", "ingredient"): continue
-            amt = _parse_amount(row[str_col_idx] if str_col_idx < len(row) else "")
-            daily_g = amt * mdd_sachets / 1000.0
-            ingredients.append({"name": name, "daily_intake_g": round(daily_g, 3)})
-
-    # Build concentration map
-    conc_map = build_ingredient_conc_map(annexure_data)
-
-    def build_table(elements: List[str]) -> Dict:
-        rows = []
-        element_totals = {sym: 0.0 for sym in elements}
-        total_intake = 0.0
-
-        for ing in ingredients:
-            if not ing.get("name","").strip(): continue
-            if ing.get("daily_intake_g", 0) == 0: continue
-            ing_concs = _match_ingredient(ing["name"], conc_map)
-            measured = {}
-            total_mass = {}
-            for sym in elements:
-                conc = ing_concs.get(sym, 0.0)
-                measured[sym] = round(conc, 4)
-                mass = ing["daily_intake_g"] * conc
-                total_mass[sym] = round(mass, 4)
-                element_totals[sym] = round(element_totals[sym] + mass, 4)
-            total_intake += ing["daily_intake_g"]
-            rows.append({
-                "ingredient":      ing["name"],
-                "daily_intake_g":  round(ing["daily_intake_g"], 3),
-                "measured_conc":   measured,
-                "total_mass":      total_mass,
-            })
-
-        pde      = {sym: ICH_PDE[sym]["pde"] for sym in elements}
-        thresh   = {sym: round(pde[sym] * 0.30, 3) if pde[sym] else None for sym in elements}
-
-        return {
-            "elements":           elements,
-            "rows":               rows,
-            "total_daily_intake": round(total_intake, 3),
-            "element_totals":     {sym: round(v, 4) for sym, v in element_totals.items()},
-            "pde":                pde,
-            "threshold_30pct":    thresh,
-        }
-
-    return {
-        "class1_2a": build_table(TABLE5_ELEMENTS),
-        "class2b":   build_table(TABLE6_ELEMENTS),
-        "class3":    build_table(TABLE7_ELEMENTS),
-    }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 – TEXT GENERATION (Claude)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
-                           calc_tables: Dict, comp_data: Dict) -> Dict:
-    """
-    Use Claude to synthesise all text sections for the new report,
-    based on the reference structure + new annexure/calculation data.
-    """
-    # Summarise annexure findings (no max() on empty sequence)
-    ann_summary = []
-    for ann in annexure_data:
-        ann_summary.append({
-            "material":       ann.get("material_name", "N/A"),
-            "supplier":       ann.get("supplier_name", "N/A"),
-            "elements_count": len(ann.get("elements", [])),
-        })
-
-    # Extract reference text for obs/conclusion
-    ref_obs = ""
-    ref_conc = ""
-    for p in ref_structure.get("pages", []):
-        for block in p.get("content_blocks", []):
-            txt = block.get("text", "").lower()
-            if "observation" in txt or "conclusion" in txt:
-                ref_obs += block.get("text", "") + " "
-
-    prompt = f"""You are a pharmaceutical regulatory writer generating a Technical Summary Report (TSR)
-for an ICH Q3D (R2) Elemental Impurities Risk Assessment.
-
-Reference report structure (extracted from previous version):
-{json.dumps(ref_structure.get("meta", {}), indent=2)}
-
-Annexure summary ({len(annexure_data)} excipients/materials):
-{json.dumps(ann_summary, indent=2)}
-
-Calculation results summary:
-- Class 1+2A total EI exposures: {json.dumps({sym: calc_tables['class1_2a']['element_totals'].get(sym) for sym in TABLE5_ELEMENTS}, indent=2)}
-- Class 2B total EI exposures: {json.dumps({sym: calc_tables['class2b']['element_totals'].get(sym) for sym in TABLE6_ELEMENTS}, indent=2)}
-- Class 3 total EI exposures: {json.dumps({sym: calc_tables['class3']['element_totals'].get(sym) for sym in TABLE7_ELEMENTS}, indent=2)}
-- ICH Q3D Class 1+2A PDEs: {json.dumps({sym: ICH_PDE[sym]['pde'] for sym in TABLE5_ELEMENTS})}
-- MDD sachets: {comp_data.get("mdd_sachets", 6)}, MDD strength: {comp_data.get("mdd_strength","40mg")}
-
-Any elements crossing 30% PDE:
-{json.dumps({sym: {"total": calc_tables['class1_2a']['element_totals'].get(sym,0),
-                   "pde30": ICH_PDE[sym]['pde']*0.3 if ICH_PDE[sym]['pde'] else None}
-             for sym in TABLE5_ELEMENTS
-             if ICH_PDE[sym]['pde'] and
-             calc_tables['class1_2a']['element_totals'].get(sym,0) > ICH_PDE[sym]['pde']*0.3}, indent=2)}
-
-Generate the following sections as JSON. Be specific, factual, and consistent with ICH Q3D regulatory language.
-Return ONLY this JSON:
-{{
-  "abstract": "...",
-  "objective": "...",
-  "study_location": "NA",
-  "background": "...",
-  "sources_intro": "...",
-  "drug_substance_section": "...",
-  "excipient_intro": "...",
-  "manufacturing_section": "...",
-  "container_closure_section": "...",
-  "utilities_section": "...",
-  "control_strategy": "...",
-  "observation": "...",
-  "conclusion": "..."
-}}"""
-
-    raw = claude_text(prompt, max_tokens=6000)
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        return json.loads(raw[s:e])
-    except Exception as ex:
-        logger.error(f"Text generation error: {ex}")
-        # Return basic sections if parsing fails
-        return {k: "" for k in ["abstract","objective","study_location","background",
-                                 "sources_intro","drug_substance_section","excipient_intro",
-                                 "manufacturing_section","container_closure_section",
-                                 "utilities_section","control_strategy","observation","conclusion"]}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 – ASSEMBLE report_data.json → call Node.js
-# ─────────────────────────────────────────────────────────────────────────────
-
-def assemble_and_generate(
-    ref_structure: Dict,
-    page_images: List[bytes],
-    figure_pages: List[Dict],
-    embedded_images: Dict[int, List[bytes]],
-    annexure_data: List[Dict],
-    comp_data: Dict,
-    calc_tables: Dict,
-    text_sections: Dict,
-) -> bytes:
-    """
-    Build the report_data.json and call generate_report.js to produce the DOCX.
-    Returns DOCX bytes.
-    """
-    # Encode figure images as base64
-    figures_b64 = []
-    for fig in figure_pages:
-        pi = fig["page_index"]
-        # Try embedded image first; fall back to full-page raster
-        if pi in embedded_images and embedded_images[pi]:
-            img_bytes = embedded_images[pi][0]
-        elif pi < len(page_images):
-            img_bytes = page_images[pi]
-        else:
-            continue
-        figures_b64.append({
-            "page_index":   pi,
-            "description":  fig.get("description", ""),
-            "figure_label": fig.get("figure_label", "Figure 1"),
-            "data_b64":     base64.standard_b64encode(img_bytes).decode(),
-        })
-
-    # Build annexure list for Table 8
-    annexure_list = []
-    for ann in annexure_data:
-        annexure_list.append({
-            "material":  ann.get("material_name", "N/A"),
-            "supplier":  ann.get("supplier_name", "N/A"),
-            "annexure":  f"Annexure {ann.get('annexure_number', '?')}",
-        })
-
-    report_data = {
-        "meta":            ref_structure.get("meta", {}),
-        "text_sections":   text_sections,
-        "composition":     comp_data.get("sections", []),
-        "annexure_list":   annexure_list,
-        "calc_tables":     calc_tables,
-        "revision_history":ref_structure.get("revision_history", []),
-        "signatures":      ref_structure.get("signatures", []),
-        "figures":         figures_b64,
-        "pde_values":      {sym: ICH_PDE[sym] for sym in ICH_PDE},
-    }
-
-    # Write JSON and call Node.js
-    with tempfile.TemporaryDirectory() as tmpdir:
-        json_path  = Path(tmpdir) / "report_data.json"
-        docx_path  = Path(tmpdir) / "report.docx"
-        js_script  = Path(__file__).parent / "generate_report.js"
-
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, ensure_ascii=False)
-
-        result = subprocess.run(
-            ["node", str(js_script), str(json_path), str(docx_path)],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Node.js error:\n{result.stderr}")
-
-        return docx_path.read_bytes()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    st.set_page_config(page_title="TSR Report Generator", layout="wide")
-    st.title("🧪 TSR Elemental Impurities Report Generator")
-    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Claude claude-opus-4-6 via Vertex AI")
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.subheader("📄 Reference Report PDF")
-        ref_pdf = st.file_uploader(
-            "Previous approved TSR report (provides template, text & figures)",
-            type=["pdf"], key="ref_pdf"
-        )
-
-    with col2:
-        st.subheader("📊 Composition Excel")
-        excel_file = st.file_uploader(
-            "Ingredient composition (sheet 1: name | function | amounts per strength)",
-            type=["xlsx","xls"], key="excel"
-        )
-
-    with col3:
-        st.subheader("📁 Annexure JSONs (1–16)")
-        annexure_files = st.file_uploader(
-            "Document AI JSONs — one per excipient/DS annexure, in order",
-            type=["json"], accept_multiple_files=True, key="annexures"
-        )
-
-    st.markdown("---")
-
-    if st.button("🚀 Generate Report", type="primary",
-                 disabled=not (ref_pdf and excel_file and annexure_files)):
-
-        progress = st.progress(0)
-        log = st.empty()
-
-        try:
-            # ── 1. Rasterize reference PDF ────────────────────────────────
-            log.info("📄 Rasterizing reference PDF pages…")
-            ref_bytes   = ref_pdf.getvalue()
-            page_images = rasterize_pdf_pages(ref_bytes, dpi=150)
-            emb_images  = extract_embedded_images(ref_bytes)
-            st.success(f"Reference PDF: {len(page_images)} pages loaded")
-            progress.progress(8)
-
-            # ── 2. Identify figure pages ──────────────────────────────────
-            log.info("🔍 Identifying figure/diagram pages with Claude…")
-            figure_pages = identify_figure_pages(page_images)
-            if figure_pages:
-                st.success(f"Found {len(figure_pages)} figure page(s): "
-                           + ", ".join(f"p{f['page_index']+1}" for f in figure_pages))
-            else:
-                st.warning("No figures detected. Check reference PDF quality.")
-            progress.progress(18)
-
-            # ── 3. Extract reference structure ────────────────────────────
-            log.info("📑 Extracting report structure with Claude…")
-            ref_structure = extract_reference_structure(page_images)
-            meta = ref_structure.get("meta", {})
-            st.success(f"Product: {meta.get('product_name','(extracted)')} | "
-                       f"Doc: {meta.get('document_no','')}")
-            progress.progress(35)
-
-            # ── 4. Parse Excel ────────────────────────────────────────────
-            log.info("📊 Parsing composition Excel…")
-            comp_data = parse_composition_excel(excel_file.getvalue())
-            n_ing = sum(len(s.get("rows",[])) for s in comp_data.get("sections",[]))
-            st.success(f"Excel: {n_ing} ingredients across {len(comp_data.get('sections',[]))} sections | "
-                       f"MDD: {comp_data.get('mdd_sachets',6)}× {comp_data.get('mdd_strength','40mg')}")
-            progress.progress(45)
-
-            # ── 5. Process annexures ──────────────────────────────────────
-            log.info(f"🔬 Processing {len(annexure_files)} annexure(s) with Claude…")
-            annexure_data = []
-            for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
-                raw_json = json.loads(af.read().decode("utf-8"))
-                ann = process_annexure(raw_json, i+1)
-                annexure_data.append(ann)
-                st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
-                         f"({ann.get('supplier_name','?')}) — {len(ann.get('elements',[]))} elements")
-                progress.progress(45 + int(20 * (i+1) / len(annexure_files)))
-
-            # ── 6. Calculate Tables 5, 6, 7 ──────────────────────────────
-            log.info("🧮 Calculating EI tables (Tables 5, 6, 7)…")
-            calc_tables = calculate_ei_tables(comp_data, annexure_data)
-            # Show crossing-30% elements
-            crossing = [sym for sym in TABLE5_ELEMENTS
-                        if ICH_PDE[sym]["pde"] and
-                           calc_tables["class1_2a"]["element_totals"].get(sym,0) >
-                           ICH_PDE[sym]["pde"] * 0.30]
-            if crossing:
-                st.warning(f"Elements crossing 30% PDE (confirmatory testing needed): {', '.join(crossing)}")
-            else:
-                st.success("All Class 1+2A elements below 30% PDE — Option 2b compliant")
-            progress.progress(72)
-
-            # ── 7. Generate text sections ─────────────────────────────────
-            log.info("✍️ Generating report text sections with Claude…")
-            text_sections = generate_text_sections(ref_structure, annexure_data, calc_tables, comp_data)
-            progress.progress(82)
-
-            # ── 8. Build DOCX ─────────────────────────────────────────────
-            log.info("📝 Building Word document (Node.js / docx-js)…")
-            docx_bytes = assemble_and_generate(
-                ref_structure, page_images, figure_pages, emb_images,
-                annexure_data, comp_data, calc_tables, text_sections
-            )
-            progress.progress(100)
-            log.success("✅ Report generated!")
-
-            doc_no  = meta.get("document_no", "TSR").replace("/","_").replace(" ","_")
-            ver     = meta.get("version","v").split(",")[0].replace(" ","").replace(".","_")
-            fname   = f"{doc_no}_{ver}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-
-            st.download_button(
-                "📥 Download Report (DOCX)",
-                data=docx_bytes, file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-            logger.exception("Pipeline error")
-
-    with st.expander("ℹ️ How it works"):
-        st.markdown("""
-**Zero hardcoded product content.** Everything is derived from your uploads:
-
-| Input | Used for |
-|---|---|
-| Reference PDF | Template layout, all boilerplate text, figures/diagrams (auto-extracted by page) |
-| Annexure JSONs | Vendor element declarations → measured concentrations for Tables 5-7 |
-| Composition Excel | Ingredient amounts → daily intakes → Table 1, basis for Tables 5-7 |
-
-**Calculation pipeline (Tables 5, 6, 7):**
-1. Daily intake (g) = ingredient amount (mg) × MDD sachets ÷ 1000
-2. Total mass (µg/day) = daily intake × measured concentration (µg/g from annexure)
-3. %PDE = total mass ÷ ICH Q3D PDE × 100
-4. Threshold = 30% of PDE (ICH Q3D Option 2b)
-
-**Figures:** Claude scans every page of the reference PDF to identify diagram pages,
-then extracts those images and embeds them in the new report at the correct position.
-        """)
-
-if __name__ == "__main__":
-    main()#!/usr/bin/env python3
-"""
-TSR Report Generator – Dr. Reddy's IPDO
-Fully dynamic: zero hardcoded product content.
-All text/images from reference PDF. All tables from Excel + Annexure JSONs + ICH Q3D.
-"""
-import os, json, base64, logging, time, subprocess, tempfile, re
-from io import BytesIO
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
-
-import streamlit as st
-import openpyxl
-import fitz          # PyMuPDF
-from anthropic import AnthropicVertex
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# VERTEX AI SETUP  (same credentials pattern as your sample code)
-# ─────────────────────────────────────────────────────────────────────────────
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
-GCP_PROJECT = "prj-thematic-analysis-dev"
-GCP_REGION  = "us-east5"
-MODEL       = "claude-opus-4-6-20250514"
-
-client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
-
-def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
-    for attempt in range(3):
-        try:
-            r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=messages)
-            return "".join(b.text for b in r.content if hasattr(b, "text"))
-        except Exception as e:
-            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
-            if attempt < 2: time.sleep(2 ** attempt)
-    raise RuntimeError("Claude API failed after 3 retries")
-
-def claude_text(prompt: str, max_tokens: int = 8192) -> str:
-    return call_claude([{"role": "user", "content": prompt}], max_tokens)
-
-def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png") -> str:
-    b64 = base64.standard_b64encode(image_bytes).decode()
-    return call_claude([{"role": "user", "content": [
-        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
-        {"type": "text",  "text": prompt}
-    ]}])
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ICH Q3D (R2) ORAL PDEs  — regulatory constants, appropriate to include
-# ─────────────────────────────────────────────────────────────────────────────
-ICH_PDE = {
-    # Class 1
-    "Pb": {"class":"1",  "name":"Lead",       "pde":5.0},
-    "As": {"class":"1",  "name":"Arsenic",    "pde":15.0},
-    "Cd": {"class":"1",  "name":"Cadmium",    "pde":5.0},
-    "Hg": {"class":"1",  "name":"Mercury",    "pde":30.0},
-    # Class 2A
-    "Co": {"class":"2A", "name":"Cobalt",     "pde":50.0},
-    "V":  {"class":"2A", "name":"Vanadium",   "pde":100.0},
-    "Ni": {"class":"2A", "name":"Nickel",     "pde":200.0},
-    # Class 2B
-    "Pd": {"class":"2B", "name":"Palladium",  "pde":100.0},
-    "Se": {"class":"2B", "name":"Selenium",   "pde":150.0},
-    "Tl": {"class":"2B", "name":"Thallium",   "pde":8.0},
-    "Au": {"class":"2B", "name":"Gold",       "pde":100.0},
-    "Ir": {"class":"2B", "name":"Iridium",    "pde":100.0},
-    "Os": {"class":"2B", "name":"Osmium",     "pde":100.0},
-    "Rh": {"class":"2B", "name":"Rhodium",    "pde":100.0},
-    "Ru": {"class":"2B", "name":"Ruthenium",  "pde":100.0},
-    "Ag": {"class":"2B", "name":"Silver",     "pde":150.0},
-    "Pt": {"class":"2B", "name":"Platinum",   "pde":100.0},
-    # Class 3
-    "Li": {"class":"3",  "name":"Lithium",    "pde":550.0},
-    "Sb": {"class":"3",  "name":"Antimony",   "pde":1200.0},
-    "Ba": {"class":"3",  "name":"Barium",     "pde":1400.0},
-    "Cr": {"class":"3",  "name":"Chromium",   "pde":11000.0},
-    "Cu": {"class":"3",  "name":"Copper",     "pde":3000.0},
-    "Mg": {"class":"3",  "name":"Magnesium",  "pde":None},
-    "Sn": {"class":"3",  "name":"Tin",        "pde":6000.0},
-    "Mo": {"class":"3",  "name":"Molybdenum", "pde":3000.0},
-}
-
-TABLE5_ELEMENTS = ["Pb","As","Cd","Hg","Co","V","Ni"]   # Class 1 + 2A
-TABLE6_ELEMENTS = ["Pd","Se","Tl","Au","Ir","Os","Rh","Ru","Ag","Pt"]  # Class 2B
-TABLE7_ELEMENTS = ["Li","Sb","Ba","Cr","Cu","Mg","Sn","Mo"]            # Class 3
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 1 – REFERENCE PDF ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 150) -> List[bytes]:
-    """Render every PDF page to a PNG image."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages = []
-    mat = fitz.Matrix(dpi/72, dpi/72)
-    for page in doc:
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        pages.append(pix.tobytes("png"))
-    doc.close()
-    return pages
-
-def extract_embedded_images(pdf_bytes: bytes) -> Dict[int, List[bytes]]:
-    """
-    Extract actual embedded bitmap images from each PDF page.
-    Returns {page_index: [image_bytes, ...]}.
-    Falls back to full-page raster if no bitmaps found on figure pages.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    result: Dict[int, List[bytes]] = {}
-    for page_num, page in enumerate(doc):
-        img_list = page.get_images(full=True)
-        if img_list:
-            imgs = []
-            for img_info in img_list:
-                try:
-                    xref = img_info[0]
-                    base = doc.extract_image(xref)
-                    imgs.append(base["image"])
-                except Exception:
-                    pass
-            if imgs:
-                result[page_num] = imgs
-    doc.close()
-    return result
-
-def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
-    """
-    Ask Claude to identify which pages contain figures/diagrams.
-    Returns list of {page_index, description, position_in_report}.
-    """
-    # Sample every page with a quick Claude call
-    prompt_template = """Look at this page image from a pharmaceutical technical report.
-Does this page contain any figure, diagram, flowchart, or schematic image (not tables, not text)?
-
-If YES, respond with JSON: {{"has_figure": true, "description": "brief description", "figure_label": "Figure X: ..."}}
-If NO, respond with JSON: {{"has_figure": false}}
-
-Return ONLY the JSON, nothing else."""
-
-    figures = []
-    for i, img in enumerate(page_images):
-        try:
-            raw = claude_vision(img, prompt_template)
-            start = raw.find("{"); end = raw.rfind("}") + 1
-            if start >= 0:
-                data = json.loads(raw[start:end])
-                if data.get("has_figure"):
-                    figures.append({
-                        "page_index": i,
-                        "description": data.get("description",""),
-                        "figure_label": data.get("figure_label",""),
-                    })
-        except Exception as e:
-            logger.warning(f"Figure detection page {i}: {e}")
-    return figures
-
-def extract_reference_structure(page_images: List[bytes]) -> Dict:
-    """
-    Send all pages to Claude and extract the full report structure:
-    product info, all section texts, table structures (not data), etc.
-    Returns a comprehensive JSON structure.
-    """
-    # Process in batches to avoid context limits
-    # First pass: extract metadata from page 1
-    meta_prompt = """This is page 1 of a pharmaceutical Technical Summary Report (TSR).
-Extract ALL header/metadata fields you can see.
-Return ONLY this JSON (fill every field exactly as shown in the document):
-{
-  "title": "",
-  "document_no": "",
-  "product_name": "",
-  "dosage_form": "",
-  "version": "",
-  "strength": "",
-  "department": "",
-  "market": "",
-  "protocol": "",
-  "sop_format_number": ""
-}"""
-    
-    meta_raw = claude_vision(page_images[0], meta_prompt)
-    try:
-        s = meta_raw.find("{"); e = meta_raw.rfind("}") + 1
-        meta = json.loads(meta_raw[s:e]) if s >= 0 else {}
-    except Exception:
-        meta = {}
-
-    # Second pass: extract full text content from all pages
-    sections_prompt = """This is a page from a pharmaceutical ICH Q3D elemental impurities Technical Summary Report.
-
-Extract ALL text content from this page preserving the structure.
-Return ONLY this JSON:
-{
-  "page_type": "title|toc|abstract|composition_table|figure|text|calculation_table|signatures|annexure_list|revision_history",
-  "section_number": null,
-  "section_title": "",
-  "content_blocks": [
-    {
-      "type": "heading|paragraph|table_caption|note|bullet",
-      "text": "exact text content",
-      "bold": false
-    }
-  ],
-  "has_table": false,
-  "table_description": ""
-}
-Return ONLY JSON, nothing else."""
-
-    pages_data = []
-    for i, img in enumerate(page_images):
-        try:
-            raw = claude_vision(img, sections_prompt)
-            s = raw.find("{"); e = raw.rfind("}") + 1
-            if s >= 0:
-                d = json.loads(raw[s:e])
-                d["page_index"] = i
-                pages_data.append(d)
-        except Exception as ex:
-            logger.warning(f"Page {i} extraction: {ex}")
-            pages_data.append({"page_index": i, "page_type": "unknown", "content_blocks": []})
-
-    # Third pass: extract revision history and electronic signatures
-    # (typically last 2 pages)
-    revision_data = {}
-    sig_data = {}
-    if len(page_images) >= 2:
-        rev_prompt = """This page contains a revision history table and/or electronic signatures.
-Extract as JSON:
-{
-  "revision_history": [
-    {"document_version": "", "changes": ""}
-  ],
-  "signatures": [
-    {"intention": "", "employee_id": "", "user_name": "", "date": ""}
-  ]
-}
-Return ONLY JSON."""
-        for i in range(max(0, len(page_images)-3), len(page_images)):
-            try:
-                raw = claude_vision(page_images[i], rev_prompt)
-                s = raw.find("{"); e = raw.rfind("}") + 1
-                if s >= 0:
-                    d = json.loads(raw[s:e])
-                    if d.get("revision_history"): revision_data = d["revision_history"]
-                    if d.get("signatures"):       sig_data      = d["signatures"]
-            except Exception:
-                pass
-
-    return {
-        "meta": meta,
-        "pages": pages_data,
-        "revision_history": revision_data,
-        "signatures": sig_data,
-    }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 2 – EXCEL COMPOSITION PARSER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_composition_excel(excel_bytes: bytes) -> Dict:
-    """
-    Parse the composition Excel file.
-    Uses Claude to understand the sheet structure rather than assuming column positions.
-    Returns {
-      "sections": [{"name": "Seal coating", "rows": [{"ingredient","status","40mg","20mg","10mg"}]}],
-      "mdd_strength": "40mg",
-      "mdd_sachets": 6,
-      "raw_rows": [...]
-    }
-    """
-    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
-    ws = wb.worksheets[0]  # Use first sheet
-
-    # Dump all rows to text for Claude
-    rows_text = []
-    all_rows = []
-    for i, row in enumerate(ws.iter_rows(values_only=True)):
-        if any(c is not None for c in row):
-            row_str = [str(c) if c is not None else "" for c in row]
-            rows_text.append(f"Row {i+1}: {' | '.join(row_str)}")
-            all_rows.append(row_str)
-    wb.close()
-
-    sheet_dump = "\n".join(rows_text[:80])  # first 80 rows
-
-    prompt = f"""Below is spreadsheet data from a pharmaceutical product composition Excel file.
-Each row is a formula ingredient. The columns typically are:
-Row number | Ingredient Name | Function | Amount for strength1 | Amount for strength2 | Amount for strength3
-
-Identify and extract:
-1. Which column holds the ingredient name
-2. Which columns hold amounts per strength (e.g., 40mg, 20mg, 10mg)
-3. Which rows are section headers (e.g., "Seal coating", "Drug Loading") vs ingredient rows
-4. Which strength represents the maximum daily dose (highest strength)
-5. How many sachets per day for worst-case MDD
-
-Return ONLY this JSON (no markdown, no explanation):
-{{
-  "ingredient_col": 1,
-  "strength_cols": {{"40mg": 3, "20mg": 4, "10mg": 5}},
-  "mdd_strength": "40mg",
-  "mdd_sachets": 6,
-  "section_header_rows": [3, 12, 18],
-  "data_start_row": 2,
-  "sections": [
-    {{
-      "name": "Seal coating",
-      "rows": [
-        {{"ingredient": "Purified water", "status": "USP", "40mg": "q.s.", "20mg": "q.s.", "10mg": "q.s."}}
+    }),
+    new TableCell({
+      borders: allBorders(4),
+      shading: shading("FFFFFF"),
+      margins: cellMargins(),
+      children: [
+        para([{ text: "Dr.Reddy's", bold: true, size: FONT_SM }]),
       ]
-    }}
-  ]
-}}
+    }),
+  ]});
 
-Spreadsheet data:
-{sheet_dump}"""
+  // Row 3: Document No | Product Name | Dosage Form | Version
+  const row3 = new TableRow({ children: [
+    tc(`Document No: ${document_no}`,   { size: FONT_SM, align: AlignmentType.LEFT }),
+    tc(`Product Name: ${product_name}`, { size: FONT_SM, align: AlignmentType.LEFT }),
+    tc(`Dosage Form: ${dosage_form}`,   { size: FONT_SM, align: AlignmentType.LEFT }),
+    tc(`Version: ${version}`,           { size: FONT_SM, align: AlignmentType.LEFT }),
+    emptyCell(),
+  ]});
 
-    raw = claude_text(prompt)
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        result = json.loads(raw[s:e])
-        result["all_rows"] = all_rows
-        return result
-    except Exception as ex:
-        logger.error(f"Excel parse error: {ex}")
-        # Fallback: return raw rows
-        return {
-            "sections": [],
-            "mdd_strength": "40mg",
-            "mdd_sachets": 6,
-            "all_rows": all_rows,
-            "ingredient_col": 1,
-            "strength_cols": {"40mg": 3, "20mg": 4, "10mg": 5}
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [1440, 3600, 2160, 2160, 1680],
+    rows: [row1, row2, row3],
+  });
+
+  return new Header({ children: [tbl, para("")] });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAGE FOOTER
+// ─────────────────────────────────────────────────────────────────────────────
+function buildPageFooter() {
+  const p = new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [
+      new TextRun({ text: "Page ", size: FONT_SM, font: FONT }),
+      new TextRun({ children: [PageNumber.CURRENT], size: FONT_SM, font: FONT }),
+      new TextRun({ text: " of ", size: FONT_SM, font: FONT }),
+      new TextRun({ children: [PageNumber.TOTAL_PAGES], size: FONT_SM, font: FONT }),
+    ]
+  });
+  return new Footer({ children: [p] });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TITLE PAGE
+// ─────────────────────────────────────────────────────────────────────────────
+function buildTitlePage(meta, sopFormat) {
+  const box = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [CONTENT_W],
+    rows: [new TableRow({ children: [
+      new TableCell({
+        borders: allBorders(8),
+        margins: { top: 200, bottom: 200, left: 200, right: 200 },
+        children: [
+          para(meta.title || "", { bold: true, size: FONT_LG + 2, align: AlignmentType.CENTER }),
+          para(""),
+          para(`SOP Format Number: ${sopFormat || meta.sop_format_number || ""}`,
+               { align: AlignmentType.CENTER, size: FONT_BODY }),
+        ]
+      })
+    ]})]
+  });
+  return [box, pageBreak()];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TABLE OF CONTENTS (extracted from reference or generated)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildTOC(pages) {
+  // Extract TOC from reference pages or build a generic one
+  const tocEntries = [
+    ["1","Abstract","3"], ["2","Objective","3"],
+    ["3","Details of the study location / testing location","3"],
+    ["4","Background","3"], ["5","Drug product elemental impurity risk assessment","5"],
+    ["6","Summary & Conclusion","17"], ["7","Reference","19"],
+    ["8","List of Annexures","19"], ["9","Revision History","19"],
+  ];
+  const rows = tocEntries.map(([no, title, pg]) =>
+    new TableRow({ children: [
+      tc(no,    { align: AlignmentType.CENTER, w: 600 }),
+      tc(title, { align: AlignmentType.LEFT,   w: 8200 }),
+      tc(pg,    { align: AlignmentType.CENTER, w: 1200 }),
+    ]})
+  );
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [600, 8200, 1200],
+    rows: [
+      new TableRow({ children: [
+        tc("S. No.", { bold: true, fill: CLR.HEADER_LIGHT, w: 600 }),
+        tc("Title",  { bold: true, fill: CLR.HEADER_LIGHT, w: 8200 }),
+        tc("Page#",  { bold: true, fill: CLR.HEADER_LIGHT, w: 1200 }),
+      ]}),
+      ...rows
+    ]
+  });
+  return [heading("TABLE OF CONTENTS"), tbl, pageBreak()];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEXT SECTIONS (1-4: Abstract, Objective, Study Location, Background)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildTextSections(txt) {
+  return [
+    heading("1. Abstract"),       para(txt.abstract || ""),
+    heading("2. Objective"),      para(txt.objective || ""),
+    heading("3. Details of the study location / testing location"),
+    para(txt.study_location || "NA"),
+    heading("4. Background:"),    para(txt.background || ""),
+    pageBreak(),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPOSITION TABLE (Table 1) – exact section-header structure
+// ─────────────────────────────────────────────────────────────────────────────
+function buildCompositionTable(sections) {
+  // Column widths summing to CONTENT_W
+  const COL_W = [4500, 1340, 1700, 1700, 1800]; // sums to 11040 = CONTENT_W
+
+  const headerRow = new TableRow({ children: [
+    tc("Name of Ingredient",     { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[0] }),
+    tc("Compendial\nStatus",     { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[1] }),
+    tc("40 mg\nmg/unit",         { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[2] }),
+    tc("20 mg\nmg/unit",         { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[3] }),
+    tc("10 mg\nmg/unit",         { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[4] }),
+  ]});
+
+  const dataRows = [];
+  (sections || []).forEach(section => {
+    // Section header row (spans all columns)
+    dataRows.push(new TableRow({ children: [
+      new TableCell({
+        columnSpan: 5,
+        borders: allBorders(4),
+        shading: shading(CLR.ROW_SECTION),
+        margins: cellMargins(),
+        children: [para(section.name || "", { bold: true, size: FONT_BODY })]
+      })
+    ]}));
+    // Ingredient rows
+    (section.rows || []).forEach(row => {
+      dataRows.push(new TableRow({ children: [
+        tc(row.ingredient || "", { align: AlignmentType.LEFT, w: COL_W[0] }),
+        tc(row.status || row.compendial_status || "", { w: COL_W[1] }),
+        tc(row["40mg"] || row.amount_40mg || "", { w: COL_W[2] }),
+        tc(row["20mg"] || row.amount_20mg || "", { w: COL_W[3] }),
+        tc(row["10mg"] || row.amount_10mg || "", { w: COL_W[4] }),
+      ]}));
+    });
+  });
+
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: COL_W,
+    rows: [headerRow, ...dataRows],
+  });
+
+  return [
+    heading("5. Drug product elemental impurity risk assessment"),
+    para("Table 1: Quantitative and Qualitative Composition",
+         { bold: true, size: FONT_BODY }),
+    tbl, pageBreak(),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FIGURE (Fishbone or any diagram extracted from reference PDF)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildFigure(fig) {
+  if (!fig || !fig.data_b64) return [];
+  const imgBuf = Buffer.from(fig.data_b64, "base64");
+
+  // Detect format
+  const type = fig.media_type && fig.media_type.includes("jpeg") ? "jpg" : "png";
+
+  // Scale to fit content width
+  const maxWPx = 600;
+  const imgH   = Math.max(100, Math.round(maxWPx * 0.55));
+  const img = new ImageRun({
+    type,
+    data:  imgBuf,
+    transformation: { width: maxWPx, height: imgH },
+    altText: { title: fig.figure_label || "Figure", description: fig.description || "", name: "fig" }
+  });
+
+  return [
+    para(fig.figure_label || "Figure 1", { bold: true, size: FONT_BODY }),
+    new Paragraph({ alignment: AlignmentType.CENTER, children: [img] }),
+    para(""),
+    pageBreak(),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ANNEXURE TABLE (Table 2 + surrounding text)
+// ─────────────────────────────────────────────────────────────────────────────
+function buildAnnexureSection(txt, annexureList) {
+  const COL_W = [4800, 3600, 2400];
+  const rows = (annexureList || []).map((ann, i) =>
+    new TableRow({ children: [
+      tc(ann.material || "",  { align: AlignmentType.LEFT, w: COL_W[0] }),
+      tc(ann.supplier || "",  { align: AlignmentType.LEFT, w: COL_W[1] }),
+      tc(ann.annexure || `Annexure ${i+1}`, { w: COL_W[2] }),
+    ]})
+  );
+
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: COL_W,
+    rows: [
+      new TableRow({ children: [
+        tc("Name of Excipient / Material", { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[0] }),
+        tc("Vendor",                        { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[1] }),
+        tc("Title of Annexure",             { bold: true, fill: CLR.HEADER_LIGHT, w: COL_W[2] }),
+      ]}),
+      ...rows
+    ]
+  });
+
+  return [
+    para(txt.sources_intro    || "", { size: FONT_BODY }),
+    para(txt.drug_substance_section || "", { size: FONT_BODY }),
+    para(txt.excipient_intro  || "", { size: FONT_BODY }),
+    para("Table No.2 Details of Annexures", { bold: true }),
+    tbl,
+    pageBreak(),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CALCULATION TABLE builder (Tables 5, 6, 7)
+// Multi-level headers: class → element, split into Measured Conc | Total Mass
+// ─────────────────────────────────────────────────────────────────────────────
+function buildCalcTable(tableNum, tableData, pdeValues) {
+  const { elements, rows, total_daily_intake, element_totals, pde, threshold_30pct } = tableData;
+  const N = elements.length;   // number of elements
+  // Column layout:
+  // [0] Component  [1] Daily intake(g)  [2..N+1] Measured Conc  [N+2..2N+1] Total Mass
+  // Total cols: 2 + 2N
+  const COMP_W   = 2600;
+  const DI_W     = 800;
+  const ELEM_W   = Math.max(400, Math.floor((CONTENT_W - COMP_W - DI_W) / (2 * N)));
+  const colWidths = [COMP_W, DI_W, ...Array(N).fill(ELEM_W), ...Array(N).fill(ELEM_W)];
+
+  // Class labels for group headers
+  const classLabels = {};
+  elements.forEach(sym => {
+    if (pdeValues[sym]) classLabels[sym] = `Class ${pdeValues[sym].class}`;
+  });
+
+  // Determine unique classes and their element spans
+  const seen = [];
+  elements.forEach(sym => {
+    const c = pdeValues[sym] ? pdeValues[sym].class : "?";
+    if (!seen.length || seen[seen.length-1].class !== c) seen.push({ class: c, count: 1 });
+    else seen[seen.length-1].count++;
+  });
+
+  // ── Header rows ──────────────────────────────────────────────────────────
+  // Row H1: "Component" | "Daily intake" | [Measured Conc (merged)] | [Total Mass (merged)]
+  const h1 = new TableRow({ children: [
+    tc("Component",               { bold: true, fill: CLR.HEADER_LIGHT, w: COMP_W }),
+    tc("Daily\nintake\n(g)",      { bold: true, fill: CLR.HEADER_LIGHT, w: DI_W }),
+    new TableCell({
+      columnSpan: N, borders: allBorders(4), shading: shading(CLR.HEADER_LIGHT),
+      margins: cellMargins(), verticalAlign: VerticalAlign.CENTER,
+      children: [para("Measured Concentration (µg/g)",
+                      { bold: true, align: AlignmentType.CENTER, size: FONT_SM })]
+    }),
+    new TableCell({
+      columnSpan: N, borders: allBorders(4), shading: shading(CLR.HEADER_LIGHT),
+      margins: cellMargins(), verticalAlign: VerticalAlign.CENTER,
+      children: [para("Total Mass of Elemental Impurity (µg/day)",
+                      { bold: true, align: AlignmentType.CENTER, size: FONT_SM })]
+    }),
+  ]});
+
+  // Row H2: blank | blank | [class-span cells for Measured] | [class-span cells for Total]
+  const h2Cells = [
+    tc("", { w: COMP_W, fill: CLR.HEADER_LIGHT }),
+    tc("", { w: DI_W,   fill: CLR.HEADER_LIGHT }),
+  ];
+  // For both Measured and Total sections, add class-span cells
+  for (let repeat = 0; repeat < 2; repeat++) {
+    seen.forEach(grp => {
+      h2Cells.push(new TableCell({
+        columnSpan: grp.count, borders: allBorders(4), shading: shading(CLR.HEADER_LIGHT),
+        margins: cellMargins(),
+        children: [para(`Class ${grp.class}`,
+                        { bold: true, align: AlignmentType.CENTER, size: FONT_SM })]
+      }));
+    });
+  }
+  const h2 = new TableRow({ children: h2Cells });
+
+  // Row H3: blank | blank | element symbols × 2
+  const h3 = new TableRow({ children: [
+    tc("", { w: COMP_W, fill: CLR.HEADER_LIGHT }),
+    tc("", { w: DI_W,   fill: CLR.HEADER_LIGHT }),
+    ...elements.map((sym, i) =>
+      tc(sym, { bold: true, fill: CLR.HEADER_LIGHT, w: ELEM_W, size: FONT_SM })),
+    ...elements.map((sym, i) =>
+      tc(sym, { bold: true, fill: CLR.HEADER_LIGHT, w: ELEM_W, size: FONT_SM })),
+  ]});
+
+  // ── Data rows ─────────────────────────────────────────────────────────────
+  const dataRows = (rows || []).map(row => {
+    const cells = [
+      tc(row.ingredient || "", { align: AlignmentType.LEFT, w: COMP_W, size: FONT_SM }),
+      tc(fmt(row.daily_intake_g, 3), { w: DI_W, size: FONT_SM }),
+      ...elements.map(sym => tc(fmt(row.measured_conc?.[sym] ?? "0", 4),
+                                { w: ELEM_W, size: FONT_SM })),
+      ...elements.map(sym => tc(fmt(row.total_mass?.[sym] ?? "0", 4),
+                                { w: ELEM_W, size: FONT_SM })),
+    ];
+    return new TableRow({ children: cells });
+  });
+
+  // ── Footer rows: TOTAL | PDE | Threshold ─────────────────────────────────
+  const makeFooterRow = (label, values, color = CLR.HEADER_LIGHT, isThreshold = false) => {
+    const cells = [
+      tc(label, { bold: true, fill: color, align: AlignmentType.LEFT, w: COMP_W, size: FONT_SM }),
+      tc(label === "TOTAL (daily intake) (g/day)" ? fmt(total_daily_intake, 3) : "",
+         { fill: color, w: DI_W, size: FONT_SM }),
+      // Blank for measured conc section
+      ...elements.map(() => tc("", { fill: color, w: ELEM_W, size: FONT_SM })),
+      // Values for total mass section
+      ...elements.map(sym => {
+        const val = values[sym];
+        const exceeded = isThreshold && element_totals[sym] !== undefined &&
+                         val !== null && element_totals[sym] > val;
+        return tc(
+          val !== null && val !== undefined ? fmt(val, 2) : "–",
+          { fill: exceeded ? "FFCCCC" : color, w: ELEM_W, size: FONT_SM,
+            color: exceeded ? CLR.RED_BOLD : "000000" }
+        );
+      }),
+    ];
+    return new TableRow({ children: cells });
+  };
+
+  const footerRows = [
+    makeFooterRow("TOTAL (daily intake) (g/day)", element_totals),
+    makeFooterRow("PDE (µg/day)", pde),
+    makeFooterRow("Threshold Limit (30% of PDE)", threshold_30pct, "FFE699", true),
+  ];
+
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: colWidths,
+    rows: [h1, h2, h3, ...dataRows, ...footerRows],
+  });
+
+  const classNameMap = { 5: "Class 1 and Class 2A", 6: "Class 2B", 7: "Class 3" };
+  const className = classNameMap[tableNum] || "";
+  return [
+    para(`Table ${tableNum}: Theoretical Elemental Impurity Assessment (${className}) — Evaluation of Daily Contribution`,
+         { bold: true, size: FONT_BODY }),
+    tbl, para(""),
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REVISION HISTORY TABLE
+// ─────────────────────────────────────────────────────────────────────────────
+function buildRevisionHistory(revisions) {
+  const rows = (revisions || []).map(rev =>
+    new TableRow({ children: [
+      tc(rev.document_version || rev["Document and Version Number"] || "",
+         { align: AlignmentType.LEFT, w: 4200 }),
+      tc(rev.changes || rev["Brief details of changes"] || "",
+         { align: AlignmentType.LEFT, w: CONTENT_W - 4200 }),
+    ]})
+  );
+  const tbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [4200, CONTENT_W - 4200],
+    rows: [
+      new TableRow({ children: [
+        tc("Document and Version Number", { bold: true, fill: CLR.HEADER_LIGHT, w: 4200 }),
+        tc("Brief details of changes",    { bold: true, fill: CLR.HEADER_LIGHT,
+                                           w: CONTENT_W - 4200 }),
+      ]}),
+      ...rows
+    ]
+  });
+  return [heading("9. Revision history:"), tbl];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGNATURES PAGE
+// ─────────────────────────────────────────────────────────────────────────────
+function buildSignatures(meta, signatures) {
+  const sigRows = (signatures && signatures.length)
+    ? signatures.map(s => new TableRow({ children: [
+        tc(s.intention    || "", { align: AlignmentType.LEFT, w: 2700 }),
+        tc(s.employee_id  || "", { w: 1800 }),
+        tc(s.user_name    || "", { align: AlignmentType.LEFT, w: 3240 }),
+        tc(s.date         || "", { align: AlignmentType.LEFT, w: 2160 }),
+      ]}))
+    : [
+        new TableRow({ children: [
+          tc("Prepared by R&D", { align: AlignmentType.LEFT, w: 2700 }),
+          tc("", { w: 1800 }), tc("", { w: 3240 }), tc("", { w: 2160 }),
+        ]}),
+        new TableRow({ children: [
+          tc("Reviewed by R&D", { align: AlignmentType.LEFT, w: 2700 }),
+          tc("", { w: 1800 }), tc("", { w: 3240 }), tc("", { w: 2160 }),
+        ]}),
+        new TableRow({ children: [
+          tc("Approved by DQA", { align: AlignmentType.LEFT, w: 2700 }),
+          tc("", { w: 1800 }), tc("", { w: 3240 }), tc("", { w: 2160 }),
+        ]}),
+      ];
+
+  const sigTbl = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [2700, 1800, 3240, 2160],
+    rows: [
+      new TableRow({ children: [
+        tc("Intention",    { bold: true, fill: CLR.HEADER_LIGHT, w: 2700 }),
+        tc("Employee ID",  { bold: true, fill: CLR.HEADER_LIGHT, w: 1800 }),
+        tc("User Name",    { bold: true, fill: CLR.HEADER_LIGHT, w: 3240 }),
+        tc("Date (IST)",   { bold: true, fill: CLR.HEADER_LIGHT, w: 2160 }),
+      ]}),
+      ...sigRows
+    ]
+  });
+
+  return [
+    para("ELECTRONIC SIGNATURES", { bold: true, size: FONT_LG, align: AlignmentType.CENTER }),
+    para(""),
+    sigTbl,
+  ];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN DOCUMENT ASSEMBLY
+// ─────────────────────────────────────────────────────────────────────────────
+async function generateReport(dataPath, outPath) {
+  const data = JSON.parse(fs.readFileSync(dataPath, "utf-8"));
+  const { meta, text_sections: txt, composition, annexure_list,
+          calc_tables, revision_history, signatures, figures, pde_values } = data;
+
+  const sopFormat = meta.sop_format_number || "";
+  const children  = [];
+
+  // 1. Title page
+  children.push(...buildTitlePage(meta, sopFormat));
+
+  // 2. Table of Contents
+  children.push(...buildTOC([]));
+
+  // 3. Abstract / Objective / Study Location / Background
+  children.push(...buildTextSections(txt));
+
+  // 4. Composition table
+  children.push(...buildCompositionTable(composition));
+
+  // 5. Figure(s) – fishbone and any other diagrams from reference PDF
+  (figures || []).forEach(fig => children.push(...buildFigure(fig)));
+
+  // 6. Sources text + Annexure Table 2
+  children.push(...buildAnnexureSection(txt, annexure_list));
+
+  // 7. Manufacturing + Container Closure + Utilities + Control Strategy
+  if (txt.manufacturing_section)
+    children.push(para(txt.manufacturing_section, { size: FONT_BODY }));
+  if (txt.container_closure_section)
+    children.push(para(txt.container_closure_section, { size: FONT_BODY }));
+  if (txt.utilities_section)
+    children.push(para(txt.utilities_section, { size: FONT_BODY }));
+  if (txt.control_strategy)
+    children.push(para(txt.control_strategy, { size: FONT_BODY }));
+  children.push(pageBreak());
+
+  // 8. Calculation Tables 5, 6, 7
+  if (calc_tables) {
+    if (calc_tables.class1_2a)
+      children.push(...buildCalcTable(5, calc_tables.class1_2a, pde_values));
+    if (calc_tables.class2b)
+      children.push(...buildCalcTable(6, calc_tables.class2b, pde_values));
+    if (calc_tables.class3)
+      children.push(...buildCalcTable(7, calc_tables.class3, pde_values));
+    children.push(pageBreak());
+  }
+
+  // 9. Observation & Conclusion
+  children.push(heading("6. Summary & Conclusion"));
+  children.push(para([{ text: "Observation:", bold: true, size: FONT_BODY }]));
+  children.push(para(txt.observation || "", { size: FONT_BODY }));
+  children.push(para([{ text: "Conclusion:", bold: true, size: FONT_BODY }]));
+  children.push(para(txt.conclusion  || "", { size: FONT_BODY }));
+  children.push(pageBreak());
+
+  // 10. List of Annexures (Table 8)
+  const ann8 = new Table({
+    width: { size: CONTENT_W, type: WidthType.DXA },
+    columnWidths: [4200, 3600, 2040],
+    rows: [
+      new TableRow({ children: [
+        tc("Name of Ingredient / Material", { bold: true, fill: CLR.HEADER_LIGHT, w: 4200 }),
+        tc("Vendor",                         { bold: true, fill: CLR.HEADER_LIGHT, w: 3600 }),
+        tc("Title of Annexure",              { bold: true, fill: CLR.HEADER_LIGHT, w: 2040 }),
+      ]}),
+      ...(annexure_list || []).map((a, i) =>
+        new TableRow({ children: [
+          tc(a.material  || "", { align: AlignmentType.LEFT, w: 4200 }),
+          tc(a.supplier  || "", { align: AlignmentType.LEFT, w: 3600 }),
+          tc(a.annexure  || `Annexure ${i+1}`, { w: 2040 }),
+        ]}))
+    ]
+  });
+  children.push(heading("8. List of annexures"), ann8, pageBreak());
+
+  // 11. Revision history
+  children.push(...buildRevisionHistory(revision_history), pageBreak());
+
+  // 12. Electronic Signatures
+  children.push(...buildSignatures(meta, signatures));
+
+  // ── Assemble Document ─────────────────────────────────────────────────────
+  const doc = new Document({
+    styles: {
+      default: { document: { run: { font: FONT, size: FONT_BODY } } }
+    },
+    sections: [{
+      properties: {
+        page: {
+          size: { width: PAGE_W, height: PAGE_H },
+          margin: { top: 1000, right: MARGIN, bottom: MARGIN, left: MARGIN }
         }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 3 – ANNEXURE JSON PROCESSOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def process_annexure(annexure_json: dict, index: int) -> Dict:
-    """
-    Use Claude to extract structured EI declaration data from a Document AI JSON.
-    Returns structured data per ingredient.
-    """
-    # Collapse the Document AI JSON to text for Claude
-    text_content = _flatten_docai_json(annexure_json)
-
-    prompt = f"""You are extracting pharmaceutical elemental impurity data from Annexure {index}.
-
-This is text extracted from a Document AI JSON of an elemental impurity declaration form
-submitted by a pharmaceutical excipient or API supplier.
-
-Extract ALL information into this exact JSON (no extra fields, no markdown):
-{{
-  "annexure_number": {index},
-  "supplier_name": "",
-  "material_name": "",
-  "source_type": "Plant/Mineral/Synthetic/Mineral derived/Plant derived",
-  "date_filled": "",
-  "elements": [
-    {{
-      "name": "",
-      "symbol": "",
-      "class": "1/2A/2B/3",
-      "intentionally_added": "Yes/No",
-      "concentration_value": 0.05,
-      "concentration_unit": "ppm",
-      "analytical_method": "ICP-MS",
-      "observed_level": "BLQ",
-      "frequency_of_testing": "Once",
-      "listed_in_coa": "Yes/No",
-      "comments": ""
-    }}
-  ]
-}}
-
-Rules:
-- concentration_value: numeric. If "BLQ", use the LOQ value (typically 0.05). If "NA" or blank, use 0.
-- symbol: use standard element symbol (Pb, As, Cd, Hg, Co, V, Ni, etc.)
-
-Document text:
-{text_content[:8000]}"""
-
-    raw = call_claude([{"role":"user","content": prompt}])
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        return json.loads(raw[s:e])
-    except Exception as ex:
-        logger.error(f"Annexure {index} parse error: {ex}")
-        return {"annexure_number": index, "supplier_name": "N/A", "material_name": "N/A", "elements": []}
-
-def _flatten_docai_json(obj, depth=0) -> str:
-    """Flatten Document AI JSON to readable text."""
-    if depth > 8: return ""
-    parts = []
-    if isinstance(obj, dict):
-        if "text" in obj and isinstance(obj["text"], str):
-            parts.append(obj["text"])
-        for v in obj.values():
-            parts.append(_flatten_docai_json(v, depth+1))
-    elif isinstance(obj, list):
-        for item in obj:
-            parts.append(_flatten_docai_json(item, depth+1))
-    elif isinstance(obj, (str, int, float)):
-        parts.append(str(obj))
-    return " ".join(p for p in parts if p.strip())
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 – CALCULATION ENGINE (Tables 5, 6, 7)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_conc(val) -> float:
-    """Parse a concentration value to float µg/g."""
-    if val is None: return 0.0
-    if isinstance(val, (int, float)): return max(0.0, float(val))
-    s = str(val).strip().lower()
-    if s in ("", "na", "nd", "blq", "bdl"): return 0.05  # use LOQ as conservative
-    # strip units
-    s = re.sub(r"(ppm|ug/g|µg/g|μg/g)", "", s).strip()
-    try: return float(s)
-    except: return 0.0
-
-def _parse_amount(val) -> float:
-    """Parse ingredient amount in mg to float."""
-    if val is None: return 0.0
-    s = str(val).strip().lower()
-    if s in ("", "q.s.", "qs", "na"): return 0.0
-    try: return float(s)
-    except: return 0.0
-
-def build_ingredient_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
-    """
-    Build a map: material_name -> {element_symbol -> concentration_µg/g}
-    from all processed annexures.
-    """
-    conc_map: Dict[str, Dict[str, float]] = {}
-    for ann in annexure_data:
-        material = ann.get("material_name", "").strip()
-        if not material: continue
-        elem_dict: Dict[str, float] = {}
-        for el in ann.get("elements", []):
-            sym = el.get("symbol", "").strip()
-            if not sym: continue
-            val = _parse_conc(el.get("concentration_value", 0))
-            elem_dict[sym] = val
-        conc_map[material] = elem_dict
-    return conc_map
-
-def _match_ingredient(ingredient_name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """Fuzzy-match ingredient name to closest key in conc_map."""
-    ingredient_lower = ingredient_name.lower()
-    best_key = None
-    best_score = 0
-    for key in conc_map:
-        key_lower = key.lower()
-        # Token overlap score
-        ing_tokens = set(re.split(r'[\s\(\)\-,]+', ingredient_lower))
-        key_tokens  = set(re.split(r'[\s\(\)\-,]+', key_lower))
-        overlap = len(ing_tokens & key_tokens)
-        if overlap > best_score:
-            best_score = overlap
-            best_key = key
-    return conc_map.get(best_key, {}) if best_score > 0 else {}
-
-def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
-    """
-    Calculate Tables 5, 6, 7.
-    Returns dict with keys 'class1_2a', 'class2b', 'class3'.
-    Each value: {
-      "elements": [symbol, ...],
-      "rows": [{ingredient, daily_intake_g, measured_conc: {sym: val}, total_mass: {sym: val}}],
-      "total_daily_intake": float,
-      "element_totals": {sym: total_µg_day},
-      "pde": {sym: float},
-      "threshold_30pct": {sym: float}
-    }
-    """
-    mdd_sachets = comp_data.get("mdd_sachets", 6)
-    mdd_strength = comp_data.get("mdd_strength", "40mg")
-    strength_cols = comp_data.get("strength_cols", {"40mg": 3})
-    ing_col = comp_data.get("ingredient_col", 1)
-    all_rows = comp_data.get("all_rows", [])
-
-    # Build per-ingredient daily intake
-    ingredients: List[Dict] = []
-    if comp_data.get("sections"):
-        for section in comp_data["sections"]:
-            for row in section.get("rows", []):
-                amt = _parse_amount(row.get(mdd_strength, row.get("40mg", 0)))
-                daily_g = amt * mdd_sachets / 1000.0
-                ingredients.append({
-                    "name": row.get("ingredient", ""),
-                    "daily_intake_g": round(daily_g, 3)
-                })
-    else:
-        # Fallback: use raw rows
-        str_col_idx = strength_cols.get(mdd_strength, strength_cols.get("40mg", 3))
-        for row in all_rows:
-            if len(row) <= ing_col: continue
-            name = row[ing_col].strip()
-            if not name or name.lower() in ("name of ingredient", "ingredient"): continue
-            amt = _parse_amount(row[str_col_idx] if str_col_idx < len(row) else "")
-            daily_g = amt * mdd_sachets / 1000.0
-            ingredients.append({"name": name, "daily_intake_g": round(daily_g, 3)})
-
-    # Build concentration map
-    conc_map = build_ingredient_conc_map(annexure_data)
-
-    def build_table(elements: List[str]) -> Dict:
-        rows = []
-        element_totals = {sym: 0.0 for sym in elements}
-        total_intake = 0.0
-
-        for ing in ingredients:
-            if ing["daily_intake_g"] == 0: continue
-            ing_concs = _match_ingredient(ing["name"], conc_map)
-            measured = {}
-            total_mass = {}
-            for sym in elements:
-                conc = ing_concs.get(sym, 0.0)
-                measured[sym] = round(conc, 4)
-                mass = ing["daily_intake_g"] * conc
-                total_mass[sym] = round(mass, 4)
-                element_totals[sym] = round(element_totals[sym] + mass, 4)
-            total_intake += ing["daily_intake_g"]
-            rows.append({
-                "ingredient":      ing["name"],
-                "daily_intake_g":  round(ing["daily_intake_g"], 3),
-                "measured_conc":   measured,
-                "total_mass":      total_mass,
-            })
-
-        pde      = {sym: ICH_PDE[sym]["pde"] for sym in elements}
-        thresh   = {sym: round(pde[sym] * 0.30, 3) if pde[sym] else None for sym in elements}
-
-        return {
-            "elements":           elements,
-            "rows":               rows,
-            "total_daily_intake": round(total_intake, 3),
-            "element_totals":     {sym: round(v, 4) for sym, v in element_totals.items()},
-            "pde":                pde,
-            "threshold_30pct":    thresh,
-        }
-
-    return {
-        "class1_2a": build_table(TABLE5_ELEMENTS),
-        "class2b":   build_table(TABLE6_ELEMENTS),
-        "class3":    build_table(TABLE7_ELEMENTS),
-    }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 – TEXT GENERATION (Claude)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
-                           calc_tables: Dict, comp_data: Dict) -> Dict:
-    """
-    Use Claude to synthesise all text sections for the new report,
-    based on the reference structure + new annexure/calculation data.
-    """
-    # Summarise annexure findings
-    ann_summary = []
-    for ann in annexure_data:
-        compliant = all(
-            ICH_PDE.get(el["symbol"], {}).get("pde") is None or
-            _parse_conc(el.get("concentration_value", 0)) * comp_data.get("mdd_sachets", 6) *
-            max(_parse_amount(row.get(comp_data.get("mdd_strength","40mg"), 0))
-                for section in comp_data.get("sections",[])
-                for row in section.get("rows",[])
-                if row.get("ingredient","").lower() in ann.get("material_name","").lower()) / 1000
-            <= ICH_PDE.get(el["symbol"],{}).get("pde", 999) * 0.30
-            if ICH_PDE.get(el["symbol"])
-            else True
-            for el in ann.get("elements", [])
-        )
-        ann_summary.append({
-            "material": ann.get("material_name"),
-            "supplier": ann.get("supplier_name"),
-            "elements_count": len(ann.get("elements", [])),
-        })
-
-    # Extract reference text for obs/conclusion
-    ref_obs = ""
-    ref_conc = ""
-    for p in ref_structure.get("pages", []):
-        for block in p.get("content_blocks", []):
-            txt = block.get("text", "").lower()
-            if "observation" in txt or "conclusion" in txt:
-                ref_obs += block.get("text", "") + " "
-
-    prompt = f"""You are a pharmaceutical regulatory writer generating a Technical Summary Report (TSR)
-for an ICH Q3D (R2) Elemental Impurities Risk Assessment.
-
-Reference report structure (extracted from previous version):
-{json.dumps(ref_structure.get("meta", {}), indent=2)}
-
-Annexure summary ({len(annexure_data)} excipients/materials):
-{json.dumps(ann_summary, indent=2)}
-
-Calculation results summary:
-- Class 1+2A total EI exposures: {json.dumps({sym: calc_tables['class1_2a']['element_totals'].get(sym) for sym in TABLE5_ELEMENTS}, indent=2)}
-- Class 2B total EI exposures: {json.dumps({sym: calc_tables['class2b']['element_totals'].get(sym) for sym in TABLE6_ELEMENTS}, indent=2)}
-- Class 3 total EI exposures: {json.dumps({sym: calc_tables['class3']['element_totals'].get(sym) for sym in TABLE7_ELEMENTS}, indent=2)}
-- ICH Q3D Class 1+2A PDEs: {json.dumps({sym: ICH_PDE[sym]['pde'] for sym in TABLE5_ELEMENTS})}
-- MDD sachets: {comp_data.get("mdd_sachets", 6)}, MDD strength: {comp_data.get("mdd_strength","40mg")}
-
-Any elements crossing 30% PDE:
-{json.dumps({sym: {"total": calc_tables['class1_2a']['element_totals'].get(sym,0),
-                   "pde30": ICH_PDE[sym]['pde']*0.3 if ICH_PDE[sym]['pde'] else None}
-             for sym in TABLE5_ELEMENTS
-             if ICH_PDE[sym]['pde'] and
-             calc_tables['class1_2a']['element_totals'].get(sym,0) > ICH_PDE[sym]['pde']*0.3}, indent=2)}
-
-Generate the following sections as JSON. Be specific, factual, and consistent with ICH Q3D regulatory language.
-Return ONLY this JSON:
-{{
-  "abstract": "...",
-  "objective": "...",
-  "study_location": "NA",
-  "background": "...",
-  "sources_intro": "...",
-  "drug_substance_section": "...",
-  "excipient_intro": "...",
-  "manufacturing_section": "...",
-  "container_closure_section": "...",
-  "utilities_section": "...",
-  "control_strategy": "...",
-  "observation": "...",
-  "conclusion": "..."
-}}"""
-
-    raw = claude_text(prompt, max_tokens=6000)
-    try:
-        s = raw.find("{"); e = raw.rfind("}") + 1
-        return json.loads(raw[s:e])
-    except Exception as ex:
-        logger.error(f"Text generation error: {ex}")
-        # Return basic sections if parsing fails
-        return {k: "" for k in ["abstract","objective","study_location","background",
-                                 "sources_intro","drug_substance_section","excipient_intro",
-                                 "manufacturing_section","container_closure_section",
-                                 "utilities_section","control_strategy","observation","conclusion"]}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STEP 6 – ASSEMBLE report_data.json → call Node.js
-# ─────────────────────────────────────────────────────────────────────────────
-
-def assemble_and_generate(
-    ref_structure: Dict,
-    page_images: List[bytes],
-    figure_pages: List[Dict],
-    embedded_images: Dict[int, List[bytes]],
-    annexure_data: List[Dict],
-    comp_data: Dict,
-    calc_tables: Dict,
-    text_sections: Dict,
-) -> bytes:
-    """
-    Build the report_data.json and call generate_report.js to produce the DOCX.
-    Returns DOCX bytes.
-    """
-    # Encode figure images as base64
-    figures_b64 = []
-    for fig in figure_pages:
-        pi = fig["page_index"]
-        # Try embedded image first; fall back to full-page raster
-        if pi in embedded_images and embedded_images[pi]:
-            img_bytes = embedded_images[pi][0]
-        elif pi < len(page_images):
-            img_bytes = page_images[pi]
-        else:
-            continue
-        figures_b64.append({
-            "page_index":   pi,
-            "description":  fig.get("description", ""),
-            "figure_label": fig.get("figure_label", "Figure 1"),
-            "data_b64":     base64.standard_b64encode(img_bytes).decode(),
-        })
-
-    # Build annexure list for Table 8
-    annexure_list = []
-    for ann in annexure_data:
-        annexure_list.append({
-            "material":  ann.get("material_name", "N/A"),
-            "supplier":  ann.get("supplier_name", "N/A"),
-            "annexure":  f"Annexure {ann.get('annexure_number', '?')}",
-        })
-
-    report_data = {
-        "meta":            ref_structure.get("meta", {}),
-        "text_sections":   text_sections,
-        "composition":     comp_data.get("sections", []),
-        "annexure_list":   annexure_list,
-        "calc_tables":     calc_tables,
-        "revision_history":ref_structure.get("revision_history", []),
-        "signatures":      ref_structure.get("signatures", []),
-        "figures":         figures_b64,
-        "pde_values":      {sym: ICH_PDE[sym] for sym in ICH_PDE},
-    }
-
-    # Write JSON and call Node.js
-    with tempfile.TemporaryDirectory() as tmpdir:
-        json_path  = Path(tmpdir) / "report_data.json"
-        docx_path  = Path(tmpdir) / "report.docx"
-        js_script  = Path(__file__).parent / "generate_report.js"
-
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, ensure_ascii=False)
-
-        result = subprocess.run(
-            ["node", str(js_script), str(json_path), str(docx_path)],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Node.js error:\n{result.stderr}")
-
-        return docx_path.read_bytes()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    st.set_page_config(page_title="TSR Report Generator", layout="wide")
-    st.title("🧪 TSR Elemental Impurities Report Generator")
-    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Claude claude-opus-4-6 via Vertex AI")
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.subheader("📄 Reference Report PDF")
-        ref_pdf = st.file_uploader(
-            "Previous approved TSR report (provides template, text & figures)",
-            type=["pdf"], key="ref_pdf"
-        )
-
-    with col2:
-        st.subheader("📊 Composition Excel")
-        excel_file = st.file_uploader(
-            "Ingredient composition (sheet 1: name | function | amounts per strength)",
-            type=["xlsx","xls"], key="excel"
-        )
-
-    with col3:
-        st.subheader("📁 Annexure JSONs (1–16)")
-        annexure_files = st.file_uploader(
-            "Document AI JSONs — one per excipient/DS annexure, in order",
-            type=["json"], accept_multiple_files=True, key="annexures"
-        )
-
-    st.markdown("---")
-
-    if st.button("🚀 Generate Report", type="primary",
-                 disabled=not (ref_pdf and excel_file and annexure_files)):
-
-        progress = st.progress(0)
-        log = st.empty()
-
-        try:
-            # ── 1. Rasterize reference PDF ────────────────────────────────
-            log.info("📄 Rasterizing reference PDF pages…")
-            ref_bytes   = ref_pdf.getvalue()
-            page_images = rasterize_pdf_pages(ref_bytes, dpi=150)
-            emb_images  = extract_embedded_images(ref_bytes)
-            st.success(f"Reference PDF: {len(page_images)} pages loaded")
-            progress.progress(8)
-
-            # ── 2. Identify figure pages ──────────────────────────────────
-            log.info("🔍 Identifying figure/diagram pages with Claude…")
-            figure_pages = identify_figure_pages(page_images)
-            if figure_pages:
-                st.success(f"Found {len(figure_pages)} figure page(s): "
-                           + ", ".join(f"p{f['page_index']+1}" for f in figure_pages))
-            else:
-                st.warning("No figures detected. Check reference PDF quality.")
-            progress.progress(18)
-
-            # ── 3. Extract reference structure ────────────────────────────
-            log.info("📑 Extracting report structure with Claude…")
-            ref_structure = extract_reference_structure(page_images)
-            meta = ref_structure.get("meta", {})
-            st.success(f"Product: {meta.get('product_name','(extracted)')} | "
-                       f"Doc: {meta.get('document_no','')}")
-            progress.progress(35)
-
-            # ── 4. Parse Excel ────────────────────────────────────────────
-            log.info("📊 Parsing composition Excel…")
-            comp_data = parse_composition_excel(excel_file.getvalue())
-            n_ing = sum(len(s.get("rows",[])) for s in comp_data.get("sections",[]))
-            st.success(f"Excel: {n_ing} ingredients across {len(comp_data.get('sections',[]))} sections | "
-                       f"MDD: {comp_data.get('mdd_sachets',6)}× {comp_data.get('mdd_strength','40mg')}")
-            progress.progress(45)
-
-            # ── 5. Process annexures ──────────────────────────────────────
-            log.info(f"🔬 Processing {len(annexure_files)} annexure(s) with Claude…")
-            annexure_data = []
-            for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
-                raw_json = json.loads(af.read().decode("utf-8"))
-                ann = process_annexure(raw_json, i+1)
-                annexure_data.append(ann)
-                st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
-                         f"({ann.get('supplier_name','?')}) — {len(ann.get('elements',[]))} elements")
-                progress.progress(45 + int(20 * (i+1) / len(annexure_files)))
-
-            # ── 6. Calculate Tables 5, 6, 7 ──────────────────────────────
-            log.info("🧮 Calculating EI tables (Tables 5, 6, 7)…")
-            calc_tables = calculate_ei_tables(comp_data, annexure_data)
-            # Show crossing-30% elements
-            crossing = [sym for sym in TABLE5_ELEMENTS
-                        if ICH_PDE[sym]["pde"] and
-                           calc_tables["class1_2a"]["element_totals"].get(sym,0) >
-                           ICH_PDE[sym]["pde"] * 0.30]
-            if crossing:
-                st.warning(f"Elements crossing 30% PDE (confirmatory testing needed): {', '.join(crossing)}")
-            else:
-                st.success("All Class 1+2A elements below 30% PDE — Option 2b compliant")
-            progress.progress(72)
-
-            # ── 7. Generate text sections ─────────────────────────────────
-            log.info("✍️ Generating report text sections with Claude…")
-            text_sections = generate_text_sections(ref_structure, annexure_data, calc_tables, comp_data)
-            progress.progress(82)
-
-            # ── 8. Build DOCX ─────────────────────────────────────────────
-            log.info("📝 Building Word document (Node.js / docx-js)…")
-            docx_bytes = assemble_and_generate(
-                ref_structure, page_images, figure_pages, emb_images,
-                annexure_data, comp_data, calc_tables, text_sections
-            )
-            progress.progress(100)
-            log.success("✅ Report generated!")
-
-            doc_no  = meta.get("document_no", "TSR").replace("/","_").replace(" ","_")
-            ver     = meta.get("version","v").split(",")[0].replace(" ","").replace(".","_")
-            fname   = f"{doc_no}_{ver}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-
-            st.download_button(
-                "📥 Download Report (DOCX)",
-                data=docx_bytes, file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-            logger.exception("Pipeline error")
-
-    with st.expander("ℹ️ How it works"):
-        st.markdown("""
-**Zero hardcoded product content.** Everything is derived from your uploads:
-
-| Input | Used for |
-|---|---|
-| Reference PDF | Template layout, all boilerplate text, figures/diagrams (auto-extracted by page) |
-| Annexure JSONs | Vendor element declarations → measured concentrations for Tables 5-7 |
-| Composition Excel | Ingredient amounts → daily intakes → Table 1, basis for Tables 5-7 |
-
-**Calculation pipeline (Tables 5, 6, 7):**
-1. Daily intake (g) = ingredient amount (mg) × MDD sachets ÷ 1000
-2. Total mass (µg/day) = daily intake × measured concentration (µg/g from annexure)
-3. %PDE = total mass ÷ ICH Q3D PDE × 100
-4. Threshold = 30% of PDE (ICH Q3D Option 2b)
-
-**Figures:** Claude scans every page of the reference PDF to identify diagram pages,
-then extracts those images and embeds them in the new report at the correct position.
-        """)
-
-if __name__ == "__main__":
-    main()
+      },
+      headers: { default: buildPageHeader(meta) },
+      footers: { default: buildPageFooter() },
+      children,
+    }]
+  });
+
+  const buf = await Packer.toBuffer(doc);
+  fs.writeFileSync(outPath, buf);
+  console.log(`Report written: ${outPath}  (${Math.round(buf.length/1024)} KB)`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+const [,, dataPath, outPath] = process.argv;
+if (!dataPath || !outPath) {
+  console.error("Usage: node generate_report.js <report_data.json> <output.docx>");
+  process.exit(1);
+}
+generateReport(dataPath, outPath).catch(e => { console.error(e); process.exit(1); });
