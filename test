@@ -243,10 +243,12 @@ def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
         errors.append("No annexure JSON files uploaded.")
     for i, (name, raw) in enumerate(annexure_raw):
         try:
-            obj = json.loads(raw)
-            if not isinstance(obj, dict):
+            cleaned = raw.lstrip("\ufeff")  # strip BOM if present
+            obj = json.loads(cleaned)
+            # Accept both dict {} and list [] — Document AI exports either
+            if not isinstance(obj, (dict, list)):
                 errors.append(
-                    f"Annexure {i + 1} ({name}): JSON root must be an object."
+                    f"Annexure {i + 1} ({name}): JSON must be object {{}} or array []."
                 )
         except json.JSONDecodeError as e:
             errors.append(f"Annexure {i + 1} ({name}): invalid JSON — {e}")
@@ -255,10 +257,15 @@ def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
     if not shutil.which("node"):
         errors.append("Node.js not found in PATH. Install Node.js >= 18.")
     else:
-        js_dir = Path(__file__).parent
-        if not (js_dir / "node_modules" / "docx").exists():
+        # Ask Node.js directly — works regardless of where node_modules lives
+        probe = subprocess.run(
+            ["node", "-e", "require('docx'); process.exit(0)"],
+            capture_output=True, timeout=10
+        )
+        if probe.returncode != 0:
             errors.append(
-                "npm package 'docx' not installed. Run: npm install docx"
+                "npm package 'docx' not importable by Node.js. "
+                "Run: npm install docx  (in the folder containing generate_report.js)"
             )
 
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -294,10 +301,10 @@ def extract_figure_from_page(pdf_bytes: bytes, page_index: int,
         page = doc.load_page(page_index)
         rect = page.rect
 
-        # Crop: skip top 25% (header) and small outer margins
+        # Crop: skip top 38% (IPDO header is large on A5 landscape) + outer margins
         crop = fitz.Rect(
             rect.x0 + rect.width  * 0.02,   # 2% left
-            rect.y0 + rect.height * 0.25,   # skip top 25% (header)
+            rect.y0 + rect.height * 0.38,   # skip top 38% (full header area)
             rect.x1 - rect.width  * 0.02,   # 2% right
             rect.y1 - rect.height * 0.03,   # 3% bottom margin
         )
@@ -312,38 +319,32 @@ def extract_figure_from_page(pdf_bytes: bytes, page_index: int,
 
 def extract_logo_from_pdf(pdf_bytes: bytes) -> Tuple[Optional[bytes], str]:
     """
-    Try to extract the Dr. Reddy's logo from the first page of the PDF.
-    Returns (image_bytes, media_type) or (None, '').
-    The logo is the small image embedded in the header area.
+    Extract the Dr. Reddy's logo by rasterizing the top-right corner of
+    the header area from page 1 at high DPI.
+    This approach captures exactly what is VISIBLE and avoids picking up
+    coloured background rectangles that are embedded as separate images.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page = doc.load_page(0)
-        img_list = page.get_images(full=True)
+        rect = page.rect
 
-        best_bytes: Optional[bytes] = None
-        best_size = 0
-
-        for img_info in img_list:
-            try:
-                xref = img_info[0]
-                base_img = doc.extract_image(xref)
-                img_bytes = base_img["image"]
-                size = len(img_bytes)
-                # Logo: small image (1 KB – 200 KB), larger than icons but not a full figure
-                if 1000 <= size <= 200000 and size > best_size:
-                    best_size = size
-                    best_bytes = img_bytes
-                    best_ext = base_img.get("ext", "png")
-            except Exception:
-                pass
-
+        # Dr. Reddy's logo sits in the top-right ~20% width × top ~13% height
+        logo_rect = fitz.Rect(
+            rect.x1 - rect.width  * 0.20,   # right 20%
+            rect.y0,                          # very top
+            rect.x1,                          # right edge
+            rect.y0 + rect.height * 0.13,    # top 13%
+        )
+        mat = fitz.Matrix(3, 3)              # 3× DPI for crisp output
+        pix = page.get_pixmap(
+            matrix=mat, alpha=False, colorspace=fitz.csRGB, clip=logo_rect
+        )
+        logo_bytes = pix.tobytes("png")
         doc.close()
 
-        if best_bytes:
-            ext = best_ext.lower()
-            media_type = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
-            return (best_bytes, media_type)
+        if len(logo_bytes) > 1000:
+            return (logo_bytes, "image/png")
     except Exception as e:
         logger.warning(f"Logo extraction failed: {e}")
 
@@ -1011,13 +1012,13 @@ def main():
 
             # Step 2: Extract Dr. Reddy's logo
             log.info("🖼 Extracting Dr. Reddy's logo from PDF…")
-            logo_bytes, logo_mt = extract_logo_from_pdf(ref_bytes)
+            logo_bytes, logo_mt = get_logo_from_assets()
             logo_b64  = base64.standard_b64encode(logo_bytes).decode() if logo_bytes else ""
             logo_type = logo_mt
             if logo_b64:
-                st.success("Logo extracted from reference PDF.")
+                st.success("✅ Logo loaded from assets/logo.png")
             else:
-                st.warning("Logo not found — will use styled text fallback.")
+                st.info("ℹ️ No logo in assets/. Save Dr. Reddys logo as assets/logo.png")
             progress.progress(10)
 
             # Step 3: Identify figure pages
@@ -1160,50 +1161,57 @@ if __name__ == "__main__":
 ####
 /**
  * generate_report.js  —  Dr. Reddy's IPDO TSR DOCX Generator
- * ICH Q3D (R2) | A5 Landscape (210 x 148 mm) | Times New Roman
- * Page borders, justified text, responsive table sizing, logo support
+ * ICH Q3D (R2) | A5 Landscape (210×148 mm) | Times New Roman 12pt body
+ *
+ * Fixes in this version:
+ *  1. Page borders — JSZip post-processing injects pgBorders XML reliably
+ *  2. Spell/grammar check disabled globally (settings) + noProof on every run
+ *  3. Header: Department, Strength, Market, Protocol in separate stacked rows
+ *     (nested table) — each field visually separated with borders
+ *  4. Title page: Title centered in large box; SOP Format Number in own row below
+ *  5. Body text: 12pt (SZ.TEXT); table cells remain 7pt (SZ.SM)
+ *  6. Word spacing: characterSpacing:15 (+0.75pt) on body runs only
+ *  7. Figure: 38% top crop (header fully removed)
+ *  8. Logo: loaded from assets/logo.png — never extracted from PDF
  *
  * Usage: node generate_report.js <data.json> <out.docx>
  */
 "use strict";
 
-var fs   = require("fs");
-var docx = require("docx");
+var fs     = require("fs");
+var JSZip  = require("jszip");
+var docx   = require("docx");
 
-var Document           = docx.Document;
-var Packer             = docx.Packer;
-var Paragraph          = docx.Paragraph;
-var TextRun            = docx.TextRun;
-var Table              = docx.Table;
-var TableRow           = docx.TableRow;
-var TableCell          = docx.TableCell;
-var ImageRun           = docx.ImageRun;
-var Header             = docx.Header;
-var Footer             = docx.Footer;
-var AlignmentType      = docx.AlignmentType;
-var BorderStyle        = docx.BorderStyle;
-var WidthType          = docx.WidthType;
-var ShadingType        = docx.ShadingType;
-var VerticalAlign      = docx.VerticalAlign;
-var PageNumber         = docx.PageNumber;
-var PageBreak          = docx.PageBreak;
-var convertInchesToTwip= docx.convertInchesToTwip;
-
-// Page border enums — graceful fallback if not in this docx version
-var PageBorderDisplay    = docx.PageBorderDisplay    || { ALL_PAGES: "allPages" };
-var PageBorderOffsetFrom = docx.PageBorderOffsetFrom || { PAGE: "page", TEXT: "text" };
+var Document            = docx.Document;
+var Packer              = docx.Packer;
+var Paragraph           = docx.Paragraph;
+var TextRun             = docx.TextRun;
+var Table               = docx.Table;
+var TableRow            = docx.TableRow;
+var TableCell           = docx.TableCell;
+var ImageRun            = docx.ImageRun;
+var Header              = docx.Header;
+var Footer              = docx.Footer;
+var AlignmentType       = docx.AlignmentType;
+var BorderStyle         = docx.BorderStyle;
+var WidthType           = docx.WidthType;
+var ShadingType         = docx.ShadingType;
+var VerticalAlign       = docx.VerticalAlign;
+var PageNumber          = docx.PageNumber;
+var PageBreak           = docx.PageBreak;
+var convertInchesToTwip = docx.convertInchesToTwip;
 
 
 // ============================================================================
 // PAGE GEOMETRY  —  A5 Landscape: 210 mm × 148 mm
 // ============================================================================
-var PAGE_W  = convertInchesToTwip(8.27);   // 210 mm
-var PAGE_H  = convertInchesToTwip(5.83);   // 148 mm
-var MAR_L   = convertInchesToTwip(0.47);   // left  margin
-var MAR_R   = convertInchesToTwip(0.47);   // right margin
-var MAR_T   = convertInchesToTwip(0.98);   // top   margin  (space for header)
-var MAR_B   = convertInchesToTwip(0.39);   // bottom margin
-var CW      = PAGE_W - MAR_L - MAR_R;     // usable content width
+var PAGE_W = convertInchesToTwip(8.27);   // 210 mm
+var PAGE_H = convertInchesToTwip(5.83);   // 148 mm
+var MAR_L  = convertInchesToTwip(0.47);
+var MAR_R  = convertInchesToTwip(0.47);
+var MAR_T  = convertInchesToTwip(0.98);   // space for header table
+var MAR_B  = convertInchesToTwip(0.39);
+var CW     = PAGE_W - MAR_L - MAR_R;      // usable content width ≈ 10260 twips
 
 
 // ============================================================================
@@ -1221,62 +1229,64 @@ var COLOR = {
 
 
 // ============================================================================
-// FONT & SIZES  (half-points: 1pt = 2 half-points)
+// FONTS & SIZES  (docx uses half-points: 1pt = 2 half-pts)
 // ============================================================================
-var FONT_BODY  = "Times New Roman";
-var FONT_HDR   = "Times New Roman";
+var FONT = "Times New Roman";
 
 var SZ = {
-  XXS:  10,   // 5pt  — very wide tables
-  XS:   12,   // 6pt  — wide tables
-  SM:   14,   // 7pt  — table headers / data
-  BODY: 18,   // 9pt  — body text
-  MD:   20,   // 10pt — section headings
-  LG:   22,   // 11pt — main heading
-  XL:   24,   // 12pt — title
+  XXS:  10,   //  5pt — very wide table columns
+  XS:   12,   //  6pt — wide table columns
+  SM:   14,   //  7pt — table headers & data
+  TEXT: 24,   // 12pt — generated body text ONLY (not tables, not header)
+  HDR:  18,   //  9pt — section headings inside document
+  MD:   20,   // 10pt — section number headings
+  LG:   22,   // 11pt — large heading
+  XL:   26,   // 13pt — title page title
 };
+
+// Character spacing for body text (+0.75pt = 15 twentieths-of-a-point)
+var BODY_CHAR_SPACING = 15;
 
 
 // ============================================================================
 // BORDER HELPERS
 // ============================================================================
 function bdr(size, color) {
-  return {
-    style: BorderStyle.SINGLE,
-    size:  size  || 4,
-    color: color || COLOR.BLACK,
-  };
+  return { style: BorderStyle.SINGLE, size: size || 4, color: color || COLOR.BLACK };
 }
 
 function allBorders(size) {
   var b = bdr(size);
-  return {
-    top: b, bottom: b, left: b, right: b,
-    insideHorizontal: b, insideVertical: b,
-  };
+  return { top: b, bottom: b, left: b, right: b,
+           insideHorizontal: b, insideVertical: b };
+}
+
+function noBorders() {
+  var nb = { style: BorderStyle.NIL, size: 0, color: COLOR.WHITE };
+  return { top: nb, bottom: nb, left: nb, right: nb };
 }
 
 function cellShade(fill) {
   return { fill: fill, type: ShadingType.CLEAR, color: "auto" };
 }
 
-function cellMargins() {
-  return { top: 30, right: 60, bottom: 30, left: 60 };
-}
+function cm() { return { top: 30, right: 60, bottom: 30, left: 60 }; }
 
 
 // ============================================================================
-// TEXT RUN
+// TEXT RUN — noProof disables Word red/blue underlines
 // ============================================================================
 function mkRun(text, opts) {
   opts = opts || {};
   return new TextRun({
-    text:    String(text == null ? "" : text),
-    bold:    !!opts.bold,
-    size:    opts.size  || SZ.BODY,
-    font:    opts.font  || FONT_BODY,
-    color:   opts.color || COLOR.BLACK,
-    italics: !!opts.italics,
+    text:             String(text == null ? "" : text),
+    bold:             !!opts.bold,
+    size:             opts.size  || SZ.TEXT,
+    font:             FONT,
+    color:            opts.color || COLOR.BLACK,
+    italics:          !!opts.italics,
+    characterSpacing: opts.characterSpacing || 0,
+    noProof:          true,   // disables spell check underline on every run
   });
 }
 
@@ -1286,15 +1296,15 @@ function mkRun(text, opts) {
 // ============================================================================
 function mkPara(content, opts) {
   opts = opts || {};
-  var children;
+  var runs;
   if (typeof content === "string") {
-    children = [mkRun(content, opts)];
+    runs = [mkRun(content, opts)];
   } else if (Array.isArray(content)) {
-    children = content;
+    runs = content;
   } else if (content) {
-    children = [content];
+    runs = [content];
   } else {
-    children = [mkRun("", opts)];
+    runs = [mkRun("", opts)];
   }
   return new Paragraph({
     alignment: opts.align || AlignmentType.LEFT,
@@ -1303,59 +1313,25 @@ function mkPara(content, opts) {
       after:  (opts.after  == null ? 40 : opts.after),
       line:   opts.line || 264,
     },
-    children: children,
+    children: runs,
   });
 }
 
-// Justified body paragraph (matches original word spacing aesthetic)
+// Justified body paragraph — 12pt, +0.75pt char spacing, 1.2 line spacing
 function bodyPara(text, opts) {
   opts = opts || {};
-  return mkPara(text, {
-    align:  AlignmentType.BOTH,   // justified
-    size:   opts.size   || SZ.BODY,
-    bold:   opts.bold   || false,
-    before: opts.before || 20,
-    after:  opts.after  || 20,
-    line:   276,                   // 1.15 line spacing
-  });
-}
-
-function centerPara(text, bold, size) {
-  return mkPara(text, {
-    align:  AlignmentType.CENTER,
-    bold:   !!bold,
-    size:   size || SZ.BODY,
-    before: 40,
-    after:  40,
-  });
-}
-
-function leftPara(text, bold, size) {
-  return mkPara(text, {
-    align:  AlignmentType.LEFT,
-    bold:   !!bold,
-    size:   size || SZ.BODY,
-    before: 20,
-    after:  20,
-  });
-}
-
-function blankPara() {
-  return mkPara("", { before: 20, after: 20 });
-}
-
-function pgBreak() {
-  return new Paragraph({ children: [new PageBreak()] });
-}
-
-function sectionHeading(text) {
-  return mkPara(text, {
-    align:  AlignmentType.LEFT,
-    bold:   true,
-    size:   SZ.MD,
-    before: 80,
-    after:  40,
-    line:   264,
+  return new Paragraph({
+    alignment: AlignmentType.BOTH,
+    spacing: { before: opts.before || 20, after: opts.after || 20, line: 288 },
+    children: [new TextRun({
+      text:             String(text == null ? "" : text),
+      bold:             !!opts.bold,
+      size:             opts.size || SZ.TEXT,
+      font:             FONT,
+      color:            COLOR.BLACK,
+      characterSpacing: BODY_CHAR_SPACING,
+      noProof:          true,
+    })],
   });
 }
 
@@ -1370,61 +1346,78 @@ function bodyParagraphs(text) {
   return result;
 }
 
+function centerPara(text, bold, size) {
+  return mkPara(text, { align: AlignmentType.CENTER, bold: !!bold,
+                         size: size || SZ.TEXT, before: 40, after: 40 });
+}
+
+function leftPara(text, bold, size) {
+  return mkPara(text, { align: AlignmentType.LEFT, bold: !!bold,
+                         size: size || SZ.TEXT, before: 20, after: 20 });
+}
+
+function blankPara() { return mkPara("", { before: 20, after: 20 }); }
+
+function pgBreak() { return new Paragraph({ children: [new PageBreak()] }); }
+
+function sectionHeading(text) {
+  return mkPara(text, { align: AlignmentType.LEFT, bold: true,
+                         size: SZ.MD, before: 80, after: 40, line: 264 });
+}
+
 
 // ============================================================================
 // TABLE CELL HELPERS
+// (table cells use SZ.SM / SZ.XS — NOT SZ.TEXT; noProof still applied)
 // ============================================================================
 function mkCell(text, opts) {
   opts = opts || {};
-  var sz    = opts.size  || SZ.SM;
-  var align = opts.align || AlignmentType.CENTER;
-  var colSpan = opts.colSpan || 1;
   return new TableCell({
-    columnSpan:    colSpan,
+    columnSpan:    opts.colSpan || 1,
     width:         opts.w ? { size: opts.w, type: WidthType.DXA } : undefined,
-    borders:       allBorders(4),
+    borders:       opts.noBorder ? noBorders() : allBorders(4),
     shading:       opts.fill ? cellShade(opts.fill) : undefined,
-    margins:       cellMargins(),
+    margins:       cm(),
     verticalAlign: VerticalAlign.CENTER,
     children: [new Paragraph({
-      alignment: align,
+      alignment: opts.align || AlignmentType.CENTER,
       spacing: { before: 0, after: 0 },
       children: [new TextRun({
-        text:  String(text == null ? "" : text),
-        bold:  !!opts.bold,
-        size:  sz,
-        font:  FONT_BODY,
-        color: opts.color || COLOR.BLACK,
+        text:    String(text == null ? "" : text),
+        bold:    !!opts.bold,
+        size:    opts.size || SZ.SM,
+        font:    FONT,
+        color:   opts.color || COLOR.BLACK,
+        noProof: true,
       })],
     })],
   });
 }
 
-function mkCellLeft(text, opts) {
+function mkCellL(text, opts) {
   opts = opts || {};
   opts.align = AlignmentType.LEFT;
   return mkCell(text, opts);
 }
 
+// Multi-line cell — each line is a separate paragraph within one cell
 function mkCellML(lines, opts) {
   opts = opts || {};
   var arr = Array.isArray(lines) ? lines : [lines];
   return new TableCell({
     columnSpan:    opts.colSpan || 1,
     width:         opts.w ? { size: opts.w, type: WidthType.DXA } : undefined,
-    borders:       allBorders(4),
+    borders:       opts.noBorder ? noBorders() : allBorders(4),
     shading:       opts.fill ? cellShade(opts.fill) : undefined,
-    margins:       cellMargins(),
+    margins:       cm(),
     verticalAlign: VerticalAlign.CENTER,
     children: arr.filter(function (l) { return l != null; }).map(function (l) {
       return new Paragraph({
         alignment: AlignmentType.LEFT,
         spacing: { before: 0, after: 0 },
         children: [new TextRun({
-          text: String(l),
-          bold: !!opts.bold,
-          size: opts.size || SZ.XS,
-          font: FONT_BODY,
+          text: String(l), bold: !!opts.bold,
+          size: opts.size || SZ.XS, font: FONT, noProof: true,
         })],
       });
     }),
@@ -1436,118 +1429,161 @@ function emptyCell(fill, w) {
     width:    w ? { size: w, type: WidthType.DXA } : undefined,
     borders:  allBorders(4),
     shading:  fill ? cellShade(fill) : undefined,
-    margins:  cellMargins(),
-    children: [new Paragraph({ children: [new TextRun("")] })],
+    margins:  cm(),
+    children: [new Paragraph({ children: [new TextRun({ text: "", noProof: true })] })],
   });
 }
 
 
 // ============================================================================
 // PAGE HEADER
-// Purpose: IPDO | TSR center | Logo right
-//          Title (spans) | Dept/Strength/Market/Protocol (stacked right)
-//          Doc No | Product Name | Dosage Form | Version
+//
+// Structure matching original Dr. Reddy's IPDO document:
+//
+// ┌──────────┬────────────────────────────────────┬──────────────────────────┐
+// │ IPDO     │   Technical Summary Report          │  [Logo / Dr. Reddy's]   │
+// ├──────────┴─────────────────────────┬───────────┼──────────────────────────┤
+// │ Title: [full title text]           │ Dept: FR&D│                          │
+// │                                    ├───────────┤                          │
+// │                                    │ Str: 10mg │                          │
+// │                                    ├───────────┤                          │
+// │                                    │ Mkt: USA  │                          │
+// │                                    ├───────────┤                          │
+// │                                    │ Prot: NA  │                          │
+// ├──────────┬──────────────────┬──────┴───────────┴──────────────────────────┤
+// │ Doc No   │ Product Name     │ Dosage Form       │ Version                 │
+// └──────────┴──────────────────┴───────────────────┴─────────────────────────┘
+//
+// The right-side "nested" column uses a nested table for Dept/Strength/Market/Protocol.
 // ============================================================================
 function buildPageHeader(meta, logoB64, logoType) {
   meta = meta || {};
-  var title      = meta.title       || "";
-  var docNo      = meta.document_no || "";
-  var prodName   = meta.product_name|| "";
-  var dosage     = meta.dosage_form || "";
-  var version    = meta.version     || "";
-  var strength   = meta.strength    || "";
-  var department = meta.department  || "";
-  var market     = meta.market      || "";
-  var protocol   = meta.protocol    || "";
+  var title      = meta.title        || "";
+  var docNo      = meta.document_no  || "";
+  var prodName   = meta.product_name || "";
+  var dosage     = meta.dosage_form  || "";
+  var version    = meta.version      || "";
+  var strength   = meta.strength     || "";
+  var department = meta.department   || "";
+  var market     = meta.market       || "";
+  var protocol   = meta.protocol     || "";
 
-  // 4-column layout
-  var C1 = 1100;   // IPDO
-  var C2 = 4800;   // Title / Doc No / Product Name (wide)
-  var C3 = 1700;   // Part of title span / Dosage Form
-  var C4 = Math.max(500, CW - C1 - C2 - C3);  // Logo / Dept info / Version
+  // Column widths — 4 main cols summing to CW
+  var C1 = 900;    // IPDO label
+  var C4 = 1700;   // Logo column
+  var C2 = 5200;   // Title / Doc No / Product Name
+  var C3 = CW - C1 - C2 - C4;  // Department/Strength/Market/Protocol
 
-  // ── Row 1: IPDO | Technical Summary Report (spans C2+C3) | Logo/Dr.Reddy's ──
+  // ── Logo cell ─────────────────────────────────────────────────────────────
   var logoCell;
   if (logoB64 && logoB64.length > 100) {
     try {
       var logoBuf = Buffer.from(logoB64, "base64");
-      var lt = (logoType || "").indexOf("jpeg") >= 0 ? "jpg" : "png";
+      var imgType = (logoType || "").indexOf("jpeg") >= 0 ? "jpg" : "png";
       var logoImg = new ImageRun({
-        type: lt,
-        data: logoBuf,
-        transformation: { width: 72, height: 36 },
+        type: imgType, data: logoBuf,
+        transformation: { width: 110, height: 44 },
       });
       logoCell = new TableCell({
-        width:  { size: C4, type: WidthType.DXA },
-        borders: allBorders(4),
-        margins: cellMargins(),
-        verticalAlign: VerticalAlign.CENTER,
+        width: { size: C4, type: WidthType.DXA },
+        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
         children: [new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { before: 0, after: 0 },
+          alignment: AlignmentType.RIGHT, spacing: { before: 0, after: 0 },
           children: [logoImg],
         })],
       });
     } catch (e) {
-      logoCell = mkCellLeft("Dr. Reddy's", {
-        bold: true, size: SZ.SM, w: C4, align: AlignmentType.RIGHT,
-      });
+      logoCell = mkCell("Dr. Reddy's",
+        { bold: true, size: SZ.XS, w: C4, align: AlignmentType.RIGHT });
     }
   } else {
-    logoCell = mkCell("Dr. Reddy's", {
-      bold: true, size: SZ.SM, w: C4, align: AlignmentType.RIGHT,
-    });
+    logoCell = mkCell("Dr. Reddy's",
+      { bold: true, size: SZ.XS, w: C4, align: AlignmentType.RIGHT });
   }
 
+  // ── Row 1: IPDO | Technical Summary Report | Logo ────────────────────────
   var row1 = new TableRow({
     children: [
-      mkCell("IPDO", {
-        bold: true, size: SZ.MD, align: AlignmentType.LEFT, w: C1,
-      }),
+      mkCell("IPDO", { bold: true, size: SZ.MD, align: AlignmentType.LEFT, w: C1 }),
       new TableCell({
-        columnSpan: 2,
-        width:  { size: C2 + C3, type: WidthType.DXA },
-        borders: allBorders(4),
-        margins: cellMargins(),
-        verticalAlign: VerticalAlign.CENTER,
+        columnSpan: 2, width: { size: C2 + C3, type: WidthType.DXA },
+        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
         children: [centerPara("Technical Summary Report", true, SZ.MD)],
       }),
       logoCell,
     ],
   });
 
-  // ── Row 2: Title (C1+C2+C3) | Dept/Strength/Market/Protocol stacked (C4) ──
+  // ── Right nested table: Department / Strength / Market / Protocol ─────────
+  // Each field gets its own row so they are visually separated with cell borders
+  var rightNestedW = C3 + C4;  // right nested table spans both C3 and C4 cols
+  function rightRow(label, value) {
+    var labelW = Math.round(rightNestedW * 0.45);
+    var valueW = rightNestedW - labelW;
+    return new TableRow({
+      children: [
+        mkCellL(label, { size: SZ.XS, bold: true, w: labelW }),
+        mkCellL(value, { size: SZ.XS, w: valueW }),
+      ],
+    });
+  }
+  var rightNestedTable = new Table({
+    width: { size: rightNestedW, type: WidthType.DXA },
+    columnWidths: [Math.round(rightNestedW * 0.45), rightNestedW - Math.round(rightNestedW * 0.45)],
+    rows: [
+      rightRow("Department:", department),
+      rightRow("Strength:",   strength),
+      rightRow("Market:",     market),
+      rightRow("Protocol:",   protocol),
+    ],
+  });
+
+  // ── Row 2: Title (left wide) | Dept/Str/Mkt/Prot nested table (right) ────
   var row2 = new TableRow({
     children: [
-      mkCellML([("Title: " + title)], {
-        colSpan: 3, w: C1 + C2 + C3, size: SZ.XS,
+      new TableCell({
+        columnSpan: 2, width: { size: C1 + C2, type: WidthType.DXA },
+        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
+        children: [new Paragraph({
+          alignment: AlignmentType.LEFT, spacing: { before: 0, after: 0 },
+          children: [new TextRun({
+            text: "Title: " + title, bold: false, size: SZ.XS, font: FONT, noProof: true,
+          })],
+        })],
       }),
-      mkCellML([
-        "Department: " + department,
-        "Strength: "   + strength,
-        "Market: "     + market,
-        "Protocol: "   + protocol,
-      ], { size: SZ.XS, w: C4 }),
+      // Right side: nested table inside a single spanning cell
+      new TableCell({
+        columnSpan: 2, width: { size: C3 + C4, type: WidthType.DXA },
+        borders: allBorders(4), margins: { top: 0, right: 0, bottom: 0, left: 0 },
+        verticalAlign: VerticalAlign.CENTER,
+        children: [rightNestedTable],
+      }),
     ],
   });
 
-  // ── Row 3: Doc No | Product Name | Dosage Form | Version ──
+  // ── Row 3: Doc No | Product Name | Dosage Form | Version ─────────────────
+  // Each field in its own cell, widths proportional
+  var r3w1 = Math.round(CW * 0.18);
+  var r3w2 = Math.round(CW * 0.35);
+  var r3w3 = Math.round(CW * 0.22);
+  var r3w4 = CW - r3w1 - r3w2 - r3w3;
+
   var row3 = new TableRow({
     children: [
-      mkCellLeft("Document No: " + docNo,          { size: SZ.XS, w: C1 }),
-      mkCellLeft("Product Name: " + prodName,      { size: SZ.XS, w: C2 }),
-      mkCellLeft("Dosage Form: " + dosage,         { size: SZ.XS, w: C3 }),
-      mkCellLeft("Version: " + version,            { size: SZ.XS, w: C4 }),
+      mkCellL("Document No: " + docNo,     { size: SZ.XS, w: r3w1 }),
+      mkCellL("Product Name: " + prodName, { size: SZ.XS, w: r3w2 }),
+      mkCellL("Dosage Form: " + dosage,    { size: SZ.XS, w: r3w3 }),
+      mkCellL("Version: " + version,       { size: SZ.XS, w: r3w4 }),
     ],
   });
 
-  var hdrTbl = new Table({
+  var hdrTable = new Table({
     width: { size: CW, type: WidthType.DXA },
     columnWidths: [C1, C2, C3, C4],
     rows: [row1, row2, row3],
   });
 
-  return new Header({ children: [hdrTbl, blankPara()] });
+  return new Header({ children: [hdrTable, blankPara()] });
 }
 
 
@@ -1557,13 +1593,12 @@ function buildPageHeader(meta, logoB64, logoType) {
 function buildPageFooter() {
   return new Footer({
     children: [new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing: { before: 0, after: 0 },
+      alignment: AlignmentType.CENTER, spacing: { before: 0, after: 0 },
       children: [
-        new TextRun({ text: "Page ",   size: SZ.XS, font: FONT_BODY }),
-        new TextRun({ children: [PageNumber.CURRENT], size: SZ.XS, font: FONT_BODY }),
-        new TextRun({ text: " of ",    size: SZ.XS, font: FONT_BODY }),
-        new TextRun({ children: [PageNumber.TOTAL_PAGES], size: SZ.XS, font: FONT_BODY }),
+        new TextRun({ text: "Page ", size: SZ.XS, font: FONT, noProof: true }),
+        new TextRun({ children: [PageNumber.CURRENT], size: SZ.XS, font: FONT }),
+        new TextRun({ text: " of ", size: SZ.XS, font: FONT, noProof: true }),
+        new TextRun({ children: [PageNumber.TOTAL_PAGES], size: SZ.XS, font: FONT }),
       ],
     })],
   });
@@ -1572,28 +1607,45 @@ function buildPageFooter() {
 
 // ============================================================================
 // TITLE PAGE
+//
+// Original layout:
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │         [Title text — centered, large, bold]                             │
+// └──────────────────────────────────────────────────────────────────────────┘
+// SOP Format Number: FORM-IPDO-GRD-0060(2.0)   ← separate row, smaller
+//
 // ============================================================================
 function buildTitlePage(meta) {
   meta = meta || {};
   var sop = meta.sop_format_number || "";
 
+  // Title box — full width, thick border, large bold centered text
   var titleBox = new Table({
     width: { size: CW, type: WidthType.DXA },
     columnWidths: [CW],
     rows: [new TableRow({
       children: [new TableCell({
-        borders:  allBorders(12),
-        margins:  { top: 400, right: 500, bottom: 400, left: 500 },
-        children: [
-          centerPara(meta.title || "", true, SZ.LG),
-          blankPara(),
-          centerPara("SOP Format Number: " + sop, false, SZ.BODY),
-        ],
+        borders: allBorders(12),
+        margins: { top: 600, right: 600, bottom: 600, left: 600 },
+        children: [centerPara(meta.title || "", true, SZ.XL)],
       })],
     })],
   });
 
-  return [titleBox, pgBreak()];
+  // SOP Format Number row — separate, below title box
+  var sopRow = new Table({
+    width: { size: CW, type: WidthType.DXA },
+    columnWidths: [CW],
+    rows: [new TableRow({
+      children: [new TableCell({
+        borders: allBorders(4),
+        margins: cm(),
+        children: [leftPara("SOP Format Number: " + sop, false, SZ.SM)],
+      })],
+    })],
+  });
+
+  return [titleBox, blankPara(), sopRow, pgBreak()];
 }
 
 
@@ -1602,18 +1654,17 @@ function buildTitlePage(meta) {
 // ============================================================================
 function buildTOC(tocEntries) {
   var def = [
-    { no: "1", title: "Abstract",                                          page: "3" },
-    { no: "2", title: "Objective",                                         page: "3" },
-    { no: "3", title: "Details of the study location / testing location", page: "3" },
-    { no: "4", title: "Background",                                        page: "3" },
-    { no: "5", title: "Drug product elemental impurity risk assessment",   page: "5" },
-    { no: "6", title: "Summary & Conclusion",                              page: "17"},
-    { no: "7", title: "Reference",                                         page: "19"},
-    { no: "8", title: "List of Annexures",                                 page: "19"},
-    { no: "9", title: "Revision History",                                  page: "19"},
+    { no: "1", title: "Abstract",                                          page: "3"  },
+    { no: "2", title: "Objective",                                         page: "3"  },
+    { no: "3", title: "Details of the study location / testing location", page: "3"  },
+    { no: "4", title: "Background",                                        page: "3"  },
+    { no: "5", title: "Drug product elemental impurity risk assessment",   page: "5"  },
+    { no: "6", title: "Summary & Conclusion",                              page: "17" },
+    { no: "7", title: "Reference",                                         page: "19" },
+    { no: "8", title: "List of Annexures",                                 page: "19" },
+    { no: "9", title: "Revision History",                                  page: "19" },
   ];
-  var entries = (Array.isArray(tocEntries) && tocEntries.length)
-    ? tocEntries : def;
+  var entries = (Array.isArray(tocEntries) && tocEntries.length) ? tocEntries : def;
 
   var W = [600, CW - 600 - 900, 900];
 
@@ -1629,7 +1680,7 @@ function buildTOC(tocEntries) {
     return new TableRow({
       children: [
         mkCell(e.no    || "", { w: W[0], size: SZ.SM }),
-        mkCellLeft(e.title || "", { w: W[1], size: SZ.SM }),
+        mkCellL(e.title || "", { w: W[1], size: SZ.SM }),
         mkCell(e.page  || "", { w: W[2], size: SZ.SM }),
       ],
     });
@@ -1646,7 +1697,7 @@ function buildTOC(tocEntries) {
 
 
 // ============================================================================
-// SECTIONS 1–4
+// SECTIONS 1–4  (Abstract, Objective, Study Location, Background)
 // ============================================================================
 function buildTextSections(txt) {
   txt = txt || {};
@@ -1695,34 +1746,29 @@ function buildCompositionTable(sections) {
   });
 
   var dataRows = [];
-  var sectArr  = Array.isArray(sections) ? sections : [];
-
-  for (var s = 0; s < sectArr.length; s++) {
-    var sec = sectArr[s];
+  var sArr = Array.isArray(sections) ? sections : [];
+  for (var si = 0; si < sArr.length; si++) {
+    var sec = sArr[si];
     if (!sec || typeof sec !== "object") continue;
-
     // Blue section-header row spanning all 5 columns
     dataRows.push(new TableRow({
       children: [new TableCell({
-        columnSpan: 5,
-        borders:    allBorders(4),
-        shading:    cellShade(COLOR.SECTION_BLUE),
-        margins:    cellMargins(),
-        children:   [leftPara(sec.name || "", true, SZ.SM)],
+        columnSpan: 5, borders: allBorders(4), shading: cellShade(COLOR.SECTION_BLUE),
+        margins: cm(),
+        children: [leftPara(sec.name || "", true, SZ.SM)],
       })],
     }));
-
-    var rowArr = Array.isArray(sec.rows) ? sec.rows : [];
-    for (var r = 0; r < rowArr.length; r++) {
-      var row = rowArr[r];
+    var rArr = Array.isArray(sec.rows) ? sec.rows : [];
+    for (var ri = 0; ri < rArr.length; ri++) {
+      var row = rArr[ri];
       if (!row || typeof row !== "object") continue;
       dataRows.push(new TableRow({
         children: [
-          mkCellLeft(String(row.ingredient || row.name || ""), { w: W[0], size: SZ.SM }),
+          mkCellL(String(row.ingredient || row.name || ""), { w: W[0], size: SZ.SM }),
           mkCell(String(row.status || row.compendial_status || ""), { w: W[1], size: SZ.SM }),
-          mkCell(String(row["40mg"] || row.amount_40mg || ""),      { w: W[2], size: SZ.SM }),
-          mkCell(String(row["20mg"] || row.amount_20mg || ""),      { w: W[3], size: SZ.SM }),
-          mkCell(String(row["10mg"] || row.amount_10mg || ""),      { w: W[4], size: SZ.SM }),
+          mkCell(String(row["40mg"] || row.amount_40mg || ""), { w: W[2], size: SZ.SM }),
+          mkCell(String(row["20mg"] || row.amount_20mg || ""), { w: W[3], size: SZ.SM }),
+          mkCell(String(row["10mg"] || row.amount_10mg || ""), { w: W[4], size: SZ.SM }),
         ],
       }));
     }
@@ -1744,38 +1790,32 @@ function buildCompositionTable(sections) {
 
 
 // ============================================================================
-// FIGURE  (diagram only — header already cropped in app.py)
+// FIGURE  (38% top already cropped in app.py — only diagram arrives here)
 // ============================================================================
 function buildFigure(fig) {
   if (!fig || !fig.data_b64 || typeof fig.data_b64 !== "string"
       || fig.data_b64.length < 100) {
     return [];
   }
-
   var imgBuf;
   try {
     imgBuf = Buffer.from(fig.data_b64, "base64");
     if (imgBuf.length < 500) return [];
-  } catch (e) {
-    return [];
-  }
+  } catch (e) { return []; }
 
   var imgType = (fig.media_type || "").indexOf("jpeg") >= 0 ? "jpg" : "png";
   var imgW    = 580;
   var imgH    = Math.round(imgW * 0.65);
 
-  var image = new ImageRun({
-    type:           imgType,
-    data:           imgBuf,
-    transformation: { width: imgW, height: imgH },
+  var img = new ImageRun({
+    type: imgType, data: imgBuf, transformation: { width: imgW, height: imgH },
   });
 
   return [
     leftPara(fig.figure_label || "Figure 1", true, SZ.SM),
     new Paragraph({
-      alignment: AlignmentType.CENTER,
-      spacing:   { before: 40, after: 40 },
-      children:  [image],
+      alignment: AlignmentType.CENTER, spacing: { before: 40, after: 40 },
+      children: [img],
     }),
     blankPara(),
     pgBreak(),
@@ -1784,22 +1824,18 @@ function buildFigure(fig) {
 
 
 // ============================================================================
-// SOURCES + TABLE 2
+// SOURCES SECTION  (narrative text + Table 2)
 // ============================================================================
 function buildSourcesSection(txt, annexureList) {
   txt = txt || {};
   var list = Array.isArray(annexureList) ? annexureList : [];
   var ch   = [];
 
-  var introTexts = [
-    txt.sources_intro,
-    txt.drug_substance_section,
-    txt.excipient_intro,
-  ];
-  for (var t = 0; t < introTexts.length; t++) {
-    if (introTexts[t]) {
-      var paras = bodyParagraphs(introTexts[t]);
-      for (var k = 0; k < paras.length; k++) ch.push(paras[k]);
+  var introBlocks = [txt.sources_intro, txt.drug_substance_section, txt.excipient_intro];
+  for (var ti = 0; ti < introBlocks.length; ti++) {
+    if (introBlocks[ti]) {
+      var ip = bodyParagraphs(introBlocks[ti]);
+      for (var pi = 0; pi < ip.length; pi++) ch.push(ip[pi]);
       ch.push(blankPara());
     }
   }
@@ -1808,45 +1844,38 @@ function buildSourcesSection(txt, annexureList) {
   var AW1 = Math.round(CW * 0.36);
   var AW2 = CW - AW0 - AW1;
 
-  var annHdr = new TableRow({
-    children: [
-      mkCell("Name of Excipient / Material",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW0, size: SZ.SM }),
-      mkCell("Vendor",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW1, size: SZ.SM }),
-      mkCell("Title of Annexure",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW2, size: SZ.SM }),
-    ],
-  });
-  var annRows = list.map(function (a, i) {
-    return new TableRow({
-      children: [
-        mkCellLeft(a.material || "", { w: AW0, size: SZ.SM }),
-        mkCellLeft(a.supplier || "", { w: AW1, size: SZ.SM }),
-        mkCell(a.annexure || ("Annexure " + (i + 1)), { w: AW2, size: SZ.SM }),
-      ],
-    });
-  });
   var annTbl = new Table({
     width: { size: CW, type: WidthType.DXA },
     columnWidths: [AW0, AW1, AW2],
-    rows: [annHdr].concat(annRows),
+    rows: [
+      new TableRow({
+        children: [
+          mkCell("Name of Excipient / Material", { bold: true, fill: COLOR.HEADER_GREY, w: AW0, size: SZ.SM }),
+          mkCell("Vendor",                        { bold: true, fill: COLOR.HEADER_GREY, w: AW1, size: SZ.SM }),
+          mkCell("Title of Annexure",             { bold: true, fill: COLOR.HEADER_GREY, w: AW2, size: SZ.SM }),
+        ],
+      }),
+    ].concat(list.map(function (a, idx) {
+      return new TableRow({
+        children: [
+          mkCellL(a.material || "", { w: AW0, size: SZ.SM }),
+          mkCellL(a.supplier || "", { w: AW1, size: SZ.SM }),
+          mkCell(a.annexure || ("Annexure " + (idx + 1)), { w: AW2, size: SZ.SM }),
+        ],
+      });
+    })),
   });
 
   ch.push(leftPara("Table No.2 Details of Annexures", true, SZ.SM));
   ch.push(annTbl);
   ch.push(blankPara());
 
-  var subTexts = [
-    txt.manufacturing_section,
-    txt.container_closure_section,
-    txt.utilities_section,
-    txt.control_strategy,
-  ];
-  for (var st = 0; st < subTexts.length; st++) {
-    if (subTexts[st]) {
-      var ps = bodyParagraphs(subTexts[st]);
-      for (var pk = 0; pk < ps.length; pk++) ch.push(ps[pk]);
+  var subBlocks = [txt.manufacturing_section, txt.container_closure_section,
+                   txt.utilities_section,      txt.control_strategy];
+  for (var si = 0; si < subBlocks.length; si++) {
+    if (subBlocks[si]) {
+      var sp = bodyParagraphs(subBlocks[si]);
+      for (var spi = 0; spi < sp.length; spi++) ch.push(sp[spi]);
       ch.push(blankPara());
     }
   }
@@ -1859,220 +1888,155 @@ function buildSourcesSection(txt, annexureList) {
 // ============================================================================
 // NUMBER FORMATTER
 // ============================================================================
-function fmt(val, decimals) {
-  if (decimals == null) decimals = 4;
+function fmt(val, dec) {
+  if (dec == null) dec = 4;
   if (val == null || val === "") return "";
-  var s = String(val).replace(/[^0-9.eE+\-]/g, "");
-  var n = parseFloat(s);
+  var n = parseFloat(String(val).replace(/[^0-9.eE+\-]/g, ""));
   if (isNaN(n) || !isFinite(n)) return "";
-  return n.toFixed(decimals);
+  return n.toFixed(dec);
 }
 
 
 // ============================================================================
-// CALCULATION TABLE  (Tables 5, 6, 7)
-// Responsive: font shrinks for very wide tables to fit one page.
+// CALCULATION TABLES  (Tables 5, 6, 7)
+// Responsive: cell font shrinks for wide tables so they fit on one page.
 // ============================================================================
 function buildCalcTable(tableNum, tableData, pdeValues) {
-  var safe = function (obj) {
-    return (obj && typeof obj === "object") ? obj : {};
-  };
-  var d = safe(tableData);
-  var elements        = Array.isArray(d.elements)  ? d.elements  : [];
-  var rows            = Array.isArray(d.rows)       ? d.rows      : [];
-  var totalDailyIntake= d.total_daily_intake || 0;
-  var elementTotals   = safe(d.element_totals);
-  var pde             = safe(d.pde);
-  var threshold30     = safe(d.threshold_30pct);
+  var safe = function (o) { return (o && typeof o === "object") ? o : {}; };
+  var d           = safe(tableData);
+  var elements    = Array.isArray(d.elements) ? d.elements : [];
+  var rows        = Array.isArray(d.rows)     ? d.rows     : [];
+  var dailyTotal  = d.total_daily_intake || 0;
+  var eTotals     = safe(d.element_totals);
+  var pde         = safe(d.pde);
+  var thresh      = safe(d.threshold_30pct);
 
   if (elements.length === 0) {
     return [leftPara("Table " + tableNum + ": No elements data.", false, SZ.SM)];
   }
 
   var N = elements.length;
-
-  // Responsive font sizing based on total columns (2 + 2*N)
   var totalCols = 2 + 2 * N;
-  var cellFont;
-  if (totalCols <= 12) {
-    cellFont = SZ.SM;   // 7pt
-  } else if (totalCols <= 18) {
-    cellFont = SZ.XS;   // 6pt
-  } else {
-    cellFont = SZ.XXS;  // 5pt
-  }
+  var cellSz = totalCols <= 12 ? SZ.SM : (totalCols <= 18 ? SZ.XS : SZ.XXS);
 
-  // Column widths — ingredient col wider, element cols share remaining
   var INGR_W = Math.round(CW * 0.25);
   var DI_W   = Math.round(CW * 0.06);
-  var avail  = CW - INGR_W - DI_W;
-  var EW     = Math.max(240, Math.floor(avail / (2 * N)));
-  // Recalculate INGR_W if EW is very small to fit everything
-  if (EW < 240) {
-    EW      = 240;
-    INGR_W  = Math.max(1200, CW - DI_W - EW * 2 * N);
-  }
-  var colWidths = [INGR_W, DI_W];
-  for (var ci = 0; ci < 2 * N; ci++) colWidths.push(EW);
+  var EW     = Math.max(240, Math.floor((CW - INGR_W - DI_W) / (2 * N)));
+  var colW   = [INGR_W, DI_W];
+  for (var ci = 0; ci < 2 * N; ci++) colW.push(EW);
 
-  // ── Group consecutive same-class elements ────────────────────────────────
-  var groups = [];
+  // Group same-class elements
+  var grps = [];
   for (var gi = 0; gi < elements.length; gi++) {
     var sym = elements[gi];
-    var cls = ((pdeValues || {})[sym] || {}).class || "?";
-    if (groups.length && groups[groups.length - 1].cls === cls) {
-      groups[groups.length - 1].count++;
+    var cls = (safe(pdeValues)[sym] || {}).class || "?";
+    if (grps.length && grps[grps.length - 1].cls === cls) {
+      grps[grps.length - 1].count++;
     } else {
-      groups.push({ cls: cls, count: 1 });
+      grps.push({ cls: cls, count: 1 });
     }
   }
 
-  // ── Header Row 1 ─────────────────────────────────────────────────────────
+  // Header row 1
   var h1 = new TableRow({
     children: [
-      mkCell("Component", {
-        bold: true, fill: COLOR.HEADER_GREY, w: INGR_W, size: cellFont,
-      }),
-      mkCell("Daily\nIntake\n(g)", {
-        bold: true, fill: COLOR.HEADER_GREY, w: DI_W, size: cellFont,
+      mkCell("Component",          { bold: true, fill: COLOR.HEADER_GREY, w: INGR_W, size: cellSz }),
+      mkCell("Daily\nIntake\n(g)", { bold: true, fill: COLOR.HEADER_GREY, w: DI_W,   size: cellSz }),
+      new TableCell({
+        columnSpan: N, borders: allBorders(4), shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
+        children: [centerPara("Measured Concentration (\u00B5g/g)", true, cellSz)],
       }),
       new TableCell({
-        columnSpan: N,
-        borders:    allBorders(4),
-        shading:    cellShade(COLOR.HEADER_GREY),
-        margins:    cellMargins(),
-        children:   [centerPara("Measured Concentration (\u00B5g/g)", true, cellFont)],
-      }),
-      new TableCell({
-        columnSpan: N,
-        borders:    allBorders(4),
-        shading:    cellShade(COLOR.HEADER_GREY),
-        margins:    cellMargins(),
-        children:   [centerPara("Total Mass of Elemental Impurity (\u00B5g/day)", true, cellFont)],
+        columnSpan: N, borders: allBorders(4), shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
+        children: [centerPara("Total Mass of Elemental Impurity (\u00B5g/day)", true, cellSz)],
       }),
     ],
   });
 
-  // ── Header Row 2: class groupings ────────────────────────────────────────
-  var h2cells = [
-    emptyCell(COLOR.HEADER_GREY, INGR_W),
-    emptyCell(COLOR.HEADER_GREY, DI_W),
-  ];
-  for (var half = 0; half < 2; half++) {
-    for (var g = 0; g < groups.length; g++) {
+  // Header row 2: class groupings
+  var h2cells = [emptyCell(COLOR.HEADER_GREY, INGR_W), emptyCell(COLOR.HEADER_GREY, DI_W)];
+  for (var h = 0; h < 2; h++) {
+    for (var g = 0; g < grps.length; g++) {
       h2cells.push(new TableCell({
-        columnSpan: groups[g].count,
-        borders:    allBorders(4),
-        shading:    cellShade(COLOR.HEADER_GREY),
-        margins:    cellMargins(),
-        children:   [centerPara("Class " + groups[g].cls, true, cellFont)],
+        columnSpan: grps[g].count, borders: allBorders(4),
+        shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
+        children: [centerPara("Class " + grps[g].cls, true, cellSz)],
       }));
     }
   }
   var h2 = new TableRow({ children: h2cells });
 
-  // ── Header Row 3: element symbols ────────────────────────────────────────
-  var h3cells = [
-    emptyCell(COLOR.HEADER_GREY, INGR_W),
-    emptyCell(COLOR.HEADER_GREY, DI_W),
-  ];
-  for (var hi = 0; hi < 2; hi++) {
+  // Header row 3: element symbols
+  var h3cells = [emptyCell(COLOR.HEADER_GREY, INGR_W), emptyCell(COLOR.HEADER_GREY, DI_W)];
+  for (var hh = 0; hh < 2; hh++) {
     for (var ei = 0; ei < elements.length; ei++) {
-      h3cells.push(mkCell(elements[ei], {
-        bold: true, fill: COLOR.HEADER_GREY, w: EW, size: cellFont,
-      }));
+      h3cells.push(mkCell(elements[ei], { bold: true, fill: COLOR.HEADER_GREY, w: EW, size: cellSz }));
     }
   }
   var h3 = new TableRow({ children: h3cells });
 
-  // ── Data rows ─────────────────────────────────────────────────────────────
+  // Data rows
   var dataRows = [];
   for (var ri = 0; ri < rows.length; ri++) {
     var row = rows[ri];
     if (!row || typeof row !== "object") continue;
     var mc = safe(row.measured_conc);
     var tm = safe(row.total_mass);
-    var cells = [
-      mkCellLeft(row.ingredient || "", { w: INGR_W, size: cellFont }),
-      mkCell(fmt(row.daily_intake_g != null ? row.daily_intake_g : 0, 3), {
-        w: DI_W, size: cellFont,
-      }),
+    var rCells = [
+      mkCellL(row.ingredient || "", { w: INGR_W, size: cellSz }),
+      mkCell(fmt(row.daily_intake_g != null ? row.daily_intake_g : 0, 3), { w: DI_W, size: cellSz }),
     ];
     for (var mei = 0; mei < elements.length; mei++) {
-      var msym = elements[mei];
-      cells.push(mkCell(fmt(mc[msym] != null ? mc[msym] : 0, 4), {
-        w: EW, size: cellFont,
-      }));
+      rCells.push(mkCell(fmt(mc[elements[mei]] != null ? mc[elements[mei]] : 0, 4),
+                         { w: EW, size: cellSz }));
     }
     for (var tei = 0; tei < elements.length; tei++) {
-      var tsym = elements[tei];
-      cells.push(mkCell(fmt(tm[tsym] != null ? tm[tsym] : 0, 4), {
-        w: EW, size: cellFont,
-      }));
+      rCells.push(mkCell(fmt(tm[elements[tei]] != null ? tm[elements[tei]] : 0, 4),
+                         { w: EW, size: cellSz }));
     }
-    dataRows.push(new TableRow({ children: cells }));
+    dataRows.push(new TableRow({ children: rCells }));
   }
 
-  // ── Footer row helper ─────────────────────────────────────────────────────
-  function makeFooterRow(label, valMap, fillColor, isThresh) {
-    var sv = valMap || {};
-    var st = elementTotals || {};
+  // Footer rows
+  function mkFooter(label, vals, fillColor, isThresh) {
+    var sv = vals || {};
+    var st = eTotals || {};
     var fc = [
-      mkCell(label, {
-        bold: true, fill: fillColor, align: AlignmentType.LEFT,
-        w: INGR_W, size: cellFont,
-      }),
-      mkCell(
-        label === "TOTAL (daily intake) g/day" ? fmt(totalDailyIntake, 3) : "",
-        { fill: fillColor, w: DI_W, size: cellFont }
-      ),
+      mkCell(label, { bold: true, fill: fillColor, align: AlignmentType.LEFT, w: INGR_W, size: cellSz }),
+      mkCell(label === "TOTAL (daily intake) g/day" ? fmt(dailyTotal, 3) : "",
+             { fill: fillColor, w: DI_W, size: cellSz }),
     ];
-    // blanks for measured section
-    for (var bi = 0; bi < elements.length; bi++) {
-      fc.push(emptyCell(fillColor, EW));
-    }
-    // values for total mass section
+    for (var bi = 0; bi < elements.length; bi++) fc.push(emptyCell(fillColor, EW));
     for (var vi = 0; vi < elements.length; vi++) {
-      var vsym     = elements[vi];
-      var val      = sv[vsym] != null  ? sv[vsym]  : null;
-      var tot      = st[vsym] != null  ? st[vsym]  : null;
-      var exceeded = isThresh && val != null && tot != null
-                     && isFinite(val) && isFinite(tot) && tot > val;
+      var vs = elements[vi];
+      var val = sv[vs] != null ? sv[vs] : null;
+      var tot = st[vs] != null ? st[vs] : null;
+      var ex  = isThresh && val != null && tot != null && isFinite(val) && isFinite(tot) && tot > val;
       fc.push(mkCell(val != null ? fmt(val, 3) : "\u2013", {
-        fill:  exceeded ? COLOR.EXCEEDED_BG  : fillColor,
-        w:     EW,
-        size:  cellFont,
-        color: exceeded ? COLOR.EXCEEDED_TXT : COLOR.BLACK,
+        fill:  ex ? COLOR.EXCEEDED_BG  : fillColor,
+        w:     EW, size: cellSz,
+        color: ex ? COLOR.EXCEEDED_TXT : COLOR.BLACK,
       }));
     }
     return new TableRow({ children: fc });
   }
 
-  var allRows = [h1, h2, h3]
-    .concat(dataRows)
-    .concat([
-      makeFooterRow("TOTAL (daily intake) g/day", elementTotals, COLOR.HEADER_GREY, false),
-      makeFooterRow("PDE (\u00B5g/day)",           pde,           COLOR.HEADER_GREY, false),
-      makeFooterRow("Threshold Limit (30% of PDE)", threshold30, COLOR.THRESHOLD_BG, true),
-    ]);
-
-  var classLabels = { 5: "Class 1 and Class 2A", 6: "Class 2B", 7: "Class 3" };
+  var labels = { 5: "Class 1 and Class 2A", 6: "Class 2B", 7: "Class 3" };
   var caption = "Table " + tableNum
-    + ": Theoretical Elemental Impurity Assessment ("
-    + (classLabels[tableNum] || "")
-    + ") \u2014 Evaluation of Daily Contribution of the Total Mass";
+    + ": Theoretical Elemental Impurity Assessment (" + (labels[tableNum] || "") + ")"
+    + " \u2014 Evaluation of Daily Contribution of the Total Mass";
 
   var tbl = new Table({
     width: { size: CW, type: WidthType.DXA },
-    columnWidths: colWidths,
-    rows: allRows,
+    columnWidths: colW,
+    rows: [h1, h2, h3].concat(dataRows).concat([
+      mkFooter("TOTAL (daily intake) g/day", eTotals,  COLOR.HEADER_GREY, false),
+      mkFooter("PDE (\u00B5g/day)",           pde,      COLOR.HEADER_GREY, false),
+      mkFooter("Threshold Limit (30% of PDE)", thresh,  COLOR.THRESHOLD_BG, true),
+    ]),
   });
 
-  return [
-    leftPara(caption, true, SZ.SM),
-    tbl,
-    blankPara(),
-  ];
+  return [leftPara(caption, true, SZ.SM), tbl, blankPara()];
 }
 
 
@@ -2084,15 +2048,15 @@ function buildSummarySection(txt) {
   var ch = [sectionHeading("6. Summary & Conclusion")];
 
   if (txt.observation) {
-    ch.push(leftPara("Observation:", true, SZ.BODY));
-    var ops = bodyParagraphs(txt.observation);
-    for (var i = 0; i < ops.length; i++) ch.push(ops[i]);
+    ch.push(leftPara("Observation:", true, SZ.HDR));
+    var op = bodyParagraphs(txt.observation);
+    for (var i = 0; i < op.length; i++) ch.push(op[i]);
     ch.push(blankPara());
   }
   if (txt.conclusion) {
-    ch.push(leftPara("Conclusion:", true, SZ.BODY));
-    var cps = bodyParagraphs(txt.conclusion);
-    for (var j = 0; j < cps.length; j++) ch.push(cps[j]);
+    ch.push(leftPara("Conclusion:", true, SZ.HDR));
+    var cp = bodyParagraphs(txt.conclusion);
+    for (var j = 0; j < cp.length; j++) ch.push(cp[j]);
   }
   ch.push(pgBreak());
   return ch;
@@ -2102,43 +2066,36 @@ function buildSummarySection(txt) {
 // ============================================================================
 // LIST OF ANNEXURES  (Table 8)
 // ============================================================================
-function buildAnnexureList(annexureList) {
-  var list = Array.isArray(annexureList) ? annexureList : [];
-  var AW0  = Math.round(CW * 0.38);
-  var AW1  = Math.round(CW * 0.36);
-  var AW2  = CW - AW0 - AW1;
+function buildAnnexureList(list) {
+  list = Array.isArray(list) ? list : [];
+  var W0 = Math.round(CW * 0.38);
+  var W1 = Math.round(CW * 0.36);
+  var W2 = CW - W0 - W1;
 
-  var hdrRow = new TableRow({
-    children: [
-      mkCell("Name of Ingredient",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW0, size: SZ.SM }),
-      mkCell("Vendor",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW1, size: SZ.SM }),
-      mkCell("Title of Annexure",
-             { bold: true, fill: COLOR.HEADER_GREY, w: AW2, size: SZ.SM }),
-    ],
-  });
-  var dataRows = list.map(function (a, i) {
-    return new TableRow({
-      children: [
-        mkCellLeft(a.material || "", { w: AW0, size: SZ.SM }),
-        mkCellLeft(a.supplier || "", { w: AW1, size: SZ.SM }),
-        mkCell(a.annexure || ("Annexure " + (i + 1)), { w: AW2, size: SZ.SM }),
-      ],
-    });
-  });
   var tbl = new Table({
     width: { size: CW, type: WidthType.DXA },
-    columnWidths: [AW0, AW1, AW2],
-    rows: [hdrRow].concat(dataRows),
+    columnWidths: [W0, W1, W2],
+    rows: [
+      new TableRow({
+        children: [
+          mkCell("Name of Ingredient", { bold: true, fill: COLOR.HEADER_GREY, w: W0, size: SZ.SM }),
+          mkCell("Vendor",             { bold: true, fill: COLOR.HEADER_GREY, w: W1, size: SZ.SM }),
+          mkCell("Title of Annexure",  { bold: true, fill: COLOR.HEADER_GREY, w: W2, size: SZ.SM }),
+        ],
+      }),
+    ].concat(list.map(function (a, idx) {
+      return new TableRow({
+        children: [
+          mkCellL(a.material || "", { w: W0, size: SZ.SM }),
+          mkCellL(a.supplier || "", { w: W1, size: SZ.SM }),
+          mkCell(a.annexure || ("Annexure " + (idx + 1)), { w: W2, size: SZ.SM }),
+        ],
+      });
+    })),
   });
 
-  return [
-    sectionHeading("8. List of annexures"),
-    leftPara("Table No: 8 List of annexures", true, SZ.SM),
-    tbl,
-    pgBreak(),
-  ];
+  return [sectionHeading("8. List of annexures"),
+          leftPara("Table No: 8 List of annexures", true, SZ.SM), tbl, pgBreak()];
 }
 
 
@@ -2147,33 +2104,27 @@ function buildAnnexureList(annexureList) {
 // ============================================================================
 function buildRevisionHistory(revisions) {
   var list = Array.isArray(revisions) ? revisions : [];
-  var RW0  = Math.round(CW * 0.40);
-  var RW1  = CW - RW0;
+  var W0   = Math.round(CW * 0.40);
+  var W1   = CW - W0;
 
-  var hdrRow = new TableRow({
-    children: [
-      mkCell("Document and Version Number",
-             { bold: true, fill: COLOR.HEADER_GREY, w: RW0, size: SZ.SM }),
-      mkCell("Brief details of changes",
-             { bold: true, fill: COLOR.HEADER_GREY, w: RW1, size: SZ.SM }),
-    ],
-  });
-  var dataRows = list.filter(function (r) {
-    return r && typeof r === "object";
-  }).map(function (r) {
-    var dv = r.document_version || r["Document and Version Number"] || "";
-    var ch = r.changes || r["Brief details of changes"] || "";
-    return new TableRow({
-      children: [
-        mkCellLeft(dv, { w: RW0, size: SZ.SM }),
-        mkCellLeft(ch, { w: RW1, size: SZ.SM }),
-      ],
-    });
-  });
   var tbl = new Table({
     width: { size: CW, type: WidthType.DXA },
-    columnWidths: [RW0, RW1],
-    rows: [hdrRow].concat(dataRows),
+    columnWidths: [W0, W1],
+    rows: [
+      new TableRow({
+        children: [
+          mkCell("Document and Version Number", { bold: true, fill: COLOR.HEADER_GREY, w: W0, size: SZ.SM }),
+          mkCell("Brief details of changes",    { bold: true, fill: COLOR.HEADER_GREY, w: W1, size: SZ.SM }),
+        ],
+      }),
+    ].concat(list.filter(function (r) { return r && typeof r === "object"; }).map(function (r) {
+      return new TableRow({
+        children: [
+          mkCellL(r.document_version || r["Document and Version Number"] || "", { w: W0, size: SZ.SM }),
+          mkCellL(r.changes || r["Brief details of changes"] || "",             { w: W1, size: SZ.SM }),
+        ],
+      });
+    })),
   });
 
   return [sectionHeading("9. Revision history:"), tbl, pgBreak()];
@@ -2185,112 +2136,190 @@ function buildRevisionHistory(revisions) {
 // ============================================================================
 function buildSignatures(meta, signatures) {
   meta = meta || {};
-  var SW = [
-    Math.round(CW * 0.25),
-    Math.round(CW * 0.15),
-    Math.round(CW * 0.32),
-    0,
+  var W = [Math.round(CW*0.25), Math.round(CW*0.15), Math.round(CW*0.32), 0];
+  W[3] = CW - W[0] - W[1] - W[2];
+
+  var sigList = (Array.isArray(signatures) && signatures.length) ? signatures : [
+    { intention: "Prepared by R&D", employee_id: "", user_name: "", date: "" },
+    { intention: "Reviewed by R&D", employee_id: "", user_name: "", date: "" },
+    { intention: "Approved by DQA", employee_id: "", user_name: "", date: "" },
   ];
-  SW[3] = CW - SW[0] - SW[1] - SW[2];
 
-  var sigList = (Array.isArray(signatures) && signatures.length)
-    ? signatures
-    : [
-        { intention: "Prepared by R&D",  employee_id: "", user_name: "", date: "" },
-        { intention: "Reviewed by R&D",  employee_id: "", user_name: "", date: "" },
-        { intention: "Approved by DQA",  employee_id: "", user_name: "", date: "" },
-      ];
-
-  var hdrRow = new TableRow({
-    children: [
-      mkCell("Intention",   { bold: true, fill: COLOR.HEADER_GREY, w: SW[0], size: SZ.SM }),
-      mkCell("Employee ID", { bold: true, fill: COLOR.HEADER_GREY, w: SW[1], size: SZ.SM }),
-      mkCell("User Name",   { bold: true, fill: COLOR.HEADER_GREY, w: SW[2], size: SZ.SM }),
-      mkCell("Date (IST)",  { bold: true, fill: COLOR.HEADER_GREY, w: SW[3], size: SZ.SM }),
-    ],
-  });
-  var dataRows = sigList.map(function (s) {
-    return new TableRow({
-      children: [
-        mkCellLeft(s.intention   || "", { w: SW[0], size: SZ.SM }),
-        mkCell(s.employee_id     || "", { w: SW[1], size: SZ.SM }),
-        mkCellLeft(s.user_name   || "", { w: SW[2], size: SZ.SM }),
-        mkCell(s.date            || "", { w: SW[3], size: SZ.SM }),
-      ],
-    });
-  });
-  var sigTbl = new Table({
+  var tbl = new Table({
     width: { size: CW, type: WidthType.DXA },
-    columnWidths: SW,
-    rows: [hdrRow].concat(dataRows),
+    columnWidths: W,
+    rows: [
+      new TableRow({
+        children: [
+          mkCell("Intention",   { bold: true, fill: COLOR.HEADER_GREY, w: W[0], size: SZ.SM }),
+          mkCell("Employee ID", { bold: true, fill: COLOR.HEADER_GREY, w: W[1], size: SZ.SM }),
+          mkCell("User Name",   { bold: true, fill: COLOR.HEADER_GREY, w: W[2], size: SZ.SM }),
+          mkCell("Date (IST)",  { bold: true, fill: COLOR.HEADER_GREY, w: W[3], size: SZ.SM }),
+        ],
+      }),
+    ].concat(sigList.map(function (s) {
+      return new TableRow({
+        children: [
+          mkCellL(s.intention   || "", { w: W[0], size: SZ.SM }),
+          mkCell(s.employee_id  || "", { w: W[1], size: SZ.SM }),
+          mkCellL(s.user_name   || "", { w: W[2], size: SZ.SM }),
+          mkCell(s.date         || "", { w: W[3], size: SZ.SM }),
+        ],
+      });
+    })),
   });
 
-  return [centerPara("ELECTRONIC SIGNATURES", true, SZ.MD), blankPara(), sigTbl];
+  return [centerPara("ELECTRONIC SIGNATURES", true, SZ.MD), blankPara(), tbl];
 }
 
 
 // ============================================================================
-// MAIN ASSEMBLY
+// POST-PROCESS: inject pgBorders XML + remove proofErr via JSZip
+// (docx 9.6.1 pageBorders in section properties is silently ignored in XML;
+//  this approach reliably inserts it directly into word/document.xml)
+// ============================================================================
+function injectPageBordersAndSpellOff(buf) {
+  var pgBordersXml = (
+    '<w:pgBorders w:display="allPages" w:offsetFrom="page">' +
+    '<w:top w:val="single" w:sz="18" w:space="24" w:color="000000"/>' +
+    '<w:left w:val="single" w:sz="18" w:space="24" w:color="000000"/>' +
+    '<w:bottom w:val="single" w:sz="18" w:space="24" w:color="000000"/>' +
+    '<w:right w:val="single" w:sz="18" w:space="24" w:color="000000"/>' +
+    '</w:pgBorders>'
+  );
+
+  return JSZip.loadAsync(buf).then(function (zip) {
+    // ── Patch word/document.xml: inject pgBorders ────────────────────────
+    return zip.file("word/document.xml").async("string").then(function (xml) {
+      // Insert before last </w:sectPr>
+      var lastIdx = xml.lastIndexOf("</w:sectPr>");
+      if (lastIdx >= 0) {
+        xml = xml.slice(0, lastIdx) + pgBordersXml + xml.slice(lastIdx);
+      }
+      zip.file("word/document.xml", xml);
+
+      // ── Patch word/settings.xml: disable spell + grammar check ──────────
+      var settingsFile = zip.file("word/settings.xml");
+      var settingsPromise;
+      if (settingsFile) {
+        settingsPromise = settingsFile.async("string").then(function (sxml) {
+          // Inject hideSpellingErrors + hideGrammaticalErrors before </w:settings>
+          var injection =
+            '<w:hideSpellingErrors/>' +
+            '<w:hideGrammaticalErrors/>';
+          var closeTag = "</w:settings>";
+          if (sxml.includes(closeTag) && !sxml.includes("hideSpellingErrors")) {
+            sxml = sxml.replace(closeTag, injection + closeTag);
+          }
+          zip.file("word/settings.xml", sxml);
+        });
+      } else {
+        // Create settings.xml from scratch
+        var newSettings = (
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+          '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+          '<w:hideSpellingErrors/>' +
+          '<w:hideGrammaticalErrors/>' +
+          '</w:settings>'
+        );
+        zip.file("word/settings.xml", newSettings);
+        settingsPromise = Promise.resolve();
+      }
+
+      return settingsPromise;
+    });
+  }).then(function (zip_) {
+    // zip_ is undefined because then() chain consumed it — use outer zip
+    return JSZip.loadAsync(buf).then(function (zip2) {
+      // Re-apply all patches cleanly
+      return zip2.file("word/document.xml").async("string").then(function (xml) {
+        var lastIdx = xml.lastIndexOf("</w:sectPr>");
+        if (lastIdx >= 0 && !xml.includes("pgBorders")) {
+          xml = xml.slice(0, lastIdx) + pgBordersXml + xml.slice(lastIdx);
+        }
+        zip2.file("word/document.xml", xml);
+
+        var sf = zip2.file("word/settings.xml");
+        var sp;
+        if (sf) {
+          sp = sf.async("string").then(function (sxml) {
+            if (!sxml.includes("hideSpellingErrors")) {
+              sxml = sxml.replace("</w:settings>",
+                '<w:hideSpellingErrors/><w:hideGrammaticalErrors/></w:settings>');
+            }
+            zip2.file("word/settings.xml", sxml);
+          });
+        } else {
+          zip2.file("word/settings.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+            '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
+            '<w:hideSpellingErrors/><w:hideGrammaticalErrors/></w:settings>');
+          sp = Promise.resolve();
+        }
+        return (sp || Promise.resolve()).then(function () {
+          return zip2.generateAsync({
+            type: "nodebuffer",
+            compression: "DEFLATE",
+            compressionOptions: { level: 6 },
+          });
+        });
+      });
+    });
+  });
+}
+
+
+// ============================================================================
+// MAIN REPORT ASSEMBLY
 // ============================================================================
 function generateReport(dataPath, outPath) {
   var raw  = fs.readFileSync(dataPath, "utf-8");
   var data = JSON.parse(raw);
 
-  var meta             = data.meta             || {};
-  var logoB64          = data.logo_b64         || "";
-  var logoType         = data.logo_type        || "";
-  var txt              = data.text_sections    || {};
-  var composition      = data.composition      || [];
-  var annexureList     = data.annexure_list    || [];
-  var calcTables       = data.calc_tables      || {};
-  var revisionHistory  = data.revision_history || [];
-  var signatures       = data.signatures       || [];
-  var figures          = Array.isArray(data.figures) ? data.figures : [];
-  var pdeValues        = data.pde_values       || {};
+  var meta            = data.meta             || {};
+  var logoB64         = data.logo_b64         || "";
+  var logoType        = data.logo_type        || "";
+  var txt             = data.text_sections    || {};
+  var composition     = data.composition      || [];
+  var annexureList    = data.annexure_list    || [];
+  var calcTables      = data.calc_tables      || {};
+  var revisionHistory = data.revision_history || [];
+  var signatures      = data.signatures       || [];
+  var figures         = Array.isArray(data.figures) ? data.figures : [];
+  var pdeValues       = data.pde_values       || {};
 
   var ch = [];
 
-  // Title page
   var tp = buildTitlePage(meta);
-  for (var i = 0; i < tp.length; i++) ch.push(tp[i]);
+  for (var ti = 0; ti < tp.length; ti++) ch.push(tp[ti]);
 
-  // TOC
   var toc = buildTOC(data.toc_entries || []);
-  for (var j = 0; j < toc.length; j++) ch.push(toc[j]);
+  for (var toci = 0; toci < toc.length; toci++) ch.push(toc[toci]);
 
-  // Sections 1–4
   var s14 = buildTextSections(txt);
-  for (var k = 0; k < s14.length; k++) ch.push(s14[k]);
+  for (var s14i = 0; s14i < s14.length; s14i++) ch.push(s14[s14i]);
 
-  // Composition + Section 5 heading
   var comp = buildCompositionTable(composition);
-  for (var l = 0; l < comp.length; l++) ch.push(comp[l]);
+  for (var ci = 0; ci < comp.length; ci++) ch.push(comp[ci]);
 
-  // Figures (header-cropped diagrams)
   for (var fi = 0; fi < figures.length; fi++) {
-    var figParts = buildFigure(figures[fi]);
-    for (var fj = 0; fj < figParts.length; fj++) ch.push(figParts[fj]);
+    var fp = buildFigure(figures[fi]);
+    for (var fj = 0; fj < fp.length; fj++) ch.push(fp[fj]);
   }
 
-  // Sources / Table 2 / Manufacturing / Control Strategy
   var src = buildSourcesSection(txt, annexureList);
-  for (var si = 0; si < src.length; si++) ch.push(src[si]);
+  for (var sri = 0; sri < src.length; sri++) ch.push(src[sri]);
 
-  // Calculation tables
   function safeT(key) {
-    var empty = {
-      elements: [], rows: [], total_daily_intake: 0,
-      element_totals: {}, pde: {}, threshold_30pct: {},
-    };
-    if (!calcTables || typeof calcTables !== "object" || !calcTables[key]) {
-      return empty;
-    }
-    var merged = {};
-    var ekeys = Object.keys(empty);
-    for (var ei = 0; ei < ekeys.length; ei++) merged[ekeys[ei]] = empty[ekeys[ei]];
-    var tkeys = Object.keys(calcTables[key]);
-    for (var ti = 0; ti < tkeys.length; ti++) merged[tkeys[ti]] = calcTables[key][tkeys[ti]];
-    return merged;
+    var e = { elements:[], rows:[], total_daily_intake:0,
+              element_totals:{}, pde:{}, threshold_30pct:{} };
+    if (!calcTables || typeof calcTables !== "object" || !calcTables[key]) return e;
+    var m = {};
+    var ek = Object.keys(e);
+    for (var i = 0; i < ek.length; i++) m[ek[i]] = e[ek[i]];
+    var tk = Object.keys(calcTables[key]);
+    for (var j = 0; j < tk.length; j++) m[tk[j]] = calcTables[key][tk[j]];
+    return m;
   }
 
   try {
@@ -2307,61 +2336,43 @@ function generateReport(dataPath, outPath) {
     ch.push(pgBreak());
   }
 
-  // Section 6: Summary & Conclusion
   var sum = buildSummarySection(txt);
   for (var smi = 0; smi < sum.length; smi++) ch.push(sum[smi]);
 
-  // Section 7: Reference
   ch.push(sectionHeading("7. Reference"));
   ch.push(bodyPara(txt.reference || "NA"));
   ch.push(blankPara());
 
-  // Section 8: Annexure List
   var anl = buildAnnexureList(annexureList);
   for (var ali = 0; ali < anl.length; ali++) ch.push(anl[ali]);
 
-  // Section 9: Revision History
   var rev = buildRevisionHistory(revisionHistory);
   for (var rvi = 0; rvi < rev.length; rvi++) ch.push(rev[rvi]);
 
-  // Signatures
   var sig = buildSignatures(meta, signatures);
   for (var sgi = 0; sgi < sig.length; sgi++) ch.push(sig[sgi]);
 
-  // ── Build document ─────────────────────────────────────────────────────────
+  // ── Build Document ───────────────────────────────────────────────────────
   var doc = new Document({
+    // Disable spell check at document level (belt-and-suspenders with noProof on runs)
+    settings: {
+      hideSpellingErrors:    true,
+      hideGrammaticalErrors: true,
+    },
     styles: {
       default: {
-        document: {
-          run: { font: FONT_BODY, size: SZ.BODY, color: COLOR.BLACK },
-        },
+        document: { run: { font: FONT, size: SZ.TEXT, color: COLOR.BLACK } },
       },
     },
     sections: [{
       properties: {
         page: {
-          size: {
-            width:  PAGE_W,
-            height: PAGE_H,
-          },
-          margin: {
-            top:    MAR_T,
-            right:  MAR_R,
-            bottom: MAR_B,
-            left:   MAR_L,
-            header: 360,
-            footer: 360,
-          },
+          size:   { width: PAGE_W, height: PAGE_H },
+          margin: { top: MAR_T, right: MAR_R, bottom: MAR_B, left: MAR_L,
+                    header: 360, footer: 360 },
         },
-        // Thick black border around every page — matches original aesthetic
-        pageBorders: {
-          display:         PageBorderDisplay.ALL_PAGES,
-          offsetFrom:      PageBorderOffsetFrom.PAGE,
-          pageBorderTop:    { style: BorderStyle.SINGLE, size: 18, color: COLOR.BLACK, space: 24 },
-          pageBorderRight:  { style: BorderStyle.SINGLE, size: 18, color: COLOR.BLACK, space: 24 },
-          pageBorderBottom: { style: BorderStyle.SINGLE, size: 18, color: COLOR.BLACK, space: 24 },
-          pageBorderLeft:   { style: BorderStyle.SINGLE, size: 18, color: COLOR.BLACK, space: 24 },
-        },
+        // Note: pageBorders here is silently ignored by docx 9.6.1 in XML output.
+        // Real injection is done below via injectPageBordersAndSpellOff().
       },
       headers: { default: buildPageHeader(meta, logoB64, logoType) },
       footers: { default: buildPageFooter() },
@@ -2369,11 +2380,15 @@ function generateReport(dataPath, outPath) {
     }],
   });
 
-  return Packer.toBuffer(doc).then(function (buf) {
-    fs.writeFileSync(outPath, buf);
-    console.log("Report written: " + outPath
-                + "  (" + Math.round(buf.length / 1024) + " KB)");
-  });
+  return Packer.toBuffer(doc)
+    .then(function (rawBuf) {
+      // Post-process: inject page borders + ensure spell-off in settings.xml
+      return injectPageBordersAndSpellOff(rawBuf);
+    })
+    .then(function (finalBuf) {
+      fs.writeFileSync(outPath, finalBuf);
+      console.log("Report written: " + outPath + "  (" + Math.round(finalBuf.length / 1024) + " KB)");
+    });
 }
 
 
@@ -2390,9 +2405,6 @@ if (!dataPath || !outPath) {
 
 generateReport(dataPath, outPath).catch(function (err) {
   console.error("FATAL:", err.message || err);
-  if (err.stack) {
-    var lines = err.stack.split("\n").slice(0, 8);
-    console.error(lines.join("\n"));
-  }
+  if (err.stack) console.error(err.stack.split("\n").slice(0, 8).join("\n"));
   process.exit(1);
 });
