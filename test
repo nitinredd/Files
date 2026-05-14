@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-TSR Report Generator – Dr. Reddy's IPDO
+TSR Report Generator — Dr. Reddy's IPDO
 ICH Q3D (R2) | Claude Opus 4.6 via Vertex AI
-A5 Landscape | Times New Roman | Page borders | No spell-check underlines
+Fully product-agnostic: works for ANY formulation (oral/parenteral/topical)
+A5 Landscape | Times New Roman | Page borders
 """
-import os
-import json
-import base64
-import logging
-import time
-import subprocess
-import tempfile
-import re
+import os, json, base64, logging, time, subprocess, tempfile, re
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -19,37 +13,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import openpyxl
-import fitz  # PyMuPDF
+import fitz
 from anthropic import AnthropicVertex
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# VERTEX AI / CLAUDE CONFIG
-# ============================================================================
+# ── Vertex AI ────────────────────────────────────────────────────────────────
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
 GCP_PROJECT = "prj-thematic-analysis-dev"
 GCP_REGION  = "us-east5"
 MODEL       = "claude-opus-4-6-20250514"
-
-client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
+client      = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
 
 
 def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
     for attempt in range(3):
         try:
-            r = client.messages.create(
-                model=MODEL, max_tokens=max_tokens, messages=messages,
-            )
+            r = client.messages.create(model=MODEL, max_tokens=max_tokens, messages=messages)
             return "".join(b.text for b in r.content if hasattr(b, "text"))
         except Exception as e:
-            logger.warning(f"Claude attempt {attempt + 1} failed: {e}")
+            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
             if attempt < 2:
                 time.sleep(2 ** attempt)
-    logger.error("Claude API failed after 3 retries")
     return ""
 
 
@@ -57,300 +43,163 @@ def claude_text(prompt: str, max_tokens: int = 8192) -> str:
     return call_claude([{"role": "user", "content": prompt}], max_tokens)
 
 
-def claude_vision(image_bytes: bytes, prompt: str,
-                  media_type: str = "image/png") -> str:
+def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png") -> str:
     if not image_bytes:
         return ""
     b64 = base64.standard_b64encode(image_bytes).decode()
-    return call_claude([{
-        "role": "user",
-        "content": [
-            {"type": "image",
-             "source": {"type": "base64", "media_type": media_type, "data": b64}},
-            {"type": "text", "text": prompt},
-        ],
-    }])
+    return call_claude([{"role": "user", "content": [
+        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+        {"type": "text", "text": prompt},
+    ]}])
 
 
-# ============================================================================
-# ICH Q3D PDE VALUES (route-specific regulatory constants)
-# ============================================================================
-ICH_ELEMENT_INFO: Dict[str, Dict[str, str]] = {
-    "Pb": {"class": "1",  "name": "Lead"},
-    "As": {"class": "1",  "name": "Arsenic"},
-    "Cd": {"class": "1",  "name": "Cadmium"},
-    "Hg": {"class": "1",  "name": "Mercury"},
-    "Co": {"class": "2A", "name": "Cobalt"},
-    "V":  {"class": "2A", "name": "Vanadium"},
-    "Ni": {"class": "2A", "name": "Nickel"},
-    "Pd": {"class": "2B", "name": "Palladium"},
-    "Se": {"class": "2B", "name": "Selenium"},
-    "Tl": {"class": "2B", "name": "Thallium"},
-    "Au": {"class": "2B", "name": "Gold"},
-    "Ir": {"class": "2B", "name": "Iridium"},
-    "Os": {"class": "2B", "name": "Osmium"},
-    "Rh": {"class": "2B", "name": "Rhodium"},
-    "Ru": {"class": "2B", "name": "Ruthenium"},
-    "Ag": {"class": "2B", "name": "Silver"},
-    "Pt": {"class": "2B", "name": "Platinum"},
-    "Li": {"class": "3",  "name": "Lithium"},
-    "Sb": {"class": "3",  "name": "Antimony"},
-    "Ba": {"class": "3",  "name": "Barium"},
-    "Cr": {"class": "3",  "name": "Chromium"},
-    "Cu": {"class": "3",  "name": "Copper"},
-    "Sn": {"class": "3",  "name": "Tin"},
-    "Mo": {"class": "3",  "name": "Molybdenum"},
+# ── ICH Q3D PDE VALUES — both oral and parenteral ────────────────────────────
+# Structure: {symbol: {class, name, oral_pde, parenteral_pde}}
+# All values in µg/day. None = no established limit.
+ICH_PDE: Dict[str, Dict] = {
+    "Pb": {"class":"1",  "name":"Lead",       "oral":5.0,    "parenteral":5.0},
+    "As": {"class":"1",  "name":"Arsenic",    "oral":15.0,   "parenteral":15.0},
+    "Cd": {"class":"1",  "name":"Cadmium",    "oral":5.0,    "parenteral":5.0},
+    "Hg": {"class":"1",  "name":"Mercury",    "oral":30.0,   "parenteral":3.0},
+    "Co": {"class":"2A", "name":"Cobalt",     "oral":50.0,   "parenteral":5.0},
+    "V":  {"class":"2A", "name":"Vanadium",   "oral":100.0,  "parenteral":10.0},
+    "Ni": {"class":"2A", "name":"Nickel",     "oral":200.0,  "parenteral":20.0},
+    "Pd": {"class":"2B", "name":"Palladium",  "oral":100.0,  "parenteral":10.0},
+    "Se": {"class":"2B", "name":"Selenium",   "oral":150.0,  "parenteral":80.0},
+    "Tl": {"class":"2B", "name":"Thallium",   "oral":8.0,    "parenteral":8.0},
+    "Au": {"class":"2B", "name":"Gold",       "oral":100.0,  "parenteral":100.0},
+    "Ir": {"class":"2B", "name":"Iridium",    "oral":100.0,  "parenteral":1.0},
+    "Os": {"class":"2B", "name":"Osmium",     "oral":100.0,  "parenteral":1.0},
+    "Rh": {"class":"2B", "name":"Rhodium",    "oral":100.0,  "parenteral":10.0},
+    "Ru": {"class":"2B", "name":"Ruthenium",  "oral":100.0,  "parenteral":10.0},
+    "Ag": {"class":"2B", "name":"Silver",     "oral":150.0,  "parenteral":10.0},
+    "Pt": {"class":"2B", "name":"Platinum",   "oral":100.0,  "parenteral":10.0},
+    "Li": {"class":"3",  "name":"Lithium",    "oral":550.0,  "parenteral":250.0},
+    "Sb": {"class":"3",  "name":"Antimony",   "oral":1200.0, "parenteral":90.0},
+    "Ba": {"class":"3",  "name":"Barium",     "oral":1400.0, "parenteral":700.0},
+    "Cr": {"class":"3",  "name":"Chromium",   "oral":11000.0,"parenteral":1100.0},
+    "Cu": {"class":"3",  "name":"Copper",     "oral":3000.0, "parenteral":300.0},
+    "Mg": {"class":"3",  "name":"Magnesium",  "oral":None,   "parenteral":None},
+    "Sn": {"class":"3",  "name":"Tin",        "oral":6000.0, "parenteral":600.0},
+    "Mo": {"class":"3",  "name":"Molybdenum", "oral":3000.0, "parenteral":150.0},
 }
 
-ICH_PDE_BY_ROUTE: Dict[str, Dict[str, Optional[float]]] = {
-    "oral": {
-        "Pb": 5.0, "As": 15.0, "Cd": 5.0, "Hg": 30.0,
-        "Co": 50.0, "V": 100.0, "Ni": 200.0,
-        "Pd": 100.0, "Se": 150.0, "Tl": 8.0, "Au": 100.0,
-        "Ir": 100.0, "Os": 100.0, "Rh": 100.0, "Ru": 100.0,
-        "Ag": 150.0, "Pt": 100.0,
-        "Li": 550.0, "Sb": 1200.0, "Ba": 1400.0,
-        "Cr": 11000.0, "Cu": 3000.0,
-        "Sn": 6000.0, "Mo": 3000.0,
-    },
-    "parenteral": {
-        "Cd": 2.0, "Pb": 5.0, "As": 15.0, "Hg": 3.0,
-        "Co": 5.0, "V": 10.0, "Ni": 20.0,
-        "Tl": 8.0, "Au": 100.0, "Pd": 10.0, "Ir": 10.0,
-        "Os": 10.0, "Rh": 10.0, "Ru": 10.0, "Se": 80.0,
-        "Ag": 10.0, "Pt": 10.0,
-        "Li": 250.0, "Sb": 90.0, "Ba": 700.0,
-        "Mo": 1500.0, "Cu": 300.0,
-        "Sn": 600.0, "Cr": 1100.0,
-    },
-}
+TABLE5_ELEMENTS = ["Pb","As","Cd","Hg","Co","V","Ni"]
+TABLE6_ELEMENTS = ["Pd","Se","Tl","Au","Ir","Os","Rh","Ru","Ag","Pt"]
+TABLE7_ELEMENTS = ["Li","Sb","Ba","Cr","Cu","Mg","Sn","Mo"]
+ALL_ELEMENTS    = TABLE5_ELEMENTS + TABLE6_ELEMENTS + TABLE7_ELEMENTS
 
 
-def build_ich_pde(route: str = "parenteral") -> Dict[str, Dict]:
-    route_key = str(route or "parenteral").strip().lower()
-    if route_key not in ICH_PDE_BY_ROUTE:
-        route_key = "parenteral"
-    route_values = ICH_PDE_BY_ROUTE[route_key]
-    return {
-        sym: {
-            "class": ICH_ELEMENT_INFO[sym]["class"],
-            "name":  ICH_ELEMENT_INFO[sym]["name"],
-            "pde":   route_values.get(sym),
-        }
-        for sym in ICH_ELEMENT_INFO
-    }
+def get_pde(sym: str, route: str) -> Optional[float]:
+    """Return PDE for a symbol given route of administration."""
+    info = ICH_PDE.get(sym, {})
+    if "parenteral" in route.lower() or "inject" in route.lower():
+        return info.get("parenteral")
+    return info.get("oral")
 
 
-def infer_pde_route(meta: Optional[Dict], override: str = "auto") -> str:
-    override_key = str(override or "auto").strip().lower()
-    if override_key in ICH_PDE_BY_ROUTE:
-        return override_key
-    meta = meta or {}
-    haystack = " ".join(str(meta.get(k, "")) for k in (
-        "title", "product_name", "dosage_form", "route", "pde_route",
-    )).lower()
-    if any(w in haystack for w in (
-        "injection", "injectable", "parenteral", "infusion", "iv", "intravenous",
-        "subcutaneous", "intramuscular", "suspension for injection",
-    )):
-        return "parenteral"
-    return "oral"
-
-
-ICH_PDE: Dict[str, Dict] = build_ich_pde("parenteral")
-
-TABLE5_ELEMENTS = ["Cd", "Pb", "As", "Hg", "Co", "V", "Ni"]
-TABLE6_ELEMENTS = ["Tl", "Au", "Pd", "Ir", "Os", "Rh", "Ru", "Se", "Ag", "Pt"]
-TABLE7_ELEMENTS = ["Li", "Sb", "Ba", "Mo", "Cu", "Sn", "Cr"]
-
-
-# ============================================================================
-# SAFE UTILITIES — never raise, always return a sane default
-# ============================================================================
+# ── Safe utilities ────────────────────────────────────────────────────────────
 def safe_int(v: Any, default: int = 0) -> int:
-    if v is None:
-        return default
-    if isinstance(v, int):
-        return v
-    try:
-        return int(float(str(v).strip()))
-    except Exception:
-        return default
+    if isinstance(v, int): return v
+    try: return int(float(str(v).strip()))
+    except: return default
 
+def safe_float(v: Any, default: float = 0.0) -> float:
+    if isinstance(v, float): return v
+    try: return float(str(v).strip().replace(",",""))
+    except: return default
 
 def safe_str(v: Any, default: str = "") -> str:
-    if v is None:
-        return default
-    return str(v).strip()
-
+    return str(v).strip() if v is not None else default
 
 def safe_json_parse(text: str, default: Any = None) -> Any:
-    if default is None:
-        default = {}
-    if not text:
-        return default
-    for strategy in ["direct", "object", "array"]:
-        try:
-            if strategy == "direct":
-                return json.loads(text)
-            elif strategy == "object":
-                s = text.find("{")
-                e = text.rfind("}") + 1
-                if s >= 0 and e > s:
-                    return json.loads(text[s:e])
-            else:
-                s = text.find("[")
-                e = text.rfind("]") + 1
-                if s >= 0 and e > s:
-                    return json.loads(text[s:e])
-        except Exception:
-            pass
+    if default is None: default = {}
+    if not text: return default
+    for fn in [
+        lambda t: json.loads(t),
+        lambda t: json.loads(t[t.find("{"):t.rfind("}")+1]),
+        lambda t: json.loads(t[t.find("["):t.rfind("]")+1]),
+    ]:
+        try: return fn(text)
+        except: pass
     return default
-
 
 def safe_list_get(lst: Any, idx: int, default: Any = None) -> Any:
     try:
-        if lst and 0 <= idx < len(lst):
-            return lst[idx]
-    except Exception:
-        pass
+        if lst and 0 <= idx < len(lst): return lst[idx]
+    except: pass
     return default
 
-
 def safe_calc_table(calc_tables: Optional[Dict], key: str) -> Dict:
-    empty: Dict = {
-        "elements": [], "rows": [], "total_daily_intake": 0.0,
-        "element_totals": {}, "pde": {}, "threshold_30pct": {},
-    }
-    if not calc_tables or not isinstance(calc_tables, dict):
-        return empty
+    empty = {"elements":[],"rows":[],"total_daily_intake":0.0,
+             "element_totals":{},"pde":{},"threshold_30pct":{}}
+    if not calc_tables or not isinstance(calc_tables, dict): return dict(empty)
     t = calc_tables.get(key)
-    if not t or not isinstance(t, dict):
-        return empty
-    out = dict(empty)
-    out.update(t)
-    return out
+    if not t or not isinstance(t, dict): return dict(empty)
+    out = dict(empty); out.update(t); return out
 
 
-# ============================================================================
-# LOGO — load from assets/ folder next to app.py
-# Never extracted from PDF (PDF images include background shapes that appear
-# as violet/purple rectangles in the rendered output).
-# Place Dr. Reddy's logo at:  assets/logo.png  (or logo.jpg / logo.jpeg)
-# ============================================================================
+# ── Logo ─────────────────────────────────────────────────────────────────────
 def load_logo_from_assets() -> Tuple[Optional[bytes], str]:
-    """
-    Load logo from the assets/ directory next to this file.
-    Returns (image_bytes, media_type) or (None, '') if not found.
-    """
     assets_dir = Path(__file__).parent / "assets"
-    candidates = [
-        ("logo.png",  "image/png"),
-        ("logo.jpg",  "image/jpeg"),
-        ("logo.jpeg", "image/jpeg"),
-    ]
-    for filename, media_type in candidates:
-        logo_path = assets_dir / filename
-        if logo_path.exists() and logo_path.stat().st_size > 500:
-            try:
-                return (logo_path.read_bytes(), media_type)
-            except Exception as e:
-                logger.warning(f"Could not read logo file {logo_path}: {e}")
+    for fname, mt in [("logo.png","image/png"),("logo.jpg","image/jpeg"),("logo.jpeg","image/jpeg")]:
+        p = assets_dir / fname
+        if p.exists() and p.stat().st_size > 500:
+            try: return (p.read_bytes(), mt)
+            except Exception as e: logger.warning(f"Logo read failed {p}: {e}")
     return (None, "")
 
 
-# ============================================================================
-# PRE-FLIGHT VALIDATION (zero API cost — runs before any Claude call)
-# ============================================================================
+# ── Pre-flight ────────────────────────────────────────────────────────────────
 def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
                     annexure_raw: List[Tuple[str, str]]) -> List[str]:
     errors: List[str] = []
-
-    # 1. Reference PDF
     try:
         doc = fitz.open(stream=ref_pdf_bytes, filetype="pdf")
-        n = len(doc)
-        doc.close()
-        if n == 0:
-            errors.append("Reference PDF has 0 pages.")
-        elif n < 5:
-            errors.append(f"Reference PDF has only {n} pages — expected 15+.")
+        n = len(doc); doc.close()
+        if n == 0: errors.append("Reference PDF has 0 pages.")
+        elif n < 5: errors.append(f"Reference PDF has only {n} pages — expected 10+.")
     except Exception as e:
         errors.append(f"Reference PDF cannot be opened: {e}")
-
-    # 2. Excel
     try:
         wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
-        if not wb.worksheets:
-            errors.append("Excel file has no sheets.")
+        if not wb.worksheets: errors.append("Excel has no sheets.")
         else:
             ws = wb.worksheets[0]
-            rows_with_data = sum(
-                1 for row in ws.iter_rows(values_only=True)
-                if any(c is not None for c in row)
-            )
-            if rows_with_data < 3:
-                errors.append(
-                    f"Excel sheet 1 has only {rows_with_data} non-empty rows."
-                )
+            nrows = sum(1 for row in ws.iter_rows(values_only=True) if any(c is not None for c in row))
+            if nrows < 3: errors.append(f"Excel sheet has only {nrows} non-empty rows.")
         wb.close()
     except Exception as e:
         errors.append(f"Excel cannot be opened: {e}")
-
-    # 3. Annexure JSONs — accept both {} (dict) and [] (list) at root; strip BOM
     if not annexure_raw:
         errors.append("No annexure JSON files uploaded.")
     for i, (name, raw) in enumerate(annexure_raw):
         try:
-            cleaned = raw.lstrip("\ufeff")
-            obj = json.loads(cleaned)
+            obj = json.loads(raw.lstrip("\ufeff"))
             if not isinstance(obj, (dict, list)):
-                errors.append(
-                    f"Annexure {i + 1} ({name}): JSON must be object {{}} or array []."
-                )
+                errors.append(f"Annexure {i+1} ({name}): JSON must be object or array.")
         except json.JSONDecodeError as e:
-            errors.append(f"Annexure {i + 1} ({name}): invalid JSON — {e}")
-
-    # 4. Node.js
+            errors.append(f"Annexure {i+1} ({name}): invalid JSON — {e}")
     import shutil
     if not shutil.which("node"):
-        errors.append("Node.js not found in PATH. Install Node.js >= 18.")
+        errors.append("Node.js not found. Install Node.js >= 18.")
     else:
-        probe = subprocess.run(
-            ["node", "-e", "require('docx'); process.exit(0)"],
-            capture_output=True, timeout=10,
-        )
-        if probe.returncode != 0:
-            errors.append(
-                "npm package 'docx' not importable. "
-                "Run: npm install docx  (in the folder containing generate_report.js)"
-            )
-        probe2 = subprocess.run(
-            ["node", "-e", "require('jszip'); process.exit(0)"],
-            capture_output=True, timeout=10,
-        )
-        if probe2.returncode != 0:
-            errors.append(
-                "npm package 'jszip' not installed. "
-                "Run: npm install jszip"
-            )
-
-    # 5. GCP credentials
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS", "")
-    if creds_path and not Path(creds_path).exists():
-        errors.append(f"GCP credentials file not found: {creds_path}")
-
+        for pkg in ["docx", "jszip"]:
+            r = subprocess.run(["node","-e",f"require('{pkg}');process.exit(0)"],
+                               capture_output=True, timeout=10)
+            if r.returncode != 0:
+                errors.append(f"npm package '{pkg}' not found. Run: npm install {pkg}")
+    creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","")
+    if creds and not Path(creds).exists():
+        errors.append(f"GCP credentials not found: {creds}")
     return errors
 
 
-# ============================================================================
-# PDF UTILITIES
-# ============================================================================
+# ── PDF utilities ─────────────────────────────────────────────────────────────
 def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
-    """Render every PDF page to an RGB PNG."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     pages: List[bytes] = []
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    mat = fitz.Matrix(dpi/72, dpi/72)
     for page in doc:
         pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
         pages.append(pix.tobytes("png"))
@@ -358,43 +207,28 @@ def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
     return pages
 
 
-def extract_figure_from_page(pdf_bytes: bytes, page_index: int,
-                              dpi: int = 200) -> bytes:
-    """
-    Rasterize one page and crop out the top 38% (IPDO header + caption row),
-    returning only the diagram area as an RGB PNG.
-    """
+def extract_figure_from_page(pdf_bytes: bytes, page_index: int, dpi: int = 200) -> bytes:
+    """Crop top 38% (header+caption) and bottom 10% (page number) of figure page."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         page = doc.load_page(page_index)
-        rect = page.rect
-        crop = fitz.Rect(
-            rect.x0 + rect.width  * 0.02,
-            rect.y0 + rect.height * 0.38,  # skip top 38% (header + caption)
-            rect.x1 - rect.width  * 0.02,
-            rect.y1 - rect.height * 0.10,  # skip bottom 10% (page number / footer)
-        )
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = page.get_pixmap(
-            matrix=mat, alpha=False, colorspace=fitz.csRGB, clip=crop,
-        )
+        r = page.rect
+        crop = fitz.Rect(r.x0 + r.width*0.02, r.y0 + r.height*0.38,
+                         r.x1 - r.width*0.02, r.y1 - r.height*0.10)
+        mat = fitz.Matrix(dpi/72, dpi/72)
+        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB, clip=crop)
         return pix.tobytes("png")
     finally:
         doc.close()
 
 
-# ============================================================================
-# REFERENCE PDF STRUCTURE EXTRACTION
-# ============================================================================
 def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
-    """Identify pages containing figures/diagrams using Claude vision."""
     prompt = (
         "Look at this page from a pharmaceutical technical report.\n"
         "Does it contain a figure, diagram, flowchart, or schematic "
         "(NOT a table, NOT only text)?\n\n"
-        'YES: {"has_figure": true, "description": "...", "figure_label": "Figure X: ..."}\n'
-        'NO:  {"has_figure": false}\n\n'
-        "Return ONLY the JSON."
+        'YES: {"has_figure":true,"description":"...","figure_label":"Figure X: ..."}\n'
+        'NO:  {"has_figure":false}\nReturn ONLY the JSON.'
     )
     figures: List[Dict] = []
     for i, img in enumerate(page_images):
@@ -402,677 +236,310 @@ def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
             raw = claude_vision(img, prompt)
             data = safe_json_parse(raw, {"has_figure": False})
             if isinstance(data, dict) and data.get("has_figure"):
-                figures.append({
-                    "page_index":   i,
-                    "description":  safe_str(data.get("description", "")),
-                    "figure_label": safe_str(data.get("figure_label", "")),
-                })
+                figures.append({"page_index": i,
+                                 "description": safe_str(data.get("description","")),
+                                 "figure_label": safe_str(data.get("figure_label",""))})
         except Exception as e:
-            logger.warning(f"Figure detection page {i}: {e}")
+            logger.warning(f"Figure detect p{i}: {e}")
     return figures
 
 
 def extract_reference_structure(page_images: List[bytes]) -> Dict:
-    """Extract metadata, section text, revision history, and signatures."""
-
+    """
+    Extract ALL metadata from page 1 of the reference PDF.
+    Also extracts TOC entries, revision history and signatures from later pages.
+    """
     meta_prompt = (
-        "This is page 1 of a pharmaceutical Technical Summary Report (TSR).\n"
-        "Extract ALL header/metadata fields exactly as shown in the document.\n"
-        "Return ONLY this JSON (no markdown, no extra text):\n"
-        '{\n'
-        '  "title": "",\n'
-        '  "document_no": "",\n'
-        '  "product_name": "",\n'
-        '  "dosage_form": "",\n'
-        '  "version": "",\n'
-        '  "strength": "",\n'
-        '  "department": "",\n'
-        '  "market": "",\n'
-        '  "protocol": "",\n'
-        '  "sop_format_number": ""\n'
-        '}'
+        "This is page 1 of a pharmaceutical TSR document.\n"
+        "Extract ALL metadata exactly as shown. Return ONLY this JSON:\n"
+        '{"title":"","document_no":"","product_name":"","dosage_form":"","version":"",'
+        '"strength":"","department":"","market":"","protocol":"",'
+        '"sop_format_number":"","route_of_administration":""}'
     )
     meta_raw = claude_vision(safe_list_get(page_images, 0, b""), meta_prompt)
     meta = safe_json_parse(meta_raw, {})
-    if not isinstance(meta, dict):
-        meta = {}
+    if not isinstance(meta, dict): meta = {}
 
-    sections_prompt = (
-        "This is a page from a pharmaceutical ICH Q3D elemental impurities TSR.\n"
-        "Extract ALL text content preserving structure.\n"
-        "Return ONLY this JSON (no markdown):\n"
-        '{\n'
-        '  "page_type": "title|toc|text|figure|calculation_table|'
-        'composition_table|signatures|revision_history",\n'
-        '  "section_number": null,\n'
-        '  "section_title": "",\n'
-        '  "content_blocks": [\n'
-        '    {"type": "heading|paragraph|bullet|note", '
-        '"text": "exact text", "bold": false}\n'
-        '  ]\n'
-        '}\n'
-        "Return ONLY JSON."
+    # Extract TOC from page 2 (if present)
+    toc_prompt = (
+        "This page may contain a TABLE OF CONTENTS. "
+        "If it does, extract all entries. Return ONLY this JSON:\n"
+        '{"is_toc":true,"entries":[{"no":"1","title":"Abstract","page":"3"}]}\n'
+        'If not a TOC page: {"is_toc":false,"entries":[]}'
     )
-
-    pages_data: List[Dict] = []
-    for i, img in enumerate(page_images):
+    toc_entries: List[Dict] = []
+    for i in range(min(3, len(page_images))):
         try:
-            raw = claude_vision(img, sections_prompt)
+            raw = claude_vision(safe_list_get(page_images, i, b""), toc_prompt)
             d = safe_json_parse(raw, {})
-            if d and isinstance(d, dict):
-                d["page_index"] = i
-                pages_data.append(d)
-            else:
-                pages_data.append({
-                    "page_index": i, "page_type": "unknown", "content_blocks": [],
-                })
-        except Exception as ex:
-            logger.warning(f"Page {i} extraction: {ex}")
-            pages_data.append({
-                "page_index": i, "page_type": "unknown", "content_blocks": [],
-            })
+            if isinstance(d, dict) and d.get("is_toc") and isinstance(d.get("entries"), list) and d["entries"]:
+                toc_entries = d["entries"]
+                break
+        except Exception: pass
 
+    # Extract revision history and signatures from last 3 pages
     revision_data: List[Dict] = []
     sig_data: List[Dict] = []
-
-    if len(page_images) >= 2:
-        rev_prompt = (
-            "This page contains a revision history table and/or electronic signatures.\n"
-            "Extract as JSON (no markdown):\n"
-            '{\n'
-            '  "revision_history": [{"document_version": "", "changes": ""}],\n'
-            '  "signatures": [{"intention": "", "employee_id": "", '
-            '"user_name": "", "date": ""}]\n'
-            '}\n'
-            "Return ONLY JSON."
-        )
-        for i in range(max(0, len(page_images) - 3), len(page_images)):
-            try:
-                raw = claude_vision(safe_list_get(page_images, i, b""), rev_prompt)
-                d = safe_json_parse(raw, {})
-                if isinstance(d, dict):
-                    rh = d.get("revision_history")
-                    sg = d.get("signatures")
-                    if isinstance(rh, list) and rh:
-                        revision_data = rh
-                    if isinstance(sg, list) and sg:
-                        sig_data = sg
-            except Exception:
-                pass
-
-    return {
-        "meta":             meta,
-        "pages":            pages_data,
-        "revision_history": revision_data,
-        "signatures":       sig_data,
-    }
-
-
-# ============================================================================
-# PRODUCT METADATA + COMPOSITION NORMALIZATION
-# ============================================================================
-META_FIELDS = [
-    "title", "document_no", "product_name", "dosage_form", "version",
-    "strength", "department", "market", "protocol", "sop_format_number",
-]
-
-
-def _slug_key(label: Any, fallback: str = "amount") -> str:
-    raw = safe_str(label).lower()
-    raw = raw.replace("µ", "u")
-    raw = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
-    return raw or fallback
-
-
-def _is_blank(v: Any) -> bool:
-    return safe_str(v).lower() in ("", "na", "n/a", "none", "null")
-
-
-def _first_nonblank(*vals: Any) -> str:
-    for v in vals:
-        s = safe_str(v)
-        if not _is_blank(s):
-            return s
-    return ""
-
-
-def _build_title_from_meta(meta: Dict) -> str:
-    product = safe_str(meta.get("product_name", ""))
-    strength = safe_str(meta.get("strength", ""))
-    if not product:
-        return safe_str(meta.get("title", ""))
-    title = f"Risk assessment for elemental impurities in {product}"
-    if strength and strength.lower() not in title.lower():
-        title += f" {strength}"
-    return title
-
-
-def merge_product_metadata(ref_meta: Dict, comp_data: Dict,
-                           overrides: Optional[Dict] = None,
-                           pde_route_override: str = "auto") -> Dict:
-    """Merge reference metadata with product-specific Excel/manual values."""
-    ref_meta = ref_meta or {}
-    comp_meta = (comp_data or {}).get("product_metadata", {})
-    if not isinstance(comp_meta, dict):
-        comp_meta = {}
-    overrides = overrides or {}
-
-    meta = {k: safe_str(ref_meta.get(k, "")) for k in META_FIELDS}
-    product_signal = False
-    for source in (comp_meta, overrides):
-        for key in META_FIELDS:
-            val = safe_str(source.get(key, ""))
-            if not _is_blank(val):
-                meta[key] = val
-                if key in ("title", "product_name", "dosage_form", "strength"):
-                    product_signal = True
-
-    if (product_signal and _is_blank(overrides.get("title", ""))
-            and _is_blank(comp_meta.get("title", ""))):
-        meta["title"] = _build_title_from_meta(meta)
-
-    route = infer_pde_route(meta, pde_route_override)
-    meta["pde_route"] = route
-    return meta
-
-
-def _iter_composition_rows(sections: Any) -> List[Dict]:
-    rows: List[Dict] = []
-    if not isinstance(sections, list):
-        return rows
-    for section in sections:
-        if not isinstance(section, dict):
-            continue
-        for row in section.get("rows", []) or []:
-            if isinstance(row, dict):
-                rows.append(row)
-    return rows
-
-
-def _infer_amount_columns(parsed: Dict, sections: List[Dict]) -> List[Dict]:
-    columns: List[Dict] = []
-    seen = set()
-
-    def add_col(key: Any, label: Any = "", unit: str = "mg") -> None:
-        k = safe_str(key)
-        if not k:
-            k = _slug_key(label)
-        if k in seen:
-            return
-        seen.add(k)
-        columns.append({
-            "key": k,
-            "label": safe_str(label) or k,
-            "unit": unit or "mg",
-        })
-
-    raw_cols = parsed.get("amount_columns", [])
-    if isinstance(raw_cols, list):
-        for col in raw_cols:
-            if isinstance(col, dict):
-                add_col(col.get("key"), col.get("label"), safe_str(col.get("unit", "mg")))
-            else:
-                add_col(col, col)
-
-    strength_cols = parsed.get("strength_cols", {})
-    if isinstance(strength_cols, dict):
-        for label in strength_cols:
-            add_col(label, label)
-
-    rows = _iter_composition_rows(sections)
-    protected = {
-        "ingredient", "name", "material", "material_name", "material_code",
-        "function", "status", "compendial_status", "comments", "source",
-    }
-    for row in rows:
-        for key, value in row.items():
-            k = safe_str(key)
-            if not k or k.lower() in protected:
-                continue
-            if _parse_amount(value) > 0:
-                add_col(k, k)
-
-    return columns
-
-
-def _normalize_composition_result(parsed: Dict,
-                                  all_rows: List[List[str]]) -> Dict:
-    if not isinstance(parsed, dict):
-        parsed = {}
-    sections = parsed.get("sections", [])
-    if not isinstance(sections, list) or not sections:
-        fallback_rows = []
-        for row in all_rows[1:]:
-            if len(row) > 1 and safe_str(row[1]):
-                fallback_rows.append({
-                    "material_code": row[0] if len(row) > 0 else "",
-                    "ingredient":    row[1],
-                    "function":      row[2] if len(row) > 2 else "",
-                    "qty_per_unit_mg": row[3] if len(row) > 3 else "0",
-                })
-        sections = [{"name": "Composition", "rows": fallback_rows}]
-
-    for section in sections:
-        if not isinstance(section, dict):
-            continue
-        section.setdefault("name", "Composition")
-        rows = section.get("rows", [])
-        if not isinstance(rows, list):
-            section["rows"] = []
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row["ingredient"] = _first_nonblank(
-                row.get("ingredient"), row.get("name"),
-                row.get("material"), row.get("material_name"),
-            )
-            row["material_code"] = _first_nonblank(
-                row.get("material_code"), row.get("code"),
-            )
-            row["function"] = _first_nonblank(row.get("function"), row.get("role"))
-            row["status"] = _first_nonblank(
-                row.get("status"), row.get("compendial_status"),
-            )
-
-    parsed["sections"] = [s for s in sections if isinstance(s, dict)]
-    amount_columns = _infer_amount_columns(parsed, parsed["sections"])
-    if not amount_columns:
-        amount_columns = [{
-            "key": "qty_per_unit_mg",
-            "label": "Qty/unit (mg)",
-            "unit": "mg",
-        }]
-    parsed["amount_columns"] = amount_columns
-
-    amount_keys = {c["key"] for c in amount_columns}
-    primary = _first_nonblank(
-        parsed.get("mdd_amount_key"),
-        parsed.get("primary_amount_key"),
-        parsed.get("mdd_strength"),
+    rev_prompt = (
+        "This page may contain revision history and/or electronic signatures.\n"
+        "Return ONLY: "
+        '{"revision_history":[{"document_version":"","changes":""}],'
+        '"signatures":[{"intention":"","employee_id":"","user_name":"","date":""}]}'
     )
-    if primary not in amount_keys:
-        primary = amount_columns[0]["key"]
-    parsed["mdd_amount_key"] = primary
-    parsed["mdd_strength"] = primary
+    for i in range(max(0, len(page_images)-3), len(page_images)):
+        try:
+            raw = claude_vision(safe_list_get(page_images, i, b""), rev_prompt)
+            d = safe_json_parse(raw, {})
+            if isinstance(d, dict):
+                rh = d.get("revision_history")
+                sg = d.get("signatures")
+                if isinstance(rh, list) and rh: revision_data = rh
+                if isinstance(sg, list) and sg: sig_data = sg
+        except Exception: pass
 
-    daily_units = parsed.get("daily_units", parsed.get("mdd_units", parsed.get("mdd_sachets", 1)))
-    try:
-        daily_units_f = float(str(daily_units).strip())
-    except Exception:
-        daily_units_f = 1.0
-    if daily_units_f <= 0:
-        daily_units_f = 1.0
-    parsed["daily_units"] = daily_units_f
-    parsed["mdd_sachets"] = daily_units_f
-    parsed["daily_unit_label"] = _first_nonblank(
-        parsed.get("daily_unit_label"), parsed.get("unit_label"), "unit/day",
-    )
-
-    columns = []
-    sample_rows = _iter_composition_rows(parsed["sections"])
-    has_code = any(safe_str(r.get("material_code", "")) for r in sample_rows)
-    has_function = any(safe_str(r.get("function", "")) for r in sample_rows)
-    has_status = any(safe_str(r.get("status", "")) for r in sample_rows)
-    if has_code:
-        columns.append({"key": "material_code", "label": "Material code"})
-    columns.append({"key": "ingredient", "label": "Name of Ingredient"})
-    if has_function:
-        columns.append({"key": "function", "label": "Function"})
-    if has_status:
-        columns.append({"key": "status", "label": "Compendial Status"})
-    for col in amount_columns:
-        columns.append({"key": col["key"], "label": col["label"]})
-    parsed["composition_columns"] = columns
-
-    product_meta = parsed.get("product_metadata", {})
-    product_meta = product_meta if isinstance(product_meta, dict) else {}
-    if _is_blank(product_meta.get("product_name", "")):
-        for row in _iter_composition_rows(parsed["sections"]):
-            function_text = safe_str(row.get("function", "")).lower()
-            if "active" in function_text or "drug substance" in function_text:
-                product_meta["product_name"] = safe_str(row.get("ingredient", ""))
-                break
-    parsed["product_metadata"] = product_meta
-    return parsed
+    return {"meta": meta, "toc_entries": toc_entries,
+            "revision_history": revision_data, "signatures": sig_data}
 
 
-# ============================================================================
-# EXCEL COMPOSITION PARSER
-# ============================================================================
+# ── Excel composition parser ──────────────────────────────────────────────────
 def parse_composition_excel(excel_bytes: bytes) -> Dict:
-    """Parse composition Excel using Claude to understand structure."""
+    """
+    Generic parser: works for oral sachets, injections, any formulation.
+    Returns sections with ingredients and their amounts.
+    """
     wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
     ws = wb.worksheets[0]
-
     rows_text: List[str] = []
-    all_rows:  List[List[str]] = []
+    all_rows: List[List[str]] = []
     for i, row in enumerate(ws.iter_rows(values_only=True)):
         if any(c is not None for c in row):
             row_str = [str(c) if c is not None else "" for c in row]
-            rows_text.append(f"Row {i + 1}: {' | '.join(row_str)}")
+            rows_text.append(f"Row {i+1}: {' | '.join(row_str)}")
             all_rows.append(row_str)
     wb.close()
-
-    sheet_dump = "\n".join(rows_text[:80])
+    sheet_dump = "\n".join(rows_text[:100])
 
     prompt = (
-        "Below is spreadsheet data from a pharmaceutical product composition file.\n"
-        "Extract the product-specific composition. Do not assume the product is a "
-        "40/20/10 mg sachet; preserve the actual dosage unit, strength columns, "
-        "ingredient names, functions, material codes, and units shown in the sheet.\n\n"
+        "Pharmaceutical composition spreadsheet. Extract:\n"
+        "1. ingredient name column\n"
+        "2. amount/concentration columns (per unit dose)\n"
+        "3. section headers vs ingredient rows\n"
+        "4. MDD (maximum daily dose) — total amount of drug product per day\n"
+        "5. dose unit (mg, mL, g, etc.)\n"
+        "6. route of administration (oral, parenteral, injection, topical, etc.)\n\n"
+        "IMPORTANT: The MDD for calculation is the amount of drug PRODUCT given per day.\n"
+        "For injections: MDD = quantity per injection × doses per day (usually 1 injection/day).\n"
+        "For oral: MDD = mg per tablet/sachet × number per day.\n\n"
         "Return ONLY this JSON (no markdown):\n"
-        '{\n'
-        '  "product_metadata": {\n'
-        '    "title": "", "document_no": "", "product_name": "",\n'
-        '    "dosage_form": "", "strength": "", "department": "",\n'
-        '    "market": "", "protocol": "", "version": "",\n'
-        '    "sop_format_number": ""\n'
-        '  },\n'
-        '  "amount_columns": [\n'
-        '    {"key": "qty_per_unit_mg", "label": "Qty/unit (mg/0.65 mL)", "unit": "mg"}\n'
-        '  ],\n'
-        '  "mdd_amount_key": "qty_per_unit_mg",\n'
-        '  "daily_units": 1,\n'
-        '  "daily_unit_label": "unit/day",\n'
-        '  "sections": [\n'
-        '    {"name": "Composition", "rows": [\n'
-        '      {"material_code": "", "ingredient": "", "function": "",\n'
-        '       "status": "", "qty_per_unit_mg": ""}\n'
+        "{\n"
+        '  "ingredient_col":1,"amount_col":3,"unit":"mg/0.65mL",\n'
+        '  "route":"oral or parenteral or injection",\n'
+        '  "mdd_g":0.65,"mdd_unit":"mL","doses_per_day":1,\n'
+        '  "sections":[\n'
+        '    {"name":"Drug Substance","rows":[\n'
+        '      {"ingredient":"...","amount":"...","unit":"...","function":"..."}\n'
         '    ]}\n'
-        '  ],\n'
-        '  "packaging": [\n'
-        '    {"material_code": "", "name": ""}\n'
         '  ]\n'
-        '}\n\n'
-        "Rules:\n"
-        "- amount_columns keys must exactly match keys used in every row.\n"
-        "- daily_units is the number of units/doses used for maximum daily intake. "
-        "Use 1 for a single daily injection unless the sheet states otherwise.\n"
-        "- If several strengths are present, choose mdd_amount_key for the worst-case "
-        "maximum daily dose.\n\n"
+        "}\n\n"
+        f"mdd_g must be in GRAMS (the total mass of product per day).\n"
         f"Spreadsheet:\n{sheet_dump}"
     )
-
     raw = claude_text(prompt)
     parsed = safe_json_parse(raw, {})
 
-    if not (isinstance(parsed, dict)
-            and isinstance(parsed.get("sections"), list)
-            and parsed["sections"]):
-        logger.warning("Excel parse: using raw-row fallback")
-        parsed = {}
+    if isinstance(parsed, dict) and isinstance(parsed.get("sections"), list) and parsed["sections"]:
+        result = parsed
+    else:
+        logger.warning("Excel parse: fallback to raw rows")
+        fallback_rows = []
+        for row in all_rows[1:]:
+            if len(row) > 2 and row[0].strip():
+                fallback_rows.append({"ingredient": row[0], "amount": row[2] if len(row)>2 else "0",
+                                       "unit": "", "function": ""})
+        result = {"sections": [{"name": "Composition", "rows": fallback_rows}],
+                  "route": "oral", "mdd_g": 1.0, "doses_per_day": 1, "unit": ""}
 
-    result = _normalize_composition_result(parsed, all_rows)
-    result["ingredient_col"] = safe_int(result.get("ingredient_col", 1), default=1)
+    result["mdd_g"] = safe_float(result.get("mdd_g", 1.0), default=1.0)
+    result["doses_per_day"] = safe_int(result.get("doses_per_day", 1), default=1)
+    result["route"] = safe_str(result.get("route", "oral")) or "oral"
+    if not isinstance(result.get("sections"), list): result["sections"] = []
     result["all_rows"] = all_rows
     return result
 
 
-# ============================================================================
-# ANNEXURE JSON PROCESSOR
-# ============================================================================
+# ── Annexure processor ────────────────────────────────────────────────────────
 def _flatten_docai_json(obj: Any, depth: int = 0) -> str:
-    """Flatten a Document AI JSON object into plain text."""
-    if depth > 8:
-        return ""
+    if depth > 8: return ""
     parts: List[str] = []
     if isinstance(obj, dict):
-        if "text" in obj and isinstance(obj["text"], str):
-            parts.append(obj["text"])
-        for v in obj.values():
-            parts.append(_flatten_docai_json(v, depth + 1))
+        if "text" in obj and isinstance(obj["text"], str): parts.append(obj["text"])
+        for v in obj.values(): parts.append(_flatten_docai_json(v, depth+1))
     elif isinstance(obj, list):
-        for item in obj:
-            parts.append(_flatten_docai_json(item, depth + 1))
-    elif isinstance(obj, (str, int, float)):
-        parts.append(str(obj))
+        for item in obj: parts.append(_flatten_docai_json(item, depth+1))
+    elif isinstance(obj, (str, int, float)): parts.append(str(obj))
     return " ".join(p for p in parts if p.strip())
 
 
 def process_annexure(annexure_json: Any, index: int) -> Dict:
-    """Extract structured EI declaration from one Document AI JSON file."""
     text_content = _flatten_docai_json(annexure_json)
-
     prompt = (
-        f"Extract pharmaceutical elemental impurity data from Annexure {index}.\n\n"
+        f"Extract elemental impurity data from Annexure {index}.\n"
         "Return ONLY this JSON (no markdown):\n"
-        '{\n'
-        f'  "annexure_number": {index},\n'
-        '  "supplier_name": "",\n'
-        '  "material_name": "",\n'
-        '  "source_type": "Plant/Mineral/Synthetic",\n'
-        '  "date_filled": "",\n'
-        '  "elements": [\n'
-        '    {"name": "", "symbol": "", "class": "1/2A/2B/3",\n'
-        '     "intentionally_added": "Yes/No",\n'
-        '     "concentration_value": 0.05, "concentration_unit": "ppm",\n'
-        '     "analytical_method": "ICP-MS", "observed_level": "BLQ",\n'
-        '     "frequency_of_testing": "Once", "listed_in_coa": "Yes/No",\n'
-        '     "comments": ""}\n'
+        "{\n"
+        f'  "annexure_number":{index},"supplier_name":"","material_name":"",\n'
+        '  "source_type":"","date_filled":"",\n'
+        '  "elements":[\n'
+        '    {"symbol":"","name":"","class":"","concentration_value":0.05,\n'
+        '     "concentration_unit":"ppm","analytical_method":"","intentionally_added":"No",\n'
+        '     "observed_level":"","listed_in_coa":"Yes","comments":""}\n'
         '  ]\n'
-        '}\n\n'
-        "Rules:\n"
-        "- concentration_value: numeric; BLQ → 0.05; NA/blank → 0\n"
-        "- symbol: standard element symbol (Pb, As, Cd, Hg, etc.)\n\n"
-        f"Document text:\n{text_content[:8000]}"
+        "}\n\n"
+        "Rules: concentration_value is numeric (µg/g=ppm). BLQ→0.05. NA/blank→0.\n"
+        f"Text:\n{text_content[:8000]}"
     )
-
-    raw = call_claude([{"role": "user", "content": prompt}])
-    default: Dict = {
-        "annexure_number": index,
-        "supplier_name":   "N/A",
-        "material_name":   "N/A",
-        "source_type":     "N/A",
-        "date_filled":     "",
-        "elements":        [],
-    }
+    raw = call_claude([{"role":"user","content":prompt}])
+    default = {"annexure_number":index,"supplier_name":"N/A","material_name":"N/A",
+               "source_type":"","date_filled":"","elements":[]}
     parsed = safe_json_parse(raw, default)
-    if not isinstance(parsed, dict):
-        return default
-    for k, v in default.items():
-        parsed.setdefault(k, v)
-    if not isinstance(parsed.get("elements"), list):
-        parsed["elements"] = []
+    if not isinstance(parsed, dict): return default
+    for k, v in default.items(): parsed.setdefault(k, v)
+    if not isinstance(parsed.get("elements"), list): parsed["elements"] = []
     return parsed
 
 
-# ============================================================================
-# CALCULATION ENGINE — Tables 5, 6, 7
-# ============================================================================
+# ── Calculation engine ────────────────────────────────────────────────────────
 def _parse_conc(val: Any) -> float:
-    """Parse a concentration value to µg/g. BLQ → 0.05 (LOQ)."""
-    if val is None:
-        return 0.0
-    if isinstance(val, (int, float)):
-        return max(0.0, float(val))
+    """Parse concentration to µg/g (ppm). BLQ→0.05."""
+    if val is None: return 0.0
+    if isinstance(val, (int, float)): return max(0.0, float(val))
     s = str(val).strip().lower()
-    s_compact = re.sub(r"\s+", "", s)
-    if s_compact in (
-        "", "na", "n/a", "nd", "notdetected", "notanalyzed",
-        "notanalysed", "nq", "notquantified", "none", "null",
-    ):
-        return 0.0
-    if s_compact in ("blq", "bdl", "<loq", "<lod"):
-        return 0.05
-    s = s.replace("µ", "u")
-    s = re.sub(r"(ppm|ug/g|mcg/g|<|>|,)", "", s).replace(" ", "")
-    try:
-        return max(0.0, float(s))
-    except (ValueError, TypeError):
-        return 0.05
+    if s in ("","na","nd","blq","bdl","none","null","nq","not detected","not quantified"): return 0.05
+    s = re.sub(r"(ppm|µg/g|ug/g|<|>|\s)", "", s)
+    try: return max(0.0, float(s))
+    except: return 0.05
 
 
-def _parse_amount(val: Any) -> float:
-    """Parse an ingredient amount (mg) to float. q.s. → 0."""
-    if val is None:
-        return 0.0
-    if isinstance(val, (int, float)):
-        return max(0.0, float(val))
+def _parse_amount_g(val: Any) -> float:
+    """Parse ingredient amount to grams."""
+    if val is None: return 0.0
     s = str(val).strip().lower()
-    if s in ("", "q.s.", "q.s", "qs", "q.s. to", "na", "n/a"):
-        return 0.0
-    if "qs" in s or "q.s" in s or "adjust" in s:
-        return 0.0
-    m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s.replace(",", ""))
-    if m:
-        try:
-            return max(0.0, float(m.group(0)))
-        except Exception:
-            return 0.0
-    try:
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def _amount_to_daily_g(amount: float, unit: str, daily_units: float) -> float:
-    """Convert one-unit amount to daily intake in g/day."""
-    unit_l = safe_str(unit, "mg").lower().replace("µ", "u")
-    amount_f = max(0.0, float(amount or 0.0))
-    if "ug" in unit_l or "mcg" in unit_l:
-        per_unit_g = amount_f / 1_000_000.0
-    elif re.search(r"(^|[^a-z])g([^a-z]|$)", unit_l) and "mg" not in unit_l:
-        per_unit_g = amount_f
-    else:
-        per_unit_g = amount_f / 1000.0
-    return per_unit_g * max(0.0, float(daily_units or 0.0))
+    if s in ("","q.s.","qs","na","qs to ph","qs to 1ml","qs to volume"): return 0.0
+    s = re.sub(r"[^\d.\-eE]","",s)
+    try: return float(s)
+    except: return 0.0
 
 
 def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
-    """Build {material_name: {element_symbol: conc_µg/g}} from all annexures."""
     conc_map: Dict[str, Dict[str, float]] = {}
     for ann in annexure_data:
-        if not isinstance(ann, dict):
-            continue
-        material = safe_str(ann.get("material_name", ""))
-        if not material:
-            continue
+        if not isinstance(ann, dict): continue
+        material = safe_str(ann.get("material_name",""))
+        if not material: continue
         elem_dict: Dict[str, float] = {}
-        for el in ann.get("elements", []) or []:
-            if not isinstance(el, dict):
-                continue
-            sym = safe_str(el.get("symbol", ""))
-            if sym:
-                elem_dict[sym] = _parse_conc(el.get("concentration_value", 0))
+        for el in (ann.get("elements") or []):
+            if not isinstance(el, dict): continue
+            sym = safe_str(el.get("symbol",""))
+            if sym: elem_dict[sym] = _parse_conc(el.get("concentration_value",0))
         conc_map[material] = elem_dict
     return conc_map
 
 
-def _match_ingredient(name: str,
-                      conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """Fuzzy-match an ingredient name to the closest annexure material."""
-    if not conc_map or not name:
-        return {}
+def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    if not conc_map or not name: return {}
     name_lower = name.lower().strip()
-    best_key: Optional[str] = None
-    best_score = 0.0
+    best_key: Optional[str] = None; best_score = 0
     for key in conc_map:
-        if not key:
-            continue
-        key_lower = key.lower().strip()
-        if key_lower in name_lower or name_lower in key_lower:
-            return conc_map.get(key, {})
-        name_tokens = set(t for t in re.split(r"[\s\(\)\-,]+", name_lower) if t)
-        key_tokens  = set(t for t in re.split(r"[\s\(\)\-,]+", key_lower)  if t)
-        if not name_tokens or not key_tokens:
-            continue
-        overlap = len(name_tokens & key_tokens)
-        score = overlap / max(len(name_tokens), len(key_tokens))
+        if not key: continue
+        tokens_n = set(t for t in re.split(r"[\s\(\)\-,/]+", name_lower) if len(t)>1)
+        tokens_k = set(t for t in re.split(r"[\s\(\)\-,/]+", key.lower()) if len(t)>1)
+        if not tokens_n or not tokens_k: continue
+        overlap = len(tokens_n & tokens_k)
+        score   = overlap / max(len(tokens_n), len(tokens_k))
         if score > best_score:
-            best_score = score
-            best_key   = key
-    return conc_map.get(best_key, {}) if best_key and best_score >= 0.45 else {}
+            best_score = score; best_key = key
+    return conc_map.get(best_key, {}) if best_score > 0.2 else {}
 
 
-def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict],
-                        pde_values: Optional[Dict[str, Dict]] = None) -> Dict:
-    """Calculate Tables 5 (Class 1+2A), 6 (2B), 7 (3)."""
-    pde_values = pde_values or ICH_PDE
-    daily_units = comp_data.get("daily_units", comp_data.get("mdd_sachets", 1))
-    try:
-        daily_units = float(daily_units)
-    except Exception:
-        daily_units = 1.0
-    if daily_units <= 0:
-        daily_units = 1.0
+def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
+    """
+    Product-agnostic EI calculation.
+    
+    Formula: Daily_exposure (µg/day) = Amount_in_MDD (g/day) × Conc (µg/g)
+    
+    For each ingredient:
+      amount_in_mdd_g = ingredient_amount × (mdd_g / dose_unit_mass)
+      daily_exposure  = amount_in_mdd_g × measured_conc_µg_per_g
+    
+    mdd_g = total mass of drug product per day in grams
+    This works for: oral sachets, injections, tablets, topical, etc.
+    """
+    route       = safe_str(comp_data.get("route","oral"))
+    mdd_g       = safe_float(comp_data.get("mdd_g", 1.0), default=1.0)
+    doses_per_day = safe_int(comp_data.get("doses_per_day", 1), default=1)
 
-    amount_key = safe_str(
-        comp_data.get("mdd_amount_key", comp_data.get("mdd_strength", "")),
-    )
-    amount_columns = comp_data.get("amount_columns", []) or []
-    amount_unit = "mg"
-    if isinstance(amount_columns, list):
-        for col in amount_columns:
-            if isinstance(col, dict) and safe_str(col.get("key")) == amount_key:
-                amount_unit = safe_str(col.get("unit", "mg")) or "mg"
-                break
-    if not amount_key and isinstance(amount_columns, list) and amount_columns:
-        first_col = amount_columns[0] if isinstance(amount_columns[0], dict) else {}
-        amount_key = safe_str(first_col.get("key", ""))
-        amount_unit = safe_str(first_col.get("unit", "mg")) or "mg"
-
+    # Build ingredient list with daily intake in grams
+    # Amount is usually "per dose unit" so multiply by doses_per_day
     ingredients: List[Dict] = []
-    for section in comp_data.get("sections") or []:
-        if not isinstance(section, dict):
-            continue
-        for row in section.get("rows", []) or []:
-            if not isinstance(row, dict):
-                continue
-            ingredient_name = safe_str(row.get("ingredient", ""))
-            if not ingredient_name:
-                continue
-            amt = _parse_amount(row.get(amount_key, row.get("40mg", 0)))
-            daily = _amount_to_daily_g(amt, amount_unit, daily_units)
-            ingredients.append({
-                "name": ingredient_name,
-                "daily_g": daily,
-                "amount_value": amt,
-                "amount_unit": amount_unit,
-            })
+    sections = comp_data.get("sections") or []
+    for section in sections:
+        if not isinstance(section, dict): continue
+        for row in (section.get("rows") or []):
+            if not isinstance(row, dict): continue
+            name = safe_str(row.get("ingredient",""))
+            if not name: continue
+            # Amount may be in mg or g; normalise to grams
+            raw_amount = row.get("amount", row.get("40mg", row.get("qty","0")))
+            amount_raw = _parse_amount_g(raw_amount)
+            unit = safe_str(row.get("unit","")).lower()
+            # Convert to grams
+            if "mg" in unit:
+                amount_g = amount_raw / 1000.0
+            elif "µg" in unit or "ug" in unit:
+                amount_g = amount_raw / 1_000_000.0
+            elif "ml" in unit or "g" in unit:
+                amount_g = amount_raw   # assume g or mL ≈ g
+            else:
+                # Best-effort: if value > 10 assume mg, else grams
+                amount_g = amount_raw / 1000.0 if amount_raw > 10 else amount_raw
+            # Daily = per-dose × doses_per_day
+            daily_g = round(amount_g * doses_per_day, 6)
+            ingredients.append({"name": name, "daily_g": daily_g})
 
     conc_map = _build_conc_map(annexure_data)
 
     def build_one_table(elements: List[str]) -> Dict:
-        rows:          List[Dict] = []
-        elem_totals:   Dict[str, float] = {sym: 0.0 for sym in elements}
+        rows: List[Dict] = []
+        elem_totals: Dict[str, float] = {sym: 0.0 for sym in elements}
         total_intake = 0.0
-
         for ing in ingredients:
-            if ing["daily_g"] == 0:
-                continue
+            if ing["daily_g"] == 0: continue
             ing_concs = _match_ingredient(ing["name"], conc_map)
-            measured:    Dict[str, float] = {}
-            total_mass:  Dict[str, float] = {}
+            measured: Dict[str, float] = {}
+            total_mass: Dict[str, float] = {}
             for sym in elements:
-                conc              = ing_concs.get(sym, 0.0)
-                measured[sym]     = round(conc, 6)
-                mass              = ing["daily_g"] * conc
-                total_mass[sym]   = round(mass, 9)
-                elem_totals[sym]  = elem_totals[sym] + mass
+                conc            = ing_concs.get(sym, 0.0)
+                measured[sym]   = round(conc, 4)
+                mass            = ing["daily_g"] * conc
+                total_mass[sym] = round(mass, 6)
+                elem_totals[sym]= round(elem_totals[sym] + mass, 6)
             total_intake += ing["daily_g"]
-            rows.append({
-                "ingredient":     ing["name"],
-                "daily_intake_g": round(ing["daily_g"], 9),
-                "amount_value":   ing["amount_value"],
-                "amount_unit":    ing["amount_unit"],
-                "measured_conc":  measured,
-                "total_mass":     total_mass,
-            })
+            rows.append({"ingredient": ing["name"],
+                         "daily_intake_g": round(ing["daily_g"], 6),
+                         "measured_conc": measured,
+                         "total_mass": total_mass})
 
-        table_pde = {sym: pde_values[sym]["pde"] for sym in elements}
-        threshold  = {
-            sym: round(table_pde[sym] * 0.30, 3) if table_pde[sym] else None
-            for sym in elements
-        }
+        # PDE by route
+        pde_vals = {sym: get_pde(sym, route) for sym in elements}
+        threshold = {sym: round(pde_vals[sym]*0.30, 4) if pde_vals[sym] else None
+                     for sym in elements}
         return {
             "elements":           elements,
             "rows":               rows,
-            "total_daily_intake": round(total_intake, 9),
-            "element_totals":     {sym: round(v, 9) for sym, v in elem_totals.items()},
-            "pde":                table_pde,
+            "total_daily_intake": round(total_intake, 6),
+            "element_totals":     {sym: round(v, 6) for sym, v in elem_totals.items()},
+            "pde":                pde_vals,
             "threshold_30pct":    threshold,
-            "formula":            "Daily exposure (ug/day) = Daily intake (g/day) x measured concentration (ug/g)",
+            "route":              route,
         }
 
     return {
@@ -1082,492 +549,328 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict],
     }
 
 
-# ============================================================================
-# TEXT SECTION GENERATION
-# ============================================================================
+# ── Text section generation ───────────────────────────────────────────────────
 def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
-                           calc_tables: Dict, comp_data: Dict,
-                           pde_values: Optional[Dict[str, Dict]] = None) -> Dict:
-    """Generate all narrative sections using Claude."""
+                           calc_tables: Dict, comp_data: Dict) -> Dict:
+    """
+    Generate all narrative text sections dynamically.
+    The prompt is product-agnostic — Claude uses reference structure + calculations.
+    """
     empty: Dict = {
-        "abstract": "", "objective": "", "study_location": "NA",
-        "background": "", "sources_intro": "", "drug_substance_section": "",
-        "excipient_intro": "", "manufacturing_section": "",
-        "container_closure_section": "", "utilities_section": "",
-        "control_strategy": "", "observation": "", "conclusion": "",
-        "reference": "NA",
+        "abstract":"","objective":"","study_location":"NA","background":"",
+        "sources_intro":"","drug_substance_section":"","excipient_intro":"",
+        "manufacturing_section":"","container_closure_section":"","utilities_section":"",
+        "control_strategy":"","testing_recommendation":"","conclusion":"",
+        "observation":"","reference":"NA",
     }
+    meta    = ref_structure.get("meta", {}) or {}
+    route   = safe_str(comp_data.get("route","oral"))
+    mdd_g   = safe_float(comp_data.get("mdd_g",1.0))
+    doses   = safe_int(comp_data.get("doses_per_day",1))
+    toc     = ref_structure.get("toc_entries",[]) or []
 
-    ann_summary = []
-    for ann in annexure_data:
-        if isinstance(ann, dict):
-            ann_summary.append({
-                "material":       ann.get("material_name", "N/A"),
-                "supplier":       ann.get("supplier_name", "N/A"),
-                "elements_count": len(ann.get("elements", []) or []),
-            })
+    ann_summary = [{"material":a.get("material_name","N/A"),
+                    "supplier":a.get("supplier_name","N/A"),
+                    "n_elements":len(a.get("elements",[])or[])}
+                   for a in annexure_data if isinstance(a, dict)]
 
-    pde_values = pde_values or ICH_PDE
-    t5 = safe_calc_table(calc_tables, "class1_2a")
-    t6 = safe_calc_table(calc_tables, "class2b")
-    t7 = safe_calc_table(calc_tables, "class3")
+    t5 = safe_calc_table(calc_tables,"class1_2a")
+    t6 = safe_calc_table(calc_tables,"class2b")
+    t7 = safe_calc_table(calc_tables,"class3")
 
-    crossing: Dict = {}
-    for table in (t5, t6, t7):
-        for sym in table.get("elements", []):
-            pde = pde_values[sym]["pde"]
-            total = table.get("element_totals", {}).get(sym, 0)
-            if pde and total > pde * 0.3:
-                crossing[sym] = {"total": total, "pde30": round(pde * 0.3, 3)}
+    crossing = {sym: {"total":t5["element_totals"].get(sym,0),
+                      "pde30":round(t5["pde"].get(sym,0)*0.3,4)}
+                for sym in TABLE5_ELEMENTS
+                if t5["pde"].get(sym) and t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.3}
 
-    comp_summary = []
-    primary_key = safe_str(comp_data.get("mdd_amount_key", comp_data.get("mdd_strength", "")))
-    for section in comp_data.get("sections", []) or []:
-        if not isinstance(section, dict):
-            continue
-        for row in section.get("rows", []) or []:
-            if isinstance(row, dict) and safe_str(row.get("ingredient", "")):
-                comp_summary.append({
-                    "ingredient": row.get("ingredient", ""),
-                    "function": row.get("function", ""),
-                    "amount": row.get(primary_key, ""),
-                })
+    # Tell Claude how many TOC sections there are so it writes the right structure
+    toc_info = ""
+    if toc:
+        toc_info = "TOC sections from reference: " + "; ".join(
+            f"{e.get('no','?')}. {e.get('title','')}" for e in toc[:15])
 
     prompt = (
         "You are a pharmaceutical regulatory writer creating an ICH Q3D (R2) TSR.\n\n"
-        f"Product metadata:\n{json.dumps(ref_structure.get('meta', {}), indent=2)}\n\n"
-        f"Composition rows:\n{json.dumps(comp_summary[:80], indent=2)}\n\n"
-        f"Annexures ({len(annexure_data)} materials):\n"
-        f"{json.dumps(ann_summary, indent=2)}\n\n"
-        "Calculation results:\n"
+        f"Product: {meta.get('product_name','')}\n"
+        f"Dosage form: {meta.get('dosage_form','')}\n"
+        f"Route: {route}\n"
+        f"MDD: {mdd_g}g/day ({doses} dose(s)/day)\n"
+        f"Document No: {meta.get('document_no','')}\n\n"
+        f"{toc_info}\n\n"
+        f"Annexures ({len(annexure_data)} materials):\n{json.dumps(ann_summary)}\n\n"
+        "Calculation formula: Daily exposure (µg/day) = Amount_in_MDD(g) × Conc(µg/g)\n"
         f"- Class 1+2A totals: {json.dumps(t5['element_totals'])}\n"
-        f"- Class 2B totals: {json.dumps(t6['element_totals'])}\n"
-        f"- Class 3 totals: {json.dumps(t7['element_totals'])}\n"
-        f"- PDE route: {ref_structure.get('meta', {}).get('pde_route', '')}\n"
-        f"- PDEs: {json.dumps({s: pde_values[s]['pde'] for s in TABLE5_ELEMENTS})}\n"
-        f"- Daily units: {comp_data.get('daily_units', 1)}, "
-        f"amount key: {comp_data.get('mdd_amount_key', primary_key)}\n\n"
-        f"Elements crossing 30% PDE: {json.dumps(crossing)}\n\n"
-        "Generate concise, factual ICH Q3D regulatory text.\n"
-        "Use only the product name, strength, dosage form, ingredients, and "
-        "suppliers present above. Do not copy product-specific wording from the "
-        "reference report if it is not in these inputs.\n"
-        "Return ONLY this JSON (no markdown, no extra text):\n"
-        '{\n'
-        '  "abstract": "...",\n'
-        '  "objective": "...",\n'
-        '  "study_location": "NA",\n'
-        '  "background": "...",\n'
-        '  "sources_intro": "...",\n'
-        '  "drug_substance_section": "...",\n'
-        '  "excipient_intro": "...",\n'
-        '  "manufacturing_section": "...",\n'
-        '  "container_closure_section": "...",\n'
-        '  "utilities_section": "...",\n'
-        '  "control_strategy": "...",\n'
-        '  "observation": "...",\n'
-        '  "conclusion": "...",\n'
-        '  "reference": "NA"\n'
-        '}'
+        f"- Class 2B totals:   {json.dumps(t6['element_totals'])}\n"
+        f"- Class 3 totals:    {json.dumps(t7['element_totals'])}\n"
+        f"- Route-specific PDEs used: {route}\n"
+        f"- Elements crossing 30% PDE: {json.dumps(crossing)}\n\n"
+        "Generate concise factual ICH Q3D regulatory text matching the product.\n"
+        "Return ONLY this JSON (no markdown):\n"
+        '{"abstract":"","objective":"","study_location":"NA","background":"",\n'
+        '"sources_intro":"","drug_substance_section":"","excipient_intro":"",\n'
+        '"manufacturing_section":"","container_closure_section":"","utilities_section":"",\n'
+        '"control_strategy":"","testing_recommendation":"","conclusion":"",\n'
+        '"observation":"","reference":"NA"}'
     )
-
     raw    = claude_text(prompt, max_tokens=6000)
     parsed = safe_json_parse(raw, {})
     if not isinstance(parsed, dict):
         logger.error("Text generation returned no valid JSON; using empty sections")
         return empty
-    for k, v in empty.items():
-        parsed.setdefault(k, v)
+    for k, v in empty.items(): parsed.setdefault(k, v)
     return parsed
 
 
-# ============================================================================
-# ASSEMBLE AND CALL Node.js GENERATOR
-# ============================================================================
-def assemble_and_generate(
-    ref_structure: Dict,
-    page_images:   List[bytes],
-    figure_pages:  List[Dict],
-    annexure_data: List[Dict],
-    comp_data:     Dict,
-    calc_tables:   Dict,
-    text_sections: Dict,
-    ref_bytes:     bytes = b"",
-    logo_b64:      str   = "",
-    logo_type:     str   = "",
-    pde_values:    Optional[Dict[str, Dict]] = None,
-) -> bytes:
-    """Build report_data.json, run generate_report.js, return DOCX bytes."""
+# ── Assemble and invoke Node.js ───────────────────────────────────────────────
+def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
+                          figure_pages: List[Dict], annexure_data: List[Dict],
+                          comp_data: Dict, calc_tables: Dict, text_sections: Dict,
+                          ref_bytes: bytes = b"", logo_b64: str = "",
+                          logo_type: str = "") -> bytes:
 
-    # Encode figure images (header already cropped in extract_figure_from_page)
     figures_b64: List[Dict] = []
     for fig in figure_pages:
-        if not isinstance(fig, dict):
-            continue
+        if not isinstance(fig, dict): continue
         pi = fig.get("page_index")
-        if pi is None:
-            continue
+        if pi is None: continue
         try:
             img_bytes = extract_figure_from_page(ref_bytes, pi, dpi=200)
         except Exception as e:
-            logger.warning(f"Figure raster page {pi}: {e}")
+            logger.warning(f"Figure raster p{pi}: {e}")
             img_bytes = safe_list_get(page_images, pi, b"")
-        if not img_bytes:
-            continue
-        figures_b64.append({
-            "page_index":   pi,
-            "description":  fig.get("description", ""),
-            "figure_label": fig.get("figure_label", "Figure 1"),
-            "data_b64":     base64.standard_b64encode(img_bytes).decode(),
-            "media_type":   "image/png",
-        })
+        if not img_bytes: continue
+        figures_b64.append({"page_index":pi,
+                             "description":fig.get("description",""),
+                             "figure_label":fig.get("figure_label","Figure 1"),
+                             "data_b64":base64.standard_b64encode(img_bytes).decode(),
+                             "media_type":"image/png"})
 
-    # Build annexure list for Table 8
-    annexure_list: List[Dict] = []
-    for ann in annexure_data:
-        if isinstance(ann, dict):
-            annexure_list.append({
-                "material":  ann.get("material_name", "N/A"),
-                "supplier":  ann.get("supplier_name", "N/A"),
-                "annexure":  f"Annexure {ann.get('annexure_number', '?')}",
-            })
+    annexure_list = [{"material":a.get("material_name","N/A"),
+                      "supplier":a.get("supplier_name","N/A"),
+                      "annexure":f"Annexure {a.get('annexure_number','?')}"}
+                     for a in annexure_data if isinstance(a, dict)]
 
     report_data = {
-        "meta":             ref_structure.get("meta", {}) or {},
+        "meta":             ref_structure.get("meta",{}) or {},
+        "toc_entries":      ref_structure.get("toc_entries",[]) or [],
         "logo_b64":         logo_b64,
         "logo_type":        logo_type,
         "text_sections":    text_sections or {},
-        "composition":      comp_data.get("sections", []) or [],
-        "composition_columns": comp_data.get("composition_columns", []) or [],
+        "composition":      comp_data.get("sections",[]) or [],
+        "comp_meta":        {"route":comp_data.get("route","oral"),
+                             "mdd_g":comp_data.get("mdd_g",1.0),
+                             "doses_per_day":comp_data.get("doses_per_day",1),
+                             "unit":comp_data.get("unit","")},
         "annexure_list":    annexure_list,
         "calc_tables":      calc_tables or {},
-        "revision_history": ref_structure.get("revision_history", []) or [],
-        "signatures":       ref_structure.get("signatures", []) or [],
+        "revision_history": ref_structure.get("revision_history",[]) or [],
+        "signatures":       ref_structure.get("signatures",[]) or [],
         "figures":          figures_b64,
-        "pde_values":       pde_values or dict(ICH_PDE),
+        "pde_values":       dict(ICH_PDE),
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
         json_path = Path(tmpdir) / "report_data.json"
         docx_path = Path(tmpdir) / "report.docx"
         js_script = Path(__file__).parent / "generate_report.js"
-
-        with open(json_path, "w", encoding="utf-8") as f:
+        with open(json_path,"w",encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False)
-
         result = subprocess.run(
             ["node", str(js_script), str(json_path), str(docx_path)],
-            capture_output=True, text=True, timeout=180,
-        )
+            capture_output=True, text=True, timeout=180)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Node.js failed (exit {result.returncode}).\n"
-                f"STDERR: {result.stderr[-2000:]}\n"
-                f"STDOUT: {result.stdout[-500:]}"
-            )
+                f"STDERR: {result.stderr[-2000:]}\nSTDOUT: {result.stdout[-500:]}")
         if not docx_path.exists():
-            raise RuntimeError(
-                f"Node.js exited OK but DOCX was not created.\n"
-                f"STDOUT: {result.stdout}"
-            )
+            raise RuntimeError(f"Node.js OK but no DOCX written.\nSTDOUT: {result.stdout}")
         docx_bytes = docx_path.read_bytes()
         if len(docx_bytes) < 5000:
-            raise RuntimeError(
-                f"Generated DOCX is too small ({len(docx_bytes)} bytes)."
-            )
+            raise RuntimeError(f"DOCX too small ({len(docx_bytes)} bytes).")
         return docx_bytes
 
 
-# ============================================================================
-# STREAMLIT UI
-# ============================================================================
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
 def main() -> None:
     st.set_page_config(page_title="TSR Report Generator", layout="wide")
     st.title("🧪 TSR Elemental Impurities Report Generator")
-    st.caption(
-        "ICH Q3D (R2) | Dr. Reddy's IPDO | Claude Opus 4.6 via Vertex AI | "
-        "A5 Landscape | Times New Roman 12pt"
-    )
+    st.caption("ICH Q3D (R2) | Dr. Reddy's IPDO | Claude Opus 4.6 | "
+               "Any formulation: oral / parenteral / topical")
     st.markdown("---")
 
     col1, col2, col3 = st.columns(3)
     with col1:
         st.subheader("📄 Reference Report PDF")
         ref_pdf = st.file_uploader(
-            "Previous approved TSR (provides template, text & figures)",
-            type=["pdf"], key="ref_pdf",
-        )
+            "Previous approved TSR for this product",
+            type=["pdf"], key="ref_pdf")
     with col2:
         st.subheader("📊 Composition Excel")
         excel_file = st.file_uploader(
-            "Sheet 1: ingredient | function | amounts per strength",
-            type=["xlsx", "xls"], key="excel",
-        )
+            "Ingredient amounts (any unit: mg, mL, mg/mL, etc.)",
+            type=["xlsx","xls"], key="excel")
     with col3:
-        st.subheader("📁 Annexure JSONs (1–16)")
+        st.subheader("📁 Annexure JSONs")
         annexure_files = st.file_uploader(
-            "Document AI JSONs — one per excipient/DS, in order",
-            type=["json"], accept_multiple_files=True, key="annexures",
-        )
-
-    with st.expander("Product metadata overrides (optional)"):
-        st.caption(
-            "Use these when the reference PDF is only a format template. "
-            "Non-empty values replace old product details extracted from the template."
-        )
-        o1, o2, o3 = st.columns(3)
-        with o1:
-            override_product = st.text_input("Product name", key="override_product")
-            override_strength = st.text_input("Strength", key="override_strength")
-            override_doc_no = st.text_input("Document No", key="override_doc_no")
-        with o2:
-            override_dosage = st.text_input("Dosage form", key="override_dosage")
-            override_market = st.text_input("Market", key="override_market")
-            override_department = st.text_input("Department", key="override_department")
-        with o3:
-            pde_route_override = st.selectbox(
-                "PDE route",
-                ["Auto", "Parenteral", "Oral"],
-                index=0,
-                key="pde_route_override",
-            )
-            daily_units_override = st.text_input(
-                "Daily units/doses override",
-                key="daily_units_override",
-                placeholder="blank = from Excel",
-            )
-            override_protocol = st.text_input("Protocol", key="override_protocol")
-
-        metadata_overrides = {
-            "product_name": override_product,
-            "strength": override_strength,
-            "document_no": override_doc_no,
-            "dosage_form": override_dosage,
-            "market": override_market,
-            "department": override_department,
-            "protocol": override_protocol,
-        }
+            "Document AI JSONs, one per material",
+            type=["json"], accept_multiple_files=True, key="annexures")
 
     st.markdown("---")
 
     btn_disabled = not (ref_pdf and excel_file and annexure_files)
     if st.button("🚀 Generate Report", type="primary", disabled=btn_disabled):
         progress = st.progress(0)
-        log      = st.empty()
-
+        log = st.empty()
         try:
-            # ── Step 0: Pre-flight ───────────────────────────────────────────
+            # Step 0: Pre-flight
             log.info("🔍 Validating uploads…")
-            annexure_raw = [
-                (af.name, af.getvalue().decode("utf-8", "replace"))
-                for af in annexure_files
-            ]
-            errors = validate_inputs(
-                ref_pdf.getvalue(), excel_file.getvalue(), annexure_raw,
-            )
+            annexure_raw = [(af.name, af.getvalue().decode("utf-8","replace"))
+                            for af in annexure_files]
+            errors = validate_inputs(ref_pdf.getvalue(), excel_file.getvalue(), annexure_raw)
             if errors:
-                for err in errors:
-                    st.error(f"❌ {err}")
+                for err in errors: st.error(f"❌ {err}")
                 st.stop()
             st.success("✅ Pre-flight OK.")
             progress.progress(4)
 
-            # ── Step 1: Rasterize reference PDF ─────────────────────────────
+            # Step 1: Rasterize PDF
             log.info("📄 Rasterizing reference PDF…")
             ref_bytes   = ref_pdf.getvalue()
             page_images = rasterize_pdf_pages(ref_bytes, dpi=150)
-            st.success(f"Reference PDF: {len(page_images)} pages loaded.")
+            st.success(f"Reference PDF: {len(page_images)} pages.")
             progress.progress(7)
 
-            # ── Step 2: Load logo ────────────────────────────────────────────
-            log.info("🖼 Loading Dr. Reddy's logo from assets/…")
+            # Step 2: Logo
+            log.info("🖼 Loading logo from assets/…")
             logo_bytes, logo_mt = load_logo_from_assets()
             logo_b64  = base64.standard_b64encode(logo_bytes).decode() if logo_bytes else ""
             logo_type = logo_mt
-            if logo_b64:
-                st.success("✅ Logo loaded from assets/logo.png")
-            else:
-                st.info(
-                    "ℹ️ No logo found in assets/. "
-                    "Save the Dr. Reddy's logo as **assets/logo.png** "
-                    "(next to app.py) for it to appear in the report."
-                )
+            if logo_b64: st.success("✅ Logo loaded from assets/logo.png")
+            else: st.info("ℹ️ No logo in assets/. Save as assets/logo.png for logo in report.")
             progress.progress(10)
 
-            # ── Step 3: Identify figure pages ────────────────────────────────
-            log.info("🔍 Identifying figure pages with Claude…")
+            # Step 3: Figure pages
+            log.info("🔍 Identifying figure pages…")
             figure_pages = identify_figure_pages(page_images)
             if figure_pages:
-                pg_str = ", ".join(f"p{f['page_index'] + 1}" for f in figure_pages)
-                st.success(f"Found {len(figure_pages)} figure page(s): {pg_str}")
+                st.success(f"Found {len(figure_pages)} figure page(s): "
+                           + ", ".join(f"p{f['page_index']+1}" for f in figure_pages))
             else:
-                st.warning("No figure pages detected in reference PDF.")
+                st.warning("No figure pages detected.")
             progress.progress(18)
 
-            # ── Step 4: Extract reference structure ──────────────────────────
-            log.info("📑 Extracting report structure with Claude…")
+            # Step 4: Reference structure
+            log.info("📑 Extracting report structure + TOC…")
             ref_structure = extract_reference_structure(page_images)
-            ref_meta      = ref_structure.get("meta", {}) or {}
-            st.success(
-                f"Reference template extracted | Doc: {ref_meta.get('document_no', '')}"
-            )
-            progress.progress(35)
+            meta = ref_structure.get("meta",{}) or {}
+            toc  = ref_structure.get("toc_entries",[]) or []
+            st.success(f"Product: {meta.get('product_name','(extracted)')} | "
+                       f"Doc: {meta.get('document_no','')} | "
+                       f"TOC sections: {len(toc)}")
+            progress.progress(32)
 
-            # ── Step 5: Parse Excel ──────────────────────────────────────────
+            # Step 5: Parse Excel
             log.info("📊 Parsing composition Excel…")
             comp_data = parse_composition_excel(excel_file.getvalue())
-            override_daily_units = _parse_amount(daily_units_override)
-            if override_daily_units > 0:
-                comp_data["daily_units"] = override_daily_units
-                comp_data["mdd_sachets"] = override_daily_units
-            meta = merge_product_metadata(
-                ref_meta,
-                comp_data,
-                metadata_overrides,
-                pde_route_override,
-            )
-            ref_structure["meta"] = meta
-            pde_values = build_ich_pde(meta.get("pde_route", "parenteral"))
-            n_ing = sum(
-                len(s.get("rows", []))
-                for s in comp_data.get("sections", [])
-                if isinstance(s, dict)
-            )
+            n_ing = sum(len(s.get("rows",[])) for s in comp_data.get("sections",[])
+                        if isinstance(s, dict))
             st.success(
-                f"Product: {meta.get('product_name', '(from Excel/template)')} | "
-                f"PDE route: {meta.get('pde_route', '')} | "
-                f"Excel: {n_ing} ingredients, "
-                f"{len(comp_data.get('sections', []))} sections | "
-                f"Daily units: {comp_data.get('daily_units', 1)} | "
-                f"Amount key: {comp_data.get('mdd_amount_key', '')}"
-            )
-            progress.progress(45)
+                f"Excel: {n_ing} ingredients | "
+                f"Route: {comp_data.get('route','?')} | "
+                f"MDD: {comp_data.get('mdd_g','?')}g/day × "
+                f"{comp_data.get('doses_per_day','?')} dose(s)")
+            progress.progress(42)
 
-            # ── Step 6: Process annexures ────────────────────────────────────
-            log.info(f"🔬 Processing {len(annexure_files)} annexure(s) with Claude…")
+            # Step 6: Process annexures
+            log.info(f"🔬 Processing {len(annexure_files)} annexure(s)…")
             annexure_data: List[Dict] = []
-            sorted_files = sorted(annexure_files, key=lambda f: f.name)
-            for i, af in enumerate(sorted_files):
+            for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
                 try:
-                    raw_json = json.loads(af.getvalue().decode("utf-8", "replace").lstrip("\ufeff"))
+                    raw_json = json.loads(af.getvalue().decode("utf-8","replace").lstrip("\ufeff"))
                 except Exception as e:
-                    st.warning(f"  ⚠️ Annexure {i + 1} ({af.name}): bad JSON — {e}")
-                    annexure_data.append({
-                        "annexure_number": i + 1, "supplier_name": "N/A",
-                        "material_name": "N/A", "elements": [],
-                    })
+                    st.warning(f"  ⚠️ Annexure {i+1} ({af.name}): bad JSON — {e}")
+                    annexure_data.append({"annexure_number":i+1,"supplier_name":"N/A",
+                                          "material_name":"N/A","elements":[]})
                     continue
-                ann = process_annexure(raw_json, i + 1)
+                ann = process_annexure(raw_json, i+1)
                 annexure_data.append(ann)
-                st.write(
-                    f"  ✅ Annexure {i + 1}: **{ann.get('material_name', '?')}** "
-                    f"({ann.get('supplier_name', '?')}) — "
-                    f"{len(ann.get('elements', []))} elements"
-                )
-                progress.progress(45 + int(20 * (i + 1) / len(annexure_files)))
+                st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
+                         f"({ann.get('supplier_name','?')}) — "
+                         f"{len(ann.get('elements',[]))} elements")
+                progress.progress(42 + int(20*(i+1)/len(annexure_files)))
 
-            # ── Step 7: Calculate EI tables ──────────────────────────────────
-            log.info("🧮 Calculating EI tables (Tables 5, 6, 7)…")
-            calc_tables = calculate_ei_tables(comp_data, annexure_data, pde_values)
-            crossing = []
-            for table_key in ("class1_2a", "class2b", "class3"):
-                table = safe_calc_table(calc_tables, table_key)
-                for sym in table.get("elements", []):
-                    pde = pde_values[sym]["pde"]
-                    if pde and table["element_totals"].get(sym, 0) > pde * 0.30:
-                        crossing.append(sym)
+            # Step 7: Calculate EI tables
+            log.info("🧮 Calculating EI tables (formula: daily_g × conc_µg/g)…")
+            calc_tables = calculate_ei_tables(comp_data, annexure_data)
+            t5 = safe_calc_table(calc_tables,"class1_2a")
+            crossing = [sym for sym in TABLE5_ELEMENTS
+                        if t5["pde"].get(sym) and
+                        t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.30]
             if crossing:
-                st.warning(
-                    f"Elements crossing 30% PDE (confirmatory testing needed): "
-                    f"{', '.join(crossing)}"
-                )
+                st.warning(f"Elements > 30% PDE: {', '.join(crossing)}")
             else:
-                st.success("All Class 1+2A elements ≤ 30% PDE — ICH Q3D Option 2b compliant.")
+                st.success("All Class 1+2A elements ≤ 30% PDE.")
             progress.progress(72)
 
-            # ── Step 8: Generate text sections ───────────────────────────────
+            # Step 8: Generate text
             log.info("✍️ Generating report text with Claude…")
             text_sections = generate_text_sections(
-                ref_structure, annexure_data, calc_tables, comp_data, pde_values,
-            )
+                ref_structure, annexure_data, calc_tables, comp_data)
             progress.progress(82)
 
-            # ── Step 9: Build DOCX ───────────────────────────────────────────
-            log.info("📝 Building DOCX (A5 Landscape, Times New Roman, page borders)…")
+            # Step 9: Build DOCX
+            log.info("📝 Building DOCX…")
             docx_bytes = assemble_and_generate(
                 ref_structure, page_images, figure_pages,
                 annexure_data, comp_data, calc_tables, text_sections,
-                ref_bytes=ref_bytes,
-                logo_b64=logo_b64,
-                logo_type=logo_type,
-                pde_values=pde_values,
-            )
+                ref_bytes=ref_bytes, logo_b64=logo_b64, logo_type=logo_type)
             progress.progress(100)
-            log.success("✅ Report generated successfully!")
+            log.success("✅ Report generated!")
 
-            doc_no = safe_str(meta.get("document_no", "TSR")).replace("/", "_").replace(" ", "_")
-            ver    = safe_str(meta.get("version", "v")).split(",")[0].replace(" ", "").replace(".", "_")
+            doc_no = safe_str(meta.get("document_no","TSR")).replace("/","_").replace(" ","_")
+            ver    = safe_str(meta.get("version","v")).split(",")[0].replace(" ","").replace(".","_")
             fname  = f"{doc_no}_{ver}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-
-            st.download_button(
-                "📥 Download Report (DOCX)",
-                data=docx_bytes, file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
+            st.download_button("📥 Download Report (DOCX)", data=docx_bytes, file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
         except Exception as e:
             st.error(f"Pipeline error: {e}")
             logger.exception("Pipeline error")
 
-    with st.expander("ℹ️ Setup & How it works"):
+    with st.expander("ℹ️ Setup & Formula"):
         st.markdown("""
-**Everything derived from your uploads — zero hardcoded product content.**
+**Formula:** `Daily exposure (µg/day) = Amount_in_MDD (g/day) × Conc (µg/g)`
 
-| Input | Used for |
-|---|---|
-| Reference PDF | Format/template, signatures/revision history, figures (header auto-cropped at 38%) |
-| Metadata overrides | Replace old template product details when generating a new product |
-| Annexure JSONs | Vendor EI declarations → concentrations for Tables 5–7 |
-| Composition Excel | Ingredient amounts → daily intakes for Tables 5–7 |
+This works for **any product**:
+- Oral sachets: amount per sachet × sachets/day → g/day
+- Injections: amount per injection → g/day
+- Topical: amount per application × applications/day → g/day
 
-**Logo setup:**
-Create an `assets/` folder next to `app.py` and save the Dr. Reddy's logo as `assets/logo.png`.
+**PDE values used:** Automatically selected based on route of administration
+(oral vs parenteral vs other).
 
-**npm dependencies (run once in the folder containing generate_report.js):**
-```
-npm install docx jszip
-```
+**npm deps (once):** `npm install docx jszip`
 
-**Output:** A5 Landscape (210×148 mm), Times New Roman 12pt body, justified text,
-black page border on every page, no Word spell-check underlines.
+**Logo:** Save as `assets/logo.png` next to `app.py`
+
+**TOC:** Extracted automatically from the reference PDF — matches the product's actual sections.
 """)
 
 
 if __name__ == "__main__":
     main()
-########################
+######################3
 /**
- * generate_report.js  —  Dr. Reddy's IPDO TSR DOCX Generator
- * ICH Q3D (R2) | A5 Landscape (210×148 mm) | Times New Roman 12pt body
- *
- * Fixes in this version:
- *  1. Page borders — JSZip post-processing injects pgBorders XML reliably
- *  2. Spell/grammar check disabled globally (settings) + noProof on every run
- *  3. Header: Department, Strength, Market, Protocol in separate stacked rows
- *     (nested table) — each field visually separated with borders
- *  4. Title page: Title centered in large box; SOP Format Number in own row below
- *  5. Body text: 12pt (SZ.TEXT); table cells remain 7pt (SZ.SM)
- *  6. Word spacing: characterSpacing:15 (+0.75pt) on body runs only
- *  7. Figure: 38% top crop (header fully removed)
- *  8. Logo: loaded from assets/logo.png — never extracted from PDF
- *
- * Usage: node generate_report.js <data.json> <out.docx>
+ * generate_report.js — Dr. Reddy's IPDO TSR Generator
+ * Fully product-agnostic: oral / parenteral / any formulation
+ * A5 Landscape | Times New Roman 12pt body | Page borders (notFirstPage)
+ * Spell-check disabled | Dynamic TOC from reference PDF
  */
 "use strict";
 
-var fs     = require("fs");
-var JSZip  = require("jszip");
-var docx   = require("docx");
+var fs    = require("fs");
+var JSZip = require("jszip");
+var docx  = require("docx");
 
 var Document            = docx.Document;
 var Packer              = docx.Packer;
@@ -1588,1256 +891,791 @@ var PageNumber          = docx.PageNumber;
 var PageBreak           = docx.PageBreak;
 var convertInchesToTwip = docx.convertInchesToTwip;
 
-
-// ============================================================================
-// PAGE GEOMETRY  —  A5 Landscape: 210 mm × 148 mm
-// ============================================================================
-var PAGE_W = convertInchesToTwip(8.27);   // 210 mm
-var PAGE_H = convertInchesToTwip(5.83);   // 148 mm
+// ── Page geometry: A5 Landscape (210×148 mm) ─────────────────────────────────
+var PAGE_W = convertInchesToTwip(8.27);
+var PAGE_H = convertInchesToTwip(5.83);
 var MAR_L  = convertInchesToTwip(0.47);
 var MAR_R  = convertInchesToTwip(0.47);
-var MAR_T  = convertInchesToTwip(0.98);   // space for header table
+var MAR_T  = convertInchesToTwip(0.98);
 var MAR_B  = convertInchesToTwip(0.39);
-var CW     = PAGE_W - MAR_L - MAR_R;      // usable content width ≈ 10260 twips
+var CW     = PAGE_W - MAR_L - MAR_R;
 
-
-// ============================================================================
-// COLORS
-// ============================================================================
-var COLOR = {
-  BLACK:        "000000",
-  WHITE:        "FFFFFF",
-  HEADER_GREY:  "D9D9D9",
-  SECTION_BLUE: "BDD7EE",
-  THRESHOLD_BG: "FFE699",
-  EXCEEDED_BG:  "FFCCCC",
-  EXCEEDED_TXT: "FF0000",
+// ── Colors ───────────────────────────────────────────────────────────────────
+var CLR = {
+  BLACK:       "000000", WHITE:      "FFFFFF",
+  HDR_GREY:    "D9D9D9", SEC_BLUE:   "BDD7EE",
+  THRESH_BG:   "FFE699", EXCEED_BG:  "FFCCCC", EXCEED_TXT: "FF0000",
 };
 
+// ── Font & sizes (half-points) ────────────────────────────────────────────────
+var F    = "Times New Roman";
+var SZ   = { XXS:10, XS:12, SM:14, TEXT:24, MD:20, LG:22, XL:26 };
+var CHAR_SP = 15; // body text character spacing (+0.75pt)
 
-// ============================================================================
-// FONTS & SIZES  (docx uses half-points: 1pt = 2 half-pts)
-// ============================================================================
-var FONT = "Times New Roman";
-
-var SZ = {
-  XXS:  10,   //  5pt — very wide table columns
-  XS:   12,   //  6pt — wide table columns
-  SM:   14,   //  7pt — table headers & data
-  TEXT: 24,   // 12pt — generated body text ONLY (not tables, not header)
-  HDR:  18,   //  9pt — section headings inside document
-  MD:   20,   // 10pt — section number headings
-  LG:   22,   // 11pt — large heading
-  XL:   26,   // 13pt — title page title
-};
-
-// Character spacing for body text (+0.75pt = 15 twentieths-of-a-point)
-var BODY_CHAR_SPACING = 15;
-
-
-// ============================================================================
-// BORDER HELPERS
-// ============================================================================
-function bdr(size, color) {
-  return { style: BorderStyle.SINGLE, size: size || 4, color: color || COLOR.BLACK };
+// ── Borders ───────────────────────────────────────────────────────────────────
+function bdr(sz, clr) {
+  return { style: BorderStyle.SINGLE, size: sz||4, color: clr||CLR.BLACK };
 }
-
-function allBorders(size) {
-  var b = bdr(size);
-  return { top: b, bottom: b, left: b, right: b,
-           insideHorizontal: b, insideVertical: b };
+function allBdr(sz) {
+  var b = bdr(sz);
+  return { top:b, bottom:b, left:b, right:b, insideHorizontal:b, insideVertical:b };
 }
-
-function noBorders() {
-  var nb = { style: BorderStyle.NIL, size: 0, color: COLOR.WHITE };
-  return { top: nb, bottom: nb, left: nb, right: nb };
+function noBdr() {
+  var n = { style:BorderStyle.NIL, size:0, color:CLR.WHITE };
+  return { top:n, bottom:n, left:n, right:n };
 }
+function shade(fill) { return { fill:fill, type:ShadingType.CLEAR, color:"auto" }; }
+function mg() { return { top:30, right:60, bottom:30, left:60 }; }
 
-function cellShade(fill) {
-  return { fill: fill, type: ShadingType.CLEAR, color: "auto" };
-}
-
-function cm() { return { top: 30, right: 60, bottom: 30, left: 60 }; }
-
-
-// ============================================================================
-// TEXT RUN — noProof disables Word red/blue underlines
-// ============================================================================
-function mkRun(text, opts) {
-  opts = opts || {};
+// ── Text run (noProof = no spell-check underline) ─────────────────────────────
+function run(text, opts) {
+  opts = opts||{};
   return new TextRun({
-    text:             String(text == null ? "" : text),
+    text:             String(text==null?"":text),
     bold:             !!opts.bold,
-    size:             opts.size  || SZ.TEXT,
-    font:             FONT,
-    color:            opts.color || COLOR.BLACK,
+    size:             opts.size||SZ.TEXT,
+    font:             F,
+    color:            opts.color||CLR.BLACK,
     italics:          !!opts.italics,
-    characterSpacing: opts.characterSpacing || 0,
-    noProof:          true,   // disables spell check underline on every run
+    characterSpacing: opts.cs||0,
+    noProof:          true,
   });
 }
 
-
-// ============================================================================
-// PARAGRAPH HELPERS
-// ============================================================================
-function mkPara(content, opts) {
-  opts = opts || {};
-  var runs;
-  if (typeof content === "string") {
-    runs = [mkRun(content, opts)];
-  } else if (Array.isArray(content)) {
-    runs = content;
-  } else if (content) {
-    runs = [content];
-  } else {
-    runs = [mkRun("", opts)];
-  }
+// ── Paragraph helpers ─────────────────────────────────────────────────────────
+function para(content, opts) {
+  opts = opts||{};
+  var children;
+  if (typeof content==="string") children=[run(content,opts)];
+  else if (Array.isArray(content)) children=content;
+  else if (content) children=[content];
+  else children=[run("",opts)];
   return new Paragraph({
-    alignment: opts.align || AlignmentType.LEFT,
-    spacing: {
-      before: (opts.before == null ? 40 : opts.before),
-      after:  (opts.after  == null ? 40 : opts.after),
-      line:   opts.line || 264,
-    },
-    children: runs,
+    alignment: opts.align||AlignmentType.LEFT,
+    spacing: { before:opts.before==null?40:opts.before,
+               after: opts.after ==null?40:opts.after,
+               line:  opts.line||264 },
+    children: children,
   });
 }
 
-// Justified body paragraph — 12pt, +0.75pt char spacing, 1.2 line spacing
 function bodyPara(text, opts) {
-  opts = opts || {};
+  opts = opts||{};
   return new Paragraph({
     alignment: AlignmentType.BOTH,
-    spacing: { before: opts.before || 20, after: opts.after || 20, line: 288 },
+    spacing: { before:opts.before||20, after:opts.after||20, line:288 },
     children: [new TextRun({
-      text:             String(text == null ? "" : text),
-      bold:             !!opts.bold,
-      size:             opts.size || SZ.TEXT,
-      font:             FONT,
-      color:            COLOR.BLACK,
-      characterSpacing: BODY_CHAR_SPACING,
-      noProof:          true,
+      text:String(text==null?"":text), bold:!!opts.bold,
+      size:opts.size||SZ.TEXT, font:F, color:CLR.BLACK,
+      characterSpacing:CHAR_SP, noProof:true,
     })],
   });
 }
 
-function bodyParagraphs(text) {
+function bodyParas(text) {
   if (!text) return [];
-  var lines = String(text).trim().split(/\n+/);
-  var result = [];
-  for (var i = 0; i < lines.length; i++) {
-    var line = lines[i].trim();
-    if (line) result.push(bodyPara(line));
-  }
-  return result;
+  return String(text).trim().split(/\n+/)
+    .filter(function(l){return l.trim();})
+    .map(function(l){return bodyPara(l.trim());});
 }
 
-function centerPara(text, bold, size) {
-  return mkPara(text, { align: AlignmentType.CENTER, bold: !!bold,
-                         size: size || SZ.TEXT, before: 40, after: 40 });
+function ctrPara(text, bold, size) {
+  return para(text, {align:AlignmentType.CENTER, bold:!!bold, size:size||SZ.TEXT, before:40, after:40});
+}
+function lftPara(text, bold, size) {
+  return para(text, {align:AlignmentType.LEFT, bold:!!bold, size:size||SZ.TEXT, before:20, after:20});
+}
+function blk() { return para("",{before:20,after:20}); }
+function pgBrk() { return new Paragraph({children:[new PageBreak()]}); }
+function secHd(text) {
+  return para(text,{align:AlignmentType.LEFT, bold:true, size:SZ.MD, before:80, after:40, line:264});
 }
 
-function leftPara(text, bold, size) {
-  return mkPara(text, { align: AlignmentType.LEFT, bold: !!bold,
-                         size: size || SZ.TEXT, before: 20, after: 20 });
-}
-
-function blankPara() { return mkPara("", { before: 20, after: 20 }); }
-
-function pgBreak() { return new Paragraph({ children: [new PageBreak()] }); }
-
-function sectionHeading(text) {
-  return mkPara(text, { align: AlignmentType.LEFT, bold: true,
-                         size: SZ.MD, before: 80, after: 40, line: 264 });
-}
-
-
-// ============================================================================
-// TABLE CELL HELPERS
-// (table cells use SZ.SM / SZ.XS — NOT SZ.TEXT; noProof still applied)
-// ============================================================================
-function mkCell(text, opts) {
-  opts = opts || {};
+// ── Cell helpers ──────────────────────────────────────────────────────────────
+function cell(text, opts) {
+  opts = opts||{};
   return new TableCell({
-    columnSpan:    opts.colSpan || 1,
-    width:         opts.w ? { size: opts.w, type: WidthType.DXA } : undefined,
-    borders:       opts.noBorder ? noBorders() : allBorders(4),
-    shading:       opts.fill ? cellShade(opts.fill) : undefined,
-    margins:       cm(),
+    columnSpan:    opts.cs||1,
+    width:         opts.w?{size:opts.w,type:WidthType.DXA}:undefined,
+    borders:       opts.nb?noBdr():allBdr(4),
+    shading:       opts.fill?shade(opts.fill):undefined,
+    margins:       mg(),
     verticalAlign: VerticalAlign.CENTER,
-    children: [new Paragraph({
-      alignment: opts.align || AlignmentType.CENTER,
-      spacing: { before: 0, after: 0 },
-      children: [new TextRun({
-        text:    String(text == null ? "" : text),
-        bold:    !!opts.bold,
-        size:    opts.size || SZ.SM,
-        font:    FONT,
-        color:   opts.color || COLOR.BLACK,
-        noProof: true,
+    children:[new Paragraph({
+      alignment:opts.align||AlignmentType.CENTER,
+      spacing:{before:0,after:0},
+      children:[new TextRun({
+        text:String(text==null?"":text), bold:!!opts.bold,
+        size:opts.size||SZ.SM, font:F, color:opts.color||CLR.BLACK, noProof:true,
       })],
     })],
   });
 }
 
-function mkCellL(text, opts) {
-  opts = opts || {};
-  opts.align = AlignmentType.LEFT;
-  return mkCell(text, opts);
-}
+function cellL(text, opts) { opts=opts||{}; opts.align=AlignmentType.LEFT; return cell(text,opts); }
 
-// Multi-line cell — each line is a separate paragraph within one cell
-function mkCellML(lines, opts) {
-  opts = opts || {};
-  var arr = Array.isArray(lines) ? lines : [lines];
+function cellML(lines, opts) {
+  opts=opts||{};
+  var arr=Array.isArray(lines)?lines:[lines];
   return new TableCell({
-    columnSpan:    opts.colSpan || 1,
-    width:         opts.w ? { size: opts.w, type: WidthType.DXA } : undefined,
-    borders:       opts.noBorder ? noBorders() : allBorders(4),
-    shading:       opts.fill ? cellShade(opts.fill) : undefined,
-    margins:       cm(),
+    columnSpan:    opts.cs||1,
+    width:         opts.w?{size:opts.w,type:WidthType.DXA}:undefined,
+    borders:       opts.nb?noBdr():allBdr(4),
+    shading:       opts.fill?shade(opts.fill):undefined,
+    margins:       mg(),
     verticalAlign: VerticalAlign.CENTER,
-    children: arr.filter(function (l) { return l != null; }).map(function (l) {
+    children:arr.filter(Boolean).map(function(l){
       return new Paragraph({
-        alignment: AlignmentType.LEFT,
-        spacing: { before: 0, after: 0 },
-        children: [new TextRun({
-          text: String(l), bold: !!opts.bold,
-          size: opts.size || SZ.XS, font: FONT, noProof: true,
-        })],
+        alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+        children:[new TextRun({text:String(l),bold:!!opts.bold,size:opts.size||SZ.XS,font:F,noProof:true})],
       });
     }),
   });
 }
 
-function emptyCell(fill, w) {
+function emptyCell(fill,w) {
   return new TableCell({
-    width:    w ? { size: w, type: WidthType.DXA } : undefined,
-    borders:  allBorders(4),
-    shading:  fill ? cellShade(fill) : undefined,
-    margins:  cm(),
-    children: [new Paragraph({ children: [new TextRun({ text: "", noProof: true })] })],
+    width:w?{size:w,type:WidthType.DXA}:undefined,
+    borders:allBdr(4), shading:fill?shade(fill):undefined, margins:mg(),
+    children:[new Paragraph({children:[new TextRun({text:"",noProof:true})]})],
   });
 }
 
+// ── PAGE HEADER ───────────────────────────────────────────────────────────────
+function buildHeader(meta, logoB64, logoType) {
+  meta = meta||{};
+  var C1=900, C4=1700, C2=5200, C3=CW-C1-C2-C4;
 
-// ============================================================================
-// PAGE HEADER
-//
-// Structure matching original Dr. Reddy's IPDO document:
-//
-// ┌──────────┬────────────────────────────────────┬──────────────────────────┐
-// │ IPDO     │   Technical Summary Report          │  [Logo / Dr. Reddy's]   │
-// ├──────────┴─────────────────────────┬───────────┼──────────────────────────┤
-// │ Title: [full title text]           │ Dept: FR&D│                          │
-// │                                    ├───────────┤                          │
-// │                                    │ Str: 10mg │                          │
-// │                                    ├───────────┤                          │
-// │                                    │ Mkt: USA  │                          │
-// │                                    ├───────────┤                          │
-// │                                    │ Prot: NA  │                          │
-// ├──────────┬──────────────────┬──────┴───────────┴──────────────────────────┤
-// │ Doc No   │ Product Name     │ Dosage Form       │ Version                 │
-// └──────────┴──────────────────┴───────────────────┴─────────────────────────┘
-//
-// The right-side "nested" column uses a nested table for Dept/Strength/Market/Protocol.
-// ============================================================================
-function buildPageHeader(meta, logoB64, logoType) {
-  meta = meta || {};
-  var title      = meta.title        || "";
-  var docNo      = meta.document_no  || "";
-  var prodName   = meta.product_name || "";
-  var dosage     = meta.dosage_form  || "";
-  var version    = meta.version      || "";
-  var strength   = meta.strength     || "";
-  var department = meta.department   || "";
-  var market     = meta.market       || "";
-  var protocol   = meta.protocol     || "";
-
-  // Column widths — 4 main cols summing to CW
-  var C1 = 900;    // IPDO label
-  var C4 = 1700;   // Logo column
-  var C2 = 5200;   // Title / Doc No / Product Name
-  var C3 = CW - C1 - C2 - C4;  // Department/Strength/Market/Protocol
-
-  // ── Logo cell ─────────────────────────────────────────────────────────────
+  // Logo cell
   var logoCell;
-  if (logoB64 && logoB64.length > 100) {
+  if (logoB64&&logoB64.length>100) {
     try {
-      var logoBuf = Buffer.from(logoB64, "base64");
-      var imgType = (logoType || "").indexOf("jpeg") >= 0 ? "jpg" : "png";
-      var logoImg = new ImageRun({
-        type: imgType, data: logoBuf,
-        transformation: { width: 110, height: 44 },
-      });
-      logoCell = new TableCell({
-        width: { size: C4, type: WidthType.DXA },
-        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
-        children: [new Paragraph({
-          alignment: AlignmentType.RIGHT, spacing: { before: 0, after: 0 },
-          children: [logoImg],
+      var buf=Buffer.from(logoB64,"base64");
+      var lt=(logoType||"").indexOf("jpeg")>=0?"jpg":"png";
+      logoCell=new TableCell({
+        width:{size:C4,type:WidthType.DXA},borders:allBdr(4),margins:mg(),
+        verticalAlign:VerticalAlign.CENTER,
+        children:[new Paragraph({alignment:AlignmentType.RIGHT,spacing:{before:0,after:0},
+          children:[new ImageRun({type:lt,data:buf,transformation:{width:110,height:44}})],
         })],
       });
-    } catch (e) {
-      logoCell = mkCell("Dr. Reddy's",
-        { bold: true, size: SZ.XS, w: C4, align: AlignmentType.RIGHT });
+    } catch(e) {
+      logoCell=cell("Dr. Reddy's",{bold:true,size:SZ.XS,w:C4,align:AlignmentType.RIGHT});
     }
   } else {
-    logoCell = mkCell("Dr. Reddy's",
-      { bold: true, size: SZ.XS, w: C4, align: AlignmentType.RIGHT });
+    logoCell=cell("Dr. Reddy's",{bold:true,size:SZ.XS,w:C4,align:AlignmentType.RIGHT});
   }
 
-  // ── Row 1: IPDO | Technical Summary Report (spans C2+C3) | Logo ────────────
-  var row1 = new TableRow({
-    children: [
-      mkCell("IPDO", { bold: true, size: SZ.MD, align: AlignmentType.LEFT, w: C1 }),
-      new TableCell({
-        columnSpan: 2, width: { size: C2 + C3, type: WidthType.DXA },
-        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
-        children: [centerPara("Technical Summary Report", true, SZ.MD)],
-      }),
-      logoCell,
-    ],
-  });
+  // Row 1: IPDO | Technical Summary Report | Logo
+  var r1=new TableRow({children:[
+    cell("IPDO",{bold:true,size:SZ.MD,align:AlignmentType.LEFT,w:C1}),
+    new TableCell({
+      columnSpan:2, width:{size:C2+C3,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[ctrPara("Technical Summary Report",true,SZ.MD)],
+    }),
+    logoCell,
+  ]});
 
-  // ── Row 2: Title (spans left 3 cols) | Dept/Str/Mkt/Prot stacked (right col) ─
-  // Use 4 separate paragraphs in the right cell — no nested table, no uneven sizing
+  // Row 2: Title (left, spans 3 cols) | Dept/Strength/Market/Protocol stacked (right)
   function hdrLine(label, value) {
     return new Paragraph({
-      alignment: AlignmentType.LEFT, spacing: { before: 0, after: 0 },
-      children: [
-        new TextRun({ text: label, bold: true,  size: SZ.XS, font: FONT, noProof: true }),
-        new TextRun({ text: " " + value, bold: false, size: SZ.XS, font: FONT, noProof: true }),
+      alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+      children:[
+        new TextRun({text:label,   bold:true, size:SZ.XS, font:F, noProof:true}),
+        new TextRun({text:" "+value,bold:false,size:SZ.XS, font:F, noProof:true}),
       ],
     });
   }
-
-  var row2 = new TableRow({
-    children: [
-      new TableCell({
-        columnSpan: 3, width: { size: C1 + C2 + C3, type: WidthType.DXA },
-        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
-        children: [new Paragraph({
-          alignment: AlignmentType.LEFT, spacing: { before: 0, after: 0 },
-          children: [new TextRun({
-            text: "Title: " + title, bold: false, size: SZ.XS, font: FONT, noProof: true,
-          })],
-        })],
-      }),
-      new TableCell({
-        width: { size: C4, type: WidthType.DXA },
-        borders: allBorders(4), margins: cm(), verticalAlign: VerticalAlign.CENTER,
-        children: [
-          hdrLine("Department:", department),
-          hdrLine("Strength:",   strength),
-          hdrLine("Market:",     market),
-          hdrLine("Protocol:",   protocol),
-        ],
-      }),
-    ],
-  });
-
-  // ── Row 3: Doc No | Product Name | Dosage Form | Version ─────────────────
-  // Each field in its own cell, widths proportional
-  var r3w1 = Math.round(CW * 0.18);
-  var r3w2 = Math.round(CW * 0.35);
-  var r3w3 = Math.round(CW * 0.22);
-  var r3w4 = CW - r3w1 - r3w2 - r3w3;
-
-  var row3 = new TableRow({
-    children: [
-      mkCellL("Document No: " + docNo,     { size: SZ.XS, w: r3w1 }),
-      mkCellL("Product Name: " + prodName, { size: SZ.XS, w: r3w2 }),
-      mkCellL("Dosage Form: " + dosage,    { size: SZ.XS, w: r3w3 }),
-      mkCellL("Version: " + version,       { size: SZ.XS, w: r3w4 }),
-    ],
-  });
-
-  var hdrTable = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [C1, C2, C3, C4],
-    rows: [row1, row2, row3],
-  });
-
-  return new Header({ children: [hdrTable, blankPara()] });
-}
-
-
-// ============================================================================
-// PAGE FOOTER
-// ============================================================================
-function buildPageFooter() {
-  return new Footer({
-    children: [new Paragraph({
-      alignment: AlignmentType.CENTER, spacing: { before: 0, after: 0 },
-      children: [
-        new TextRun({ text: "Page ", size: SZ.XS, font: FONT, noProof: true }),
-        new TextRun({ children: [PageNumber.CURRENT], size: SZ.XS, font: FONT }),
-        new TextRun({ text: " of ", size: SZ.XS, font: FONT, noProof: true }),
-        new TextRun({ children: [PageNumber.TOTAL_PAGES], size: SZ.XS, font: FONT }),
+  var r2=new TableRow({children:[
+    new TableCell({
+      columnSpan:3, width:{size:C1+C2+C3,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[new Paragraph({
+        alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+        children:[new TextRun({text:"Title: "+(meta.title||""),
+                               bold:false,size:SZ.XS,font:F,noProof:true})],
+      })],
+    }),
+    new TableCell({
+      width:{size:C4,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[
+        hdrLine("Department:", meta.department||""),
+        hdrLine("Strength:",   meta.strength||""),
+        hdrLine("Market:",     meta.market||""),
+        hdrLine("Protocol:",   meta.protocol||""),
       ],
-    })],
+    }),
+  ]});
+
+  // Row 3: Doc No | Product Name | Dosage Form | Version (4 separate cells)
+  var w1=Math.round(CW*0.18), w2=Math.round(CW*0.35),
+      w3=Math.round(CW*0.22), w4=CW-w1-w2-w3;
+  var r3=new TableRow({children:[
+    cellL("Document No: "+(meta.document_no||""),  {size:SZ.XS,w:w1}),
+    cellL("Product Name: "+(meta.product_name||""),{size:SZ.XS,w:w2}),
+    cellL("Dosage Form: "+(meta.dosage_form||""),  {size:SZ.XS,w:w3}),
+    cellL("Version: "+(meta.version||""),           {size:SZ.XS,w:w4}),
+  ]});
+
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA},
+    columnWidths:[C1,C2,C3,C4],
+    rows:[r1,r2,r3],
   });
+  return new Header({children:[tbl,blk()]});
 }
 
+// ── PAGE FOOTER ───────────────────────────────────────────────────────────────
+function buildFooter() {
+  return new Footer({children:[new Paragraph({
+    alignment:AlignmentType.CENTER, spacing:{before:0,after:0},
+    children:[
+      new TextRun({text:"Page ",size:SZ.XS,font:F,noProof:true}),
+      new TextRun({children:[PageNumber.CURRENT],size:SZ.XS,font:F}),
+      new TextRun({text:" of ",size:SZ.XS,font:F,noProof:true}),
+      new TextRun({children:[PageNumber.TOTAL_PAGES],size:SZ.XS,font:F}),
+    ],
+  })]});
+}
 
-// ============================================================================
-// TITLE PAGE
-//
-// Original layout:
-// ┌──────────────────────────────────────────────────────────────────────────┐
-// │         [Title text — centered, large, bold]                             │
-// └──────────────────────────────────────────────────────────────────────────┘
-// SOP Format Number: FORM-IPDO-GRD-0060(2.0)   ← separate row, smaller
-//
-// ============================================================================
+// ── TITLE PAGE ────────────────────────────────────────────────────────────────
+// Original layout: SOP row first (above), then large title box below
 function buildTitlePage(meta) {
-  meta = meta || {};
-  var sop = meta.sop_format_number || "";
-
-  // Title box — full width, thick border, large bold centered text
-  var titleBox = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [CW],
-    rows: [new TableRow({
-      children: [new TableCell({
-        borders: allBorders(12),
-        margins: { top: 600, right: 600, bottom: 600, left: 600 },
-        children: [centerPara(meta.title || "", true, SZ.XL)],
-      })],
-    })],
+  meta=meta||{};
+  var sop=meta.sop_format_number||"";
+  var sopRow=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
+    rows:[new TableRow({children:[new TableCell({
+      borders:allBdr(4), margins:mg(),
+      children:[lftPara("SOP Format Number: "+sop, false, SZ.SM)],
+    })]})],
   });
-
-  // SOP Format Number row — separate, below title box
-  var sopRow = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [CW],
-    rows: [new TableRow({
-      children: [new TableCell({
-        borders: allBorders(4),
-        margins: cm(),
-        children: [leftPara("SOP Format Number: " + sop, false, SZ.SM)],
-      })],
-    })],
+  var titleBox=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
+    rows:[new TableRow({children:[new TableCell({
+      borders:allBdr(12),
+      margins:{top:600,right:600,bottom:600,left:600},
+      children:[ctrPara(meta.title||"",true,SZ.XL)],
+    })]})],
   });
-
-  // In the original document: SOP Format Number appears ABOVE the title box
-  return [sopRow, blankPara(), titleBox, pgBreak()];
+  // SOP above, title below (matches original document)
+  return [sopRow, blk(), titleBox, pgBrk()];
 }
 
+// ── TABLE OF CONTENTS ─────────────────────────────────────────────────────────
+// Dynamic: uses entries extracted from the reference PDF.
+// Falls back to computed defaults based on figureCount.
+function buildTOC(tocEntries, figureCount) {
+  figureCount = figureCount||0;
+  // Compute page estimates for default TOC
+  var p14   = 3;               // Sections 1-4
+  var pRisk = p14+1;           // Risk assessment / Section 5
+  var pComp = pRisk+1+figureCount; // After figure(s)
+  var pCtrl = pComp+3;         // Control / conclusion (after calc tables ~3pp)
+  var pAnn  = pCtrl+1;         // Annexure list
+  var pRef  = pAnn+1;          // References
+  var pRev  = pRef;            // Revision history (same page usually)
 
-// ============================================================================
-// TABLE OF CONTENTS
-// ============================================================================
-function buildTOC(tocEntries, pageMap) {
-  // pageMap is computed in generateReport() based on actual section order
-  // Falls back to reasonable defaults if not provided
-  pageMap = pageMap || {};
-  var p_s14  = pageMap.sections_1_4  || 3;   // Sections 1-4 start
-  var p_s5   = pageMap.section_5     || 4;   // Section 5 start
-  var p_sum  = pageMap.summary       || 13;  // Section 6 start
-  var p_ref  = pageMap.reference     || p_sum + 2;
-  var p_ann  = pageMap.annexure_list || p_ref + 1;
-  var p_rev  = pageMap.revision      || p_ann + 1;
-
-  var def = [
-    { no: "1", title: "Abstract",                                          page: String(p_s14) },
-    { no: "2", title: "Objective",                                         page: String(p_s14) },
-    { no: "3", title: "Details of the study location / testing location",  page: String(p_s14) },
-    { no: "4", title: "Background",                                        page: String(p_s14) },
-    { no: "5", title: "Drug product elemental impurity risk assessment",   page: String(p_s5)  },
-    { no: "6", title: "Summary & Conclusion",                              page: String(p_sum) },
-    { no: "7", title: "Reference",                                         page: String(p_ref) },
-    { no: "8", title: "List of Annexures",                                 page: String(p_ann) },
-    { no: "9", title: "Revision History",                                  page: String(p_rev) },
-  ];
-  var entries = (Array.isArray(tocEntries) && tocEntries.length) ? tocEntries : def;
-
-  var W = [600, CW - 600 - 900, 900];
-
-  var hdrRow = new TableRow({
-    children: [
-      mkCell("S. No.", { bold: true, fill: COLOR.HEADER_GREY, w: W[0], size: SZ.SM }),
-      mkCell("Title",  { bold: true, fill: COLOR.HEADER_GREY, w: W[1], size: SZ.SM }),
-      mkCell("Page#",  { bold: true, fill: COLOR.HEADER_GREY, w: W[2], size: SZ.SM }),
-    ],
-  });
-
-  var dataRows = entries.map(function (e) {
-    return new TableRow({
-      children: [
-        mkCell(e.no    || "", { w: W[0], size: SZ.SM }),
-        mkCellL(e.title || "", { w: W[1], size: SZ.SM }),
-        mkCell(e.page  || "", { w: W[2], size: SZ.SM }),
-      ],
-    });
-  });
-
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: W,
-    rows: [hdrRow].concat(dataRows),
-  });
-
-  return [centerPara("TABLE OF CONTENTS", true, SZ.MD), tbl, pgBreak()];
-}
-
-
-// ============================================================================
-// SECTIONS 1–4  (Abstract, Objective, Study Location, Background)
-// ============================================================================
-function buildTextSections(txt) {
-  txt = txt || {};
-  var ch = [];
-
-  function addSection(num, title, content) {
-    ch.push(sectionHeading(num + ". " + title));
-    var paras = bodyParagraphs(content);
-    for (var i = 0; i < paras.length; i++) ch.push(paras[i]);
-    ch.push(blankPara());
-  }
-
-  addSection(1, "Abstract",  txt.abstract  || "");
-  addSection(2, "Objective", txt.objective || "");
-  addSection(3, "Details of the study location / testing location",
-             txt.study_location || "NA");
-
-  ch.push(sectionHeading("4. Background:"));
-  var bgParas = bodyParagraphs(txt.background || "");
-  for (var j = 0; j < bgParas.length; j++) ch.push(bgParas[j]);
-  ch.push(blankPara());
-  ch.push(pgBreak());
-  return ch;
-}
-
-
-// ============================================================================
-// COMPOSITION TABLE  (Table 1)
-// ============================================================================
-function buildCompositionTable(sections, columns) {
-  columns = (Array.isArray(columns) && columns.length) ? columns : [
-    { key: "ingredient", label: "Name of Ingredient" },
-    { key: "status",     label: "Compendial Status" },
-    { key: "40mg",       label: "40 mg mg/unit" },
-    { key: "20mg",       label: "20 mg mg/unit" },
-    { key: "10mg",       label: "10 mg mg/unit" },
+  // Default: 9-section structure (Esomeprazole-style)
+  var def9=[
+    {no:"1",title:"Abstract",                                         page:String(p14)},
+    {no:"2",title:"Objective",                                        page:String(p14)},
+    {no:"3",title:"Details of the study location / testing location", page:String(p14)},
+    {no:"4",title:"Background",                                       page:String(p14)},
+    {no:"5",title:"Drug product elemental impurity risk assessment",  page:String(pRisk)},
+    {no:"6",title:"Summary & Conclusion",                             page:String(pCtrl)},
+    {no:"7",title:"Reference",                                        page:String(pAnn)},
+    {no:"8",title:"List of Annexures",                                page:String(pRef)},
+    {no:"9",title:"Revision History",                                 page:String(pRev)},
   ];
 
-  var fixed = 0;
-  var weights = columns.map(function (c) {
-    var key = String((c && c.key) || "").toLowerCase();
-    if (key === "ingredient") return 3.0;
-    if (key === "function") return 1.4;
-    if (key === "material_code") return 1.2;
-    return 1.0;
-  });
-  for (var wi = 0; wi < weights.length; wi++) fixed += weights[wi];
-  var W = weights.map(function (w) { return Math.max(650, Math.round(CW * w / fixed)); });
-  var wSum = W.reduce(function (a, b) { return a + b; }, 0);
-  W[W.length - 1] += (CW - wSum);
+  var entries = (Array.isArray(tocEntries)&&tocEntries.length) ? tocEntries : def9;
 
-  var hdrRow = new TableRow({
-    children: columns.map(function (col, idx) {
-      return mkCell(String((col && col.label) || (col && col.key) || ""),
-                    { bold: true, fill: COLOR.HEADER_GREY, w: W[idx], size: SZ.SM });
-    }),
-  });
-
-  var dataRows = [];
-  var sArr = Array.isArray(sections) ? sections : [];
-  for (var si = 0; si < sArr.length; si++) {
-    var sec = sArr[si];
-    if (!sec || typeof sec !== "object") continue;
-    // Blue section-header row spanning all 5 columns
-    dataRows.push(new TableRow({
-      children: [new TableCell({
-        columnSpan: columns.length, borders: allBorders(4), shading: cellShade(COLOR.SECTION_BLUE),
-        margins: cm(),
-        children: [leftPara(sec.name || "", true, SZ.SM)],
-      })],
-    }));
-    var rArr = Array.isArray(sec.rows) ? sec.rows : [];
-    for (var ri = 0; ri < rArr.length; ri++) {
-      var row = rArr[ri];
-      if (!row || typeof row !== "object") continue;
-      dataRows.push(new TableRow({
-        children: columns.map(function (col, idx) {
-          var key = (col && col.key) || "";
-          var val = row[key];
-          if (key === "ingredient") val = row.ingredient || row.name || "";
-          if (key === "status") val = row.status || row.compendial_status || "";
-          if (key === "function") val = row.function || row.role || "";
-          if (key === "material_code") val = row.material_code || row.code || "";
-          return mkCellL(String(val == null ? "" : val), { w: W[idx], size: SZ.SM });
-        }),
-      }));
-    }
-  }
-
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: W,
-    rows: [hdrRow].concat(dataRows),
-  });
-
-  return [
-    sectionHeading("5. Drug product elemental impurity risk assessment"),
-    leftPara("Table 1: Quantitative and Qualitative Composition", true, SZ.SM),
-    tbl,
-    pgBreak(),
-  ];
-}
-
-
-// ============================================================================
-// FIGURE  (38% top already cropped in app.py — only diagram arrives here)
-// ============================================================================
-function buildFigure(fig) {
-  if (!fig || !fig.data_b64 || typeof fig.data_b64 !== "string"
-      || fig.data_b64.length < 100) {
-    return [];
-  }
-  var imgBuf;
-  try {
-    imgBuf = Buffer.from(fig.data_b64, "base64");
-    if (imgBuf.length < 500) return [];
-  } catch (e) { return []; }
-
-  var imgType = (fig.media_type || "").indexOf("jpeg") >= 0 ? "jpg" : "png";
-  // After 38% top crop and 10% bottom crop, the remaining diagram is ~52% of page height
-  // Adjust aspect ratio to match the cropped rectangle dimensions
-  var imgW    = 560;
-  var imgH    = Math.round(imgW * 0.52);
-
-  var img = new ImageRun({
-    type: imgType, data: imgBuf, transformation: { width: imgW, height: imgH },
-  });
-
-  return [
-    leftPara(fig.figure_label || "Figure 1", true, SZ.SM),
-    new Paragraph({
-      alignment: AlignmentType.CENTER, spacing: { before: 40, after: 40 },
-      children: [img],
-    }),
-    blankPara(),
-    pgBreak(),
-  ];
-}
-
-
-// ============================================================================
-// SOURCES SECTION  (narrative text + Table 2)
-// ============================================================================
-function buildSourcesSection(txt, annexureList) {
-  txt = txt || {};
-  var list = Array.isArray(annexureList) ? annexureList : [];
-  var ch   = [];
-
-  var introBlocks = [txt.sources_intro, txt.drug_substance_section, txt.excipient_intro];
-  for (var ti = 0; ti < introBlocks.length; ti++) {
-    if (introBlocks[ti]) {
-      var ip = bodyParagraphs(introBlocks[ti]);
-      for (var pi = 0; pi < ip.length; pi++) ch.push(ip[pi]);
-      ch.push(blankPara());
-    }
-  }
-
-  var AW0 = Math.round(CW * 0.40);
-  var AW1 = Math.round(CW * 0.36);
-  var AW2 = CW - AW0 - AW1;
-
-  var annTbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [AW0, AW1, AW2],
-    rows: [
-      new TableRow({
-        children: [
-          mkCell("Name of Excipient / Material", { bold: true, fill: COLOR.HEADER_GREY, w: AW0, size: SZ.SM }),
-          mkCell("Vendor",                        { bold: true, fill: COLOR.HEADER_GREY, w: AW1, size: SZ.SM }),
-          mkCell("Title of Annexure",             { bold: true, fill: COLOR.HEADER_GREY, w: AW2, size: SZ.SM }),
-        ],
-      }),
-    ].concat(list.map(function (a, idx) {
-      return new TableRow({
-        children: [
-          mkCellL(a.material || "", { w: AW0, size: SZ.SM }),
-          mkCellL(a.supplier || "", { w: AW1, size: SZ.SM }),
-          mkCell(a.annexure || ("Annexure " + (idx + 1)), { w: AW2, size: SZ.SM }),
-        ],
-      });
+  var W=[600, CW-600-900, 900];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("S. No.",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Title", {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("Page#", {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+      ]}),
+    ].concat(entries.map(function(e){
+      return new TableRow({children:[
+        cell(e.no||"",    {w:W[0],size:SZ.SM}),
+        cellL(e.title||"",{w:W[1],size:SZ.SM}),
+        cell(e.page||"",  {w:W[2],size:SZ.SM}),
+      ]});
     })),
   });
+  return [ctrPara("TABLE OF CONTENTS",true,SZ.MD), tbl, pgBrk()];
+}
 
-  ch.push(leftPara("Table No.2 Details of Annexures", true, SZ.SM));
-  ch.push(annTbl);
-  ch.push(blankPara());
-
-  var subBlocks = [txt.manufacturing_section, txt.container_closure_section,
-                   txt.utilities_section,      txt.control_strategy];
-  for (var si = 0; si < subBlocks.length; si++) {
-    if (subBlocks[si]) {
-      var sp = bodyParagraphs(subBlocks[si]);
-      for (var spi = 0; spi < sp.length; spi++) ch.push(sp[spi]);
-      ch.push(blankPara());
-    }
+// ── SECTIONS 1-4 ─────────────────────────────────────────────────────────────
+function buildTextSections(txt) {
+  txt=txt||{};
+  var ch=[];
+  function addSec(num,title,content) {
+    ch.push(secHd(num+". "+title));
+    bodyParas(content).forEach(function(p){ch.push(p);});
+    ch.push(blk());
   }
-
-  ch.push(pgBreak());
+  addSec(1,"Abstract",   txt.abstract||"");
+  addSec(2,"Objective",  txt.objective||"");
+  addSec(3,"Details of the study location / testing location", txt.study_location||"NA");
+  ch.push(secHd("4. Background:"));
+  bodyParas(txt.background||"").forEach(function(p){ch.push(p);});
+  ch.push(blk());
+  ch.push(pgBrk());
   return ch;
 }
 
+// ── COMPOSITION TABLE ─────────────────────────────────────────────────────────
+function buildCompositionTable(sections, compMeta) {
+  compMeta = compMeta||{};
+  var unit = compMeta.unit||"mg/unit";
 
-// ============================================================================
-// NUMBER FORMATTER
-// ============================================================================
+  var W=[Math.round(CW*0.38),Math.round(CW*0.12),Math.round(CW*0.16),
+         Math.round(CW*0.16),0];
+  W[4]=CW-W[0]-W[1]-W[2]-W[3];
+
+  var hdr=new TableRow({children:[
+    cell("Name of Ingredient",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+    cell("Function",          {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+    cell("Amount\n"+unit,     {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+    cell("Compendial\nStatus",{bold:true,fill:CLR.HDR_GREY,w:W[3],size:SZ.SM}),
+    cell("Qty/Unit\nor MDD",  {bold:true,fill:CLR.HDR_GREY,w:W[4],size:SZ.SM}),
+  ]});
+
+  var rows=[];
+  var sArr=Array.isArray(sections)?sections:[];
+  for (var si=0;si<sArr.length;si++) {
+    var sec=sArr[si];
+    if (!sec||typeof sec!=="object") continue;
+    rows.push(new TableRow({children:[new TableCell({
+      columnSpan:5, borders:allBdr(4), shading:shade(CLR.SEC_BLUE), margins:mg(),
+      children:[lftPara(sec.name||"",true,SZ.SM)],
+    })]}));
+    var rArr=Array.isArray(sec.rows)?sec.rows:[];
+    for (var ri=0;ri<rArr.length;ri++) {
+      var r=rArr[ri];
+      if (!r||typeof r!=="object") continue;
+      rows.push(new TableRow({children:[
+        cellL(String(r.ingredient||r.name||""),{w:W[0],size:SZ.SM}),
+        cell(String(r.function||r.role||""),   {w:W[1],size:SZ.SM}),
+        cell(String(r.amount||r["40mg"]||r.qty||""),{w:W[2],size:SZ.SM}),
+        cell(String(r.status||r.compendial_status||""),{w:W[3],size:SZ.SM}),
+        cell(String(r.qty_unit||r.amount||""), {w:W[4],size:SZ.SM}),
+      ]}));
+    }
+  }
+
+  var tbl=new Table({width:{size:CW,type:WidthType.DXA},columnWidths:W,rows:[hdr].concat(rows)});
+  return [
+    secHd("5. Drug product elemental impurity risk assessment"),
+    lftPara("Table 1: Quantitative and Qualitative Composition",true,SZ.SM),
+    tbl, pgBrk(),
+  ];
+}
+
+// ── FIGURE ────────────────────────────────────────────────────────────────────
+function buildFigure(fig) {
+  if (!fig||!fig.data_b64||typeof fig.data_b64!=="string"||fig.data_b64.length<100) return[];
+  var buf;
+  try { buf=Buffer.from(fig.data_b64,"base64"); if(buf.length<500) return[]; }
+  catch(e) { return[]; }
+  var imgW=560, imgH=Math.round(imgW*0.52);
+  return [
+    lftPara(fig.figure_label||"Figure 1",true,SZ.SM),
+    new Paragraph({alignment:AlignmentType.CENTER,spacing:{before:40,after:40},
+      children:[new ImageRun({type:(fig.media_type||"").indexOf("jpeg")>=0?"jpg":"png",
+                               data:buf,transformation:{width:imgW,height:imgH}})]}),
+    blk(), pgBrk(),
+  ];
+}
+
+// ── SOURCES SECTION + TABLE 2 ─────────────────────────────────────────────────
+function buildSourcesSection(txt, annexureList) {
+  txt=txt||{}; annexureList=Array.isArray(annexureList)?annexureList:[];
+  var ch=[];
+
+  [txt.sources_intro,txt.drug_substance_section,txt.excipient_intro].forEach(function(t){
+    if(t){ bodyParas(t).forEach(function(p){ch.push(p);}); ch.push(blk()); }
+  });
+
+  var W=[Math.round(CW*0.40),Math.round(CW*0.36),0];
+  W[2]=CW-W[0]-W[1];
+  var annTbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Name of Excipient / Material",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Vendor",                       {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("Title of Annexure",            {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+      ]}),
+    ].concat(annexureList.map(function(a,i){
+      return new TableRow({children:[
+        cellL(a.material||"", {w:W[0],size:SZ.SM}),
+        cellL(a.supplier||"", {w:W[1],size:SZ.SM}),
+        cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
+      ]});
+    })),
+  });
+  ch.push(lftPara("Table No.2 Details of Annexures",true,SZ.SM));
+  ch.push(annTbl); ch.push(blk());
+
+  [txt.manufacturing_section,txt.container_closure_section,
+   txt.utilities_section,txt.control_strategy].forEach(function(t){
+    if(t){ bodyParas(t).forEach(function(p){ch.push(p);}); ch.push(blk()); }
+  });
+  ch.push(pgBrk());
+  return ch;
+}
+
+// ── NUMBER FORMATTER ──────────────────────────────────────────────────────────
 function fmt(val, dec) {
-  if (dec == null) dec = 4;
-  if (val == null || val === "") return "";
-  var n = parseFloat(String(val).replace(/[^0-9.eE+\-]/g, ""));
-  if (isNaN(n) || !isFinite(n)) return "";
+  if (dec==null) dec=4;
+  if (val==null||val==="") return "";
+  var n=parseFloat(String(val).replace(/[^0-9.eE+\-]/g,""));
+  if (isNaN(n)||!isFinite(n)) return "";
   return n.toFixed(dec);
 }
 
-
-// ============================================================================
-// CALCULATION TABLES  (Tables 5, 6, 7)
-// Responsive: cell font shrinks for wide tables so they fit on one page.
-// ============================================================================
+// ── CALCULATION TABLES 5/6/7 ─────────────────────────────────────────────────
+// Formula: Daily exposure (µg/day) = daily_intake_g × conc_µg_per_g
+// Responsive: font shrinks for wide tables
 function buildCalcTable(tableNum, tableData, pdeValues) {
-  var safe = function (o) { return (o && typeof o === "object") ? o : {}; };
-  var d           = safe(tableData);
-  var elements    = Array.isArray(d.elements) ? d.elements : [];
-  var rows        = Array.isArray(d.rows)     ? d.rows     : [];
-  var dailyTotal  = d.total_daily_intake || 0;
-  var eTotals     = safe(d.element_totals);
-  var pde         = safe(d.pde);
-  var thresh      = safe(d.threshold_30pct);
+  var d=(tableData&&typeof tableData==="object")?tableData:{};
+  var elements  = Array.isArray(d.elements)?d.elements:[];
+  var rows      = Array.isArray(d.rows)?d.rows:[];
+  var total     = d.total_daily_intake||0;
+  var eTotals   = d.element_totals||{};
+  var pde       = d.pde||{};
+  var thresh    = d.threshold_30pct||{};
+  var route     = d.route||"oral";
 
-  if (elements.length === 0) {
-    return [leftPara("Table " + tableNum + ": No elements data.", false, SZ.SM)];
+  if (elements.length===0) return [lftPara("Table "+tableNum+": No elements data.",false,SZ.SM)];
+
+  var N=elements.length;
+  var totalCols=2+2*N;
+  var sz=totalCols<=12?SZ.SM:(totalCols<=18?SZ.XS:SZ.XXS);
+  var INGR=Math.round(CW*0.25), DI=Math.round(CW*0.06);
+  var EW=Math.max(240,Math.floor((CW-INGR-DI)/(2*N)));
+  var colW=[INGR,DI]; for(var ci=0;ci<2*N;ci++) colW.push(EW);
+
+  // Group consecutive same-class elements
+  var grps=[];
+  for(var gi=0;gi<elements.length;gi++){
+    var sym=elements[gi];
+    var cls=((pdeValues||{})[sym]||{}).class||"?";
+    if(grps.length&&grps[grps.length-1].cls===cls) grps[grps.length-1].count++;
+    else grps.push({cls:cls,count:1});
   }
 
-  var N = elements.length;
-  var totalCols = 2 + 2 * N;
-  var cellSz = totalCols <= 12 ? SZ.SM : (totalCols <= 18 ? SZ.XS : SZ.XXS);
+  // Header rows
+  var h1=new TableRow({children:[
+    cell("Component",        {bold:true,fill:CLR.HDR_GREY,w:INGR,size:sz}),
+    cell("Daily\nIntake\n(g)",{bold:true,fill:CLR.HDR_GREY,w:DI,  size:sz}),
+    new TableCell({columnSpan:N,borders:allBdr(4),shading:shade(CLR.HDR_GREY),margins:mg(),
+      children:[ctrPara("Measured Concentration (\u00B5g/g)",true,sz)]}),
+    new TableCell({columnSpan:N,borders:allBdr(4),shading:shade(CLR.HDR_GREY),margins:mg(),
+      children:[ctrPara("Daily Exposure (\u00B5g/day)",true,sz)]}),
+  ]});
 
-  var INGR_W = Math.round(CW * 0.25);
-  var DI_W   = Math.round(CW * 0.06);
-  var EW     = Math.max(240, Math.floor((CW - INGR_W - DI_W) / (2 * N)));
-  var colW   = [INGR_W, DI_W];
-  for (var ci = 0; ci < 2 * N; ci++) colW.push(EW);
+  var h2cells=[emptyCell(CLR.HDR_GREY,INGR),emptyCell(CLR.HDR_GREY,DI)];
+  for(var h=0;h<2;h++) grps.forEach(function(g){
+    h2cells.push(new TableCell({columnSpan:g.count,borders:allBdr(4),shading:shade(CLR.HDR_GREY),
+      margins:mg(),children:[ctrPara("Class "+g.cls,true,sz)]}));
+  });
+  var h2=new TableRow({children:h2cells});
 
-  // Group same-class elements
-  var grps = [];
-  for (var gi = 0; gi < elements.length; gi++) {
-    var sym = elements[gi];
-    var cls = (safe(pdeValues)[sym] || {}).class || "?";
-    if (grps.length && grps[grps.length - 1].cls === cls) {
-      grps[grps.length - 1].count++;
-    } else {
-      grps.push({ cls: cls, count: 1 });
-    }
-  }
+  var h3cells=[emptyCell(CLR.HDR_GREY,INGR),emptyCell(CLR.HDR_GREY,DI)];
+  for(var hh=0;hh<2;hh++) elements.forEach(function(s){
+    h3cells.push(cell(s,{bold:true,fill:CLR.HDR_GREY,w:EW,size:sz}));
+  });
+  var h3=new TableRow({children:h3cells});
 
-  // Header row 1
-  var h1 = new TableRow({
-    children: [
-      mkCell("Component",          { bold: true, fill: COLOR.HEADER_GREY, w: INGR_W, size: cellSz }),
-      mkCell("Daily\nIntake\n(g)", { bold: true, fill: COLOR.HEADER_GREY, w: DI_W,   size: cellSz }),
-      new TableCell({
-        columnSpan: N, borders: allBorders(4), shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
-        children: [centerPara("Measured Concentration (\u00B5g/g)", true, cellSz)],
-      }),
-      new TableCell({
-        columnSpan: N, borders: allBorders(4), shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
-        children: [centerPara("Total Mass of Elemental Impurity (\u00B5g/day)", true, cellSz)],
-      }),
-    ],
+  var dataRows=rows.filter(Boolean).map(function(row){
+    var mc=row.measured_conc||{}, tm=row.total_mass||{};
+    var cells=[
+      cellL(row.ingredient||"",{w:INGR,size:sz}),
+      cell(fmt(row.daily_intake_g!=null?row.daily_intake_g:0,6),{w:DI,size:sz}),
+    ];
+    elements.forEach(function(s){ cells.push(cell(fmt(mc[s]!=null?mc[s]:0,4),{w:EW,size:sz})); });
+    elements.forEach(function(s){ cells.push(cell(fmt(tm[s]!=null?tm[s]:0,6),{w:EW,size:sz})); });
+    return new TableRow({children:cells});
   });
 
-  // Header row 2: class groupings
-  var h2cells = [emptyCell(COLOR.HEADER_GREY, INGR_W), emptyCell(COLOR.HEADER_GREY, DI_W)];
-  for (var h = 0; h < 2; h++) {
-    for (var g = 0; g < grps.length; g++) {
-      h2cells.push(new TableCell({
-        columnSpan: grps[g].count, borders: allBorders(4),
-        shading: cellShade(COLOR.HEADER_GREY), margins: cm(),
-        children: [centerPara("Class " + grps[g].cls, true, cellSz)],
-      }));
-    }
-  }
-  var h2 = new TableRow({ children: h2cells });
-
-  // Header row 3: element symbols
-  var h3cells = [emptyCell(COLOR.HEADER_GREY, INGR_W), emptyCell(COLOR.HEADER_GREY, DI_W)];
-  for (var hh = 0; hh < 2; hh++) {
-    for (var ei = 0; ei < elements.length; ei++) {
-      h3cells.push(mkCell(elements[ei], { bold: true, fill: COLOR.HEADER_GREY, w: EW, size: cellSz }));
-    }
-  }
-  var h3 = new TableRow({ children: h3cells });
-
-  // Data rows
-  var dataRows = [];
-  for (var ri = 0; ri < rows.length; ri++) {
-    var row = rows[ri];
-    if (!row || typeof row !== "object") continue;
-    var mc = safe(row.measured_conc);
-    var tm = safe(row.total_mass);
-    var rCells = [
-      mkCellL(row.ingredient || "", { w: INGR_W, size: cellSz }),
-      mkCell(fmt(row.daily_intake_g != null ? row.daily_intake_g : 0, 6), { w: DI_W, size: cellSz }),
+  function footerRow(label,vals,fill,isThresh){
+    var fc=[
+      cell(label,{bold:true,fill:fill,align:AlignmentType.LEFT,w:INGR,size:sz}),
+      cell(label==="TOTAL daily intake (g/day)"?fmt(total,6):"",{fill:fill,w:DI,size:sz}),
     ];
-    for (var mei = 0; mei < elements.length; mei++) {
-      rCells.push(mkCell(fmt(mc[elements[mei]] != null ? mc[elements[mei]] : 0, 4),
-                         { w: EW, size: cellSz }));
-    }
-    for (var tei = 0; tei < elements.length; tei++) {
-      rCells.push(mkCell(fmt(tm[elements[tei]] != null ? tm[elements[tei]] : 0, 9),
-                         { w: EW, size: cellSz }));
-    }
-    dataRows.push(new TableRow({ children: rCells }));
-  }
-
-  // Footer rows
-  function mkFooter(label, vals, fillColor, isThresh) {
-    var sv = vals || {};
-    var st = eTotals || {};
-    var fc = [
-      mkCell(label, { bold: true, fill: fillColor, align: AlignmentType.LEFT, w: INGR_W, size: cellSz }),
-      mkCell(label === "TOTAL (daily intake) g/day" ? fmt(dailyTotal, 6) : "",
-             { fill: fillColor, w: DI_W, size: cellSz }),
-    ];
-    for (var bi = 0; bi < elements.length; bi++) fc.push(emptyCell(fillColor, EW));
-    for (var vi = 0; vi < elements.length; vi++) {
-      var vs = elements[vi];
-      var val = sv[vs] != null ? sv[vs] : null;
-      var tot = st[vs] != null ? st[vs] : null;
-      var ex  = isThresh && val != null && tot != null && isFinite(val) && isFinite(tot) && tot > val;
-      var dec = label === "TOTAL (daily intake) g/day" ? 9 : 3;
-      fc.push(mkCell(val != null ? fmt(val, dec) : "\u2013", {
-        fill:  ex ? COLOR.EXCEEDED_BG  : fillColor,
-        w:     EW, size: cellSz,
-        color: ex ? COLOR.EXCEEDED_TXT : COLOR.BLACK,
+    elements.forEach(function(){ fc.push(emptyCell(fill,EW)); });
+    elements.forEach(function(s){
+      var val=vals[s]!=null?vals[s]:null;
+      var tot=eTotals[s]!=null?eTotals[s]:null;
+      var ex=isThresh&&val!=null&&tot!=null&&isFinite(val)&&isFinite(tot)&&tot>val;
+      fc.push(cell(val!=null?fmt(val,3):"\u2013",{
+        fill:ex?CLR.EXCEED_BG:fill, w:EW, size:sz,
+        color:ex?CLR.EXCEED_TXT:CLR.BLACK,
       }));
-    }
-    return new TableRow({ children: fc });
+    });
+    return new TableRow({children:fc});
   }
 
-  var labels = { 5: "Class 1 and Class 2A", 6: "Class 2B", 7: "Class 3" };
-  var caption = "Table " + tableNum
-    + ": Theoretical Elemental Impurity Assessment (" + (labels[tableNum] || "") + ")"
-    + " \u2014 Evaluation of Daily Contribution of the Total Mass";
+  var lbls={5:"Class 1 and Class 2A",6:"Class 2B",7:"Class 3"};
+  var caption="Table "+tableNum+": Theoretical Elemental Impurity Assessment ("
+    +(lbls[tableNum]||"")+")"
+    +" \u2014 Evaluation of Daily Exposure [Route: "+route+"]";
 
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: colW,
-    rows: [h1, h2, h3].concat(dataRows).concat([
-      mkFooter("TOTAL (daily intake) g/day", eTotals,  COLOR.HEADER_GREY, false),
-      mkFooter("PDE (\u00B5g/day)",           pde,      COLOR.HEADER_GREY, false),
-      mkFooter("Threshold Limit (30% of PDE)", thresh,  COLOR.THRESHOLD_BG, true),
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:colW,
+    rows:[h1,h2,h3].concat(dataRows).concat([
+      footerRow("TOTAL daily intake (g/day)",eTotals,CLR.HDR_GREY,false),
+      footerRow("PDE (\u00B5g/day)",         pde,    CLR.HDR_GREY,false),
+      footerRow("Threshold (30% PDE)",       thresh, CLR.THRESH_BG,true),
     ]),
   });
-
-  return [leftPara(caption, true, SZ.SM), tbl, blankPara()];
+  return [lftPara(caption,true,SZ.SM), tbl, blk()];
 }
 
-
-// ============================================================================
-// SUMMARY & CONCLUSION
-// ============================================================================
-function buildSummarySection(txt) {
-  txt = txt || {};
-  var ch = [sectionHeading("6. Summary & Conclusion")];
-
-  if (txt.observation) {
-    ch.push(leftPara("Observation:", true, SZ.HDR));
-    var op = bodyParagraphs(txt.observation);
-    for (var i = 0; i < op.length; i++) ch.push(op[i]);
-    ch.push(blankPara());
+// ── SUMMARY & CONCLUSION ──────────────────────────────────────────────────────
+function buildSummary(txt) {
+  txt=txt||{};
+  var ch=[secHd("6. Summary & Conclusion")];
+  if(txt.observation){
+    ch.push(lftPara("Observation:",true,SZ.TEXT));
+    bodyParas(txt.observation).forEach(function(p){ch.push(p);});
+    ch.push(blk());
   }
-  if (txt.conclusion) {
-    ch.push(leftPara("Conclusion:", true, SZ.HDR));
-    var cp = bodyParagraphs(txt.conclusion);
-    for (var j = 0; j < cp.length; j++) ch.push(cp[j]);
+  if(txt.conclusion){
+    ch.push(lftPara("Conclusion:",true,SZ.TEXT));
+    bodyParas(txt.conclusion).forEach(function(p){ch.push(p);});
   }
-  ch.push(pgBreak());
+  ch.push(pgBrk());
   return ch;
 }
 
-
-// ============================================================================
-// LIST OF ANNEXURES  (Table 8)
-// ============================================================================
+// ── ANNEXURE LIST ─────────────────────────────────────────────────────────────
 function buildAnnexureList(list) {
-  list = Array.isArray(list) ? list : [];
-  var W0 = Math.round(CW * 0.38);
-  var W1 = Math.round(CW * 0.36);
-  var W2 = CW - W0 - W1;
-
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [W0, W1, W2],
-    rows: [
-      new TableRow({
-        children: [
-          mkCell("Name of Ingredient", { bold: true, fill: COLOR.HEADER_GREY, w: W0, size: SZ.SM }),
-          mkCell("Vendor",             { bold: true, fill: COLOR.HEADER_GREY, w: W1, size: SZ.SM }),
-          mkCell("Title of Annexure",  { bold: true, fill: COLOR.HEADER_GREY, w: W2, size: SZ.SM }),
-        ],
-      }),
-    ].concat(list.map(function (a, idx) {
-      return new TableRow({
-        children: [
-          mkCellL(a.material || "", { w: W0, size: SZ.SM }),
-          mkCellL(a.supplier || "", { w: W1, size: SZ.SM }),
-          mkCell(a.annexure || ("Annexure " + (idx + 1)), { w: W2, size: SZ.SM }),
-        ],
-      });
+  list=Array.isArray(list)?list:[];
+  var W=[Math.round(CW*0.38),Math.round(CW*0.36),0]; W[2]=CW-W[0]-W[1];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Name of Ingredient",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Vendor",            {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("Title of Annexure", {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+      ]}),
+    ].concat(list.map(function(a,i){
+      return new TableRow({children:[
+        cellL(a.material||"",{w:W[0],size:SZ.SM}),
+        cellL(a.supplier||"",{w:W[1],size:SZ.SM}),
+        cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
+      ]});
     })),
   });
-
-  return [sectionHeading("8. List of annexures"),
-          leftPara("Table No: 8 List of annexures", true, SZ.SM), tbl, pgBreak()];
+  return [secHd("8. List of annexures"),
+          lftPara("Table No: 8 List of annexures",true,SZ.SM), tbl, pgBrk()];
 }
 
-
-// ============================================================================
-// REVISION HISTORY
-// ============================================================================
-function buildRevisionHistory(revisions) {
-  var list = Array.isArray(revisions) ? revisions : [];
-  var W0   = Math.round(CW * 0.40);
-  var W1   = CW - W0;
-
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: [W0, W1],
-    rows: [
-      new TableRow({
-        children: [
-          mkCell("Document and Version Number", { bold: true, fill: COLOR.HEADER_GREY, w: W0, size: SZ.SM }),
-          mkCell("Brief details of changes",    { bold: true, fill: COLOR.HEADER_GREY, w: W1, size: SZ.SM }),
-        ],
-      }),
-    ].concat(list.filter(function (r) { return r && typeof r === "object"; }).map(function (r) {
-      return new TableRow({
-        children: [
-          mkCellL(r.document_version || r["Document and Version Number"] || "", { w: W0, size: SZ.SM }),
-          mkCellL(r.changes || r["Brief details of changes"] || "",             { w: W1, size: SZ.SM }),
-        ],
-      });
+// ── REVISION HISTORY ──────────────────────────────────────────────────────────
+function buildRevision(revisions) {
+  revisions=Array.isArray(revisions)?revisions:[];
+  var W=[Math.round(CW*0.40),0]; W[1]=CW-W[0];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Document and Version Number",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Brief details of changes",   {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+      ]}),
+    ].concat(revisions.filter(function(r){return r&&typeof r==="object";}).map(function(r){
+      return new TableRow({children:[
+        cellL(r.document_version||r["Document and Version Number"]||"",{w:W[0],size:SZ.SM}),
+        cellL(r.changes||r["Brief details of changes"]||"",{w:W[1],size:SZ.SM}),
+      ]});
     })),
   });
-
-  return [sectionHeading("9. Revision history:"), tbl, pgBreak()];
+  return [secHd("9. Revision history:"), tbl, pgBrk()];
 }
 
-
-// ============================================================================
-// ELECTRONIC SIGNATURES
-// ============================================================================
+// ── ELECTRONIC SIGNATURES ─────────────────────────────────────────────────────
 function buildSignatures(meta, signatures) {
-  meta = meta || {};
-  var W = [Math.round(CW*0.25), Math.round(CW*0.15), Math.round(CW*0.32), 0];
-  W[3] = CW - W[0] - W[1] - W[2];
-
-  var sigList = (Array.isArray(signatures) && signatures.length) ? signatures : [
-    { intention: "Prepared by R&D", employee_id: "", user_name: "", date: "" },
-    { intention: "Reviewed by R&D", employee_id: "", user_name: "", date: "" },
-    { intention: "Approved by DQA", employee_id: "", user_name: "", date: "" },
+  meta=meta||{};
+  var W=[Math.round(CW*0.25),Math.round(CW*0.15),Math.round(CW*0.32),0];
+  W[3]=CW-W[0]-W[1]-W[2];
+  var sigs=(Array.isArray(signatures)&&signatures.length)?signatures:[
+    {intention:"Prepared by R&D",employee_id:"",user_name:"",date:""},
+    {intention:"Reviewed by R&D",employee_id:"",user_name:"",date:""},
+    {intention:"Approved by DQA",employee_id:"",user_name:"",date:""},
   ];
-
-  var tbl = new Table({
-    width: { size: CW, type: WidthType.DXA },
-    columnWidths: W,
-    rows: [
-      new TableRow({
-        children: [
-          mkCell("Intention",   { bold: true, fill: COLOR.HEADER_GREY, w: W[0], size: SZ.SM }),
-          mkCell("Employee ID", { bold: true, fill: COLOR.HEADER_GREY, w: W[1], size: SZ.SM }),
-          mkCell("User Name",   { bold: true, fill: COLOR.HEADER_GREY, w: W[2], size: SZ.SM }),
-          mkCell("Date (IST)",  { bold: true, fill: COLOR.HEADER_GREY, w: W[3], size: SZ.SM }),
-        ],
-      }),
-    ].concat(sigList.map(function (s) {
-      return new TableRow({
-        children: [
-          mkCellL(s.intention   || "", { w: W[0], size: SZ.SM }),
-          mkCell(s.employee_id  || "", { w: W[1], size: SZ.SM }),
-          mkCellL(s.user_name   || "", { w: W[2], size: SZ.SM }),
-          mkCell(s.date         || "", { w: W[3], size: SZ.SM }),
-        ],
-      });
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Intention",  {bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Employee ID",{bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("User Name",  {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+        cell("Date (IST)", {bold:true,fill:CLR.HDR_GREY,w:W[3],size:SZ.SM}),
+      ]}),
+    ].concat(sigs.map(function(s){
+      return new TableRow({children:[
+        cellL(s.intention||"",  {w:W[0],size:SZ.SM}),
+        cell(s.employee_id||"", {w:W[1],size:SZ.SM}),
+        cellL(s.user_name||"",  {w:W[2],size:SZ.SM}),
+        cell(s.date||"",        {w:W[3],size:SZ.SM}),
+      ]});
     })),
   });
-
-  return [centerPara("ELECTRONIC SIGNATURES", true, SZ.MD), blankPara(), tbl];
+  return [ctrPara("ELECTRONIC SIGNATURES",true,SZ.MD), blk(), tbl];
 }
 
-
-// ============================================================================
-// POST-PROCESS: inject pgBorders XML + remove proofErr via JSZip
-// (docx 9.6.1 pageBorders in section properties is silently ignored in XML;
-//  this approach reliably inserts it directly into word/document.xml)
-// ============================================================================
-function injectPageBordersAndSpellOff(buf) {
-  // notFirstPage = no border on title page; offsetFrom="text" = border hugs content
-  var pgBordersXml = (
-    '<w:pgBorders w:display="notFirstPage" w:offsetFrom="text">' +
-    '<w:top w:val="single" w:sz="6" w:space="4" w:color="000000"/>' +
-    '<w:left w:val="single" w:sz="6" w:space="4" w:color="000000"/>' +
-    '<w:bottom w:val="single" w:sz="6" w:space="4" w:color="000000"/>' +
-    '<w:right w:val="single" w:sz="6" w:space="4" w:color="000000"/>' +
+// ── PAGE BORDER + SPELL-OFF INJECTION (JSZip post-processing) ────────────────
+function injectBordersAndSpellOff(buf) {
+  // notFirstPage = no border on title page; offsetFrom="text" = hugs content
+  var pgBXml=(
+    '<w:pgBorders w:display="notFirstPage" w:offsetFrom="text">'+
+    '<w:top    w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:left   w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:bottom w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:right  w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
     '</w:pgBorders>'
   );
+  var spellOff='<w:hideSpellingErrors/><w:hideGrammaticalErrors/>';
 
-  return JSZip.loadAsync(buf).then(function (zip) {
-    // ── Patch word/document.xml: inject pgBorders ────────────────────────
-    return zip.file("word/document.xml").async("string").then(function (xml) {
-      // Insert before last </w:sectPr>
-      var lastIdx = xml.lastIndexOf("</w:sectPr>");
-      if (lastIdx >= 0) {
-        xml = xml.slice(0, lastIdx) + pgBordersXml + xml.slice(lastIdx);
-      }
-      zip.file("word/document.xml", xml);
+  return JSZip.loadAsync(buf).then(function(zip){
+    return zip.file("word/document.xml").async("string").then(function(xml){
+      // Inject borders before last </w:sectPr>
+      var idx=xml.lastIndexOf("</w:sectPr>");
+      if (idx>=0 && !xml.includes("pgBorders"))
+        xml=xml.slice(0,idx)+pgBXml+xml.slice(idx);
+      zip.file("word/document.xml",xml);
 
-      // ── Patch word/settings.xml: disable spell + grammar check ──────────
-      var settingsFile = zip.file("word/settings.xml");
-      var settingsPromise;
-      if (settingsFile) {
-        settingsPromise = settingsFile.async("string").then(function (sxml) {
-          // Inject hideSpellingErrors + hideGrammaticalErrors before </w:settings>
-          var injection =
-            '<w:hideSpellingErrors/>' +
-            '<w:hideGrammaticalErrors/>';
-          var closeTag = "</w:settings>";
-          if (sxml.includes(closeTag) && !sxml.includes("hideSpellingErrors")) {
-            sxml = sxml.replace(closeTag, injection + closeTag);
-          }
-          zip.file("word/settings.xml", sxml);
+      var sf=zip.file("word/settings.xml");
+      var sp;
+      if (sf) {
+        sp=sf.async("string").then(function(sxml){
+          if (!sxml.includes("hideSpellingErrors"))
+            sxml=sxml.replace("</w:settings>",spellOff+"</w:settings>");
+          zip.file("word/settings.xml",sxml);
         });
       } else {
-        // Create settings.xml from scratch
-        var newSettings = (
-          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-          '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-          '<w:hideSpellingErrors/>' +
-          '<w:hideGrammaticalErrors/>' +
-          '</w:settings>'
-        );
-        zip.file("word/settings.xml", newSettings);
-        settingsPromise = Promise.resolve();
+        zip.file("word/settings.xml",
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'+
+          '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'+
+          spellOff+'</w:settings>');
+        sp=Promise.resolve();
       }
-
-      return settingsPromise;
-    });
-  }).then(function (zip_) {
-    // zip_ is undefined because then() chain consumed it — use outer zip
-    return JSZip.loadAsync(buf).then(function (zip2) {
-      // Re-apply all patches cleanly
-      return zip2.file("word/document.xml").async("string").then(function (xml) {
-        var lastIdx = xml.lastIndexOf("</w:sectPr>");
-        if (lastIdx >= 0 && !xml.includes("pgBorders")) {
-          xml = xml.slice(0, lastIdx) + pgBordersXml + xml.slice(lastIdx);
-        }
-        zip2.file("word/document.xml", xml);
-
-        var sf = zip2.file("word/settings.xml");
-        var sp;
-        if (sf) {
-          sp = sf.async("string").then(function (sxml) {
-            if (!sxml.includes("hideSpellingErrors")) {
-              sxml = sxml.replace("</w:settings>",
-                '<w:hideSpellingErrors/><w:hideGrammaticalErrors/></w:settings>');
-            }
-            zip2.file("word/settings.xml", sxml);
-          });
-        } else {
-          zip2.file("word/settings.xml",
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-            '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-            '<w:hideSpellingErrors/><w:hideGrammaticalErrors/></w:settings>');
-          sp = Promise.resolve();
-        }
-        return (sp || Promise.resolve()).then(function () {
-          return zip2.generateAsync({
-            type: "nodebuffer",
-            compression: "DEFLATE",
-            compressionOptions: { level: 6 },
-          });
-        });
+      return (sp||Promise.resolve()).then(function(){
+        return zip.generateAsync({type:"nodebuffer",compression:"DEFLATE",
+          compressionOptions:{level:6}});
       });
     });
   });
 }
 
-
-// ============================================================================
-// MAIN REPORT ASSEMBLY
-// ============================================================================
+// ── MAIN ASSEMBLY ─────────────────────────────────────────────────────────────
 function generateReport(dataPath, outPath) {
-  var raw  = fs.readFileSync(dataPath, "utf-8");
+  var raw  = fs.readFileSync(dataPath,"utf-8");
   var data = JSON.parse(raw);
 
-  var meta            = data.meta             || {};
-  var logoB64         = data.logo_b64         || "";
-  var logoType        = data.logo_type        || "";
-  var txt             = data.text_sections    || {};
-  var composition     = data.composition      || [];
-  var compositionCols = data.composition_columns || [];
-  var annexureList    = data.annexure_list    || [];
-  var calcTables      = data.calc_tables      || {};
-  var revisionHistory = data.revision_history || [];
-  var signatures      = data.signatures       || [];
-  var figures         = Array.isArray(data.figures) ? data.figures : [];
-  var pdeValues       = data.pde_values       || {};
+  var meta        = data.meta            ||{};
+  var tocEntries  = data.toc_entries     ||[];
+  var logoB64     = data.logo_b64        ||"";
+  var logoType    = data.logo_type       ||"";
+  var txt         = data.text_sections   ||{};
+  var composition = data.composition     ||[];
+  var compMeta    = data.comp_meta       ||{};
+  var annList     = data.annexure_list   ||[];
+  var calcTables  = data.calc_tables     ||{};
+  var revHistory  = data.revision_history||[];
+  var signatures  = data.signatures      ||[];
+  var figures     = Array.isArray(data.figures)?data.figures:[];
+  var pdeValues   = data.pde_values      ||{};
 
-  var ch = [];
+  var ch=[];
 
-  var tp = buildTitlePage(meta);
-  for (var ti = 0; ti < tp.length; ti++) ch.push(tp[ti]);
+  var tp=buildTitlePage(meta);
+  tp.forEach(function(x){ch.push(x);});
 
-  // ── Compute TOC page numbers based on document structure ─────────────────
-  // Each section that ends with pgBreak() advances the page counter by 1.
-  // Additional pages come from tables and figures that overflow.
-  var figureCount = figures.length;
-  // Estimate pages consumed per section (conservative):
-  // p1=Title, p2=TOC, p3=Sections1-4, p4=Composition(may be2pp), p5+=Figures
-  var pS14   = 3;                            // Sections 1-4 always on p3
-  var pComp  = pS14 + 1;                    // Composition table page
-  var pFig   = pComp + 1;                   // First figure page (if any)
-  var pAfterFig = pFig + figureCount;        // After all figures
-  // Sources section: ~2 pages (text + table 2 + manufacturing text)
-  var pCalc  = pAfterFig + 2;               // Calc tables start
-  // Calc tables: Class1+2A is widest (~2pp), Class2B (~1pp), Class3 (~1pp) = ~4pp
-  var pSum   = pCalc + 4;                   // Summary & Conclusion
-  var pRef   = pSum + 2;                    // Reference
-  var pAnn   = pRef + 1;                    // List of Annexures
-  var pRev   = pAnn + 1;                    // Revision History
+  var toc=buildTOC(tocEntries, figures.length);
+  toc.forEach(function(x){ch.push(x);});
 
-  var pageMap = {
-    sections_1_4:  pS14,
-    section_5:     pComp,
-    summary:       pSum,
-    reference:     pRef,
-    annexure_list: pAnn,
-    revision:      pRev,
-  };
+  var s14=buildTextSections(txt);
+  s14.forEach(function(x){ch.push(x);});
 
-  var toc = buildTOC(data.toc_entries || [], pageMap);
-  for (var toci = 0; toci < toc.length; toci++) ch.push(toc[toci]);
+  var comp=buildCompositionTable(composition, compMeta);
+  comp.forEach(function(x){ch.push(x);});
 
-  var s14 = buildTextSections(txt);
-  for (var s14i = 0; s14i < s14.length; s14i++) ch.push(s14[s14i]);
+  figures.forEach(function(fig){
+    buildFigure(fig).forEach(function(x){ch.push(x);});
+  });
 
-  var comp = buildCompositionTable(composition, compositionCols);
-  for (var ci = 0; ci < comp.length; ci++) ch.push(comp[ci]);
+  var src=buildSourcesSection(txt, annList);
+  src.forEach(function(x){ch.push(x);});
 
-  for (var fi = 0; fi < figures.length; fi++) {
-    var fp = buildFigure(figures[fi]);
-    for (var fj = 0; fj < fp.length; fj++) ch.push(fp[fj]);
-  }
-
-  var src = buildSourcesSection(txt, annexureList);
-  for (var sri = 0; sri < src.length; sri++) ch.push(src[sri]);
-
-  function safeT(key) {
-    var e = { elements:[], rows:[], total_daily_intake:0,
-              element_totals:{}, pde:{}, threshold_30pct:{} };
-    if (!calcTables || typeof calcTables !== "object" || !calcTables[key]) return e;
-    var m = {};
-    var ek = Object.keys(e);
-    for (var i = 0; i < ek.length; i++) m[ek[i]] = e[ek[i]];
-    var tk = Object.keys(calcTables[key]);
-    for (var j = 0; j < tk.length; j++) m[tk[j]] = calcTables[key][tk[j]];
+  function safeT(key){
+    var e={elements:[],rows:[],total_daily_intake:0,
+           element_totals:{},pde:{},threshold_30pct:{},route:"oral"};
+    if (!calcTables||typeof calcTables!=="object"||!calcTables[key]) return e;
+    var m={};
+    Object.keys(e).forEach(function(k){m[k]=e[k];});
+    Object.keys(calcTables[key]).forEach(function(k){m[k]=calcTables[key][k];});
     return m;
   }
 
   try {
-    var t5 = buildCalcTable(5, safeT("class1_2a"), pdeValues);
-    for (var t5i = 0; t5i < t5.length; t5i++) ch.push(t5[t5i]);
-    var t6 = buildCalcTable(6, safeT("class2b"), pdeValues);
-    for (var t6i = 0; t6i < t6.length; t6i++) ch.push(t6[t6i]);
-    var t7 = buildCalcTable(7, safeT("class3"), pdeValues);
-    for (var t7i = 0; t7i < t7.length; t7i++) ch.push(t7[t7i]);
-    ch.push(pgBreak());
-  } catch (err) {
-    console.error("Calc table error:", err.message);
-    ch.push(leftPara("Calculation table error: " + err.message));
-    ch.push(pgBreak());
+    buildCalcTable(5,safeT("class1_2a"),pdeValues).forEach(function(x){ch.push(x);});
+    buildCalcTable(6,safeT("class2b"),  pdeValues).forEach(function(x){ch.push(x);});
+    buildCalcTable(7,safeT("class3"),   pdeValues).forEach(function(x){ch.push(x);});
+    ch.push(pgBrk());
+  } catch(err){
+    console.error("Calc table error:",err.message);
+    ch.push(lftPara("Calc table error: "+err.message)); ch.push(pgBrk());
   }
 
-  var sum = buildSummarySection(txt);
-  for (var smi = 0; smi < sum.length; smi++) ch.push(sum[smi]);
+  buildSummary(txt).forEach(function(x){ch.push(x);});
 
-  ch.push(sectionHeading("7. Reference"));
-  ch.push(bodyPara(txt.reference || "NA"));
-  ch.push(blankPara());
+  ch.push(secHd("7. Reference"));
+  ch.push(bodyPara(txt.reference||"NA"));
+  ch.push(blk());
 
-  var anl = buildAnnexureList(annexureList);
-  for (var ali = 0; ali < anl.length; ali++) ch.push(anl[ali]);
+  buildAnnexureList(annList).forEach(function(x){ch.push(x);});
+  buildRevision(revHistory).forEach(function(x){ch.push(x);});
+  buildSignatures(meta, signatures).forEach(function(x){ch.push(x);});
 
-  var rev = buildRevisionHistory(revisionHistory);
-  for (var rvi = 0; rvi < rev.length; rvi++) ch.push(rev[rvi]);
-
-  var sig = buildSignatures(meta, signatures);
-  for (var sgi = 0; sgi < sig.length; sgi++) ch.push(sig[sgi]);
-
-  // ── Build Document ───────────────────────────────────────────────────────
-  var doc = new Document({
-    // Disable spell check at document level (belt-and-suspenders with noProof on runs)
-    settings: {
-      hideSpellingErrors:    true,
-      hideGrammaticalErrors: true,
-    },
-    styles: {
-      default: {
-        document: { run: { font: FONT, size: SZ.TEXT, color: COLOR.BLACK } },
-      },
-    },
-    sections: [{
-      properties: {
-        page: {
-          size:   { width: PAGE_W, height: PAGE_H },
-          margin: { top: MAR_T, right: MAR_R, bottom: MAR_B, left: MAR_L,
-                    header: 360, footer: 360 },
-        },
-        // Note: pageBorders here is silently ignored by docx 9.6.1 in XML output.
-        // Real injection is done below via injectPageBordersAndSpellOff().
-      },
-      headers: { default: buildPageHeader(meta, logoB64, logoType) },
-      footers: { default: buildPageFooter() },
-      children: ch,
+  var doc=new Document({
+    settings:{hideSpellingErrors:true, hideGrammaticalErrors:true},
+    styles:{default:{document:{run:{font:F,size:SZ.TEXT,color:CLR.BLACK}}}},
+    sections:[{
+      properties:{page:{
+        size:{width:PAGE_W,height:PAGE_H},
+        margin:{top:MAR_T,right:MAR_R,bottom:MAR_B,left:MAR_L,header:360,footer:360},
+      }},
+      headers:{default:buildHeader(meta,logoB64,logoType)},
+      footers:{default:buildFooter()},
+      children:ch,
     }],
   });
 
   return Packer.toBuffer(doc)
-    .then(function (rawBuf) {
-      // Post-process: inject page borders + ensure spell-off in settings.xml
-      return injectPageBordersAndSpellOff(rawBuf);
-    })
-    .then(function (finalBuf) {
-      fs.writeFileSync(outPath, finalBuf);
-      console.log("Report written: " + outPath + "  (" + Math.round(finalBuf.length / 1024) + " KB)");
+    .then(injectBordersAndSpellOff)
+    .then(function(finalBuf){
+      fs.writeFileSync(outPath,finalBuf);
+      console.log("Report written: "+outPath+" ("+Math.round(finalBuf.length/1024)+" KB)");
     });
 }
 
-
-// ============================================================================
-// ENTRY POINT
-// ============================================================================
-var dataPath = process.argv[2];
-var outPath  = process.argv[3];
-
-if (!dataPath || !outPath) {
-  console.error("Usage: node generate_report.js <data.json> <out.docx>");
-  process.exit(1);
-}
-
-generateReport(dataPath, outPath).catch(function (err) {
-  console.error("FATAL:", err.message || err);
-  if (err.stack) console.error(err.stack.split("\n").slice(0, 8).join("\n"));
+// ── Entry point ───────────────────────────────────────────────────────────────
+var dp=process.argv[2], op=process.argv[3];
+if (!dp||!op){console.error("Usage: node generate_report.js <data.json> <out.docx>"); process.exit(1);}
+generateReport(dp,op).catch(function(err){
+  console.error("FATAL:",err.message||err);
+  if (err.stack) console.error(err.stack.split("\n").slice(0,8).join("\n"));
   process.exit(1);
 });
