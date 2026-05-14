@@ -441,6 +441,10 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
         '  "mdd_g": 1.0,\n'
         '  "doses_per_day": 1,\n'
         '  "unit": "exact unit string e.g. mg/unit or mg/0.65mL",\n'
+        '  "ingredient_col": "exact column header for ingredient name",\n'
+        '  "amount_col": "exact column header for ingredient amount",\n'
+        '  "amount_unit": "mg",\n'
+        '  "amount_per_dose": true,\n'
         '  "columns": ["exact col1 header","exact col2 header","..."],\n'
         '  "sections": [\n'
         '    {\n'
@@ -452,10 +456,13 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
         '  ]\n'
         "}\n\n"
         "IMPORTANT:\n"
-        "- columns[]: exact headers as in the spreadsheet (e.g. [\"S.No.\",\"Material code\",\"Name of Ingredient\",\"Function\",\"Qty/unit (mg/0.65 mL)\"])\n"
+        "- columns[]: exact headers as in the spreadsheet\n"
         "- For each row, map each value to its exact column header\n"
         "- mdd_g in GRAMS (e.g. injection 0.65mL → 0.65g)\n"
-        "- For EI calculation: amount_col is whichever column has mg amounts\n"
+        "- ingredient_col: exact column header containing the ingredient/material name\n"
+        "- amount_col: exact column header containing the ingredient amount (mg or g per dose)\n"
+        "- amount_unit: unit of the amount column: 'mg', 'g', 'mL', or 'mg/mL'\n"
+        "- amount_per_dose: true if amounts are per single dose, false if already per day\n"
         f"Spreadsheet:\n{sheet_dump}"
     )
     raw = claude_text(prompt)
@@ -473,10 +480,15 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
         result = {"sections": [{"name": "Composition", "rows": fallback_rows}],
                   "route": "oral", "mdd_g": 1.0, "doses_per_day": 1, "unit": ""}
 
-    result["mdd_g"] = safe_float(result.get("mdd_g", 1.0), default=1.0)
-    result["doses_per_day"] = safe_int(result.get("doses_per_day", 1), default=1)
-    result["route"] = safe_str(result.get("route", "oral")) or "oral"
+    result["mdd_g"]          = safe_float(result.get("mdd_g", 1.0), default=1.0)
+    result["doses_per_day"]   = safe_int(result.get("doses_per_day", 1), default=1)
+    result["route"]           = safe_str(result.get("route", "oral")) or "oral"
+    result["ingredient_col"]  = safe_str(result.get("ingredient_col", ""))
+    result["amount_col"]      = safe_str(result.get("amount_col", ""))
+    result["amount_unit"]     = safe_str(result.get("amount_unit", "mg"))
+    result["amount_per_dose"] = bool(result.get("amount_per_dose", True))
     if not isinstance(result.get("sections"), list): result["sections"] = []
+    if not isinstance(result.get("columns"), list):  result["columns"] = []
     result["all_rows"] = all_rows
     return result
 
@@ -559,19 +571,41 @@ def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
 
 
 def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    """
+    Fuzzy match ingredient name to annexure material name.
+    Strategy 1: exact match (case-insensitive)
+    Strategy 2: token overlap score >= 0.15
+    Strategy 3: one name is a substring of the other
+    """
     if not conc_map or not name: return {}
     name_lower = name.lower().strip()
-    best_key: Optional[str] = None; best_score = 0
+
+    # Strategy 1: exact match
+    for key in conc_map:
+        if key and key.lower().strip() == name_lower:
+            return conc_map[key]
+
+    # Strategy 2 + 3: token overlap + substring
+    best_key: Optional[str] = None
+    best_score: float = 0.0
     for key in conc_map:
         if not key: continue
-        tokens_n = set(t for t in re.split(r"[\s\(\)\-,/]+", name_lower) if len(t)>1)
-        tokens_k = set(t for t in re.split(r"[\s\(\)\-,/]+", key.lower()) if len(t)>1)
+        key_lower = key.lower().strip()
+        tokens_n = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', name_lower) if len(t) > 1)
+        tokens_k = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', key_lower)  if len(t) > 1)
         if not tokens_n or not tokens_k: continue
         overlap = len(tokens_n & tokens_k)
         score   = overlap / max(len(tokens_n), len(tokens_k))
+        # Substring bonus: if either fully contains the other
+        if name_lower in key_lower or key_lower in name_lower:
+            score = max(score, 0.5)
         if score > best_score:
             best_score = score; best_key = key
-    return conc_map.get(best_key, {}) if best_score > 0.2 else {}
+    if best_score >= 0.15 and best_key:
+        logger.debug(f"Matched '{name}' → '{best_key}' (score={best_score:.2f})")
+        return conc_map[best_key]
+    logger.debug(f"No annexure match for '{name}' (best={best_score:.2f})")
+    return {}
 
 
 def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
@@ -591,33 +625,77 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     mdd_g       = safe_float(comp_data.get("mdd_g", 1.0), default=1.0)
     doses_per_day = safe_int(comp_data.get("doses_per_day", 1), default=1)
 
+    # Column keys Claude extracted from the spreadsheet
+    ingredient_col  = safe_str(comp_data.get("ingredient_col", ""))
+    amount_col      = safe_str(comp_data.get("amount_col", ""))
+    amount_unit_raw = safe_str(comp_data.get("amount_unit", "mg")).lower()
+    amount_per_dose = comp_data.get("amount_per_dose", True)
+
+    def _get_field(row: Dict, col_key: str, fallbacks: List[str]) -> str:
+        """Get a value from a row, checking columns dict first, then direct keys."""
+        cols_dict = row.get("columns", {})
+        if isinstance(cols_dict, dict):
+            # Try exact column key
+            if col_key and col_key in cols_dict:
+                return safe_str(cols_dict[col_key])
+            # Try all column values if key not found
+            for k, v in cols_dict.items():
+                for fb in fallbacks:
+                    if fb.lower() in k.lower():
+                        return safe_str(v)
+        # Try direct row keys
+        for fb in fallbacks:
+            if fb in row:
+                return safe_str(row[fb])
+        return ""
+
     # Build ingredient list with daily intake in grams
-    # Amount is usually "per dose unit" so multiply by doses_per_day
     ingredients: List[Dict] = []
     sections = comp_data.get("sections") or []
     for section in sections:
         if not isinstance(section, dict): continue
         for row in (section.get("rows") or []):
             if not isinstance(row, dict): continue
-            name = safe_str(row.get("ingredient",""))
+
+            # ── Get ingredient name ──────────────────────────────────────────
+            name = _get_field(row, ingredient_col,
+                              ["ingredient","name","Name of Ingredient",
+                               "material","Material","component","Component"])
             if not name: continue
-            # Amount may be in mg or g; normalise to grams
-            raw_amount = row.get("amount", row.get("40mg", row.get("qty","0")))
-            amount_raw = _parse_amount_g(raw_amount)
-            unit = safe_str(row.get("unit","")).lower()
-            # Convert to grams
-            if "mg" in unit:
-                amount_g = amount_raw / 1000.0
-            elif "µg" in unit or "ug" in unit:
+
+            # ── Get raw amount ───────────────────────────────────────────────
+            raw_amount_str = _get_field(row, amount_col,
+                                        ["amount","qty","Qty","40mg","quantity",
+                                         "Quantity","mg/unit","mg/0.65mL","mg/mL"])
+            amount_raw = _parse_amount_g(raw_amount_str)
+            if amount_raw == 0:
+                continue  # skip fillers/QS with no amount
+
+            # ── Convert to grams based on reported unit ──────────────────────
+            if "µg" in amount_unit_raw or "ug" in amount_unit_raw:
                 amount_g = amount_raw / 1_000_000.0
-            elif "ml" in unit or "g" in unit:
-                amount_g = amount_raw   # assume g or mL ≈ g
+            elif "mg" in amount_unit_raw:
+                amount_g = amount_raw / 1000.0
+            elif "ml" in amount_unit_raw:
+                # mL ≈ g for aqueous solutions
+                amount_g = amount_raw
+            elif "g" in amount_unit_raw:
+                amount_g = amount_raw
             else:
-                # Best-effort: if value > 10 assume mg, else grams
-                amount_g = amount_raw / 1000.0 if amount_raw > 10 else amount_raw
-            # Daily = per-dose × doses_per_day
-            daily_g = round(amount_g * doses_per_day, 6)
+                # Best-effort: values > 200 are almost certainly mg
+                amount_g = amount_raw / 1000.0 if amount_raw > 1 else amount_raw
+
+            # ── Scale to daily dose ──────────────────────────────────────────
+            # If amount_per_dose, multiply by doses_per_day; if already daily, use as-is
+            if amount_per_dose:
+                daily_g = round(amount_g * doses_per_day, 8)
+            else:
+                daily_g = round(amount_g, 8)
+
             ingredients.append({"name": name, "daily_g": daily_g})
+
+    logger.info(f"EI calc: {len(ingredients)} ingredients with non-zero amounts, "
+                f"route={route}, mdd_g={mdd_g}g, {len(annexure_data)} annexures")
 
     conc_map = _build_conc_map(annexure_data)
 
@@ -626,7 +704,7 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
         elem_totals: Dict[str, float] = {sym: 0.0 for sym in elements}
         total_intake = 0.0
         for ing in ingredients:
-            if ing["daily_g"] == 0: continue
+            if ing["daily_g"] == 0: continue  # strict zero only; tiny values are valid
             ing_concs = _match_ingredient(ing["name"], conc_map)
             measured: Dict[str, float] = {}
             total_mass: Dict[str, float] = {}
@@ -779,7 +857,10 @@ def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
         "comp_meta":         {"route": comp_data.get("route","oral"),
                               "mdd_g": comp_data.get("mdd_g",1.0),
                               "doses_per_day": comp_data.get("doses_per_day",1),
-                              "unit": comp_data.get("unit","")},
+                              "unit": comp_data.get("unit",""),
+                              "ingredient_col": comp_data.get("ingredient_col",""),
+                              "amount_col": comp_data.get("amount_col",""),
+                              "amount_unit": comp_data.get("amount_unit","mg")},
         "annexure_list":     annexure_list,
         "calc_tables":       calc_tables or {},
         "revision_history":  ref_structure.get("revision_history",[]) or [],
@@ -927,13 +1008,29 @@ def main() -> None:
             log.info("🧮 Calculating EI tables (formula: daily_g × conc_µg/g)…")
             calc_tables = calculate_ei_tables(comp_data, annexure_data)
             t5 = safe_calc_table(calc_tables,"class1_2a")
+
+            # Show calculation diagnostics
+            n_rows_5 = len(t5.get("rows",[]))
+            ann_materials = [a.get("material_name","?") for a in annexure_data
+                             if isinstance(a,dict)]
+            st.write(f"  📊 Calc diagnostics: route={comp_data.get('route','?')} | "
+                     f"mdd_g={comp_data.get('mdd_g','?')}g | "
+                     f"ingredient_col='{comp_data.get('ingredient_col','?')}' | "
+                     f"amount_col='{comp_data.get('amount_col','?')}' | "
+                     f"Class1+2A rows={n_rows_5}")
+            if n_rows_5 == 0:
+                st.warning("⚠️ No ingredient rows in Class1+2A table — check "
+                           "ingredient_col / amount_col / annexure matching above.")
+            st.write(f"  📦 Annexure materials: {', '.join(ann_materials[:8])}")
+
             crossing = [sym for sym in TABLE5_ELEMENTS
                         if t5["pde"].get(sym) and
                         t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.30]
             if crossing:
                 st.warning(f"Elements > 30% PDE: {', '.join(crossing)}")
             else:
-                st.success("All Class 1+2A elements ≤ 30% PDE.")
+                st.success("All Class 1+2A elements ≤ 30% PDE." if n_rows_5>0
+                           else "⚠️ Tables empty — check diagnostics above.")
             progress.progress(72)
 
             # Step 8: Generate text
@@ -983,7 +1080,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-################
+##########################
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
