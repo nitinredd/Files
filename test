@@ -386,28 +386,78 @@ def extract_composition_tables(pages_data: List[Dict]) -> Dict:
 
 def extract_additional_tables(pages_data: List[Dict]) -> List[Dict]:
     """
-    Extract all non-composition, non-EI-calculation tables from the PDF
-    (e.g. risk tables, potential risk action tables, packing tables).
-    These are rendered verbatim in the generated document.
+    Extract ONLY tables from the PDF that are NOT already rendered by the
+    structured pipeline. Specifically, skip:
+    - Tables of contents (TOC)
+    - Composition / ingredient / packing tables (Table 1, Table 2)
+    - EI calculation tables (Tables 3-7, anything with Class 1/2/3 element columns)
+    - Annexure list tables
+    - Revision history tables
+    - Electronic signature tables
+    - Any table on a figure page
+
+    What remains (e.g. "Potential risk and action required" summary tables,
+    drug substance details tables, packing tables if not already captured)
+    is rendered verbatim.
     """
+    # Keywords that identify pipeline-handled tables — skip these
+    SKIP_CAPTIONS = [
+        "table of contents", "s. no.", "s.no",
+        "table 1", "table 2", "table 3", "table 4",
+        "table 5", "table 6", "table 7",
+        "table no.1", "table no.2", "table no.3", "table no.4",
+        "table no.5", "table no.6", "table no.7",
+        "quantitative", "qualitative", "composition",
+        "concentration of the target", "target elements",
+        "theoretical elemental", "class 1", "class 2", "class 3",
+        "daily contribution", "daily exposure",
+        "pde", "threshold", "measured conc",
+        "list of annexure", "annexure", "annexure list",
+        "revision history", "electronic signature",
+        "packing material",
+    ]
+    # Keywords in column headers that identify pipeline-handled tables
+    SKIP_COLUMNS = [
+        "pb", "as", "cd", "hg", "co", "pd", "se", "li", "sb", "ba",
+        "measured concentration", "daily exposure", "total daily",
+        "employee id", "user name", "intention",
+        "document and version", "brief details",
+        "s. no.", "title", "page#",
+    ]
+
     additional: List[Dict] = []
-    skip_keywords = ["class 1","class 2","class 3","measured conc","total mass",
-                     "daily exposure","pde","threshold","table 3","table 4",
-                     "table 5","table 6","table 7"]
-    comp_keywords = ["table 1","table 2","ingredient","packing","material"]
+    seen_captions: set = set()
+
     for page in pages_data:
         if not isinstance(page, dict): continue
+        # Skip figure pages entirely
+        if page.get("page_type") == "figure": continue
         for sec in (page.get("sections") or []):
             if not isinstance(sec, dict): continue
             for tbl in (sec.get("tables") or []):
                 if not isinstance(tbl, dict): continue
-                cap = safe_str(tbl.get("caption","")).lower()
-                if any(kw in cap for kw in skip_keywords): continue
-                if any(kw in cap for kw in comp_keywords): continue
-                cols = tbl.get("columns",[])
-                rows = tbl.get("rows",[])
-                if isinstance(cols, list) and cols and isinstance(rows, list) and rows:
-                    additional.append(tbl)
+
+                cap  = safe_str(tbl.get("caption","")).lower().strip()
+                cols = tbl.get("columns") or []
+                rows = tbl.get("rows") or []
+
+                # Must have at least 2 columns and 1 data row
+                if not isinstance(cols, list) or len(cols) < 2: continue
+                if not isinstance(rows, list) or len(rows) < 1: continue
+
+                # Skip by caption keyword
+                if any(kw in cap for kw in SKIP_CAPTIONS): continue
+
+                # Skip by column header keyword
+                cols_lower = [str(c).lower() for c in cols]
+                if any(any(kw in cl for cl in cols_lower) for kw in SKIP_COLUMNS): continue
+
+                # Deduplicate by caption
+                if cap and cap in seen_captions: continue
+                if cap: seen_captions.add(cap)
+
+                additional.append(tbl)
+
     return additional
 
 
@@ -1080,7 +1130,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-##########################
+##################3
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
@@ -1434,22 +1484,75 @@ function buildTOC(tocEntries, figureCount) {
   return [ctrPara("TABLE OF CONTENTS",true,SZ.MD), tbl, pgBrk()];
 }
 
-// ── SECTIONS 1-4 ─────────────────────────────────────────────────────────────
+// ── ALL TEXT SECTIONS ────────────────────────────────────────────────────────
+// Renders sections 1-4 and all narrative sub-sections that follow.
+// Keeping everything here avoids duplication with buildSourcesSection.
 function buildTextSections(txt) {
   txt=txt||{};
   var ch=[];
-  function addSec(num,title,content) {
+
+  function addSec(num, title, content) {
+    if (!content && content !== "") return;  // skip empty optional sections
     ch.push(secHd(num+". "+title));
     bodyParas(content).forEach(function(p){ch.push(p);});
     ch.push(blk());
   }
+
+  // Sections 1-4
   addSec(1,"Abstract",   txt.abstract||"");
   addSec(2,"Objective",  txt.objective||"");
-  addSec(3,"Details of the study location / testing location", txt.study_location||"NA");
+  addSec(3,"Details of the study location / testing location",
+            txt.study_location||"NA");
+
   ch.push(secHd("4. Background:"));
   bodyParas(txt.background||"").forEach(function(p){ch.push(p);});
   ch.push(blk());
+
+  // Drug substance / excipient / manufacturing narrative (after Table 2)
+  // These appear AFTER the composition table and Table 2 in the document flow.
+  // They are stored here and rendered after buildSourcesSection in generateReport.
+  var postCompSections = [
+    txt.sources_intro,
+    txt.drug_substance_section,
+    txt.excipient_intro,
+    txt.manufacturing_section,
+    txt.container_closure_section,
+    txt.utilities_section,
+    txt.control_strategy,
+    txt.testing_recommendation,
+  ];
+  var hasPostComp = postCompSections.some(function(t){return !!t;});
+
+  // Store for use by generateReport — do NOT render here
+  // (they are rendered by buildPostCompSections after Table 2)
+  ch._postCompSections = postCompSections;
+  ch._hasPostComp = hasPostComp;
+
   ch.push(pgBrk());
+  return ch;
+}
+
+// Renders the narrative sections that appear after the composition table + Table 2
+function buildPostCompSections(txt) {
+  txt=txt||{};
+  var ch=[];
+  var sections = [
+    txt.sources_intro,
+    txt.drug_substance_section,
+    txt.excipient_intro,
+    txt.manufacturing_section,
+    txt.container_closure_section,
+    txt.utilities_section,
+    txt.control_strategy,
+    txt.testing_recommendation,
+  ];
+  sections.forEach(function(t){
+    if(t){
+      bodyParas(t).forEach(function(p){ch.push(p);});
+      ch.push(blk());
+    }
+  });
+  if (ch.length > 0) ch.push(pgBrk());
   return ch;
 }
 
@@ -1602,41 +1705,39 @@ function buildFigure(fig) {
   ];
 }
 
-// ── SOURCES SECTION + TABLE 2 ─────────────────────────────────────────────────
+// ── TABLE 2: ANNEXURE DETAILS ────────────────────────────────────────────────
+// NOTE: Narrative text (sources_intro, drug_substance, excipient, manufacturing,
+// container_closure, utilities, control_strategy) is rendered ONLY in
+// buildTextSections to avoid duplication. This function renders Table 2 only.
 function buildSourcesSection(txt, annexureList) {
   txt=txt||{}; annexureList=Array.isArray(annexureList)?annexureList:[];
   var ch=[];
 
-  [txt.sources_intro,txt.drug_substance_section,txt.excipient_intro].forEach(function(t){
-    if(t){ bodyParas(t).forEach(function(p){ch.push(p);}); ch.push(blk()); }
-  });
+  // Table 2: Annexure list (if annexures exist)
+  if (annexureList.length > 0) {
+    var W=[Math.round(CW*0.40),Math.round(CW*0.36),0];
+    W[2]=CW-W[0]-W[1];
+    var annTbl=new Table({
+      width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+      rows:[
+        new TableRow({children:[
+          cell("Name of Excipient / Material",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+          cell("Vendor",                       {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+          cell("Title of Annexure",            {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+        ]}),
+      ].concat(annexureList.map(function(a,i){
+        return new TableRow({children:[
+          cellL(a.material||"", {w:W[0],size:SZ.SM}),
+          cellL(a.supplier||"", {w:W[1],size:SZ.SM}),
+          cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
+        ]});
+      })),
+    });
+    ch.push(lftPara("Table No.2 Details of Annexures",true,SZ.SM));
+    ch.push(annTbl);
+    ch.push(blk());
+  }
 
-  var W=[Math.round(CW*0.40),Math.round(CW*0.36),0];
-  W[2]=CW-W[0]-W[1];
-  var annTbl=new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
-    rows:[
-      new TableRow({children:[
-        cell("Name of Excipient / Material",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
-        cell("Vendor",                       {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
-        cell("Title of Annexure",            {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
-      ]}),
-    ].concat(annexureList.map(function(a,i){
-      return new TableRow({children:[
-        cellL(a.material||"", {w:W[0],size:SZ.SM}),
-        cellL(a.supplier||"", {w:W[1],size:SZ.SM}),
-        cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
-      ]});
-    })),
-  });
-  ch.push(lftPara("Table No.2 Details of Annexures",true,SZ.SM));
-  ch.push(annTbl); ch.push(blk());
-
-  [txt.manufacturing_section,txt.container_closure_section,
-   txt.utilities_section,txt.control_strategy].forEach(function(t){
-    if(t){ bodyParas(t).forEach(function(p){ch.push(p);}); ch.push(blk()); }
-  });
-  ch.push(pgBrk());
   return ch;
 }
 
@@ -1934,18 +2035,27 @@ function generateReport(dataPath, outPath) {
   var toc=buildTOC(tocEntries, figures.length);
   toc.forEach(function(x){ch.push(x);});
 
+  // Sections 1-4 (Abstract, Objective, Study Location, Background) + page break
   var s14=buildTextSections(txt);
   s14.forEach(function(x){ch.push(x);});
 
+  // Composition table (with exact columns from Excel)
   var comp=buildCompositionTable(composition, compColumns, compMeta);
   comp.forEach(function(x){ch.push(x);});
 
+  // Figures (fishbone diagram etc.)
   figures.forEach(function(fig){
     buildFigure(fig).forEach(function(x){ch.push(x);});
   });
 
-  var src=buildSourcesSection(txt, annList);
-  src.forEach(function(x){ch.push(x);});
+  // Table 2: Annexure details (no narrative text here — avoid duplication)
+  var annTbl2=buildSourcesSection(txt, annList);
+  annTbl2.forEach(function(x){ch.push(x);});
+
+  // Post-composition narrative: drug substance, excipients, manufacturing, etc.
+  // Rendered ONCE here, nowhere else.
+  var postComp=buildPostCompSections(txt);
+  postComp.forEach(function(x){ch.push(x);});
 
   function safeT(key){
     var e={elements:[],rows:[],total_daily_intake:0,
