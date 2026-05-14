@@ -246,9 +246,14 @@ def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
 
 def extract_reference_structure(page_images: List[bytes]) -> Dict:
     """
-    Extract ALL metadata from page 1 of the reference PDF.
-    Also extracts TOC entries, revision history and signatures from later pages.
+    Extract ALL content from the reference PDF:
+    - Page 1 metadata (header fields)
+    - TOC (whatever sections the product has)
+    - Every page: section text AND any tables (with exact columns)
+    - Revision history and signatures
+    This is the key to product-agnosticism: we extract as-is, render as-is.
     """
+    # ── Metadata from page 1 ─────────────────────────────────────────────────
     meta_prompt = (
         "This is page 1 of a pharmaceutical TSR document.\n"
         "Extract ALL metadata exactly as shown. Return ONLY this JSON:\n"
@@ -260,28 +265,74 @@ def extract_reference_structure(page_images: List[bytes]) -> Dict:
     meta = safe_json_parse(meta_raw, {})
     if not isinstance(meta, dict): meta = {}
 
-    # Extract TOC from page 2 (if present)
+    # ── TOC from page 2 ───────────────────────────────────────────────────────
     toc_prompt = (
-        "This page may contain a TABLE OF CONTENTS. "
-        "If it does, extract all entries. Return ONLY this JSON:\n"
+        "This page may contain a TABLE OF CONTENTS.\n"
+        "If it does, extract ALL entries exactly. Return ONLY this JSON:\n"
         '{"is_toc":true,"entries":[{"no":"1","title":"Abstract","page":"3"}]}\n'
         'If not a TOC page: {"is_toc":false,"entries":[]}'
     )
     toc_entries: List[Dict] = []
-    for i in range(min(3, len(page_images))):
+    for i in range(min(4, len(page_images))):
         try:
             raw = claude_vision(safe_list_get(page_images, i, b""), toc_prompt)
             d = safe_json_parse(raw, {})
             if isinstance(d, dict) and d.get("is_toc") and isinstance(d.get("entries"), list) and d["entries"]:
                 toc_entries = d["entries"]
                 break
-        except Exception: pass
+        except Exception:
+            pass
 
-    # Extract revision history and signatures from last 3 pages
+    # ── Extract every page: section text + verbatim tables ───────────────────
+    # This is the critical step: we capture ALL tables exactly as they appear,
+    # with their actual column headers, so we render them as-is in the DOCX.
+    page_prompt = (
+        "This is a page from a pharmaceutical ICH Q3D TSR document.\n\n"
+        "Extract EVERYTHING on this page. Return ONLY this JSON:\n"
+        "{\n"
+        '  "page_type": "title|toc|text|figure|table|mixed",\n'
+        '  "sections": [\n'
+        '    {\n'
+        '      "heading": "exact heading text or null",\n'
+        '      "heading_level": 1,\n'
+        '      "content": "all paragraph text, preserving bold markers as **bold**",\n'
+        '      "tables": [\n'
+        '        {\n'
+        '          "caption": "Table X: ...",\n'
+        '          "columns": ["Col1", "Col2", "Col3"],\n'
+        '          "rows": [["val1", "val2", "val3"]]\n'
+        '        }\n'
+        '      ]\n'
+        '    }\n'
+        '  ]\n'
+        "}\n\n"
+        "Rules:\n"
+        "- Extract tables with EXACT column headers as shown in the document\n"
+        "- For multi-row header cells, join with newline e.g. 'Concentration\nin PPM'\n"
+        "- Preserve all numeric values exactly\n"
+        "- Include ALL tables on the page (packing material, composition, risk tables, etc.)\n"
+        "- Return ONLY JSON, no commentary"
+    )
+
+    pages_data: List[Dict] = []
+    for i, img in enumerate(page_images):
+        try:
+            raw = claude_vision(img, page_prompt)
+            d = safe_json_parse(raw, {})
+            if isinstance(d, dict):
+                d["page_index"] = i
+                pages_data.append(d)
+            else:
+                pages_data.append({"page_index": i, "page_type": "unknown", "sections": []})
+        except Exception as ex:
+            logger.warning(f"Page {i} extraction: {ex}")
+            pages_data.append({"page_index": i, "page_type": "unknown", "sections": []})
+
+    # ── Revision history and signatures (last 3 pages) ────────────────────────
     revision_data: List[Dict] = []
     sig_data: List[Dict] = []
     rev_prompt = (
-        "This page may contain revision history and/or electronic signatures.\n"
+        "This page may contain revision history table and/or electronic signatures.\n"
         "Return ONLY: "
         '{"revision_history":[{"document_version":"","changes":""}],'
         '"signatures":[{"intention":"","employee_id":"","user_name":"","date":""}]}'
@@ -295,10 +346,69 @@ def extract_reference_structure(page_images: List[bytes]) -> Dict:
                 sg = d.get("signatures")
                 if isinstance(rh, list) and rh: revision_data = rh
                 if isinstance(sg, list) and sg: sig_data = sg
-        except Exception: pass
+        except Exception:
+            pass
 
-    return {"meta": meta, "toc_entries": toc_entries,
-            "revision_history": revision_data, "signatures": sig_data}
+    return {
+        "meta": meta,
+        "toc_entries": toc_entries,
+        "pages": pages_data,
+        "revision_history": revision_data,
+        "signatures": sig_data,
+    }
+
+
+def extract_composition_tables(pages_data: List[Dict]) -> Dict:
+    """
+    From the page-by-page extraction, find and return all composition/ingredient
+    tables exactly as extracted — columns, rows, captions preserved verbatim.
+    """
+    comp_tables: List[Dict] = []
+    for page in pages_data:
+        if not isinstance(page, dict): continue
+        for sec in (page.get("sections") or []):
+            if not isinstance(sec, dict): continue
+            for tbl in (sec.get("tables") or []):
+                if not isinstance(tbl, dict): continue
+                # Identify composition/ingredient/packing tables
+                cap = safe_str(tbl.get("caption","")).lower()
+                cols = tbl.get("columns", [])
+                is_comp = any(kw in cap for kw in
+                              ["ingredient","composition","packing","material","substance",
+                               "excipient","table 1","table 2","detail"])
+                if is_comp or (cols and any("ingredient" in str(c).lower() or
+                                             "material" in str(c).lower() or
+                                             "component" in str(c).lower()
+                                             for c in cols)):
+                    comp_tables.append(tbl)
+    return {"tables": comp_tables}
+
+
+def extract_additional_tables(pages_data: List[Dict]) -> List[Dict]:
+    """
+    Extract all non-composition, non-EI-calculation tables from the PDF
+    (e.g. risk tables, potential risk action tables, packing tables).
+    These are rendered verbatim in the generated document.
+    """
+    additional: List[Dict] = []
+    skip_keywords = ["class 1","class 2","class 3","measured conc","total mass",
+                     "daily exposure","pde","threshold","table 3","table 4",
+                     "table 5","table 6","table 7"]
+    comp_keywords = ["table 1","table 2","ingredient","packing","material"]
+    for page in pages_data:
+        if not isinstance(page, dict): continue
+        for sec in (page.get("sections") or []):
+            if not isinstance(sec, dict): continue
+            for tbl in (sec.get("tables") or []):
+                if not isinstance(tbl, dict): continue
+                cap = safe_str(tbl.get("caption","")).lower()
+                if any(kw in cap for kw in skip_keywords): continue
+                if any(kw in cap for kw in comp_keywords): continue
+                cols = tbl.get("columns",[])
+                rows = tbl.get("rows",[])
+                if isinstance(cols, list) and cols and isinstance(rows, list) and rows:
+                    additional.append(tbl)
+    return additional
 
 
 # ── Excel composition parser ──────────────────────────────────────────────────
@@ -320,28 +430,32 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
     sheet_dump = "\n".join(rows_text[:100])
 
     prompt = (
-        "Pharmaceutical composition spreadsheet. Extract:\n"
-        "1. ingredient name column\n"
-        "2. amount/concentration columns (per unit dose)\n"
-        "3. section headers vs ingredient rows\n"
-        "4. MDD (maximum daily dose) — total amount of drug product per day\n"
-        "5. dose unit (mg, mL, g, etc.)\n"
-        "6. route of administration (oral, parenteral, injection, topical, etc.)\n\n"
-        "IMPORTANT: The MDD for calculation is the amount of drug PRODUCT given per day.\n"
-        "For injections: MDD = quantity per injection × doses per day (usually 1 injection/day).\n"
-        "For oral: MDD = mg per tablet/sachet × number per day.\n\n"
+        "Pharmaceutical composition spreadsheet. Extract EVERYTHING.\n\n"
+        "1. ALL column headers exactly as they appear\n"
+        "2. ALL rows including section headers and ingredient rows\n"
+        "3. Route of administration (oral/parenteral/injection/topical)\n"
+        "4. MDD in grams (total drug product per day)\n\n"
         "Return ONLY this JSON (no markdown):\n"
         "{\n"
-        '  "ingredient_col":1,"amount_col":3,"unit":"mg/0.65mL",\n'
-        '  "route":"oral or parenteral or injection",\n'
-        '  "mdd_g":0.65,"mdd_unit":"mL","doses_per_day":1,\n'
-        '  "sections":[\n'
-        '    {"name":"Drug Substance","rows":[\n'
-        '      {"ingredient":"...","amount":"...","unit":"...","function":"..."}\n'
-        '    ]}\n'
+        '  "route": "oral or parenteral or injection",\n'
+        '  "mdd_g": 1.0,\n'
+        '  "doses_per_day": 1,\n'
+        '  "unit": "exact unit string e.g. mg/unit or mg/0.65mL",\n'
+        '  "columns": ["exact col1 header","exact col2 header","..."],\n'
+        '  "sections": [\n'
+        '    {\n'
+        '      "name": "section header or empty string",\n'
+        '      "rows": [\n'
+        '        {"ingredient":"...","columns":{"Col1":"val","Col2":"val",...}}\n'
+        '      ]\n'
+        '    }\n'
         '  ]\n'
         "}\n\n"
-        f"mdd_g must be in GRAMS (the total mass of product per day).\n"
+        "IMPORTANT:\n"
+        "- columns[]: exact headers as in the spreadsheet (e.g. [\"S.No.\",\"Material code\",\"Name of Ingredient\",\"Function\",\"Qty/unit (mg/0.65 mL)\"])\n"
+        "- For each row, map each value to its exact column header\n"
+        "- mdd_g in GRAMS (e.g. injection 0.65mL → 0.65g)\n"
+        "- For EI calculation: amount_col is whichever column has mg amounts\n"
         f"Spreadsheet:\n{sheet_dump}"
     )
     raw = claude_text(prompt)
@@ -650,23 +764,30 @@ def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
                       "annexure":f"Annexure {a.get('annexure_number','?')}"}
                      for a in annexure_data if isinstance(a, dict)]
 
+    pages_data = ref_structure.get("pages", []) or []
+    additional_tables = extract_additional_tables(pages_data)
+
     report_data = {
-        "meta":             ref_structure.get("meta",{}) or {},
-        "toc_entries":      ref_structure.get("toc_entries",[]) or [],
-        "logo_b64":         logo_b64,
-        "logo_type":        logo_type,
-        "text_sections":    text_sections or {},
-        "composition":      comp_data.get("sections",[]) or [],
-        "comp_meta":        {"route":comp_data.get("route","oral"),
-                             "mdd_g":comp_data.get("mdd_g",1.0),
-                             "doses_per_day":comp_data.get("doses_per_day",1),
-                             "unit":comp_data.get("unit","")},
-        "annexure_list":    annexure_list,
-        "calc_tables":      calc_tables or {},
-        "revision_history": ref_structure.get("revision_history",[]) or [],
-        "signatures":       ref_structure.get("signatures",[]) or [],
-        "figures":          figures_b64,
-        "pde_values":       dict(ICH_PDE),
+        "meta":              ref_structure.get("meta",{}) or {},
+        "toc_entries":       ref_structure.get("toc_entries",[]) or [],
+        "logo_b64":          logo_b64,
+        "logo_type":         logo_type,
+        "text_sections":     text_sections or {},
+        # Composition: exact columns from Excel as extracted
+        "composition":       comp_data.get("sections",[]) or [],
+        "comp_columns":      comp_data.get("columns",[]) or [],
+        "comp_meta":         {"route": comp_data.get("route","oral"),
+                              "mdd_g": comp_data.get("mdd_g",1.0),
+                              "doses_per_day": comp_data.get("doses_per_day",1),
+                              "unit": comp_data.get("unit","")},
+        "annexure_list":     annexure_list,
+        "calc_tables":       calc_tables or {},
+        "revision_history":  ref_structure.get("revision_history",[]) or [],
+        "signatures":        ref_structure.get("signatures",[]) or [],
+        "figures":           figures_b64,
+        "pde_values":        dict(ICH_PDE),
+        # All non-EI tables extracted verbatim from reference PDF
+        "additional_tables": additional_tables,
     }
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -759,14 +880,17 @@ def main() -> None:
                 st.warning("No figure pages detected.")
             progress.progress(18)
 
-            # Step 4: Reference structure
-            log.info("📑 Extracting report structure + TOC…")
+            # Step 4: Reference structure — extracts metadata, TOC, ALL page content
+            log.info("📑 Extracting report structure, TOC, and all page tables…")
             ref_structure = extract_reference_structure(page_images)
             meta = ref_structure.get("meta",{}) or {}
             toc  = ref_structure.get("toc_entries",[]) or []
+            pages_data = ref_structure.get("pages",[]) or []
+            n_tbls = sum(len(s.get("tables",[]) or [])
+                         for p in pages_data for s in (p.get("sections",[]) or []))
             st.success(f"Product: {meta.get('product_name','(extracted)')} | "
                        f"Doc: {meta.get('document_no','')} | "
-                       f"TOC sections: {len(toc)}")
+                       f"TOC: {len(toc)} sections | Tables found in PDF: {n_tbls}")
             progress.progress(32)
 
             # Step 5: Parse Excel
@@ -859,7 +983,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-######################3
+################
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
@@ -1232,50 +1356,135 @@ function buildTextSections(txt) {
   return ch;
 }
 
-// ── COMPOSITION TABLE ─────────────────────────────────────────────────────────
-function buildCompositionTable(sections, compMeta) {
-  compMeta = compMeta||{};
-  var unit = compMeta.unit||"mg/unit";
+// ── GENERIC TABLE RENDERER ───────────────────────────────────────────────────
+// Renders ANY table from extracted PDF/Excel data with exact column headers.
+// columns: array of header strings
+// rows: array of arrays (same length as columns)
+// caption: optional caption string
+function renderGenericTable(caption, columns, rows) {
+  if (!Array.isArray(columns)||!columns.length) return [];
+  if (!Array.isArray(rows)||!rows.length) return [];
 
-  var W=[Math.round(CW*0.38),Math.round(CW*0.12),Math.round(CW*0.16),
-         Math.round(CW*0.16),0];
-  W[4]=CW-W[0]-W[1]-W[2]-W[3];
+  var N = columns.length;
+  // Distribute widths: first col gets 30%, rest share equally if >1 col
+  var firstW = Math.round(CW * 0.30);
+  var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
+  // Last col absorbs rounding remainder
+  var colWidths = [firstW];
+  for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
+  if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
 
-  var hdr=new TableRow({children:[
-    cell("Name of Ingredient",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
-    cell("Function",          {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
-    cell("Amount\n"+unit,     {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
-    cell("Compendial\nStatus",{bold:true,fill:CLR.HDR_GREY,w:W[3],size:SZ.SM}),
-    cell("Qty/Unit\nor MDD",  {bold:true,fill:CLR.HDR_GREY,w:W[4],size:SZ.SM}),
-  ]});
+  // Responsive font based on column count
+  var sz = N <= 4 ? SZ.SM : (N <= 8 ? SZ.XS : SZ.XXS);
 
-  var rows=[];
-  var sArr=Array.isArray(sections)?sections:[];
-  for (var si=0;si<sArr.length;si++) {
-    var sec=sArr[si];
-    if (!sec||typeof sec!=="object") continue;
-    rows.push(new TableRow({children:[new TableCell({
-      columnSpan:5, borders:allBdr(4), shading:shade(CLR.SEC_BLUE), margins:mg(),
-      children:[lftPara(sec.name||"",true,SZ.SM)],
-    })]}));
-    var rArr=Array.isArray(sec.rows)?sec.rows:[];
-    for (var ri=0;ri<rArr.length;ri++) {
-      var r=rArr[ri];
-      if (!r||typeof r!=="object") continue;
-      rows.push(new TableRow({children:[
-        cellL(String(r.ingredient||r.name||""),{w:W[0],size:SZ.SM}),
-        cell(String(r.function||r.role||""),   {w:W[1],size:SZ.SM}),
-        cell(String(r.amount||r["40mg"]||r.qty||""),{w:W[2],size:SZ.SM}),
-        cell(String(r.status||r.compendial_status||""),{w:W[3],size:SZ.SM}),
-        cell(String(r.qty_unit||r.amount||""), {w:W[4],size:SZ.SM}),
-      ]}));
+  var hdrCells = columns.map(function(col, i) {
+    return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
+  });
+  var hdrRow = new TableRow({children: hdrCells});
+
+  var dataRows = rows.filter(Boolean).map(function(row) {
+    var rowArr = Array.isArray(row) ? row : [];
+    var cells = colWidths.map(function(w, i) {
+      var val = rowArr[i] != null ? String(rowArr[i]) : "";
+      return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
+    });
+    return new TableRow({children: cells});
+  });
+
+  var tbl = new Table({
+    width: {size:CW, type:WidthType.DXA},
+    columnWidths: colWidths,
+    rows: [hdrRow].concat(dataRows),
+  });
+
+  var result = [];
+  if (caption) result.push(lftPara(caption, true, SZ.SM));
+  result.push(tbl);
+  result.push(blk());
+  return result;
+}
+
+
+// ── COMPOSITION TABLE — uses exact columns extracted from Excel ───────────────
+// sections: [{name, rows:[{ingredient, columns:{ColName:val}}]}]
+// compColumns: exact column headers from Excel
+function buildCompositionTable(sections, compColumns, compMeta) {
+  compMeta    = compMeta    || {};
+  compColumns = Array.isArray(compColumns) && compColumns.length ? compColumns : null;
+
+  // Determine columns to render
+  var cols;
+  if (compColumns) {
+    // Use exact columns from Excel as extracted by Claude
+    cols = compColumns;
+  } else {
+    // Fallback: standard oral sachet columns
+    cols = ["Name of Ingredient","Function",
+            "40 mg\nmg/unit","20 mg\nmg/unit","10 mg\nmg/unit"];
+  }
+
+  var N = cols.length;
+  var firstW = Math.round(CW * 0.35);
+  var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
+  var colWidths = [firstW];
+  for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
+  if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
+
+  var sz = N <= 4 ? SZ.SM : (N <= 6 ? SZ.XS : SZ.XXS);
+
+  var hdrRow = new TableRow({children: cols.map(function(col, i) {
+    return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
+  })});
+
+  var dataRows = [];
+  var sArr = Array.isArray(sections) ? sections : [];
+  for (var si = 0; si < sArr.length; si++) {
+    var sec = sArr[si];
+    if (!sec || typeof sec !== "object") continue;
+    // Section header row (blue) spanning all columns
+    if (sec.name) {
+      dataRows.push(new TableRow({children:[new TableCell({
+        columnSpan:N, borders:allBdr(4), shading:shade(CLR.SEC_BLUE), margins:mg(),
+        children:[lftPara(sec.name, true, sz)],
+      })]}));
+    }
+    var rArr = Array.isArray(sec.rows) ? sec.rows : [];
+    for (var ri = 0; ri < rArr.length; ri++) {
+      var row = rArr[ri];
+      if (!row || typeof row !== "object") continue;
+      // Extract values in column order from the "columns" map or fallback fields
+      var cells = colWidths.map(function(w, i) {
+        var colName = cols[i] || "";
+        var val = "";
+        if (row.columns && typeof row.columns === "object") {
+          // New format: {ingredient:"...", columns:{ColName:val}}
+          val = row.columns[colName] != null ? String(row.columns[colName]) : "";
+          // If not found by exact name, try ingredient for first col
+          if (!val && i === 0) val = String(row.ingredient || row.name || "");
+        } else {
+          // Old format fallback
+          if (i === 0) val = String(row.ingredient || row.name || "");
+          else if (i === 1) val = String(row.function || row.role || row.status || "");
+          else {
+            var keys = ["40mg","20mg","10mg","amount","qty","qty_unit","compendial_status"];
+            val = String(row[keys[i-1]] || row.amount || "");
+          }
+        }
+        return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
+      });
+      dataRows.push(new TableRow({children: cells}));
     }
   }
 
-  var tbl=new Table({width:{size:CW,type:WidthType.DXA},columnWidths:W,rows:[hdr].concat(rows)});
+  var tbl = new Table({
+    width:{size:CW,type:WidthType.DXA},
+    columnWidths:colWidths,
+    rows:[hdrRow].concat(dataRows),
+  });
+
   return [
     secHd("5. Drug product elemental impurity risk assessment"),
-    lftPara("Table 1: Quantitative and Qualitative Composition",true,SZ.SM),
+    lftPara("Table 1: Quantitative and Qualitative Composition", true, SZ.SM),
     tbl, pgBrk(),
   ];
 }
@@ -1442,6 +1651,26 @@ function buildCalcTable(tableNum, tableData, pdeValues) {
   return [lftPara(caption,true,SZ.SM), tbl, blk()];
 }
 
+// ── ADDITIONAL TABLES (verbatim from reference PDF) ──────────────────────────
+// Renders any extra tables that were extracted from the PDF but don't fit
+// into the standard EI calculation tables.
+// E.g.: Potential risk table, packing material table, summary tables, etc.
+function buildAdditionalTables(additionalTables) {
+  if (!Array.isArray(additionalTables) || !additionalTables.length) return [];
+  var ch = [];
+  for (var i = 0; i < additionalTables.length; i++) {
+    var tbl = additionalTables[i];
+    if (!tbl || typeof tbl !== "object") continue;
+    var cols = Array.isArray(tbl.columns) ? tbl.columns : [];
+    var rows = Array.isArray(tbl.rows)    ? tbl.rows    : [];
+    if (!cols.length || !rows.length) continue;
+    var parts = renderGenericTable(tbl.caption || "", cols, rows);
+    parts.forEach(function(p) { ch.push(p); });
+  }
+  return ch;
+}
+
+
 // ── SUMMARY & CONCLUSION ──────────────────────────────────────────────────────
 function buildSummary(txt) {
   txt=txt||{};
@@ -1589,8 +1818,10 @@ function generateReport(dataPath, outPath) {
   var logoB64     = data.logo_b64        ||"";
   var logoType    = data.logo_type       ||"";
   var txt         = data.text_sections   ||{};
-  var composition = data.composition     ||[];
-  var compMeta    = data.comp_meta       ||{};
+  var composition       = data.composition      ||[];
+  var compColumns       = data.comp_columns      ||[];
+  var compMeta          = data.comp_meta         ||{};
+  var additionalTables  = data.additional_tables ||[];
   var annList     = data.annexure_list   ||[];
   var calcTables  = data.calc_tables     ||{};
   var revHistory  = data.revision_history||[];
@@ -1609,7 +1840,7 @@ function generateReport(dataPath, outPath) {
   var s14=buildTextSections(txt);
   s14.forEach(function(x){ch.push(x);});
 
-  var comp=buildCompositionTable(composition, compMeta);
+  var comp=buildCompositionTable(composition, compColumns, compMeta);
   comp.forEach(function(x){ch.push(x);});
 
   figures.forEach(function(fig){
@@ -1638,6 +1869,9 @@ function generateReport(dataPath, outPath) {
     console.error("Calc table error:",err.message);
     ch.push(lftPara("Calc table error: "+err.message)); ch.push(pgBrk());
   }
+
+  // Additional verbatim tables from reference PDF (risk tables, etc.)
+  buildAdditionalTables(additionalTables).forEach(function(x){ch.push(x);});
 
   buildSummary(txt).forEach(function(x){ch.push(x);});
 
