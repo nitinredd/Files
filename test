@@ -267,68 +267,66 @@ def extract_reference_structure(page_images: List[bytes]) -> Dict:
 
     # ── TOC from page 2 ───────────────────────────────────────────────────────
     toc_prompt = (
-        "This page may contain a TABLE OF CONTENTS.\n"
-        "If it does, extract ALL entries exactly. Return ONLY this JSON:\n"
+        "This page is from a pharmaceutical Technical Summary Report.\n\n"
+        "Does this page contain a TABLE OF CONTENTS section?\n"
+        "A real TABLE OF CONTENTS has:\n"
+        "  - A heading 'TABLE OF CONTENTS' or 'CONTENTS'\n"
+        "  - Numbered section entries (1, 2, 3...) with titles and page numbers\n"
+        "  - Page numbers are integers (e.g. 3, 4, 15)\n\n"
+        "The IPDO page header table (IPDO | Technical Summary Report | Dr.Reddy's)\n"
+        "is NOT a table of contents — ignore it.\n"
+        "A metadata table (Title, Document No, Product Name, Department...) is\n"
+        "NOT a table of contents — return is_toc:false for those pages.\n\n"
+        "If this IS a TABLE OF CONTENTS, return ONLY:\n"
         '{"is_toc":true,"entries":[{"no":"1","title":"Abstract","page":"3"}]}\n'
-        'If not a TOC page: {"is_toc":false,"entries":[]}'
+        "If NOT a TOC page:\n"
+        '{"is_toc":false,"entries":[]}'
     )
     toc_entries: List[Dict] = []
     for i in range(min(4, len(page_images))):
         try:
             raw = claude_vision(safe_list_get(page_images, i, b""), toc_prompt)
             d = safe_json_parse(raw, {})
-            if isinstance(d, dict) and d.get("is_toc") and isinstance(d.get("entries"), list) and d["entries"]:
-                toc_entries = d["entries"]
+            if not (isinstance(d, dict) and d.get("is_toc")): continue
+            candidates = d.get("entries", [])
+            if not isinstance(candidates, list) or not candidates: continue
+
+            # Validate: real TOC entries have:
+            #   "no"   = numeric string or small integer ("1","2",...,"12")
+            #   "page" = numeric string ("3","4","15","16")
+            # If the header metadata table was mistaken for a TOC, entries look like:
+            #   {"no":"Title","title":"Risk assessment...","page":"FR&D"}
+            # We reject those by checking that both "no" and "page" are numeric.
+            def is_valid_toc_entry(e: Dict) -> bool:
+                if not isinstance(e, dict): return False
+                no_val   = safe_str(e.get("no",   "")).strip()
+                page_val = safe_str(e.get("page",  "")).strip()
+                # "no" must be a small integer string ("1"–"20")
+                try:
+                    n = int(no_val)
+                    if n < 1 or n > 50: return False
+                except (ValueError, TypeError):
+                    return False
+                # "page" must be a numeric string
+                try:
+                    int(page_val)
+                except (ValueError, TypeError):
+                    return False
+                return True
+
+            valid = [e for e in candidates if is_valid_toc_entry(e)]
+            # Require at least 3 valid entries to accept as a real TOC
+            if len(valid) >= 3:
+                toc_entries = valid
                 break
         except Exception:
             pass
 
-    # ── Extract every page: section text + verbatim tables ───────────────────
-    # This is the critical step: we capture ALL tables exactly as they appear,
-    # with their actual column headers, so we render them as-is in the DOCX.
-    page_prompt = (
-        "This is a page from a pharmaceutical ICH Q3D TSR document.\n\n"
-        "Extract EVERYTHING on this page. Return ONLY this JSON:\n"
-        "{\n"
-        '  "page_type": "title|toc|text|figure|table|mixed",\n'
-        '  "sections": [\n'
-        '    {\n'
-        '      "heading": "exact heading text or null",\n'
-        '      "heading_level": 1,\n'
-        '      "content": "all paragraph text, preserving bold markers as **bold**",\n'
-        '      "tables": [\n'
-        '        {\n'
-        '          "caption": "Table X: ...",\n'
-        '          "columns": ["Col1", "Col2", "Col3"],\n'
-        '          "rows": [["val1", "val2", "val3"]]\n'
-        '        }\n'
-        '      ]\n'
-        '    }\n'
-        '  ]\n'
-        "}\n\n"
-        "Rules:\n"
-        "- Extract tables with EXACT column headers as shown in the document\n"
-        "- For multi-row header cells, join with newline e.g. 'Concentration\nin PPM'\n"
-        "- Preserve all numeric values exactly\n"
-        "- Include ALL tables on the page (packing material, composition, risk tables, etc.)\n"
-        "- Return ONLY JSON, no commentary"
-    )
-
-    pages_data: List[Dict] = []
-    for i, img in enumerate(page_images):
-        try:
-            raw = claude_vision(img, page_prompt)
-            d = safe_json_parse(raw, {})
-            if isinstance(d, dict):
-                d["page_index"] = i
-                pages_data.append(d)
-            else:
-                pages_data.append({"page_index": i, "page_type": "unknown", "sections": []})
-        except Exception as ex:
-            logger.warning(f"Page {i} extraction: {ex}")
-            pages_data.append({"page_index": i, "page_type": "unknown", "sections": []})
-
     # ── Revision history and signatures (last 3 pages) ────────────────────────
+    # NOTE: We no longer do per-page full extraction — it was only used for
+    # additional_tables which caused the header table to repeat 12+ times.
+    # Removing saves ~18 Claude API calls per report.
+    pages_data: List[Dict] = []   # kept for compatibility, not populated
     revision_data: List[Dict] = []
     sig_data: List[Dict] = []
     rev_prompt = (
@@ -350,11 +348,10 @@ def extract_reference_structure(page_images: List[bytes]) -> Dict:
             pass
 
     return {
-        "meta": meta,
-        "toc_entries": toc_entries,
-        "pages": pages_data,
+        "meta":             meta,
+        "toc_entries":      toc_entries,
         "revision_history": revision_data,
-        "signatures": sig_data,
+        "signatures":       sig_data,
     }
 
 
@@ -386,79 +383,22 @@ def extract_composition_tables(pages_data: List[Dict]) -> Dict:
 
 def extract_additional_tables(pages_data: List[Dict]) -> List[Dict]:
     """
-    Extract ONLY tables from the PDF that are NOT already rendered by the
-    structured pipeline. Specifically, skip:
-    - Tables of contents (TOC)
-    - Composition / ingredient / packing tables (Table 1, Table 2)
-    - EI calculation tables (Tables 3-7, anything with Class 1/2/3 element columns)
-    - Annexure list tables
-    - Revision history tables
-    - Electronic signature tables
-    - Any table on a figure page
+    Intentionally returns empty list.
 
-    What remains (e.g. "Potential risk and action required" summary tables,
-    drug substance details tables, packing tables if not already captured)
-    is rendered verbatim.
+    We previously tried to extract "extra" tables from the PDF pages verbatim,
+    but the repeating IPDO header table (Field | Value) appears on every page
+    and was passing all filters, causing it to be rendered 12+ times.
+
+    The structured pipeline already renders every needed table:
+      - Table 1: Composition (from Excel)
+      - Table 2: Annexure list (from annexure_data)
+      - Tables 5/6/7: EI calculations (from calculate_ei_tables)
+      - Revision history, signatures, TOC (from reference structure)
+
+    Any additional product-specific tables (e.g. "Potential risk" summary)
+    are captured as text in the Claude-generated text_sections instead.
     """
-    # Keywords that identify pipeline-handled tables — skip these
-    SKIP_CAPTIONS = [
-        "table of contents", "s. no.", "s.no",
-        "table 1", "table 2", "table 3", "table 4",
-        "table 5", "table 6", "table 7",
-        "table no.1", "table no.2", "table no.3", "table no.4",
-        "table no.5", "table no.6", "table no.7",
-        "quantitative", "qualitative", "composition",
-        "concentration of the target", "target elements",
-        "theoretical elemental", "class 1", "class 2", "class 3",
-        "daily contribution", "daily exposure",
-        "pde", "threshold", "measured conc",
-        "list of annexure", "annexure", "annexure list",
-        "revision history", "electronic signature",
-        "packing material",
-    ]
-    # Keywords in column headers that identify pipeline-handled tables
-    SKIP_COLUMNS = [
-        "pb", "as", "cd", "hg", "co", "pd", "se", "li", "sb", "ba",
-        "measured concentration", "daily exposure", "total daily",
-        "employee id", "user name", "intention",
-        "document and version", "brief details",
-        "s. no.", "title", "page#",
-    ]
-
-    additional: List[Dict] = []
-    seen_captions: set = set()
-
-    for page in pages_data:
-        if not isinstance(page, dict): continue
-        # Skip figure pages entirely
-        if page.get("page_type") == "figure": continue
-        for sec in (page.get("sections") or []):
-            if not isinstance(sec, dict): continue
-            for tbl in (sec.get("tables") or []):
-                if not isinstance(tbl, dict): continue
-
-                cap  = safe_str(tbl.get("caption","")).lower().strip()
-                cols = tbl.get("columns") or []
-                rows = tbl.get("rows") or []
-
-                # Must have at least 2 columns and 1 data row
-                if not isinstance(cols, list) or len(cols) < 2: continue
-                if not isinstance(rows, list) or len(rows) < 1: continue
-
-                # Skip by caption keyword
-                if any(kw in cap for kw in SKIP_CAPTIONS): continue
-
-                # Skip by column header keyword
-                cols_lower = [str(c).lower() for c in cols]
-                if any(any(kw in cl for cl in cols_lower) for kw in SKIP_COLUMNS): continue
-
-                # Deduplicate by caption
-                if cap and cap in seen_captions: continue
-                if cap: seen_captions.add(cap)
-
-                additional.append(tbl)
-
-    return additional
+    return []
 
 
 # ── Excel composition parser ──────────────────────────────────────────────────
@@ -892,8 +832,7 @@ def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
                       "annexure":f"Annexure {a.get('annexure_number','?')}"}
                      for a in annexure_data if isinstance(a, dict)]
 
-    pages_data = ref_structure.get("pages", []) or []
-    additional_tables = extract_additional_tables(pages_data)
+    additional_tables = extract_additional_tables([])
 
     report_data = {
         "meta":              ref_structure.get("meta",{}) or {},
@@ -1016,12 +955,9 @@ def main() -> None:
             ref_structure = extract_reference_structure(page_images)
             meta = ref_structure.get("meta",{}) or {}
             toc  = ref_structure.get("toc_entries",[]) or []
-            pages_data = ref_structure.get("pages",[]) or []
-            n_tbls = sum(len(s.get("tables",[]) or [])
-                         for p in pages_data for s in (p.get("sections",[]) or []))
             st.success(f"Product: {meta.get('product_name','(extracted)')} | "
                        f"Doc: {meta.get('document_no','')} | "
-                       f"TOC: {len(toc)} sections | Tables found in PDF: {n_tbls}")
+                       f"TOC: {len(toc)} sections")
             progress.progress(32)
 
             # Step 5: Parse Excel
@@ -1130,7 +1066,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-##################3
+#################################
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
