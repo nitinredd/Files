@@ -532,43 +532,188 @@ def _flatten_docai_json(obj: Any, depth: int = 0) -> str:
     return " ".join(p for p in parts if p.strip())
 
 
+def _extract_docai_tables(obj):
+    """
+    Extract structured table grids from a Document AI JSON.
+    Returns list of tables; each table is list of rows; each row is list of cell strings.
+    Handles Document AI v1/v1beta3 table structure and common variants.
+    """
+    tables = []
+    doc_text = obj.get("text", "") if isinstance(obj, dict) else ""
+
+    def cell_text(cell):
+        if isinstance(cell, str): return cell.strip()
+        if not isinstance(cell, dict): return ""
+        if "text" in cell: return str(cell["text"]).strip()
+        if "mentionText" in cell: return str(cell["mentionText"]).strip()
+        anchor = cell.get("layout", {}).get("textAnchor", {})
+        if anchor and doc_text:
+            segments = anchor.get("textSegments", [])
+            parts = []
+            for seg in segments:
+                start = int(seg.get("startIndex", 0))
+                end   = int(seg.get("endIndex", 0))
+                if end > start:
+                    parts.append(doc_text[start:end])
+            if parts: return "".join(parts).strip()
+        for key in ("content", "value"):
+            if key in cell:
+                v = cell[key]
+                if isinstance(v, dict) and "text" in v: return str(v["text"]).strip()
+                if isinstance(v, str): return v.strip()
+        return ""
+
+    def extract_node(node, depth=0):
+        if depth > 10 or not node: return
+        if isinstance(node, dict):
+            if "tables" in node:
+                for tbl in (node["tables"] or []):
+                    grid = []
+                    for section in ("headerRows", "bodyRows"):
+                        for row in (tbl.get(section) or []):
+                            row_cells = [cell_text(c) for c in (row.get("cells") or [])]
+                            if any(row_cells): grid.append(row_cells)
+                    if len(grid) >= 2: tables.append(grid)
+            for rows_key in ("tableRows", "rows"):
+                if rows_key in node:
+                    grid = []
+                    for row in (node.get(rows_key) or []):
+                        if isinstance(row, dict):
+                            rc = [cell_text(c)
+                                  for c in (row.get("cells") or row.get("tableCells") or [])]
+                        elif isinstance(row, list):
+                            rc = [str(c).strip() for c in row]
+                        else: continue
+                        if any(rc): grid.append(rc)
+                    if len(grid) >= 2: tables.append(grid)
+            for v in node.values(): extract_node(v, depth+1)
+        elif isinstance(node, list):
+            for item in node: extract_node(item, depth+1)
+
+    extract_node(obj)
+    return tables
+
+
+def _tables_to_text(tables):
+    """Format extracted tables as readable text for Claude."""
+    parts = []
+    for ti, table in enumerate(tables):
+        parts.append(f"=== Table {ti+1} ===")
+        for row in table:
+            parts.append(" | ".join(row))
+        parts.append("")
+    return "\n".join(parts)
+
+
+EXCIPIENT_SYNONYMS: Dict[str, List[str]] = {
+    "dextrose":       ["glucose", "d-glucose", "dextrose anhydrous",
+                       "anhydrous dextrose", "glucose anhydrous", "d-glucose anhydrous"],
+    "glucose":        ["dextrose", "d-glucose", "dextrose anhydrous",
+                       "glucose anhydrous", "d-glucose anhydrous"],
+    "sucrose":        ["sugar", "saccharose", "cane sugar"],
+    "lactose":        ["lactose monohydrate", "alpha-lactose monohydrate"],
+    "starch":         ["corn starch", "maize starch", "potato starch",
+                       "pregelatinized starch"],
+    "cellulose":      ["microcrystalline cellulose", "mcc", "avicel"],
+    "talc":           ["purified talc", "hydrous magnesium silicate", "talcum"],
+    "iron oxide":     ["ferric oxide", "iron oxide red", "iron oxide yellow",
+                       "iron oxide black", "fe2o3", "fe3o4"],
+    "silicon dioxide":["colloidal silicon dioxide", "colloidal silica",
+                       "silica", "aerosil", "cab-o-sil"],
+    "magnesium stearate": ["mg stearate", "magnesium stearate vegetable"],
+    "hydroxypropyl cellulose": ["hpc", "klucel", "hydroxypropylcellulose"],
+    "hydroxypropyl methylcellulose": ["hpmc", "hypromellose", "methocel"],
+    "polyvinyl alcohol": ["pva"],
+    "polysorbate 80": ["tween 80", "polysorbatum 80"],
+    "polysorbate 20": ["tween 20"],
+    "polyethylene glycol": ["peg", "macrogol", "carbowax"],
+    "titanium dioxide": ["tio2", "titanium white"],
+    "povidone":       ["pvp", "polyvinylpyrrolidone", "kollidon", "plasdone"],
+    "crospovidone":   ["crosslinked pvp", "polyplasdone"],
+    "sodium starch glycolate": ["explotab", "primojel"],
+    "croscarmellose sodium": ["ac-di-sol", "sodium croscarmellose"],
+    "sodium lauryl sulfate": ["sls", "sodium dodecyl sulfate", "sds"],
+    "xanthan gum":    ["xanthan", "kelzan"],
+    "sugar spheres":  ["nonpareil seeds", "sugar beads", "sucrose spheres",
+                       "sugar pellets", "nonpareils", "nonpareil"],
+}
+
+
 def process_annexure(annexure_json: Any, index: int) -> Dict:
-    text_content = _flatten_docai_json(annexure_json)
-    prompt = (
-        f"Extract elemental impurity data from Annexure {index}.\n"
-        "Return ONLY this JSON (no markdown):\n"
-        "{\n"
-        f'  "annexure_number":{index},"supplier_name":"","material_name":"",\n'
-        '  "source_type":"","date_filled":"",\n'
-        '  "elements":[\n'
-        '    {"symbol":"","name":"","class":"","concentration_value":0.05,\n'
-        '     "concentration_unit":"ppm","analytical_method":"","intentionally_added":"No",\n'
-        '     "observed_level":"","listed_in_coa":"Yes","comments":""}\n'
-        '  ]\n'
-        "}\n\n"
-        "Rules: concentration_value is numeric (µg/g=ppm). BLQ→0.05. NA/blank→0.\n"
-        f"Text:\n{text_content[:8000]}"
-    )
-    raw = call_claude([{"role":"user","content":prompt}])
+    """
+    Extract EI data from one Document AI JSON annexure.
+    Uses structured table extraction first (real numbers), then flat text fallback.
+    """
     default = {"annexure_number":index,"supplier_name":"N/A","material_name":"N/A",
                "source_type":"","date_filled":"","elements":[]}
+
+    tables     = _extract_docai_tables(annexure_json)
+    table_text = _tables_to_text(tables) if tables else ""
+    flat_text  = _flatten_docai_json(annexure_json)
+
+    if table_text:
+        content = (
+            "STRUCTURED TABLES (use these for concentration values):\n"
+            + table_text[:5000]
+            + "\n\nMETADATA TEXT (use for supplier/material name):\n"
+            + flat_text[:1500]
+        )
+        note = "Tables above contain vendor-declared concentrations. Read EVERY number exactly."
+    else:
+        content = flat_text[:7000]
+        note = "Extract all elemental impurity concentrations from the text."
+
+    prompt = (
+        f"Extract elemental impurity data from Annexure {index}.\n\n"
+        f"{note}\n\n"
+        "CRITICAL: concentration_value MUST be the ACTUAL number from the document.\n"
+        "- Printed value '0.3' → 0.3\n"
+        "- '<0.5' → 0.5\n"
+        "- BLQ / ND / Not Detected → 0.0  (NOT 0.05)\n"
+        "- Blank / NA / not tested → 0.0\n"
+        "- ONLY use 0.05 if 0.05 is literally printed in the document\n"
+        "- Extract ALL 25 ICH Q3D elements even if value is 0.0\n\n"
+        "Return ONLY this JSON:\n"
+        "{\n"
+        f'  "annexure_number":{index},\n'
+        '  "supplier_name":"exact supplier name","material_name":"exact material name",\n'
+        '  "source_type":"","date_filled":"",\n'
+        '  "elements":[{"symbol":"Pb","name":"Lead","class":"1",\n'
+        '    "concentration_value":0.3,"concentration_unit":"ppm",\n'
+        '    "analytical_method":"ICP-MS","intentionally_added":"No",\n'
+        '    "observed_level":"0.3","listed_in_coa":"Yes","comments":""}]\n'
+        "}\n\nDocument:\n" + content
+    )
+
+    raw    = call_claude([{"role":"user","content":prompt}], max_tokens=4096)
     parsed = safe_json_parse(raw, default)
     if not isinstance(parsed, dict): return default
     for k, v in default.items(): parsed.setdefault(k, v)
     if not isinstance(parsed.get("elements"), list): parsed["elements"] = []
+
+    # Flag 0.05 plague
+    vals  = [e.get("concentration_value",0) for e in parsed["elements"] if isinstance(e,dict)]
+    n_005 = sum(1 for v in vals if isinstance(v,(int,float)) and abs(v-0.05)<0.001)
+    if vals and n_005/len(vals) > 0.5:
+        logger.warning(f"Annexure {index}: {n_005}/{len(vals)} elements=0.05 (placeholder?)")
+        parsed["_warning_placeholder_values"] = True
+        parsed["_n_placeholder"] = n_005
     return parsed
 
 
 # ── Calculation engine ────────────────────────────────────────────────────────
 def _parse_conc(val: Any) -> float:
-    """Parse concentration to µg/g (ppm). BLQ→0.05."""
+    """Parse concentration to µg/g (ppm). BLQ/ND → 0.0 (not 0.05)."""
     if val is None: return 0.0
     if isinstance(val, (int, float)): return max(0.0, float(val))
     s = str(val).strip().lower()
-    if s in ("","na","nd","blq","bdl","none","null","nq","not detected","not quantified"): return 0.05
-    s = re.sub(r"(ppm|µg/g|ug/g|<|>|\s)", "", s)
+    if s in ("","na","nd","blq","bdl","none","null","nq",
+             "not detected","not quantified","below lod","below loq",
+             "below limit","absent"): return 0.0
+    s = re.sub(r"(ppm|µg/g|ug/g|\s)", "", s)
+    s = s.replace("<","").replace(">","")
     try: return max(0.0, float(s))
-    except: return 0.05
+    except: return 0.0
 
 
 def _parse_amount_g(val: Any) -> float:
@@ -597,12 +742,7 @@ def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
 
 
 def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """
-    Fuzzy match ingredient name to annexure material name.
-    Strategy 1: exact match (case-insensitive)
-    Strategy 2: token overlap score >= 0.15
-    Strategy 3: one name is a substring of the other
-    """
+    """Match ingredient to annexure via exact, synonym, token-overlap, substring."""
     if not conc_map or not name: return {}
     name_lower = name.lower().strip()
 
@@ -611,28 +751,45 @@ def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[
         if key and key.lower().strip() == name_lower:
             return conc_map[key]
 
-    # Strategy 2 + 3: token overlap + substring
+    # Strategy 2: synonym expansion
+    candidate_names: set = {name_lower}
+    for base_name, synonyms in EXCIPIENT_SYNONYMS.items():
+        all_variants = [base_name] + synonyms
+        for variant in all_variants:
+            vl = variant.lower()
+            if vl == name_lower or vl in name_lower or name_lower in vl:
+                candidate_names.update(v.lower() for v in all_variants)
+                break
+    for candidate in candidate_names:
+        for key in conc_map:
+            if key and key.lower().strip() == candidate:
+                logger.debug(f"Synonym: '{name}' -> '{key}'")
+                return conc_map[key]
+
+    # Strategy 3: token overlap + substring
     best_key: Optional[str] = None
     best_score: float = 0.0
     for key in conc_map:
         if not key: continue
-        key_lower = key.lower().strip()
-        tokens_n = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', name_lower) if len(t) > 1)
-        tokens_k = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', key_lower)  if len(t) > 1)
-        if not tokens_n or not tokens_k: continue
-        overlap = len(tokens_n & tokens_k)
-        score   = overlap / max(len(tokens_n), len(tokens_k))
-        # Substring bonus: if either fully contains the other
-        if name_lower in key_lower or key_lower in name_lower:
+        kl = key.lower().strip()
+        tn = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', name_lower) if len(t) > 1)
+        tk = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', kl)         if len(t) > 1)
+        if not tn or not tk: continue
+        score = len(tn & tk) / max(len(tn), len(tk))
+        if name_lower in kl or kl in name_lower:
             score = max(score, 0.5)
+        for cand in candidate_names:
+            tc = set(t for t in re.split(r'[\s\(\)\-,/\.\*]+', cand) if len(t) > 1)
+            if tc:
+                score = max(score, len(tc & tk) / max(len(tc), len(tk)))
         if score > best_score:
             best_score = score; best_key = key
-    if best_score >= 0.15 and best_key:
-        logger.debug(f"Matched '{name}' → '{best_key}' (score={best_score:.2f})")
-        return conc_map[best_key]
-    logger.debug(f"No annexure match for '{name}' (best={best_score:.2f})")
-    return {}
 
+    if best_score >= 0.15 and best_key:
+        logger.debug(f"Token: '{name}' -> '{best_key}' ({best_score:.2f})")
+        return conc_map[best_key]
+    logger.warning(f"No match for '{name}' (best={best_score:.2f})")
+    return {}
 
 def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     """
@@ -799,10 +956,22 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
     t6 = safe_calc_table(calc_tables,"class2b")
     t7 = safe_calc_table(calc_tables,"class3")
 
-    crossing = {sym: {"total":t5["element_totals"].get(sym,0),
-                      "pde30":round(t5["pde"].get(sym,0)*0.3,4)}
-                for sym in TABLE5_ELEMENTS
-                if t5["pde"].get(sym) and t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.3}
+    crossing = {}
+    for sym in TABLE5_ELEMENTS:
+        pde_val = t5["pde"].get(sym, 0) or 0
+        total   = t5["element_totals"].get(sym, 0) or 0
+        if pde_val and total > pde_val * 0.3:
+            rows_with_sym = [r for r in t5.get("rows",[]) if isinstance(r,dict)]
+            dominant = max(rows_with_sym,
+                          key=lambda r: r.get("total_mass",{}).get(sym, 0),
+                          default={})
+            crossing[sym] = {
+                "total":               round(total, 4),
+                "pde":                 round(pde_val, 4),
+                "pde30":               round(pde_val * 0.3, 4),
+                "pct_pde":             round(total / pde_val * 100, 1),
+                "dominant_contributor":dominant.get("ingredient", "unknown"),
+            }
 
     # Tell Claude how many TOC sections there are so it writes the right structure
     toc_info = ""
@@ -1024,9 +1193,26 @@ def main() -> None:
                     continue
                 ann = process_annexure(raw_json, i+1)
                 annexure_data.append(ann)
-                st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
-                         f"({ann.get('supplier_name','?')}) — "
-                         f"{len(ann.get('elements',[]))} elements")
+                els   = ann.get("elements", []) or []
+                n_005 = sum(1 for e in els if isinstance(e, dict) and
+                            abs(e.get("concentration_value", -1) - 0.05) < 0.001)
+                n_real= sum(1 for e in els if isinstance(e, dict) and
+                            e.get("concentration_value", 0) > 0 and
+                            abs(e.get("concentration_value", 0) - 0.05) > 0.001)
+                has_warn = ann.get("_warning_placeholder_values", False)
+                status = "⚠️" if has_warn else "✅"
+                st.write(
+                    f"  {status} Annexure {i+1}: "
+                    f"**{ann.get('material_name','?')}** "
+                    f"({ann.get('supplier_name','?')}) — "
+                    f"{len(els)} elements | real: {n_real} | 0.05 placeholders: {n_005}"
+                )
+                if has_warn:
+                    st.warning(
+                        f"  ⚠️ Annexure {i+1}: "
+                        f"{n_005}/{len(els)} concentrations = 0.05 (likely placeholder). "
+                        "Check that the annexure JSON contains readable EI table data."
+                    )
                 progress.progress(42 + int(20*(i+1)/len(annexure_files)))
 
             # Step 7: Calculate EI tables
@@ -1118,7 +1304,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-!!!
+rrrrr
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
