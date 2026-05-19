@@ -5,21 +5,16 @@ ICH Q3D (R2) | Claude Opus 4.6 via Vertex AI
 Fully product-agnostic: works for ANY formulation (oral/parenteral/topical)
 A5 Landscape | Times New Roman | Page borders
 """
-import os, json, base64, hashlib, logging, time, subprocess, tempfile, re
+import os, json, base64, logging, time, subprocess, tempfile, re
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
 import openpyxl
 import fitz
 from anthropic import AnthropicVertex
-
-from citation_builder import (
-    CitationBuilder, find_field_path_in_docai, get_ich_guideline_table,
-)
-from traceability import write_traceability_report
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -180,7 +175,7 @@ def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
         errors.append("No annexure JSON files uploaded.")
     for i, (name, raw) in enumerate(annexure_raw):
         try:
-            obj = json.loads(raw.lstrip("﻿"))
+            obj = json.loads(raw.lstrip("\ufeff"))
             if not isinstance(obj, (dict, list)):
                 errors.append(f"Annexure {i+1} ({name}): JSON must be object or array.")
         except json.JSONDecodeError as e:
@@ -249,9 +244,7 @@ def identify_figure_pages(page_images: List[bytes]) -> List[Dict]:
     return figures
 
 
-def extract_reference_structure(page_images: List[bytes],
-                                 pdf_filename: str = "",
-                                 citation_builder: Optional[CitationBuilder] = None) -> Dict:
+def extract_reference_structure(page_images: List[bytes]) -> Dict:
     """
     Extract ALL content from the reference PDF:
     - Page 1 metadata (header fields)
@@ -271,15 +264,6 @@ def extract_reference_structure(page_images: List[bytes],
     meta_raw = claude_vision(safe_list_get(page_images, 0, b""), meta_prompt)
     meta = safe_json_parse(meta_raw, {})
     if not isinstance(meta, dict): meta = {}
-
-    # Record metadata citations (Layer 3)
-    if citation_builder and pdf_filename:
-        for field, val in meta.items():
-            if val:
-                citation_builder.cite_metadata_field(
-                    field, str(val), pdf_filename, 1,
-                    "claude_vision_extraction"
-                )
 
     # ── TOC from page 2 ───────────────────────────────────────────────────────
     toc_prompt = (
@@ -307,15 +291,23 @@ def extract_reference_structure(page_images: List[bytes],
             candidates = d.get("entries", [])
             if not isinstance(candidates, list) or not candidates: continue
 
+            # Validate: real TOC entries have:
+            #   "no"   = numeric string or small integer ("1","2",...,"12")
+            #   "page" = numeric string ("3","4","15","16")
+            # If the header metadata table was mistaken for a TOC, entries look like:
+            #   {"no":"Title","title":"Risk assessment...","page":"FR&D"}
+            # We reject those by checking that both "no" and "page" are numeric.
             def is_valid_toc_entry(e: Dict) -> bool:
                 if not isinstance(e, dict): return False
                 no_val   = safe_str(e.get("no",   "")).strip()
                 page_val = safe_str(e.get("page",  "")).strip()
+                # "no" must be a small integer string ("1"–"20")
                 try:
                     n = int(no_val)
                     if n < 1 or n > 50: return False
                 except (ValueError, TypeError):
                     return False
+                # "page" must be a numeric string
                 try:
                     int(page_val)
                 except (ValueError, TypeError):
@@ -323,6 +315,7 @@ def extract_reference_structure(page_images: List[bytes],
                 return True
 
             valid = [e for e in candidates if is_valid_toc_entry(e)]
+            # Require at least 3 valid entries to accept as a real TOC
             if len(valid) >= 3:
                 toc_entries = valid
                 break
@@ -330,7 +323,10 @@ def extract_reference_structure(page_images: List[bytes],
             pass
 
     # ── Revision history and signatures (last 3 pages) ────────────────────────
-    pages_data: List[Dict] = []
+    # NOTE: We no longer do per-page full extraction — it was only used for
+    # additional_tables which caused the header table to repeat 12+ times.
+    # Removing saves ~18 Claude API calls per report.
+    pages_data: List[Dict] = []   # kept for compatibility, not populated
     revision_data: List[Dict] = []
     sig_data: List[Dict] = []
     rev_prompt = (
@@ -360,6 +356,10 @@ def extract_reference_structure(page_images: List[bytes],
 
 
 def extract_composition_tables(pages_data: List[Dict]) -> Dict:
+    """
+    From the page-by-page extraction, find and return all composition/ingredient
+    tables exactly as extracted — columns, rows, captions preserved verbatim.
+    """
     comp_tables: List[Dict] = []
     for page in pages_data:
         if not isinstance(page, dict): continue
@@ -367,6 +367,7 @@ def extract_composition_tables(pages_data: List[Dict]) -> Dict:
             if not isinstance(sec, dict): continue
             for tbl in (sec.get("tables") or []):
                 if not isinstance(tbl, dict): continue
+                # Identify composition/ingredient/packing tables
                 cap = safe_str(tbl.get("caption","")).lower()
                 cols = tbl.get("columns", [])
                 is_comp = any(kw in cap for kw in
@@ -383,34 +384,31 @@ def extract_composition_tables(pages_data: List[Dict]) -> Dict:
 def extract_additional_tables(pages_data: List[Dict]) -> List[Dict]:
     """
     Intentionally returns empty list.
-    The structured pipeline already renders every needed table.
-    Any additional product-specific tables are captured in Claude-generated text_sections.
+
+    We previously tried to extract "extra" tables from the PDF pages verbatim,
+    but the repeating IPDO header table (Field | Value) appears on every page
+    and was passing all filters, causing it to be rendered 12+ times.
+
+    The structured pipeline already renders every needed table:
+      - Table 1: Composition (from Excel)
+      - Table 2: Annexure list (from annexure_data)
+      - Tables 5/6/7: EI calculations (from calculate_ei_tables)
+      - Revision history, signatures, TOC (from reference structure)
+
+    Any additional product-specific tables (e.g. "Potential risk" summary)
+    are captured as text in the Claude-generated text_sections instead.
     """
     return []
 
 
 # ── Excel composition parser ──────────────────────────────────────────────────
-def _find_excel_row_number(ingredient_name: str, all_rows: List[List[str]]) -> int:
-    """Find the 1-based row number in the original Excel rows that matches ingredient_name."""
-    ing_lower = ingredient_name.lower().strip()
-    if not ing_lower:
-        return 0
-    for i, row in enumerate(all_rows):
-        for cell_val in row:
-            if cell_val and ing_lower in cell_val.lower():
-                return i + 1  # 1-based (matches "Row N:" in rows_text)
-    return 0
-
-
-def parse_composition_excel(excel_bytes: bytes, excel_filename: str = "") -> Dict:
+def parse_composition_excel(excel_bytes: bytes) -> Dict:
     """
     Generic parser: works for oral sachets, injections, any formulation.
     Returns sections with ingredients and their amounts.
-    Each ingredient row is tagged with _row_number and _excel_filename for citations.
     """
     wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
     ws = wb.worksheets[0]
-    sheet_name = ws.title if ws.title else "Sheet1"
     rows_text: List[str] = []
     all_rows: List[List[str]] = []
     for i, row in enumerate(ws.iter_rows(values_only=True)):
@@ -422,21 +420,37 @@ def parse_composition_excel(excel_bytes: bytes, excel_filename: str = "") -> Dic
     sheet_dump = "\n".join(rows_text[:100])
 
     prompt = (
-        "Pharmaceutical composition spreadsheet. Extract EVERYTHING.\n\n"
-        "1. ALL column headers exactly as they appear\n"
-        "2. ALL rows including section headers and ingredient rows\n"
-        "3. Route of administration (oral/parenteral/injection/topical)\n"
-        "4. MDD in grams (total drug product per day)\n\n"
+        "Pharmaceutical composition spreadsheet. Extract EVERYTHING accurately.\n\n"
+        "This spreadsheet lists ingredients for a drug product.\n"
+        "Your most critical task is correctly identifying doses_per_day.\n\n"
+        "IMPORTANT DEFINITIONS:\n"
+        "- doses_per_day: number of unit doses taken per day at MAXIMUM DAILY DOSE\n"
+        "  For oral sachets: if MDD=240mg and each sachet=40mg → doses_per_day=6\n"
+        "  For oral tablets: if MDD=2 tablets/day → doses_per_day=2\n"
+        "  For injections: usually 1 (one injection per day)\n"
+        "  For topical: number of applications per day\n"
+        "- amount_per_dose: each row's amount is per SINGLE DOSE UNIT (sachet/tablet/injection)\n"
+        "  Daily intake for each ingredient = amount_per_dose × doses_per_day\n"
+        "- mdd_g: total mass of drug PRODUCT administered per day in grams\n"
+        "  NOT just the active ingredient strength.\n"
+        "  For sachets: (sum of ALL ingredient amounts in one sachet, in mg) "
+        "× doses_per_day ÷ 1000\n\n"
         "Return ONLY this JSON (no markdown):\n"
         "{\n"
-        '  "route": "oral or parenteral or injection",\n'
-        '  "mdd_g": 1.0,\n'
-        '  "doses_per_day": 1,\n'
-        '  "unit": "exact unit string e.g. mg/unit or mg/0.65mL",\n'
-        '  "ingredient_col": "exact column header for ingredient name",\n'
-        '  "amount_col": "exact column header for ingredient amount",\n'
+        '  "route": "oral or parenteral or injection or topical",\n'
+        '  "doses_per_day": 6,\n'
+        "  // CRITICAL: number of unit doses at MDD. "
+        "For 240mg/day in 40mg sachets this is 6.\n"
+        '  "mdd_strength_mg": 40,\n'
+        "  // strength of one unit dose in mg (e.g. 40mg sachet)\n"
+        '  "mdd_total_mg_per_day": 240,\n'
+        "  // total active ingredient per day = mdd_strength_mg × doses_per_day\n"
+        '  "mdd_g": 19.0,\n'
+        "  // total PRODUCT mass per day in grams (all ingredients × doses_per_day / 1000)\n"
+        '  "unit": "mg/sachet",\n'
+        '  "ingredient_col": "Name of Ingredient",\n'
+        '  "amount_col": "exact column header for per-dose ingredient amount",\n'
         '  "amount_unit": "mg",\n'
-        '  "amount_per_dose": true,\n'
         '  "columns": ["exact col1 header","exact col2 header","..."],\n'
         '  "sections": [\n'
         '    {\n'
@@ -447,14 +461,15 @@ def parse_composition_excel(excel_bytes: bytes, excel_filename: str = "") -> Dic
         '    }\n'
         '  ]\n'
         "}\n\n"
-        "IMPORTANT:\n"
+        "RULES:\n"
         "- columns[]: exact headers as in the spreadsheet\n"
-        "- For each row, map each value to its exact column header\n"
-        "- mdd_g in GRAMS (e.g. injection 0.65mL → 0.65g)\n"
-        "- ingredient_col: exact column header containing the ingredient/material name\n"
-        "- amount_col: exact column header containing the ingredient amount (mg or g per dose)\n"
-        "- amount_unit: unit of the amount column: 'mg', 'g', 'mL', or 'mg/mL'\n"
-        "- amount_per_dose: true if amounts are per single dose, false if already per day\n"
+        "- amount_col: the column with per-unit-dose ingredient amounts\n"
+        "- amount_unit: 'mg', 'g', 'mL', or 'mg/mL'\n"
+        "- For each row, map values to exact column headers\n"
+        "- If the spreadsheet has columns for multiple strengths (40mg, 20mg, 10mg),\n"
+        "  amount_col should be the HIGHEST STRENGTH column (worst case for EI)\n"
+        "- mdd_g = total product mass per day. For sachets with multiple ingredients\n"
+        "  summing to ~3g per sachet × 6 sachets = ~18-20g/day\n"
         f"Spreadsheet:\n{sheet_dump}"
     )
     raw = claude_text(prompt)
@@ -472,29 +487,35 @@ def parse_composition_excel(excel_bytes: bytes, excel_filename: str = "") -> Dic
         result = {"sections": [{"name": "Composition", "rows": fallback_rows}],
                   "route": "oral", "mdd_g": 1.0, "doses_per_day": 1, "unit": ""}
 
-    result["mdd_g"]          = safe_float(result.get("mdd_g", 1.0), default=1.0)
-    result["doses_per_day"]   = safe_int(result.get("doses_per_day", 1), default=1)
-    result["route"]           = safe_str(result.get("route", "oral")) or "oral"
-    result["ingredient_col"]  = safe_str(result.get("ingredient_col", ""))
-    result["amount_col"]      = safe_str(result.get("amount_col", ""))
-    result["amount_unit"]     = safe_str(result.get("amount_unit", "mg"))
-    result["amount_per_dose"] = bool(result.get("amount_per_dose", True))
+    doses_per_day    = safe_int(result.get("doses_per_day", 1), default=1)
+    mdd_strength_mg  = safe_float(result.get("mdd_strength_mg", 0.0), default=0.0)
+    mdd_total_mg     = safe_float(result.get("mdd_total_mg_per_day", 0.0), default=0.0)
+
+    # Cross-check: if Claude returned mdd_strength_mg and doses_per_day,
+    # verify they are consistent with mdd_total_mg_per_day
+    if mdd_strength_mg > 0 and doses_per_day > 0:
+        expected_total = mdd_strength_mg * doses_per_day
+        if mdd_total_mg > 0 and abs(expected_total - mdd_total_mg) > 1.0:
+            logger.warning(
+                f"MDD inconsistency: strength={mdd_strength_mg}mg × "
+                f"doses={doses_per_day} = {expected_total}mg/day but "
+                f"mdd_total_mg_per_day={mdd_total_mg}mg. "
+                f"Using strength×doses = {expected_total}mg/day."
+            )
+            mdd_total_mg = expected_total
+
+    result["mdd_g"]             = safe_float(result.get("mdd_g", 1.0), default=1.0)
+    result["doses_per_day"]     = doses_per_day
+    result["mdd_strength_mg"]   = mdd_strength_mg
+    result["mdd_total_mg_per_day"] = mdd_total_mg
+    result["route"]             = safe_str(result.get("route", "oral")) or "oral"
+    result["ingredient_col"]    = safe_str(result.get("ingredient_col", ""))
+    result["amount_col"]        = safe_str(result.get("amount_col", ""))
+    result["amount_unit"]       = safe_str(result.get("amount_unit", "mg"))
+    result["amount_per_dose"]   = True  # amounts are always per-dose; we scale by doses_per_day
     if not isinstance(result.get("sections"), list): result["sections"] = []
     if not isinstance(result.get("columns"), list):  result["columns"] = []
-    result["all_rows"]     = all_rows
-    result["_sheet_name"]  = sheet_name
-    result["_excel_filename"] = excel_filename
-
-    # Tag every ingredient row with its Excel row number for citations
-    for section in result["sections"]:
-        if not isinstance(section, dict): continue
-        for row in (section.get("rows") or []):
-            if not isinstance(row, dict): continue
-            ingredient = row.get("ingredient", "")
-            row["_row_number"]     = _find_excel_row_number(ingredient, all_rows)
-            row["_excel_filename"] = excel_filename
-            row["_sheet_name"]     = sheet_name
-
+    result["all_rows"] = all_rows
     return result
 
 
@@ -511,13 +532,7 @@ def _flatten_docai_json(obj: Any, depth: int = 0) -> str:
     return " ".join(p for p in parts if p.strip())
 
 
-def process_annexure(annexure_json: Any, index: int,
-                     filename: str = "") -> Dict:
-    """
-    Process a Document AI JSON annexure.
-    Each extracted element is tagged with _field_path (where in the JSON the
-    concentration value was found) and _filename for citation purposes.
-    """
+def process_annexure(annexure_json: Any, index: int) -> Dict:
     text_content = _flatten_docai_json(annexure_json)
     prompt = (
         f"Extract elemental impurity data from Annexure {index}.\n"
@@ -541,16 +556,6 @@ def process_annexure(annexure_json: Any, index: int,
     if not isinstance(parsed, dict): return default
     for k, v in default.items(): parsed.setdefault(k, v)
     if not isinstance(parsed.get("elements"), list): parsed["elements"] = []
-
-    # Tag each element with its field path in the raw Document AI JSON
-    for el in parsed["elements"]:
-        if not isinstance(el, dict): continue
-        conc_val = el.get("concentration_value", "")
-        # Search for the concentration value in the raw JSON tree
-        el["_field_path"] = find_field_path_in_docai(annexure_json, str(conc_val))
-        el["_filename"] = filename
-
-    parsed["_filename"] = filename
     return parsed
 
 
@@ -591,28 +596,24 @@ def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
     return conc_map
 
 
-def _match_ingredient_with_meta(
-    name: str,
-    conc_map: Dict[str, Dict[str, float]],
-) -> Tuple[Dict[str, float], float, str, str]:
+def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
     """
-    Fuzzy match an ingredient name to an annexure material name.
-    Returns (conc_dict, score, matched_key, method).
-    method is one of: "exact" | "substring" | "token_overlap" | "none"
+    Fuzzy match ingredient name to annexure material name.
+    Strategy 1: exact match (case-insensitive)
+    Strategy 2: token overlap score >= 0.15
+    Strategy 3: one name is a substring of the other
     """
-    if not conc_map or not name:
-        return {}, 0.0, "", "none"
+    if not conc_map or not name: return {}
     name_lower = name.lower().strip()
 
-    # Strategy 1: exact (case-insensitive)
+    # Strategy 1: exact match
     for key in conc_map:
         if key and key.lower().strip() == name_lower:
-            return conc_map[key], 1.0, key, "exact"
+            return conc_map[key]
 
     # Strategy 2 + 3: token overlap + substring
     best_key: Optional[str] = None
     best_score: float = 0.0
-    best_method: str = "none"
     for key in conc_map:
         if not key: continue
         key_lower = key.lower().strip()
@@ -621,65 +622,54 @@ def _match_ingredient_with_meta(
         if not tokens_n or not tokens_k: continue
         overlap = len(tokens_n & tokens_k)
         score   = overlap / max(len(tokens_n), len(tokens_k))
-        method  = "token_overlap"
+        # Substring bonus: if either fully contains the other
         if name_lower in key_lower or key_lower in name_lower:
-            sub = max(score, 0.5)
-            if sub > score:
-                score  = sub
-                method = "substring"
+            score = max(score, 0.5)
         if score > best_score:
-            best_score = score
-            best_key   = key
-            best_method = method
-
+            best_score = score; best_key = key
     if best_score >= 0.15 and best_key:
         logger.debug(f"Matched '{name}' → '{best_key}' (score={best_score:.2f})")
-        return conc_map[best_key], best_score, best_key, best_method
+        return conc_map[best_key]
     logger.debug(f"No annexure match for '{name}' (best={best_score:.2f})")
-    return {}, 0.0, "", "none"
+    return {}
 
 
-def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    concs, _, _, _ = _match_ingredient_with_meta(name, conc_map)
-    return concs
-
-
-def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict],
-                        citation_builder: Optional[CitationBuilder] = None,
-                        annexure_filenames: Optional[List[str]] = None,
-                        excel_filename: str = "") -> Dict:
+def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     """
     Product-agnostic EI calculation.
-
+    
     Formula: Daily_exposure (µg/day) = Amount_in_MDD (g/day) × Conc (µg/g)
-
-    When citation_builder is provided, every cell in Tables 5/6/7 is traced back
-    to its source (annexure element, Excel row, ICH Q3D table).
+    
+    For each ingredient:
+      amount_in_mdd_g = ingredient_amount × (mdd_g / dose_unit_mass)
+      daily_exposure  = amount_in_mdd_g × measured_conc_µg_per_g
+    
+    mdd_g = total mass of drug product per day in grams
+    This works for: oral sachets, injections, tablets, topical, etc.
     """
-    route         = safe_str(comp_data.get("route","oral"))
-    mdd_g         = safe_float(comp_data.get("mdd_g", 1.0), default=1.0)
+    route       = safe_str(comp_data.get("route","oral"))
+    mdd_g       = safe_float(comp_data.get("mdd_g", 1.0), default=1.0)
     doses_per_day = safe_int(comp_data.get("doses_per_day", 1), default=1)
+
+    # Column keys Claude extracted from the spreadsheet
     ingredient_col  = safe_str(comp_data.get("ingredient_col", ""))
     amount_col      = safe_str(comp_data.get("amount_col", ""))
     amount_unit_raw = safe_str(comp_data.get("amount_unit", "mg")).lower()
     amount_per_dose = comp_data.get("amount_per_dose", True)
-    sheet_name      = safe_str(comp_data.get("_sheet_name", "Sheet1"))
-
-    # Build annexure lookup by material name (for citation metadata)
-    ann_by_material: Dict[str, Dict] = {
-        safe_str(ann.get("material_name","")): ann
-        for ann in annexure_data if isinstance(ann, dict)
-    }
 
     def _get_field(row: Dict, col_key: str, fallbacks: List[str]) -> str:
+        """Get a value from a row, checking columns dict first, then direct keys."""
         cols_dict = row.get("columns", {})
         if isinstance(cols_dict, dict):
+            # Try exact column key
             if col_key and col_key in cols_dict:
                 return safe_str(cols_dict[col_key])
+            # Try all column values if key not found
             for k, v in cols_dict.items():
                 for fb in fallbacks:
                     if fb.lower() in k.lower():
                         return safe_str(v)
+        # Try direct row keys
         for fb in fallbacks:
             if fb in row:
                 return safe_str(row[fb])
@@ -693,172 +683,76 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict],
         for row in (section.get("rows") or []):
             if not isinstance(row, dict): continue
 
+            # ── Get ingredient name ──────────────────────────────────────────
             name = _get_field(row, ingredient_col,
                               ["ingredient","name","Name of Ingredient",
                                "material","Material","component","Component"])
             if not name: continue
 
+            # ── Get raw amount ───────────────────────────────────────────────
             raw_amount_str = _get_field(row, amount_col,
                                         ["amount","qty","Qty","40mg","quantity",
                                          "Quantity","mg/unit","mg/0.65mL","mg/mL"])
             amount_raw = _parse_amount_g(raw_amount_str)
             if amount_raw == 0:
-                continue
+                continue  # skip fillers/QS with no amount
 
+            # ── Convert to grams based on reported unit ──────────────────────
             if "µg" in amount_unit_raw or "ug" in amount_unit_raw:
                 amount_g = amount_raw / 1_000_000.0
             elif "mg" in amount_unit_raw:
                 amount_g = amount_raw / 1000.0
             elif "ml" in amount_unit_raw:
+                # mL ≈ g for aqueous solutions
                 amount_g = amount_raw
             elif "g" in amount_unit_raw:
                 amount_g = amount_raw
             else:
+                # Best-effort: values > 200 are almost certainly mg
                 amount_g = amount_raw / 1000.0 if amount_raw > 1 else amount_raw
 
-            if amount_per_dose:
-                daily_g = round(amount_g * doses_per_day, 8)
-            else:
-                daily_g = round(amount_g, 8)
+            # ── Scale to daily dose ──────────────────────────────────────────
+            # daily_g = per-dose amount in grams × number of doses per day
+            # This is the ONLY correct formula — never divide by anything.
+            # doses_per_day for Esomeprazole 40mg × 6 sachets = 6
+            # daily_g for Sugar Spheres (302mg/sachet) = 0.302 × 6 = 1.812g ✓
+            daily_g = round(amount_g * doses_per_day, 8)
+            ingredients.append({"name": name, "daily_g": daily_g})
 
-            ingredients.append({
-                "name":            name,
-                "daily_g":         daily_g,
-                "_row_number":     row.get("_row_number", 0),
-                "_raw_amount_str": raw_amount_str,
-                "_excel_filename": row.get("_excel_filename", excel_filename),
-                "_sheet_name":     row.get("_sheet_name", sheet_name),
-            })
-
-    logger.info(f"EI calc: {len(ingredients)} ingredients with non-zero amounts, "
-                f"route={route}, mdd_g={mdd_g}g, {len(annexure_data)} annexures")
+    mdd_total = comp_data.get("mdd_total_mg_per_day", 0)
+    logger.info(
+        f"EI calc: {len(ingredients)} ingredients | route={route} | "
+        f"doses_per_day={doses_per_day} | mdd_strength={comp_data.get('mdd_strength_mg',0)}mg | "
+        f"mdd_total={mdd_total}mg/day | annexures={len(annexure_data)}"
+    )
 
     conc_map = _build_conc_map(annexure_data)
 
-    # Track which ingredient→annexure matches have been cited (once per ingredient)
-    cited_matches: set = set()
-
-    def build_one_table(elements: List[str], table_name: str) -> Dict:
+    def build_one_table(elements: List[str]) -> Dict:
         rows: List[Dict] = []
         elem_totals: Dict[str, float] = {sym: 0.0 for sym in elements}
         total_intake = 0.0
-
         for ing in ingredients:
-            if ing["daily_g"] == 0:
-                continue
-
-            ing_concs, match_score, matched_key, match_method = \
-                _match_ingredient_with_meta(ing["name"], conc_map)
-
-            # Cite the ingredient→annexure match (once per unique ingredient)
-            if citation_builder and matched_key and ing["name"] not in cited_matches:
-                matched_ann = ann_by_material.get(matched_key, {})
-                ann_idx = matched_ann.get("annexure_number", 0)
-                citation_builder.cite_ingredient_match(
-                    ing["name"], matched_key, ann_idx, match_score, match_method
-                )
-                cited_matches.add(ing["name"])
-
-            # Cite the daily intake from Excel (per table, since each table
-            # is a distinct calculation block with its own element set)
-            intake_cid = ""
-            if citation_builder:
-                intake_cid = citation_builder.cite_daily_intake(
-                    table_name,
-                    ing["name"],
-                    ing["daily_g"],
-                    ing.get("_excel_filename", excel_filename),
-                    ing.get("_sheet_name", sheet_name),
-                    ing.get("_row_number", 0),
-                    ing.get("_raw_amount_str", ""),
-                    comp_data.get("amount_unit", "mg"),
-                    mdd_g,
-                    doses_per_day,
-                    amount_col,
-                )
-
+            if ing["daily_g"] == 0: continue  # strict zero only; tiny values are valid
+            ing_concs = _match_ingredient(ing["name"], conc_map)
             measured: Dict[str, float] = {}
             total_mass: Dict[str, float] = {}
-            ann_index_for_row = 0
-
             for sym in elements:
                 conc            = ing_concs.get(sym, 0.0)
                 measured[sym]   = round(conc, 4)
                 mass            = ing["daily_g"] * conc
                 total_mass[sym] = round(mass, 6)
                 elem_totals[sym]= round(elem_totals[sym] + mass, 6)
-
-                if citation_builder:
-                    # Cite measured concentration from annexure
-                    conc_cid = ""
-                    if matched_key:
-                        matched_ann = ann_by_material.get(matched_key, {})
-                        ann_idx     = matched_ann.get("annexure_number", 0)
-                        ann_index_for_row = ann_idx
-                        ann_fname   = (
-                            annexure_filenames[ann_idx - 1]
-                            if annexure_filenames and 0 < ann_idx <= len(annexure_filenames)
-                            else matched_ann.get("_filename", "")
-                        )
-                        el_data = next(
-                            (e for e in (matched_ann.get("elements") or [])
-                             if isinstance(e, dict) and e.get("symbol") == sym),
-                            {}
-                        )
-                        conc_cid = citation_builder.cite_measured_conc(
-                            table_name, ing["name"], sym,
-                            conc, ann_idx, ann_fname,
-                            matched_key,
-                            matched_ann.get("supplier_name", ""),
-                            el_data.get("_field_path", "text_extraction"),
-                            str(el_data.get("concentration_value", "")),
-                            el_data.get("concentration_unit", "ppm"),
-                            el_data.get("analytical_method", ""),
-                        )
-
-                    # Cite daily exposure as a derived calculation
-                    citation_builder.cite_daily_exposure(
-                        table_name, ing["name"], sym,
-                        round(mass, 6),
-                        intake_cid, conc_cid,
-                        ing["daily_g"], conc,
-                    )
-
             total_intake += ing["daily_g"]
-            rows.append({
-                "ingredient":         ing["name"],
-                "daily_intake_g":     round(ing["daily_g"], 6),
-                "measured_conc":      measured,
-                "total_mass":         total_mass,
-                "_annexure_source":   matched_key,
-                "_annexure_index":    ann_index_for_row,
-            })
+            rows.append({"ingredient": ing["name"],
+                         "daily_intake_g": round(ing["daily_g"], 6),
+                         "measured_conc": measured,
+                         "total_mass": total_mass})
 
-        # PDE and 30% threshold by route
-        pde_vals  = {sym: get_pde(sym, route) for sym in elements}
-        threshold = {
-            sym: round(pde_vals[sym] * 0.30, 4) if pde_vals[sym] else None
-            for sym in elements
-        }
-
-        # PDE and threshold guideline citations
-        pde_sources: Dict[str, str] = {}
-        if citation_builder:
-            for sym in elements:
-                pde = pde_vals.get(sym)
-                if pde is not None:
-                    ich_class     = ICH_PDE.get(sym, {}).get("class", "?")
-                    guideline_tbl = get_ich_guideline_table(ich_class)
-                    pde_sources[sym] = guideline_tbl
-                    pde_cid = citation_builder.cite_pde(
-                        table_name, sym, pde, ich_class, route, guideline_tbl
-                    )
-                    thresh = threshold.get(sym)
-                    if thresh is not None:
-                        citation_builder.cite_threshold(
-                            table_name, sym, thresh, pde_cid, pde
-                        )
-
+        # PDE by route
+        pde_vals = {sym: get_pde(sym, route) for sym in elements}
+        threshold = {sym: round(pde_vals[sym]*0.30, 4) if pde_vals[sym] else None
+                     for sym in elements}
         return {
             "elements":           elements,
             "rows":               rows,
@@ -867,24 +761,21 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict],
             "pde":                pde_vals,
             "threshold_30pct":    threshold,
             "route":              route,
-            "pde_sources":        pde_sources,
         }
 
     return {
-        "class1_2a": build_one_table(TABLE5_ELEMENTS, "Table 5 / Class 1+2A"),
-        "class2b":   build_one_table(TABLE6_ELEMENTS, "Table 6 / Class 2B"),
-        "class3":    build_one_table(TABLE7_ELEMENTS, "Table 7 / Class 3"),
+        "class1_2a": build_one_table(TABLE5_ELEMENTS),
+        "class2b":   build_one_table(TABLE6_ELEMENTS),
+        "class3":    build_one_table(TABLE7_ELEMENTS),
     }
 
 
 # ── Text section generation ───────────────────────────────────────────────────
 def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
-                           calc_tables: Dict, comp_data: Dict,
-                           citation_builder: Optional[CitationBuilder] = None) -> Dict:
+                           calc_tables: Dict, comp_data: Dict) -> Dict:
     """
     Generate all narrative text sections dynamically.
     The prompt is product-agnostic — Claude uses reference structure + calculations.
-    When citation_builder is provided, records which prompt inputs were used.
     """
     empty: Dict = {
         "abstract":"","objective":"","study_location":"NA","background":"",
@@ -913,6 +804,7 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
                 for sym in TABLE5_ELEMENTS
                 if t5["pde"].get(sym) and t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.3}
 
+    # Tell Claude how many TOC sections there are so it writes the right structure
     toc_info = ""
     if toc:
         toc_info = "TOC sections from reference: " + "; ".join(
@@ -941,56 +833,22 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
         '"control_strategy":"","testing_recommendation":"","conclusion":"",\n'
         '"observation":"","reference":"NA"}'
     )
-
-    generation_ts = datetime.now(timezone.utc).isoformat()
     raw    = claude_text(prompt, max_tokens=6000)
     parsed = safe_json_parse(raw, {})
     if not isinstance(parsed, dict):
         logger.error("Text generation returned no valid JSON; using empty sections")
         return empty
     for k, v in empty.items(): parsed.setdefault(k, v)
-
-    # Record text generation citations (Layer 2)
-    if citation_builder:
-        prompt_hash    = hashlib.sha256(prompt.encode()).hexdigest()[:16]
-        ann_numbers    = [a.get("annexure_number", i+1) for i, a in enumerate(annexure_data)]
-        meta_fields    = [k for k, v in meta.items() if v]
-        calc_refs      = ["element_totals", "pde", "threshold_30pct", "crossing"]
-
-        for section_key, section_val in parsed.items():
-            if section_val and section_val != "NA":
-                citation_builder.cite_text_section(
-                    section_key,
-                    "generate_text_sections_v1",
-                    prompt_hash,
-                    meta_fields,
-                    ann_numbers,
-                    calc_refs,
-                    generation_ts,
-                )
-
     return parsed
 
 
 # ── Assemble and invoke Node.js ───────────────────────────────────────────────
-def assemble_and_generate(
-    ref_structure: Dict, page_images: List[bytes],
-    figure_pages: List[Dict], annexure_data: List[Dict],
-    comp_data: Dict, calc_tables: Dict, text_sections: Dict,
-    ref_bytes: bytes = b"", logo_b64: str = "",
-    logo_type: str = "",
-    citation_builder: Optional[CitationBuilder] = None,
-    enable_inline_citations: bool = False,
-    report_id: str = "",
-    pdf_filename: str = "",
-) -> Tuple[bytes, Optional[Dict], Optional[str]]:
-    """
-    Assemble all data, invoke Node.js to build the DOCX, and write
-    citation_ledger.json + traceability_report.html alongside the output.
+def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
+                          figure_pages: List[Dict], annexure_data: List[Dict],
+                          comp_data: Dict, calc_tables: Dict, text_sections: Dict,
+                          ref_bytes: bytes = b"", logo_b64: str = "",
+                          logo_type: str = "") -> bytes:
 
-    Returns (docx_bytes, ledger_dict, html_string).
-    ledger_dict and html_string are None when citation_builder is not provided.
-    """
     figures_b64: List[Dict] = []
     for fig in figure_pages:
         if not isinstance(fig, dict): continue
@@ -1021,6 +879,7 @@ def assemble_and_generate(
         "logo_b64":          logo_b64,
         "logo_type":         logo_type,
         "text_sections":     text_sections or {},
+        # Composition: exact columns from Excel as extracted
         "composition":       comp_data.get("sections",[]) or [],
         "comp_columns":      comp_data.get("columns",[]) or [],
         "comp_meta":         {"route": comp_data.get("route","oral"),
@@ -1036,25 +895,16 @@ def assemble_and_generate(
         "signatures":        ref_structure.get("signatures",[]) or [],
         "figures":           figures_b64,
         "pde_values":        dict(ICH_PDE),
+        # All non-EI tables extracted verbatim from reference PDF
         "additional_tables": additional_tables,
-        # Citation layer controls
-        "enable_inline_citations": enable_inline_citations,
     }
 
-    generated_at  = datetime.now(timezone.utc).isoformat()
-    ledger_dict: Optional[Dict] = None
-    html_str:    Optional[str]  = None
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        json_path    = Path(tmpdir) / "report_data.json"
-        docx_path    = Path(tmpdir) / "report.docx"
-        ledger_path  = Path(tmpdir) / "citation_ledger.json"
-        html_path    = Path(tmpdir) / "traceability_report.html"
-        js_script    = Path(__file__).parent / "generate_report.js"
-
+        json_path = Path(tmpdir) / "report_data.json"
+        docx_path = Path(tmpdir) / "report.docx"
+        js_script = Path(__file__).parent / "generate_report.js"
         with open(json_path,"w",encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False)
-
         result = subprocess.run(
             ["node", str(js_script), str(json_path), str(docx_path)],
             capture_output=True, text=True, timeout=180)
@@ -1067,19 +917,7 @@ def assemble_and_generate(
         docx_bytes = docx_path.read_bytes()
         if len(docx_bytes) < 5000:
             raise RuntimeError(f"DOCX too small ({len(docx_bytes)} bytes).")
-
-        # Build and write citation ledger + HTML
-        if citation_builder:
-            try:
-                ledger_dict = citation_builder.write_ledger(
-                    str(ledger_path), report_id, generated_at
-                )
-                write_traceability_report(ledger_dict, str(html_path))
-                html_str = html_path.read_text(encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Citation ledger write failed: {e}")
-
-        return docx_bytes, ledger_dict, html_str
+        return docx_bytes
 
 
 # ── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -1109,19 +947,12 @@ def main() -> None:
 
     st.markdown("---")
 
-    enable_inline_citations = st.checkbox(
-        "🔗 Enable inline citations in DOCX "
-        "(appends [Ann.N] and [ICH-Q3D-A2.N] markers to table values)",
-        value=False,
-        help="When ON, superscript-style footnote markers appear in Tables 5/6/7 cells."
-    )
-
     btn_disabled = not (ref_pdf and excel_file and annexure_files)
     if st.button("🚀 Generate Report", type="primary", disabled=btn_disabled):
         progress = st.progress(0)
         log = st.empty()
         try:
-            # ── Step 0: Pre-flight ──────────────────────────────────────────
+            # Step 0: Pre-flight
             log.info("🔍 Validating uploads…")
             annexure_raw = [(af.name, af.getvalue().decode("utf-8","replace"))
                             for af in annexure_files]
@@ -1132,20 +963,14 @@ def main() -> None:
             st.success("✅ Pre-flight OK.")
             progress.progress(4)
 
-            # ── Initialise citation builder ─────────────────────────────────
-            cb = CitationBuilder()
-
-            # ── Step 1: Rasterize PDF ───────────────────────────────────────
+            # Step 1: Rasterize PDF
             log.info("📄 Rasterizing reference PDF…")
             ref_bytes   = ref_pdf.getvalue()
             page_images = rasterize_pdf_pages(ref_bytes, dpi=150)
             st.success(f"Reference PDF: {len(page_images)} pages.")
-
-            # Register PDF for integrity hash
-            cb.register_pdf(ref_pdf.name, ref_bytes, len(page_images))
             progress.progress(7)
 
-            # ── Step 2: Logo ────────────────────────────────────────────────
+            # Step 2: Logo
             log.info("🖼 Loading logo from assets/…")
             logo_bytes, logo_mt = load_logo_from_assets()
             logo_b64  = base64.standard_b64encode(logo_bytes).decode() if logo_bytes else ""
@@ -1154,7 +979,7 @@ def main() -> None:
             else: st.info("ℹ️ No logo in assets/. Save as assets/logo.png for logo in report.")
             progress.progress(10)
 
-            # ── Step 3: Figure pages ────────────────────────────────────────
+            # Step 3: Figure pages
             log.info("🔍 Identifying figure pages…")
             figure_pages = identify_figure_pages(page_images)
             if figure_pages:
@@ -1164,13 +989,9 @@ def main() -> None:
                 st.warning("No figure pages detected.")
             progress.progress(18)
 
-            # ── Step 4: Reference structure ─────────────────────────────────
+            # Step 4: Reference structure — extracts metadata, TOC, ALL page content
             log.info("📑 Extracting report structure, TOC, and all page tables…")
-            ref_structure = extract_reference_structure(
-                page_images,
-                pdf_filename=ref_pdf.name,
-                citation_builder=cb,
-            )
+            ref_structure = extract_reference_structure(page_images)
             meta = ref_structure.get("meta",{}) or {}
             toc  = ref_structure.get("toc_entries",[]) or []
             st.success(f"Product: {meta.get('product_name','(extracted)')} | "
@@ -1178,18 +999,9 @@ def main() -> None:
                        f"TOC: {len(toc)} sections")
             progress.progress(32)
 
-            # ── Step 5: Parse Excel ─────────────────────────────────────────
+            # Step 5: Parse Excel
             log.info("📊 Parsing composition Excel…")
-            comp_data = parse_composition_excel(
-                excel_file.getvalue(),
-                excel_filename=excel_file.name,
-            )
-            # Register Excel for integrity hash
-            cb.register_excel(
-                excel_file.name,
-                excel_file.getvalue(),
-                comp_data.get("_sheet_name", "Sheet1"),
-            )
+            comp_data = parse_composition_excel(excel_file.getvalue())
             n_ing = sum(len(s.get("rows",[])) for s in comp_data.get("sections",[])
                         if isinstance(s, dict))
             st.success(
@@ -1199,55 +1011,54 @@ def main() -> None:
                 f"{comp_data.get('doses_per_day','?')} dose(s)")
             progress.progress(42)
 
-            # ── Step 6: Process annexures ───────────────────────────────────
+            # Step 6: Process annexures
             log.info(f"🔬 Processing {len(annexure_files)} annexure(s)…")
             annexure_data: List[Dict] = []
-            sorted_files  = sorted(annexure_files, key=lambda f: f.name)
-            annexure_filenames: List[str] = []
-            for i, af in enumerate(sorted_files):
+            for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
                 try:
-                    raw_json = json.loads(af.getvalue().decode("utf-8","replace").lstrip("﻿"))
+                    raw_json = json.loads(af.getvalue().decode("utf-8","replace").lstrip("\ufeff"))
                 except Exception as e:
                     st.warning(f"  ⚠️ Annexure {i+1} ({af.name}): bad JSON — {e}")
                     annexure_data.append({"annexure_number":i+1,"supplier_name":"N/A",
                                           "material_name":"N/A","elements":[]})
-                    annexure_filenames.append(af.name)
                     continue
-                ann = process_annexure(raw_json, i+1, filename=af.name)
+                ann = process_annexure(raw_json, i+1)
                 annexure_data.append(ann)
-                annexure_filenames.append(af.name)
-                # Register annexure for integrity hash
-                cb.register_annexure(
-                    i+1, af.name, af.getvalue(),
-                    ann.get("material_name","N/A"),
-                    ann.get("supplier_name","N/A"),
-                )
                 st.write(f"  ✅ Annexure {i+1}: **{ann.get('material_name','?')}** "
                          f"({ann.get('supplier_name','?')}) — "
                          f"{len(ann.get('elements',[]))} elements")
                 progress.progress(42 + int(20*(i+1)/len(annexure_files)))
 
-            # ── Step 7: Calculate EI tables ─────────────────────────────────
+            # Step 7: Calculate EI tables
             log.info("🧮 Calculating EI tables (formula: daily_g × conc_µg/g)…")
-            calc_tables = calculate_ei_tables(
-                comp_data, annexure_data,
-                citation_builder=cb,
-                annexure_filenames=annexure_filenames,
-                excel_filename=excel_file.name,
-            )
+            calc_tables = calculate_ei_tables(comp_data, annexure_data)
             t5 = safe_calc_table(calc_tables,"class1_2a")
 
+            # Show calculation diagnostics
             n_rows_5 = len(t5.get("rows",[]))
             ann_materials = [a.get("material_name","?") for a in annexure_data
                              if isinstance(a,dict)]
-            st.write(f"  📊 Calc diagnostics: route={comp_data.get('route','?')} | "
-                     f"mdd_g={comp_data.get('mdd_g','?')}g | "
-                     f"ingredient_col='{comp_data.get('ingredient_col','?')}' | "
-                     f"amount_col='{comp_data.get('amount_col','?')}' | "
-                     f"Class1+2A rows={n_rows_5}")
+
+            strength_mg = comp_data.get("mdd_strength_mg", 0)
+            doses_day   = comp_data.get("doses_per_day", 1)
+            total_mg    = comp_data.get("mdd_total_mg_per_day", 0)
+            route_used  = comp_data.get("route","?")
+            total_g_calc= sum(r.get("daily_intake_g",0) for r in t5.get("rows",[]))
+
+            st.write(
+                f"  📊 **MDD**: {strength_mg}mg × {doses_day} dose(s)/day "
+                f"= {total_mg}mg/day | Route: {route_used}"
+            )
+            st.write(
+                f"  📊 **Calc check**: sum of all daily intakes in Table 5 "
+                f"= {total_g_calc:.4f}g/day | Class1+2A rows: {n_rows_5}"
+            )
             if n_rows_5 == 0:
-                st.warning("⚠️ No ingredient rows in Class1+2A table — check "
-                           "ingredient_col / amount_col / annexure matching above.")
+                st.warning("⚠️ No ingredient rows — check ingredient_col / "
+                           "amount_col / annexure matching.")
+            if doses_day == 1 and strength_mg > 0 and "sachet" in route_used.lower():
+                st.warning("⚠️ doses_per_day=1 for a sachet product — verify "
+                           "this is correct (MDD may require more than 1 sachet).")
             st.write(f"  📦 Annexure materials: {', '.join(ann_materials[:8])}")
 
             crossing = [sym for sym in TABLE5_ELEMENTS
@@ -1260,87 +1071,30 @@ def main() -> None:
                            else "⚠️ Tables empty — check diagnostics above.")
             progress.progress(72)
 
-            # ── Step 8: Generate text ───────────────────────────────────────
+            # Step 8: Generate text
             log.info("✍️ Generating report text with Claude…")
             text_sections = generate_text_sections(
-                ref_structure, annexure_data, calc_tables, comp_data,
-                citation_builder=cb,
-            )
+                ref_structure, annexure_data, calc_tables, comp_data)
             progress.progress(82)
 
-            # ── Step 9: Build DOCX + ledger + HTML ─────────────────────────
-            log.info("📝 Building DOCX + citation ledger…")
-            doc_no  = safe_str(meta.get("document_no","TSR")).replace("/","_").replace(" ","_")
-            ver     = safe_str(meta.get("version","v")).split(",")[0].replace(" ","").replace(".","_")
-            ts_str  = datetime.now().strftime('%Y%m%d_%H%M%S')
-            base_name  = f"{doc_no}_{ver}_{ts_str}"
-            report_id  = base_name
-
-            docx_bytes, ledger_dict, html_str = assemble_and_generate(
+            # Step 9: Build DOCX
+            log.info("📝 Building DOCX…")
+            docx_bytes = assemble_and_generate(
                 ref_structure, page_images, figure_pages,
                 annexure_data, comp_data, calc_tables, text_sections,
-                ref_bytes=ref_bytes, logo_b64=logo_b64, logo_type=logo_type,
-                citation_builder=cb,
-                enable_inline_citations=enable_inline_citations,
-                report_id=report_id,
-                pdf_filename=ref_pdf.name,
-            )
+                ref_bytes=ref_bytes, logo_b64=logo_b64, logo_type=logo_type)
             progress.progress(100)
             log.success("✅ Report generated!")
 
-            # Persist outputs so download buttons survive re-runs caused by clicking them
-            st.session_state["_tsr_docx"]      = docx_bytes
-            st.session_state["_tsr_ledger"]    = ledger_dict
-            st.session_state["_tsr_html"]      = html_str
-            st.session_state["_tsr_base_name"] = base_name
+            doc_no = safe_str(meta.get("document_no","TSR")).replace("/","_").replace(" ","_")
+            ver    = safe_str(meta.get("version","v")).split(",")[0].replace(" ","").replace(".","_")
+            fname  = f"{doc_no}_{ver}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            st.download_button("📥 Download Report (DOCX)", data=docx_bytes, file_name=fname,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
         except Exception as e:
             st.error(f"Pipeline error: {e}")
             logger.exception("Pipeline error")
-
-    # ── Persistent download panel ─────────────────────────────────────────────
-    # Rendered on every run so clicking any one button doesn't lose the others.
-    if "_tsr_docx" in st.session_state:
-        st.markdown("### 📥 Downloads")
-        dl1, dl2, dl3 = st.columns(3)
-        _base = st.session_state["_tsr_base_name"]
-        _docx = st.session_state["_tsr_docx"]
-        _ledger = st.session_state["_tsr_ledger"]
-        _html = st.session_state["_tsr_html"]
-
-        with dl1:
-            st.download_button(
-                "📄 Report (DOCX)",
-                data=_docx,
-                file_name=f"{_base}.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key="dl_docx",
-            )
-        with dl2:
-            if _ledger:
-                st.download_button(
-                    "📋 Citation Ledger (JSON)",
-                    data=json.dumps(_ledger, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name=f"{_base}_citation_ledger.json",
-                    mime="application/json",
-                    key="dl_ledger",
-                )
-                n_cit = _ledger.get("summary", {}).get("total_citations", 0)
-                low   = _ledger.get("summary", {}).get("low_confidence_matches", 0)
-                st.caption(f"{n_cit} citations | {low} low-confidence matches")
-            else:
-                st.info("Citation ledger not generated.")
-        with dl3:
-            if _html:
-                st.download_button(
-                    "🔍 Traceability Report (HTML)",
-                    data=_html.encode("utf-8"),
-                    file_name=f"{_base}_traceability.html",
-                    mime="text/html",
-                    key="dl_html",
-                )
-            else:
-                st.info("Traceability report not generated.")
 
     with st.expander("ℹ️ Setup & Formula"):
         st.markdown("""
@@ -1354,14 +1108,6 @@ This works for **any product**:
 **PDE values used:** Automatically selected based on route of administration
 (oral vs parenteral vs other).
 
-**Citation Ledger:** A `citation_ledger.json` is generated alongside every DOCX,
-recording the exact source (annexure field path, Excel row, ICH Q3D table) for
-every number in Tables 5, 6, and 7.
-
-**Traceability Report:** A self-contained `traceability_report.html` shows the
-full audit trail: input hashes, ingredient matching scores, calculation chains,
-and text generation provenance.
-
 **npm deps (once):** `npm install docx jszip`
 
 **Logo:** Save as `assets/logo.png` next to `app.py`
@@ -1372,3 +1118,993 @@ and text generation provenance.
 
 if __name__ == "__main__":
     main()
+!!!
+/**
+ * generate_report.js — Dr. Reddy's IPDO TSR Generator
+ * Fully product-agnostic: oral / parenteral / any formulation
+ * A5 Landscape | Times New Roman 12pt body | Page borders (notFirstPage)
+ * Spell-check disabled | Dynamic TOC from reference PDF
+ */
+"use strict";
+
+var fs    = require("fs");
+var JSZip = require("jszip");
+var docx  = require("docx");
+
+var Document            = docx.Document;
+var Packer              = docx.Packer;
+var Paragraph           = docx.Paragraph;
+var TextRun             = docx.TextRun;
+var Table               = docx.Table;
+var TableRow            = docx.TableRow;
+var TableCell           = docx.TableCell;
+var ImageRun            = docx.ImageRun;
+var Header              = docx.Header;
+var Footer              = docx.Footer;
+var AlignmentType       = docx.AlignmentType;
+var BorderStyle         = docx.BorderStyle;
+var WidthType           = docx.WidthType;
+var ShadingType         = docx.ShadingType;
+var VerticalAlign       = docx.VerticalAlign;
+var PageNumber          = docx.PageNumber;
+var PageBreak           = docx.PageBreak;
+var convertInchesToTwip = docx.convertInchesToTwip;
+
+// ── Page geometry: A5 Landscape (210×148 mm) ─────────────────────────────────
+var PAGE_W = convertInchesToTwip(8.27);
+var PAGE_H = convertInchesToTwip(5.83);
+var MAR_L  = convertInchesToTwip(0.47);
+var MAR_R  = convertInchesToTwip(0.47);
+var MAR_T  = convertInchesToTwip(0.98);
+var MAR_B  = convertInchesToTwip(0.39);
+var CW     = PAGE_W - MAR_L - MAR_R;
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+var CLR = {
+  BLACK:       "000000", WHITE:      "FFFFFF",
+  HDR_GREY:    "D9D9D9", SEC_BLUE:   "BDD7EE",
+  THRESH_BG:   "FFE699", EXCEED_BG:  "FFCCCC", EXCEED_TXT: "FF0000",
+};
+
+// ── Font & sizes (half-points) ────────────────────────────────────────────────
+var F    = "Times New Roman";
+var SZ   = { XXS:10, XS:12, SM:14, TEXT:24, MD:20, LG:22, XL:26 };
+var CHAR_SP = 15; // body text character spacing (+0.75pt)
+
+// ── Borders ───────────────────────────────────────────────────────────────────
+function bdr(sz, clr) {
+  return { style: BorderStyle.SINGLE, size: sz||4, color: clr||CLR.BLACK };
+}
+function allBdr(sz) {
+  var b = bdr(sz);
+  return { top:b, bottom:b, left:b, right:b, insideHorizontal:b, insideVertical:b };
+}
+function noBdr() {
+  var n = { style:BorderStyle.NIL, size:0, color:CLR.WHITE };
+  return { top:n, bottom:n, left:n, right:n };
+}
+function shade(fill) { return { fill:fill, type:ShadingType.CLEAR, color:"auto" }; }
+function mg() { return { top:30, right:60, bottom:30, left:60 }; }
+
+// ── Text run (noProof = no spell-check underline) ─────────────────────────────
+function run(text, opts) {
+  opts = opts||{};
+  return new TextRun({
+    text:             String(text==null?"":text),
+    bold:             !!opts.bold,
+    size:             opts.size||SZ.TEXT,
+    font:             F,
+    color:            opts.color||CLR.BLACK,
+    italics:          !!opts.italics,
+    characterSpacing: opts.cs||0,
+    noProof:          true,
+  });
+}
+
+// ── Paragraph helpers ─────────────────────────────────────────────────────────
+function para(content, opts) {
+  opts = opts||{};
+  var children;
+  if (typeof content==="string") children=[run(content,opts)];
+  else if (Array.isArray(content)) children=content;
+  else if (content) children=[content];
+  else children=[run("",opts)];
+  return new Paragraph({
+    alignment: opts.align||AlignmentType.LEFT,
+    spacing: { before:opts.before==null?40:opts.before,
+               after: opts.after ==null?40:opts.after,
+               line:  opts.line||264 },
+    children: children,
+  });
+}
+
+function bodyPara(text, opts) {
+  opts = opts||{};
+  return new Paragraph({
+    alignment: AlignmentType.BOTH,
+    spacing: { before:opts.before||20, after:opts.after||20, line:288 },
+    children: [new TextRun({
+      text:String(text==null?"":text), bold:!!opts.bold,
+      size:opts.size||SZ.TEXT, font:F, color:CLR.BLACK,
+      characterSpacing:CHAR_SP, noProof:true,
+    })],
+  });
+}
+
+function bodyParas(text) {
+  if (!text) return [];
+  return String(text).trim().split(/\n+/)
+    .filter(function(l){return l.trim();})
+    .map(function(l){return bodyPara(l.trim());});
+}
+
+function ctrPara(text, bold, size) {
+  return para(text, {align:AlignmentType.CENTER, bold:!!bold, size:size||SZ.TEXT, before:40, after:40});
+}
+function lftPara(text, bold, size) {
+  return para(text, {align:AlignmentType.LEFT, bold:!!bold, size:size||SZ.TEXT, before:20, after:20});
+}
+function blk() { return para("",{before:20,after:20}); }
+function pgBrk() { return new Paragraph({children:[new PageBreak()]}); }
+function secHd(text) {
+  return para(text,{align:AlignmentType.LEFT, bold:true, size:SZ.MD, before:80, after:40, line:264});
+}
+
+// ── Cell helpers ──────────────────────────────────────────────────────────────
+function cell(text, opts) {
+  opts = opts||{};
+  return new TableCell({
+    columnSpan:    opts.cs||1,
+    width:         opts.w?{size:opts.w,type:WidthType.DXA}:undefined,
+    borders:       opts.nb?noBdr():allBdr(4),
+    shading:       opts.fill?shade(opts.fill):undefined,
+    margins:       mg(),
+    verticalAlign: VerticalAlign.CENTER,
+    children:[new Paragraph({
+      alignment:opts.align||AlignmentType.CENTER,
+      spacing:{before:0,after:0},
+      children:[new TextRun({
+        text:String(text==null?"":text), bold:!!opts.bold,
+        size:opts.size||SZ.SM, font:F, color:opts.color||CLR.BLACK, noProof:true,
+      })],
+    })],
+  });
+}
+
+function cellL(text, opts) { opts=opts||{}; opts.align=AlignmentType.LEFT; return cell(text,opts); }
+
+function cellML(lines, opts) {
+  opts=opts||{};
+  var arr=Array.isArray(lines)?lines:[lines];
+  return new TableCell({
+    columnSpan:    opts.cs||1,
+    width:         opts.w?{size:opts.w,type:WidthType.DXA}:undefined,
+    borders:       opts.nb?noBdr():allBdr(4),
+    shading:       opts.fill?shade(opts.fill):undefined,
+    margins:       mg(),
+    verticalAlign: VerticalAlign.CENTER,
+    children:arr.filter(Boolean).map(function(l){
+      return new Paragraph({
+        alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+        children:[new TextRun({text:String(l),bold:!!opts.bold,size:opts.size||SZ.XS,font:F,noProof:true})],
+      });
+    }),
+  });
+}
+
+function emptyCell(fill,w) {
+  return new TableCell({
+    width:w?{size:w,type:WidthType.DXA}:undefined,
+    borders:allBdr(4), shading:fill?shade(fill):undefined, margins:mg(),
+    children:[new Paragraph({children:[new TextRun({text:"",noProof:true})]})],
+  });
+}
+
+// ── PAGE HEADER ───────────────────────────────────────────────────────────────
+function buildHeader(meta, logoB64, logoType) {
+  meta = meta||{};
+  var C1=900, C4=1700, C2=5200, C3=CW-C1-C2-C4;
+
+  // Logo cell
+  var logoCell;
+  if (logoB64&&logoB64.length>100) {
+    try {
+      var buf=Buffer.from(logoB64,"base64");
+      var lt=(logoType||"").indexOf("jpeg")>=0?"jpg":"png";
+      logoCell=new TableCell({
+        width:{size:C4,type:WidthType.DXA},borders:allBdr(4),margins:mg(),
+        verticalAlign:VerticalAlign.CENTER,
+        children:[new Paragraph({alignment:AlignmentType.RIGHT,spacing:{before:0,after:0},
+          children:[new ImageRun({type:lt,data:buf,transformation:{width:110,height:44}})],
+        })],
+      });
+    } catch(e) {
+      logoCell=cell("Dr. Reddy's",{bold:true,size:SZ.XS,w:C4,align:AlignmentType.RIGHT});
+    }
+  } else {
+    logoCell=cell("Dr. Reddy's",{bold:true,size:SZ.XS,w:C4,align:AlignmentType.RIGHT});
+  }
+
+  // Row 1: IPDO | Technical Summary Report | Logo
+  var r1=new TableRow({children:[
+    cell("IPDO",{bold:true,size:SZ.MD,align:AlignmentType.LEFT,w:C1}),
+    new TableCell({
+      columnSpan:2, width:{size:C2+C3,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[ctrPara("Technical Summary Report",true,SZ.MD)],
+    }),
+    logoCell,
+  ]});
+
+  // Row 2: Title (left, spans 3 cols) | Dept/Strength/Market/Protocol stacked (right)
+  function hdrLine(label, value) {
+    return new Paragraph({
+      alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+      children:[
+        new TextRun({text:label,   bold:true, size:SZ.XS, font:F, noProof:true}),
+        new TextRun({text:" "+value,bold:false,size:SZ.XS, font:F, noProof:true}),
+      ],
+    });
+  }
+  var r2=new TableRow({children:[
+    new TableCell({
+      columnSpan:3, width:{size:C1+C2+C3,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[new Paragraph({
+        alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
+        children:[new TextRun({text:"Title: "+(meta.title||""),
+                               bold:false,size:SZ.XS,font:F,noProof:true})],
+      })],
+    }),
+    new TableCell({
+      width:{size:C4,type:WidthType.DXA},
+      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
+      children:[
+        hdrLine("Department:", meta.department||""),
+        hdrLine("Strength:",   meta.strength||""),
+        hdrLine("Market:",     meta.market||""),
+        hdrLine("Protocol:",   meta.protocol||""),
+      ],
+    }),
+  ]});
+
+  // Row 3: Doc No | Product Name | Dosage Form | Version (4 separate cells)
+  var w1=Math.round(CW*0.18), w2=Math.round(CW*0.35),
+      w3=Math.round(CW*0.22), w4=CW-w1-w2-w3;
+  var r3=new TableRow({children:[
+    cellL("Document No: "+(meta.document_no||""),  {size:SZ.XS,w:w1}),
+    cellL("Product Name: "+(meta.product_name||""),{size:SZ.XS,w:w2}),
+    cellL("Dosage Form: "+(meta.dosage_form||""),  {size:SZ.XS,w:w3}),
+    cellL("Version: "+(meta.version||""),           {size:SZ.XS,w:w4}),
+  ]});
+
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA},
+    columnWidths:[C1,C2,C3,C4],
+    rows:[r1,r2,r3],
+  });
+  return new Header({children:[tbl,blk()]});
+}
+
+// ── PAGE FOOTER ───────────────────────────────────────────────────────────────
+function buildFooter() {
+  return new Footer({children:[new Paragraph({
+    alignment:AlignmentType.CENTER, spacing:{before:0,after:0},
+    children:[
+      new TextRun({text:"Page ",size:SZ.XS,font:F,noProof:true}),
+      new TextRun({children:[PageNumber.CURRENT],size:SZ.XS,font:F}),
+      new TextRun({text:" of ",size:SZ.XS,font:F,noProof:true}),
+      new TextRun({children:[PageNumber.TOTAL_PAGES],size:SZ.XS,font:F}),
+    ],
+  })]});
+}
+
+// ── TITLE PAGE ────────────────────────────────────────────────────────────────
+// Original layout: SOP row first (above), then large title box below
+function buildTitlePage(meta) {
+  meta=meta||{};
+  var sop=meta.sop_format_number||"";
+  var sopRow=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
+    rows:[new TableRow({children:[new TableCell({
+      borders:allBdr(4), margins:mg(),
+      children:[lftPara("SOP Format Number: "+sop, false, SZ.SM)],
+    })]})],
+  });
+  var titleBox=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
+    rows:[new TableRow({children:[new TableCell({
+      borders:allBdr(12),
+      margins:{top:600,right:600,bottom:600,left:600},
+      children:[ctrPara(meta.title||"",true,SZ.XL)],
+    })]})],
+  });
+  // SOP above, title below (matches original document)
+  return [sopRow, blk(), titleBox, pgBrk()];
+}
+
+// ── TABLE OF CONTENTS ─────────────────────────────────────────────────────────
+// Dynamic: uses entries extracted from the reference PDF.
+// Falls back to computed defaults based on figureCount.
+function buildTOC(tocEntries, figureCount) {
+  figureCount = figureCount||0;
+  // Compute page estimates for default TOC
+  var p14   = 3;               // Sections 1-4
+  var pRisk = p14+1;           // Risk assessment / Section 5
+  var pComp = pRisk+1+figureCount; // After figure(s)
+  var pCtrl = pComp+3;         // Control / conclusion (after calc tables ~3pp)
+  var pAnn  = pCtrl+1;         // Annexure list
+  var pRef  = pAnn+1;          // References
+  var pRev  = pRef;            // Revision history (same page usually)
+
+  // Default: 9-section structure (Esomeprazole-style)
+  var def9=[
+    {no:"1",title:"Abstract",                                         page:String(p14)},
+    {no:"2",title:"Objective",                                        page:String(p14)},
+    {no:"3",title:"Details of the study location / testing location", page:String(p14)},
+    {no:"4",title:"Background",                                       page:String(p14)},
+    {no:"5",title:"Drug product elemental impurity risk assessment",  page:String(pRisk)},
+    {no:"6",title:"Summary & Conclusion",                             page:String(pCtrl)},
+    {no:"7",title:"Reference",                                        page:String(pAnn)},
+    {no:"8",title:"List of Annexures",                                page:String(pRef)},
+    {no:"9",title:"Revision History",                                 page:String(pRev)},
+  ];
+
+  var entries = (Array.isArray(tocEntries)&&tocEntries.length) ? tocEntries : def9;
+
+  var W=[600, CW-600-900, 900];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("S. No.",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Title", {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("Page#", {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+      ]}),
+    ].concat(entries.map(function(e){
+      return new TableRow({children:[
+        cell(e.no||"",    {w:W[0],size:SZ.SM}),
+        cellL(e.title||"",{w:W[1],size:SZ.SM}),
+        cell(e.page||"",  {w:W[2],size:SZ.SM}),
+      ]});
+    })),
+  });
+  return [ctrPara("TABLE OF CONTENTS",true,SZ.MD), tbl, pgBrk()];
+}
+
+// ── ALL TEXT SECTIONS ────────────────────────────────────────────────────────
+// Renders sections 1-4 and all narrative sub-sections that follow.
+// Keeping everything here avoids duplication with buildSourcesSection.
+function buildTextSections(txt) {
+  txt=txt||{};
+  var ch=[];
+
+  function addSec(num, title, content) {
+    if (!content && content !== "") return;  // skip empty optional sections
+    ch.push(secHd(num+". "+title));
+    bodyParas(content).forEach(function(p){ch.push(p);});
+    ch.push(blk());
+  }
+
+  // Sections 1-4
+  addSec(1,"Abstract",   txt.abstract||"");
+  addSec(2,"Objective",  txt.objective||"");
+  addSec(3,"Details of the study location / testing location",
+            txt.study_location||"NA");
+
+  ch.push(secHd("4. Background:"));
+  bodyParas(txt.background||"").forEach(function(p){ch.push(p);});
+  ch.push(blk());
+
+  // Drug substance / excipient / manufacturing narrative (after Table 2)
+  // These appear AFTER the composition table and Table 2 in the document flow.
+  // They are stored here and rendered after buildSourcesSection in generateReport.
+  var postCompSections = [
+    txt.sources_intro,
+    txt.drug_substance_section,
+    txt.excipient_intro,
+    txt.manufacturing_section,
+    txt.container_closure_section,
+    txt.utilities_section,
+    txt.control_strategy,
+    txt.testing_recommendation,
+  ];
+  var hasPostComp = postCompSections.some(function(t){return !!t;});
+
+  // Store for use by generateReport — do NOT render here
+  // (they are rendered by buildPostCompSections after Table 2)
+  ch._postCompSections = postCompSections;
+  ch._hasPostComp = hasPostComp;
+
+  ch.push(pgBrk());
+  return ch;
+}
+
+// Renders the narrative sections that appear after the composition table + Table 2
+function buildPostCompSections(txt) {
+  txt=txt||{};
+  var ch=[];
+  var sections = [
+    txt.sources_intro,
+    txt.drug_substance_section,
+    txt.excipient_intro,
+    txt.manufacturing_section,
+    txt.container_closure_section,
+    txt.utilities_section,
+    txt.control_strategy,
+    txt.testing_recommendation,
+  ];
+  sections.forEach(function(t){
+    if(t){
+      bodyParas(t).forEach(function(p){ch.push(p);});
+      ch.push(blk());
+    }
+  });
+  if (ch.length > 0) ch.push(pgBrk());
+  return ch;
+}
+
+// ── GENERIC TABLE RENDERER ───────────────────────────────────────────────────
+// Renders ANY table from extracted PDF/Excel data with exact column headers.
+// columns: array of header strings
+// rows: array of arrays (same length as columns)
+// caption: optional caption string
+function renderGenericTable(caption, columns, rows) {
+  if (!Array.isArray(columns)||!columns.length) return [];
+  if (!Array.isArray(rows)||!rows.length) return [];
+
+  var N = columns.length;
+  // Distribute widths: first col gets 30%, rest share equally if >1 col
+  var firstW = Math.round(CW * 0.30);
+  var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
+  // Last col absorbs rounding remainder
+  var colWidths = [firstW];
+  for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
+  if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
+
+  // Responsive font based on column count
+  var sz = N <= 4 ? SZ.SM : (N <= 8 ? SZ.XS : SZ.XXS);
+
+  var hdrCells = columns.map(function(col, i) {
+    return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
+  });
+  var hdrRow = new TableRow({children: hdrCells});
+
+  var dataRows = rows.filter(Boolean).map(function(row) {
+    var rowArr = Array.isArray(row) ? row : [];
+    var cells = colWidths.map(function(w, i) {
+      var val = rowArr[i] != null ? String(rowArr[i]) : "";
+      return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
+    });
+    return new TableRow({children: cells});
+  });
+
+  var tbl = new Table({
+    width: {size:CW, type:WidthType.DXA},
+    columnWidths: colWidths,
+    rows: [hdrRow].concat(dataRows),
+  });
+
+  var result = [];
+  if (caption) result.push(lftPara(caption, true, SZ.SM));
+  result.push(tbl);
+  result.push(blk());
+  return result;
+}
+
+
+// ── COMPOSITION TABLE — uses exact columns extracted from Excel ───────────────
+// sections: [{name, rows:[{ingredient, columns:{ColName:val}}]}]
+// compColumns: exact column headers from Excel
+function buildCompositionTable(sections, compColumns, compMeta) {
+  compMeta    = compMeta    || {};
+  compColumns = Array.isArray(compColumns) && compColumns.length ? compColumns : null;
+
+  // Determine columns to render
+  var cols;
+  if (compColumns) {
+    // Use exact columns from Excel as extracted by Claude
+    cols = compColumns;
+  } else {
+    // Fallback: standard oral sachet columns
+    cols = ["Name of Ingredient","Function",
+            "40 mg\nmg/unit","20 mg\nmg/unit","10 mg\nmg/unit"];
+  }
+
+  var N = cols.length;
+  var firstW = Math.round(CW * 0.35);
+  var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
+  var colWidths = [firstW];
+  for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
+  if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
+
+  var sz = N <= 4 ? SZ.SM : (N <= 6 ? SZ.XS : SZ.XXS);
+
+  var hdrRow = new TableRow({children: cols.map(function(col, i) {
+    return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
+  })});
+
+  var dataRows = [];
+  var sArr = Array.isArray(sections) ? sections : [];
+  for (var si = 0; si < sArr.length; si++) {
+    var sec = sArr[si];
+    if (!sec || typeof sec !== "object") continue;
+    // Section header row (blue) spanning all columns
+    if (sec.name) {
+      dataRows.push(new TableRow({children:[new TableCell({
+        columnSpan:N, borders:allBdr(4), shading:shade(CLR.SEC_BLUE), margins:mg(),
+        children:[lftPara(sec.name, true, sz)],
+      })]}));
+    }
+    var rArr = Array.isArray(sec.rows) ? sec.rows : [];
+    for (var ri = 0; ri < rArr.length; ri++) {
+      var row = rArr[ri];
+      if (!row || typeof row !== "object") continue;
+      // Extract values in column order from the "columns" map or fallback fields
+      var cells = colWidths.map(function(w, i) {
+        var colName = cols[i] || "";
+        var val = "";
+        if (row.columns && typeof row.columns === "object") {
+          // New format: {ingredient:"...", columns:{ColName:val}}
+          val = row.columns[colName] != null ? String(row.columns[colName]) : "";
+          // If not found by exact name, try ingredient for first col
+          if (!val && i === 0) val = String(row.ingredient || row.name || "");
+        } else {
+          // Old format fallback
+          if (i === 0) val = String(row.ingredient || row.name || "");
+          else if (i === 1) val = String(row.function || row.role || row.status || "");
+          else {
+            var keys = ["40mg","20mg","10mg","amount","qty","qty_unit","compendial_status"];
+            val = String(row[keys[i-1]] || row.amount || "");
+          }
+        }
+        return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
+      });
+      dataRows.push(new TableRow({children: cells}));
+    }
+  }
+
+  var tbl = new Table({
+    width:{size:CW,type:WidthType.DXA},
+    columnWidths:colWidths,
+    rows:[hdrRow].concat(dataRows),
+  });
+
+  return [
+    secHd("5. Drug product elemental impurity risk assessment"),
+    lftPara("Table 1: Quantitative and Qualitative Composition", true, SZ.SM),
+    tbl, pgBrk(),
+  ];
+}
+
+// ── FIGURE ────────────────────────────────────────────────────────────────────
+function buildFigure(fig) {
+  if (!fig||!fig.data_b64||typeof fig.data_b64!=="string"||fig.data_b64.length<100) return[];
+  var buf;
+  try { buf=Buffer.from(fig.data_b64,"base64"); if(buf.length<500) return[]; }
+  catch(e) { return[]; }
+  var imgW=560, imgH=Math.round(imgW*0.52);
+  return [
+    lftPara(fig.figure_label||"Figure 1",true,SZ.SM),
+    new Paragraph({alignment:AlignmentType.CENTER,spacing:{before:40,after:40},
+      children:[new ImageRun({type:(fig.media_type||"").indexOf("jpeg")>=0?"jpg":"png",
+                               data:buf,transformation:{width:imgW,height:imgH}})]}),
+    blk(), pgBrk(),
+  ];
+}
+
+// ── TABLE 2: ANNEXURE DETAILS ────────────────────────────────────────────────
+// NOTE: Narrative text (sources_intro, drug_substance, excipient, manufacturing,
+// container_closure, utilities, control_strategy) is rendered ONLY in
+// buildTextSections to avoid duplication. This function renders Table 2 only.
+function buildSourcesSection(txt, annexureList) {
+  txt=txt||{}; annexureList=Array.isArray(annexureList)?annexureList:[];
+  var ch=[];
+
+  // Table 2: Annexure list (if annexures exist)
+  if (annexureList.length > 0) {
+    var W=[Math.round(CW*0.40),Math.round(CW*0.36),0];
+    W[2]=CW-W[0]-W[1];
+    var annTbl=new Table({
+      width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+      rows:[
+        new TableRow({children:[
+          cell("Name of Excipient / Material",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+          cell("Vendor",                       {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+          cell("Title of Annexure",            {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+        ]}),
+      ].concat(annexureList.map(function(a,i){
+        return new TableRow({children:[
+          cellL(a.material||"", {w:W[0],size:SZ.SM}),
+          cellL(a.supplier||"", {w:W[1],size:SZ.SM}),
+          cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
+        ]});
+      })),
+    });
+    ch.push(lftPara("Table No.2 Details of Annexures",true,SZ.SM));
+    ch.push(annTbl);
+    ch.push(blk());
+  }
+
+  return ch;
+}
+
+// ── NUMBER FORMATTER ──────────────────────────────────────────────────────────
+function fmt(val, dec) {
+  if (dec==null) dec=4;
+  if (val==null||val==="") return "";
+  var n=parseFloat(String(val).replace(/[^0-9.eE+\-]/g,""));
+  if (isNaN(n)||!isFinite(n)) return "";
+  return n.toFixed(dec);
+}
+
+// ── CALCULATION TABLES 5/6/7 ─────────────────────────────────────────────────
+// Formula: Daily exposure (µg/day) = daily_intake_g × conc_µg_per_g
+// Responsive: font shrinks for wide tables
+function buildCalcTable(tableNum, tableData, pdeValues) {
+  var d=(tableData&&typeof tableData==="object")?tableData:{};
+  var elements  = Array.isArray(d.elements)?d.elements:[];
+  var rows      = Array.isArray(d.rows)?d.rows:[];
+  var total     = d.total_daily_intake||0;
+  var eTotals   = d.element_totals||{};
+  var pde       = d.pde||{};
+  var thresh    = d.threshold_30pct||{};
+  var route     = d.route||"oral";
+
+  if (elements.length===0) return [lftPara("Table "+tableNum+": No elements data.",false,SZ.SM)];
+
+  var N=elements.length;
+  var totalCols=2+2*N;
+  var sz=totalCols<=12?SZ.SM:(totalCols<=18?SZ.XS:SZ.XXS);
+  var INGR=Math.round(CW*0.25), DI=Math.round(CW*0.06);
+  var EW=Math.max(240,Math.floor((CW-INGR-DI)/(2*N)));
+  var colW=[INGR,DI]; for(var ci=0;ci<2*N;ci++) colW.push(EW);
+
+  // Group consecutive same-class elements
+  var grps=[];
+  for(var gi=0;gi<elements.length;gi++){
+    var sym=elements[gi];
+    var cls=((pdeValues||{})[sym]||{}).class||"?";
+    if(grps.length&&grps[grps.length-1].cls===cls) grps[grps.length-1].count++;
+    else grps.push({cls:cls,count:1});
+  }
+
+  // Header rows
+  var h1=new TableRow({children:[
+    cell("Component",        {bold:true,fill:CLR.HDR_GREY,w:INGR,size:sz}),
+    cell("Daily\nIntake\n(g)",{bold:true,fill:CLR.HDR_GREY,w:DI,  size:sz}),
+    new TableCell({columnSpan:N,borders:allBdr(4),shading:shade(CLR.HDR_GREY),margins:mg(),
+      children:[ctrPara("Measured Concentration (\u00B5g/g)",true,sz)]}),
+    new TableCell({columnSpan:N,borders:allBdr(4),shading:shade(CLR.HDR_GREY),margins:mg(),
+      children:[ctrPara("Daily Exposure (\u00B5g/day)",true,sz)]}),
+  ]});
+
+  var h2cells=[emptyCell(CLR.HDR_GREY,INGR),emptyCell(CLR.HDR_GREY,DI)];
+  for(var h=0;h<2;h++) grps.forEach(function(g){
+    h2cells.push(new TableCell({columnSpan:g.count,borders:allBdr(4),shading:shade(CLR.HDR_GREY),
+      margins:mg(),children:[ctrPara("Class "+g.cls,true,sz)]}));
+  });
+  var h2=new TableRow({children:h2cells});
+
+  var h3cells=[emptyCell(CLR.HDR_GREY,INGR),emptyCell(CLR.HDR_GREY,DI)];
+  for(var hh=0;hh<2;hh++) elements.forEach(function(s){
+    h3cells.push(cell(s,{bold:true,fill:CLR.HDR_GREY,w:EW,size:sz}));
+  });
+  var h3=new TableRow({children:h3cells});
+
+  var dataRows=rows.filter(Boolean).map(function(row){
+    var mc=row.measured_conc||{}, tm=row.total_mass||{};
+    var cells=[
+      cellL(row.ingredient||"",{w:INGR,size:sz}),
+      cell(fmt(row.daily_intake_g!=null?row.daily_intake_g:0,6),{w:DI,size:sz}),
+    ];
+    elements.forEach(function(s){ cells.push(cell(fmt(mc[s]!=null?mc[s]:0,4),{w:EW,size:sz})); });
+    elements.forEach(function(s){ cells.push(cell(fmt(tm[s]!=null?tm[s]:0,6),{w:EW,size:sz})); });
+    return new TableRow({children:cells});
+  });
+
+  function footerRow(label,vals,fill,isThresh){
+    var fc=[
+      cell(label,{bold:true,fill:fill,align:AlignmentType.LEFT,w:INGR,size:sz}),
+      cell(label==="TOTAL daily intake (g/day)"?fmt(total,6):"",{fill:fill,w:DI,size:sz}),
+    ];
+    elements.forEach(function(){ fc.push(emptyCell(fill,EW)); });
+    elements.forEach(function(s){
+      var val=vals[s]!=null?vals[s]:null;
+      var tot=eTotals[s]!=null?eTotals[s]:null;
+      var ex=isThresh&&val!=null&&tot!=null&&isFinite(val)&&isFinite(tot)&&tot>val;
+      fc.push(cell(val!=null?fmt(val,3):"\u2013",{
+        fill:ex?CLR.EXCEED_BG:fill, w:EW, size:sz,
+        color:ex?CLR.EXCEED_TXT:CLR.BLACK,
+      }));
+    });
+    return new TableRow({children:fc});
+  }
+
+  var lbls={5:"Class 1 and Class 2A",6:"Class 2B",7:"Class 3"};
+  var caption="Table "+tableNum+": Theoretical Elemental Impurity Assessment ("
+    +(lbls[tableNum]||"")+")"
+    +" \u2014 Evaluation of Daily Exposure [Route: "+route+"]";
+
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:colW,
+    rows:[h1,h2,h3].concat(dataRows).concat([
+      footerRow("TOTAL daily intake (g/day)",eTotals,CLR.HDR_GREY,false),
+      footerRow("PDE (\u00B5g/day)",         pde,    CLR.HDR_GREY,false),
+      footerRow("Threshold (30% PDE)",       thresh, CLR.THRESH_BG,true),
+    ]),
+  });
+  return [lftPara(caption,true,SZ.SM), tbl, blk()];
+}
+
+// ── ADDITIONAL TABLES (verbatim from reference PDF) ──────────────────────────
+// Renders any extra tables that were extracted from the PDF but don't fit
+// into the standard EI calculation tables.
+// E.g.: Potential risk table, packing material table, summary tables, etc.
+function buildAdditionalTables(additionalTables) {
+  if (!Array.isArray(additionalTables) || !additionalTables.length) return [];
+  var ch = [];
+  for (var i = 0; i < additionalTables.length; i++) {
+    var tbl = additionalTables[i];
+    if (!tbl || typeof tbl !== "object") continue;
+    var cols = Array.isArray(tbl.columns) ? tbl.columns : [];
+    var rows = Array.isArray(tbl.rows)    ? tbl.rows    : [];
+    if (!cols.length || !rows.length) continue;
+    var parts = renderGenericTable(tbl.caption || "", cols, rows);
+    parts.forEach(function(p) { ch.push(p); });
+  }
+  return ch;
+}
+
+
+// ── SUMMARY & CONCLUSION ──────────────────────────────────────────────────────
+function buildSummary(txt) {
+  txt=txt||{};
+  var ch=[secHd("6. Summary & Conclusion")];
+  if(txt.observation){
+    ch.push(lftPara("Observation:",true,SZ.TEXT));
+    bodyParas(txt.observation).forEach(function(p){ch.push(p);});
+    ch.push(blk());
+  }
+  if(txt.conclusion){
+    ch.push(lftPara("Conclusion:",true,SZ.TEXT));
+    bodyParas(txt.conclusion).forEach(function(p){ch.push(p);});
+  }
+  ch.push(pgBrk());
+  return ch;
+}
+
+// ── ANNEXURE LIST ─────────────────────────────────────────────────────────────
+function buildAnnexureList(list) {
+  list=Array.isArray(list)?list:[];
+  var W=[Math.round(CW*0.38),Math.round(CW*0.36),0]; W[2]=CW-W[0]-W[1];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Name of Ingredient",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Vendor",            {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("Title of Annexure", {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+      ]}),
+    ].concat(list.map(function(a,i){
+      return new TableRow({children:[
+        cellL(a.material||"",{w:W[0],size:SZ.SM}),
+        cellL(a.supplier||"",{w:W[1],size:SZ.SM}),
+        cell(a.annexure||("Annexure "+(i+1)),{w:W[2],size:SZ.SM}),
+      ]});
+    })),
+  });
+  return [secHd("8. List of annexures"),
+          lftPara("Table No: 8 List of annexures",true,SZ.SM), tbl, pgBrk()];
+}
+
+// ── REVISION HISTORY ──────────────────────────────────────────────────────────
+function buildRevision(revisions) {
+  revisions=Array.isArray(revisions)?revisions:[];
+  var W=[Math.round(CW*0.40),0]; W[1]=CW-W[0];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Document and Version Number",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Brief details of changes",   {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+      ]}),
+    ].concat(revisions.filter(function(r){return r&&typeof r==="object";}).map(function(r){
+      return new TableRow({children:[
+        cellL(r.document_version||r["Document and Version Number"]||"",{w:W[0],size:SZ.SM}),
+        cellL(r.changes||r["Brief details of changes"]||"",{w:W[1],size:SZ.SM}),
+      ]});
+    })),
+  });
+  return [secHd("9. Revision history:"), tbl, pgBrk()];
+}
+
+// ── ELECTRONIC SIGNATURES ─────────────────────────────────────────────────────
+function buildSignatures(meta, signatures) {
+  meta=meta||{};
+  var W=[Math.round(CW*0.25),Math.round(CW*0.15),Math.round(CW*0.32),0];
+  W[3]=CW-W[0]-W[1]-W[2];
+  var sigs=(Array.isArray(signatures)&&signatures.length)?signatures:[
+    {intention:"Prepared by R&D",employee_id:"",user_name:"",date:""},
+    {intention:"Reviewed by R&D",employee_id:"",user_name:"",date:""},
+    {intention:"Approved by DQA",employee_id:"",user_name:"",date:""},
+  ];
+  var tbl=new Table({
+    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
+    rows:[
+      new TableRow({children:[
+        cell("Intention",  {bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+        cell("Employee ID",{bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+        cell("User Name",  {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+        cell("Date (IST)", {bold:true,fill:CLR.HDR_GREY,w:W[3],size:SZ.SM}),
+      ]}),
+    ].concat(sigs.map(function(s){
+      return new TableRow({children:[
+        cellL(s.intention||"",  {w:W[0],size:SZ.SM}),
+        cell(s.employee_id||"", {w:W[1],size:SZ.SM}),
+        cellL(s.user_name||"",  {w:W[2],size:SZ.SM}),
+        cell(s.date||"",        {w:W[3],size:SZ.SM}),
+      ]});
+    })),
+  });
+  return [ctrPara("ELECTRONIC SIGNATURES",true,SZ.MD), blk(), tbl];
+}
+
+// ── PAGE BORDER + SPELL-OFF INJECTION (JSZip post-processing) ────────────────
+function injectBordersAndSpellOff(buf) {
+  // notFirstPage = no border on title page; offsetFrom="text" = hugs content
+  var pgBXml=(
+    '<w:pgBorders w:display="notFirstPage" w:offsetFrom="text">'+
+    '<w:top    w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:left   w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:bottom w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '<w:right  w:val="single" w:sz="6" w:space="4" w:color="000000"/>'+
+    '</w:pgBorders>'
+  );
+  var spellOff='<w:hideSpellingErrors/><w:hideGrammaticalErrors/>';
+
+  return JSZip.loadAsync(buf).then(function(zip){
+    return zip.file("word/document.xml").async("string").then(function(xml){
+      // Inject borders before last </w:sectPr>
+      var idx=xml.lastIndexOf("</w:sectPr>");
+      if (idx>=0 && !xml.includes("pgBorders"))
+        xml=xml.slice(0,idx)+pgBXml+xml.slice(idx);
+      zip.file("word/document.xml",xml);
+
+      var sf=zip.file("word/settings.xml");
+      var sp;
+      if (sf) {
+        sp=sf.async("string").then(function(sxml){
+          if (!sxml.includes("hideSpellingErrors"))
+            sxml=sxml.replace("</w:settings>",spellOff+"</w:settings>");
+          zip.file("word/settings.xml",sxml);
+        });
+      } else {
+        zip.file("word/settings.xml",
+          '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'+
+          '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'+
+          spellOff+'</w:settings>');
+        sp=Promise.resolve();
+      }
+      return (sp||Promise.resolve()).then(function(){
+        return zip.generateAsync({type:"nodebuffer",compression:"DEFLATE",
+          compressionOptions:{level:6}});
+      });
+    });
+  });
+}
+
+// ── MAIN ASSEMBLY ─────────────────────────────────────────────────────────────
+function generateReport(dataPath, outPath) {
+  var raw  = fs.readFileSync(dataPath,"utf-8");
+  var data = JSON.parse(raw);
+
+  var meta        = data.meta            ||{};
+  var tocEntries  = data.toc_entries     ||[];
+  var logoB64     = data.logo_b64        ||"";
+  var logoType    = data.logo_type       ||"";
+  var txt         = data.text_sections   ||{};
+  var composition       = data.composition      ||[];
+  var compColumns       = data.comp_columns      ||[];
+  var compMeta          = data.comp_meta         ||{};
+  var additionalTables  = data.additional_tables ||[];
+  var annList     = data.annexure_list   ||[];
+  var calcTables  = data.calc_tables     ||{};
+  var revHistory  = data.revision_history||[];
+  var signatures  = data.signatures      ||[];
+  var figures     = Array.isArray(data.figures)?data.figures:[];
+  var pdeValues   = data.pde_values      ||{};
+
+  var ch=[];
+
+  var tp=buildTitlePage(meta);
+  tp.forEach(function(x){ch.push(x);});
+
+  var toc=buildTOC(tocEntries, figures.length);
+  toc.forEach(function(x){ch.push(x);});
+
+  // Sections 1-4 (Abstract, Objective, Study Location, Background) + page break
+  var s14=buildTextSections(txt);
+  s14.forEach(function(x){ch.push(x);});
+
+  // Composition table (with exact columns from Excel)
+  var comp=buildCompositionTable(composition, compColumns, compMeta);
+  comp.forEach(function(x){ch.push(x);});
+
+  // Figures (fishbone diagram etc.)
+  figures.forEach(function(fig){
+    buildFigure(fig).forEach(function(x){ch.push(x);});
+  });
+
+  // Table 2: Annexure details (no narrative text here — avoid duplication)
+  var annTbl2=buildSourcesSection(txt, annList);
+  annTbl2.forEach(function(x){ch.push(x);});
+
+  // Post-composition narrative: drug substance, excipients, manufacturing, etc.
+  // Rendered ONCE here, nowhere else.
+  var postComp=buildPostCompSections(txt);
+  postComp.forEach(function(x){ch.push(x);});
+
+  function safeT(key){
+    var e={elements:[],rows:[],total_daily_intake:0,
+           element_totals:{},pde:{},threshold_30pct:{},route:"oral"};
+    if (!calcTables||typeof calcTables!=="object"||!calcTables[key]) return e;
+    var m={};
+    Object.keys(e).forEach(function(k){m[k]=e[k];});
+    Object.keys(calcTables[key]).forEach(function(k){m[k]=calcTables[key][k];});
+    return m;
+  }
+
+  try {
+    buildCalcTable(5,safeT("class1_2a"),pdeValues).forEach(function(x){ch.push(x);});
+    buildCalcTable(6,safeT("class2b"),  pdeValues).forEach(function(x){ch.push(x);});
+    buildCalcTable(7,safeT("class3"),   pdeValues).forEach(function(x){ch.push(x);});
+    ch.push(pgBrk());
+  } catch(err){
+    console.error("Calc table error:",err.message);
+    ch.push(lftPara("Calc table error: "+err.message)); ch.push(pgBrk());
+  }
+
+  // Additional verbatim tables from reference PDF (risk tables, etc.)
+  buildAdditionalTables(additionalTables).forEach(function(x){ch.push(x);});
+
+  buildSummary(txt).forEach(function(x){ch.push(x);});
+
+  ch.push(secHd("7. Reference"));
+  ch.push(bodyPara(txt.reference||"NA"));
+  ch.push(blk());
+
+  buildAnnexureList(annList).forEach(function(x){ch.push(x);});
+  buildRevision(revHistory).forEach(function(x){ch.push(x);});
+  buildSignatures(meta, signatures).forEach(function(x){ch.push(x);});
+
+  var doc=new Document({
+    settings:{hideSpellingErrors:true, hideGrammaticalErrors:true},
+    styles:{default:{document:{run:{font:F,size:SZ.TEXT,color:CLR.BLACK}}}},
+    sections:[{
+      properties:{page:{
+        size:{width:PAGE_W,height:PAGE_H},
+        margin:{top:MAR_T,right:MAR_R,bottom:MAR_B,left:MAR_L,header:360,footer:360},
+      }},
+      headers:{default:buildHeader(meta,logoB64,logoType)},
+      footers:{default:buildFooter()},
+      children:ch,
+    }],
+  });
+
+  return Packer.toBuffer(doc)
+    .then(injectBordersAndSpellOff)
+    .then(function(finalBuf){
+      fs.writeFileSync(outPath,finalBuf);
+      console.log("Report written: "+outPath+" ("+Math.round(finalBuf.length/1024)+" KB)");
+    });
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+var dp=process.argv[2], op=process.argv[3];
+if (!dp||!op){console.error("Usage: node generate_report.js <data.json> <out.docx>"); process.exit(1);}
+generateReport(dp,op).catch(function(err){
+  console.error("FATAL:",err.message||err);
+  if (err.stack) console.error(err.stack.split("\n").slice(0,8).join("\n"));
+  process.exit(1);
+});
