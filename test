@@ -5,7 +5,7 @@ ICH Q3D (R2) | Claude Opus 4.6 via Vertex AI
 Fully product-agnostic: works for ANY formulation (oral/parenteral/topical)
 A5 Landscape | Times New Roman | Page borders
 """
-import os, json, base64, logging, time, subprocess, tempfile, re
+import os, json, base64, logging, time, subprocess, tempfile, re, hashlib
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime
@@ -20,7 +20,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ── Vertex AI ────────────────────────────────────────────────────────────────
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+default_creds = Path(__file__).parent / "datascience-254609-genai.json"
+if not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") and default_creds.exists():
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(default_creds)
 GCP_PROJECT = "prj-thematic-analysis-dev"
 GCP_REGION  = "us-east5"
 MODEL       = "claude-opus-4-6-20250514"
@@ -43,14 +45,15 @@ def claude_text(prompt: str, max_tokens: int = 8192) -> str:
     return call_claude([{"role": "user", "content": prompt}], max_tokens)
 
 
-def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png") -> str:
+def claude_vision(image_bytes: bytes, prompt: str, media_type: str = "image/png",
+                  max_tokens: int = 8192) -> str:
     if not image_bytes:
         return ""
     b64 = base64.standard_b64encode(image_bytes).decode()
     return call_claude([{"role": "user", "content": [
         {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
         {"type": "text", "text": prompt},
-    ]}])
+    ]}], max_tokens=max_tokens)
 
 
 # ── ICH Q3D PDE VALUES — both oral and parenteral ────────────────────────────
@@ -150,9 +153,24 @@ def load_logo_from_assets() -> Tuple[Optional[bytes], str]:
     return (None, "")
 
 
+def node_runtime_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    bundled = Path.home() / ".cache" / "codex-runtimes" / "codex-primary-runtime" / \
+        "dependencies" / "node" / "node_modules"
+    node_paths = []
+    if bundled.exists():
+        node_paths.extend([str(bundled), str(bundled / ".pnpm" / "node_modules")])
+    existing = env.get("NODE_PATH", "")
+    if existing:
+        node_paths.append(existing)
+    if node_paths:
+        env["NODE_PATH"] = os.pathsep.join(dict.fromkeys(node_paths))
+    return env
+
+
 # ── Pre-flight ────────────────────────────────────────────────────────────────
 def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
-                    annexure_raw: List[Tuple[str, str]]) -> List[str]:
+                    annexure_uploads: List[Tuple[str, bytes]]) -> List[str]:
     errors: List[str] = []
     try:
         doc = fitz.open(stream=ref_pdf_bytes, filetype="pdf")
@@ -171,9 +189,24 @@ def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
         wb.close()
     except Exception as e:
         errors.append(f"Excel cannot be opened: {e}")
-    if not annexure_raw:
-        errors.append("No annexure JSON files uploaded.")
-    for i, (name, raw) in enumerate(annexure_raw):
+    if not annexure_uploads:
+        errors.append("No annexure JSON/PDF files uploaded.")
+    for i, (name, raw_bytes) in enumerate(annexure_uploads):
+        lower_name = name.lower()
+        if lower_name.endswith(".json"):
+            raw = raw_bytes.decode("utf-8","replace")
+        elif lower_name.endswith(".pdf"):
+            try:
+                doc = fitz.open(stream=raw_bytes, filetype="pdf")
+                n = len(doc); doc.close()
+                if n == 0:
+                    errors.append(f"Annexure {i+1} ({name}): PDF has 0 pages.")
+            except Exception as e:
+                errors.append(f"Annexure {i+1} ({name}): PDF cannot be opened: {e}")
+            continue
+        else:
+            errors.append(f"Annexure {i+1} ({name}): upload must be JSON or PDF.")
+            continue
         try:
             obj = json.loads(raw.lstrip("\ufeff"))
             if not isinstance(obj, (dict, list)):
@@ -186,7 +219,7 @@ def validate_inputs(ref_pdf_bytes: bytes, excel_bytes: bytes,
     else:
         for pkg in ["docx", "jszip"]:
             r = subprocess.run(["node","-e",f"require('{pkg}');process.exit(0)"],
-                               capture_output=True, timeout=10)
+                               capture_output=True, timeout=10, env=node_runtime_env())
             if r.returncode != 0:
                 errors.append(f"npm package '{pkg}' not found. Run: npm install {pkg}")
     creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS","")
@@ -205,6 +238,213 @@ def rasterize_pdf_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
         pages.append(pix.tobytes("png"))
     doc.close()
     return pages
+
+
+ELEMENT_NAME_TO_SYMBOL = {
+    safe_str(info.get("name", "")).lower(): sym
+    for sym, info in ICH_PDE.items()
+    if isinstance(info, dict)
+}
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _annexure_cache_path(file_sha256: str) -> Path:
+    cache_dir = Path(__file__).parent / ".annexure_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{file_sha256}.json"
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        text = safe_str(value)
+        if text:
+            return text
+    return ""
+
+
+def _normalise_element_symbol(row: Dict) -> str:
+    raw = _first_text(row.get("symbol"), row.get("element_symbol"), row.get("Symbol"))
+    raw = re.sub(r"[^A-Za-z]", "", raw)
+    if raw:
+        for sym in ALL_ELEMENTS:
+            if sym.lower() == raw.lower():
+                return sym
+    name = _first_text(row.get("element"), row.get("element_name"),
+                       row.get("name"), row.get("Element"))
+    key = re.sub(r"\s+", " ", name.lower()).strip()
+    return ELEMENT_NAME_TO_SYMBOL.get(key, "")
+
+
+def _iter_pdf_extracted_rows(page_data: Any) -> List[Dict]:
+    if not isinstance(page_data, dict):
+        return []
+    rows: List[Dict] = []
+    for key in ("rows", "elements"):
+        value = page_data.get(key)
+        if isinstance(value, list):
+            rows.extend(r for r in value if isinstance(r, dict))
+    for table in page_data.get("tables") or []:
+        if not isinstance(table, dict):
+            continue
+        table_rows = table.get("rows") or table.get("body_rows") or []
+        if isinstance(table_rows, list):
+            rows.extend(r for r in table_rows if isinstance(r, dict))
+    return rows
+
+
+def _cell_value(value: Any) -> str:
+    if value is None:
+        return "NOT_REPORTED"
+    text = safe_str(value)
+    return text if text else "NOT_REPORTED"
+
+
+def _rows_to_docai_like_json(rows: List[Dict], metadata: Dict,
+                             file_name: str, file_sha256: str,
+                             page_count: int, page_extractions: List[Dict]) -> Dict:
+    headers = [
+        "Symbol", "Element", "Observed Level", "Concentration Value",
+        "Concentration Unit", "Analytical Method", "Intentionally Added",
+        "Listed In COA", "Data Status", "Comments",
+    ]
+    body_rows = []
+    text_lines = [
+        f"Annexure PDF file: {file_name}",
+        f"Supplier Name: {metadata.get('supplier_name','')}",
+        f"Material Name: {metadata.get('material_name','')}",
+        f"Source Type: {metadata.get('source_type','')}",
+        f"Date Filled: {metadata.get('date_filled','')}",
+        "Extracted elemental impurity table:",
+        " | ".join(headers),
+    ]
+    for row in rows:
+        symbol = _normalise_element_symbol(row)
+        if not symbol:
+            continue
+        element_name = _first_text(
+            row.get("element"), row.get("element_name"), row.get("name"),
+            ICH_PDE.get(symbol, {}).get("name", ""),
+        )
+        concentration_value = row.get("concentration_value")
+        observed_level = _first_text(
+            row.get("observed_level"), row.get("reported_value"),
+            row.get("result"), concentration_value,
+        )
+        values = [
+            symbol,
+            element_name,
+            _cell_value(observed_level),
+            _cell_value(concentration_value),
+            _first_text(row.get("concentration_unit"), row.get("unit")),
+            _first_text(row.get("analytical_method"), row.get("method")),
+            _first_text(row.get("intentionally_added"), row.get("intended")),
+            _first_text(row.get("listed_in_coa"), row.get("listed_in_coa_or_spec")),
+            _first_text(row.get("data_status"), row.get("status")),
+            _first_text(row.get("comments"), row.get("note")),
+        ]
+        body_rows.append({"cells": [{"text": str(v)} for v in values]})
+        text_lines.append(" | ".join(str(v) for v in values))
+
+    table = {
+        "headerRows": [{"cells": [{"text": h} for h in headers]}],
+        "bodyRows": body_rows,
+    }
+    return {
+        "text": "\n".join(text_lines),
+        "tables": [table],
+        "_source": {
+            "type": "pdf",
+            "filename": file_name,
+            "sha256": file_sha256,
+            "pages": page_count,
+            "cache_hit": False,
+            "page_extractions": page_extractions,
+        },
+    }
+
+
+def extract_annexure_pdf_to_json(pdf_bytes: bytes, file_name: str,
+                                 dpi: int = 200) -> Dict:
+    """
+    Convert an uploaded annexure PDF into a Document-AI-like JSON object.
+    The result is cached by SHA-256 so repeated runs do not re-call Claude.
+    """
+    file_sha256 = _sha256_bytes(pdf_bytes)
+    cache_path = _annexure_cache_path(file_sha256)
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                cached.setdefault("_source", {})
+                cached["_source"]["cache_hit"] = True
+                return cached
+        except Exception as e:
+            logger.warning(f"Annexure cache read failed for {file_name}: {e}")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    metadata: Dict[str, str] = {}
+    extracted_rows: List[Dict] = []
+    page_extractions: List[Dict] = []
+    mat = fitz.Matrix(dpi/72, dpi/72)
+    elements_hint = ", ".join(ALL_ELEMENTS)
+    try:
+        page_count = len(doc)
+        for page_index in range(page_count):
+            pix = doc.load_page(page_index).get_pixmap(
+                matrix=mat, alpha=False, colorspace=fitz.csRGB)
+            image_bytes = pix.tobytes("png")
+            prompt = (
+                "This is one page of a pharmaceutical elemental impurity annexure PDF.\n"
+                "Extract only supplier-provided elemental impurity table data visible on this page.\n"
+                "Do not infer, estimate, or fill missing concentrations. Do not create default values.\n"
+                "If a concentration cell is blank, NA, not tested, or not reported, use null.\n"
+                "If the page does not contain elemental impurity table rows, return page_has_ei_table false.\n"
+                "Use numeric concentration_value only when the number is printed. For '<0.5', use 0.5 and keep observed_level '<0.5'.\n"
+                "Do not output the 25 ICH elements unless they are actually present on this page.\n"
+                f"ICH element symbols to recognize: {elements_hint}.\n\n"
+                "Return ONLY this JSON object:\n"
+                "{\n"
+                '  "page_has_ei_table": false,\n'
+                '  "supplier_name": "", "material_name": "", "source_type": "", "date_filled": "",\n'
+                '  "tables": [{"title": "", "rows": [\n'
+                '    {"symbol": "Pb", "element": "Lead", "observed_level": "<0.5",\n'
+                '     "concentration_value": 0.5, "concentration_unit": "ug/g",\n'
+                '     "analytical_method": "", "intentionally_added": "",\n'
+                '     "listed_in_coa": "", "data_status": "reported", "comments": ""}\n'
+                "  ]}]\n"
+                "}"
+            )
+            raw = claude_vision(image_bytes, prompt, max_tokens=6000)
+            parsed = safe_json_parse(raw, {})
+            if not isinstance(parsed, dict):
+                parsed = {"page_has_ei_table": False, "parse_error": "Claude returned non-object JSON"}
+            parsed["_page_number"] = page_index + 1
+            page_extractions.append(parsed)
+
+            for key in ("supplier_name", "material_name", "source_type", "date_filled"):
+                if not metadata.get(key) and safe_str(parsed.get(key)):
+                    metadata[key] = safe_str(parsed.get(key))
+
+            rows = _iter_pdf_extracted_rows(parsed)
+            if rows:
+                extracted_rows.extend(rows)
+    finally:
+        doc.close()
+
+    docai_like = _rows_to_docai_like_json(
+        extracted_rows, metadata, file_name, file_sha256, page_count, page_extractions)
+    body_rows = docai_like.get("tables", [{}])[0].get("bodyRows", [])
+    if not body_rows:
+        raise ValueError(f"No elemental impurity table rows were extracted from {file_name}.")
+    try:
+        cache_path.write_text(json.dumps(docai_like, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Annexure cache write failed for {file_name}: {e}")
+    return docai_like
 
 
 def extract_figure_from_page(pdf_bytes: bytes, page_index: int, dpi: int = 200) -> bytes:
@@ -478,16 +718,12 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
     if isinstance(parsed, dict) and isinstance(parsed.get("sections"), list) and parsed["sections"]:
         result = parsed
     else:
-        logger.warning("Excel parse: fallback to raw rows")
-        fallback_rows = []
-        for row in all_rows[1:]:
-            if len(row) > 2 and row[0].strip():
-                fallback_rows.append({"ingredient": row[0], "amount": row[2] if len(row)>2 else "0",
-                                       "unit": "", "function": ""})
-        result = {"sections": [{"name": "Composition", "rows": fallback_rows}],
-                  "route": "oral", "mdd_g": 1.0, "doses_per_day": 1, "unit": ""}
+        raise ValueError(
+            "Composition Excel could not be parsed into structured rows. "
+            "No default MDD, route, or ingredient amounts were applied."
+        )
 
-    doses_per_day    = safe_int(result.get("doses_per_day", 1), default=1)
+    doses_per_day    = safe_int(result.get("doses_per_day", 0), default=0)
     mdd_strength_mg  = safe_float(result.get("mdd_strength_mg", 0.0), default=0.0)
     mdd_total_mg     = safe_float(result.get("mdd_total_mg_per_day", 0.0), default=0.0)
 
@@ -504,14 +740,61 @@ def parse_composition_excel(excel_bytes: bytes) -> Dict:
             )
             mdd_total_mg = expected_total
 
-    result["mdd_g"]             = safe_float(result.get("mdd_g", 1.0), default=1.0)
+    amount_col_text = safe_str(result.get("amount_col", ""))
+    unit_text = safe_str(result.get("amount_unit", ""))
+    if not unit_text:
+        unit_hint = (amount_col_text + " " + safe_str(result.get("unit", ""))).lower()
+        if "ug" in unit_hint or "Âµg" in unit_hint:
+            unit_text = "ug"
+        elif "mg" in unit_hint:
+            unit_text = "mg"
+        elif "ml" in unit_hint:
+            unit_text = "mL"
+        elif re.search(r"(^|\W)g($|\W)", unit_hint):
+            unit_text = "g"
+
+    if doses_per_day <= 0:
+        raise ValueError("Composition Excel did not provide a valid doses_per_day; MDD scaling cannot continue.")
+    if not safe_str(result.get("route", "")):
+        raise ValueError("Composition Excel did not provide route of administration; route-specific PDEs cannot be selected.")
+    if not safe_str(result.get("ingredient_col", "")):
+        raise ValueError("Composition Excel did not identify the ingredient column.")
+    if not amount_col_text:
+        raise ValueError("Composition Excel did not identify the per-dose amount column.")
+    if not unit_text:
+        raise ValueError("Composition Excel did not identify the amount unit.")
+
+    parsed_mdd_g = safe_float(result.get("mdd_g", 0.0), default=0.0)
+    if parsed_mdd_g <= 0:
+        per_dose_total_g = 0.0
+        for section in result.get("sections", []) or []:
+            if not isinstance(section, dict):
+                continue
+            for row in section.get("rows", []) or []:
+                if not isinstance(row, dict):
+                    continue
+                cols = row.get("columns", {})
+                raw_amount = cols.get(amount_col_text) if isinstance(cols, dict) else row.get("amount")
+                amount_raw = _parse_amount_g(raw_amount)
+                unit_lower = unit_text.lower()
+                if "ug" in unit_lower or "Âµg" in unit_lower:
+                    per_dose_total_g += amount_raw / 1_000_000.0
+                elif "mg" in unit_lower:
+                    per_dose_total_g += amount_raw / 1000.0
+                elif "ml" in unit_lower or "g" in unit_lower:
+                    per_dose_total_g += amount_raw
+        parsed_mdd_g = round(per_dose_total_g * doses_per_day, 8)
+    if parsed_mdd_g <= 0:
+        raise ValueError("Composition Excel did not provide enough numeric amount data to calculate product MDD in g/day.")
+
+    result["mdd_g"]             = parsed_mdd_g
     result["doses_per_day"]     = doses_per_day
     result["mdd_strength_mg"]   = mdd_strength_mg
     result["mdd_total_mg_per_day"] = mdd_total_mg
-    result["route"]             = safe_str(result.get("route", "oral")) or "oral"
+    result["route"]             = safe_str(result.get("route", ""))
     result["ingredient_col"]    = safe_str(result.get("ingredient_col", ""))
     result["amount_col"]        = safe_str(result.get("amount_col", ""))
-    result["amount_unit"]       = safe_str(result.get("amount_unit", "mg"))
+    result["amount_unit"]       = unit_text
     result["amount_per_dose"]   = True  # amounts are always per-dose; we scale by doses_per_day
     if not isinstance(result.get("sections"), list): result["sections"] = []
     if not isinstance(result.get("columns"), list):  result["columns"] = []
@@ -644,7 +927,7 @@ def process_annexure(annexure_json: Any, index: int) -> Dict:
     Extract EI data from one Document AI JSON annexure.
     Uses structured table extraction first (real numbers), then flat text fallback.
     """
-    default = {"annexure_number":index,"supplier_name":"N/A","material_name":"N/A",
+    default = {"annexure_number":index,"supplier_name":"","material_name":"",
                "source_type":"","date_filled":"","elements":[]}
 
     tables     = _extract_docai_tables(annexure_json)
@@ -666,13 +949,15 @@ def process_annexure(annexure_json: Any, index: int) -> Dict:
     prompt = (
         f"Extract elemental impurity data from Annexure {index}.\n\n"
         f"{note}\n\n"
-        "CRITICAL: concentration_value MUST be the ACTUAL number from the document.\n"
+        "CRITICAL: concentration_value MUST be the ACTUAL value from the document.\n"
         "- Printed value '0.3' → 0.3\n"
         "- '<0.5' → 0.5\n"
         "- BLQ / ND / Not Detected → 0.0  (NOT 0.05)\n"
         "- Blank / NA / not tested → 0.0\n"
-        "- ONLY use 0.05 if 0.05 is literally printed in the document\n"
-        "- Extract ALL 25 ICH Q3D elements even if value is 0.0\n\n"
+        "- ONLY use 0.05 if 0.05 is literally printed in the document.\n"
+        "- Blank / NA / not tested / not reported means concentration_value null, not 0.0.\n"
+        "- This null rule overrides any conflicting wording above.\n"
+        "- Do not output absent elements. Do not fill all 25 ICH Q3D elements by template.\n\n"
         "Return ONLY this JSON:\n"
         "{\n"
         f'  "annexure_number":{index},\n'
@@ -681,7 +966,8 @@ def process_annexure(annexure_json: Any, index: int) -> Dict:
         '  "elements":[{"symbol":"Pb","name":"Lead","class":"1",\n'
         '    "concentration_value":0.3,"concentration_unit":"ppm",\n'
         '    "analytical_method":"ICP-MS","intentionally_added":"No",\n'
-        '    "observed_level":"0.3","listed_in_coa":"Yes","comments":""}]\n'
+        '    "observed_level":"0.3","listed_in_coa":"Yes",\n'
+        '    "data_status":"reported","comments":""}]\n'
         "}\n\nDocument:\n" + content
     )
 
@@ -690,9 +976,15 @@ def process_annexure(annexure_json: Any, index: int) -> Dict:
     if not isinstance(parsed, dict): return default
     for k, v in default.items(): parsed.setdefault(k, v)
     if not isinstance(parsed.get("elements"), list): parsed["elements"] = []
+    if isinstance(annexure_json, dict) and isinstance(annexure_json.get("_source"), dict):
+        parsed["_source"] = annexure_json["_source"]
+    if not parsed["elements"]:
+        parsed["_error"] = "No elemental impurity rows were extracted from this annexure."
 
     # Flag 0.05 plague
-    vals  = [e.get("concentration_value",0) for e in parsed["elements"] if isinstance(e,dict)]
+    vals  = [_parse_conc(e.get("concentration_value"))
+             for e in parsed["elements"] if isinstance(e,dict)]
+    vals  = [v for v in vals if isinstance(v, (int, float))]
     n_005 = sum(1 for v in vals if isinstance(v,(int,float)) and abs(v-0.05)<0.001)
     if vals and n_005/len(vals) > 0.5:
         logger.warning(f"Annexure {index}: {n_005}/{len(vals)} elements=0.05 (placeholder?)")
@@ -716,6 +1008,37 @@ def _parse_conc(val: Any) -> float:
     except: return 0.0
 
 
+def _parse_conc(val: Any) -> Optional[float]:
+    """Parse concentration to ug/g (ppm). Missing/not reported stays None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return max(0.0, float(val))
+    s = str(val).strip().lower()
+    missing_terms = {
+        "", "na", "n/a", "none", "null", "not tested", "not reported",
+        "not available", "not applicable", "not provided", "nr",
+        "not determined", "no data", "not_reported", "not reported.",
+    }
+    non_detect_terms = {
+        "nd", "blq", "bdl", "nq", "not detected", "not quantified",
+        "below lod", "below loq", "below limit", "absent",
+    }
+    if s in missing_terms:
+        return None
+    if s in non_detect_terms:
+        return 0.0
+    s = re.sub(r"(ppm|µg/g|Âµg/g|ug/g|mcg/g|\s)", "", s)
+    s = s.replace("<","").replace(">","")
+    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+    if not match:
+        return None
+    try:
+        return max(0.0, float(match.group(0)))
+    except Exception:
+        return None
+
+
 def _parse_amount_g(val: Any) -> float:
     """Parse ingredient amount to grams."""
     if val is None: return 0.0
@@ -726,22 +1049,26 @@ def _parse_amount_g(val: Any) -> float:
     except: return 0.0
 
 
-def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, float]]:
-    conc_map: Dict[str, Dict[str, float]] = {}
+def _build_conc_map(annexure_data: List[Dict]) -> Dict[str, Dict[str, Optional[float]]]:
+    conc_map: Dict[str, Dict[str, Optional[float]]] = {}
     for ann in annexure_data:
         if not isinstance(ann, dict): continue
         material = safe_str(ann.get("material_name",""))
         if not material: continue
-        elem_dict: Dict[str, float] = {}
+        elem_dict: Dict[str, Optional[float]] = {}
         for el in (ann.get("elements") or []):
             if not isinstance(el, dict): continue
             sym = safe_str(el.get("symbol",""))
-            if sym: elem_dict[sym] = _parse_conc(el.get("concentration_value",0))
+            status = safe_str(el.get("data_status","")).lower()
+            conc = None if any(t in status for t in ("not_reported", "not reported", "not tested", "missing")) \
+                else _parse_conc(el.get("concentration_value"))
+            if sym:
+                elem_dict[sym] = conc
         conc_map[material] = elem_dict
     return conc_map
 
 
-def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, Optional[float]]]) -> Dict[str, Optional[float]]:
     """Match ingredient to annexure via exact, synonym, token-overlap, substring."""
     if not conc_map or not name: return {}
     name_lower = name.lower().strip()
@@ -791,6 +1118,139 @@ def _match_ingredient(name: str, conc_map: Dict[str, Dict[str, float]]) -> Dict[
     logger.warning(f"No match for '{name}' (best={best_score:.2f})")
     return {}
 
+
+def _quality_flag(severity: str, code: str, message: str,
+                  details: Optional[Dict] = None) -> Dict:
+    return {
+        "severity": severity,
+        "code": code,
+        "message": message,
+        "details": details or {},
+    }
+
+
+def _numeric_values(values: List[Any]) -> List[float]:
+    nums: List[float] = []
+    for value in values:
+        if isinstance(value, (int, float)) and value is not None:
+            nums.append(float(value))
+    return nums
+
+
+def diagnose_ei_data_quality(comp_data: Dict, annexure_data: List[Dict],
+                             calc_tables: Dict) -> List[Dict]:
+    flags: List[Dict] = []
+
+    for ann in annexure_data:
+        if not isinstance(ann, dict):
+            continue
+        material = safe_str(ann.get("material_name", "unknown material"))
+        supplier = safe_str(ann.get("supplier_name", "unknown supplier"))
+        elements = [e for e in (ann.get("elements") or []) if isinstance(e, dict)]
+        if ann.get("_error") or not elements:
+            flags.append(_quality_flag(
+                "critical", "annexure_no_ei_rows",
+                f"No elemental impurity rows were extracted for {material} ({supplier}).",
+                {"material": material, "supplier": supplier},
+            ))
+            continue
+        vals = [_parse_conc(e.get("concentration_value")) for e in elements]
+        vals = [v for v in vals if isinstance(v, (int, float))]
+        if not vals:
+            flags.append(_quality_flag(
+                "critical", "annexure_no_numeric_concentrations",
+                f"Annexure for {material} has no numeric supplier concentration values.",
+                {"material": material, "supplier": supplier},
+            ))
+        if len(vals) >= 5:
+            counts: Dict[float, int] = {}
+            for value in vals:
+                rounded = round(value, 4)
+                counts[rounded] = counts.get(rounded, 0) + 1
+            value, count = max(counts.items(), key=lambda item: item[1])
+            if count / len(vals) >= 0.5:
+                severity = "critical" if abs(value - 0.05) < 0.001 else "warning"
+                flags.append(_quality_flag(
+                    severity, "uniform_annexure_concentrations",
+                    f"{count}/{len(vals)} concentrations for {material} are identical ({value:g} ug/g).",
+                    {"material": material, "value": value, "count": count, "total": len(vals)},
+                ))
+
+    t5 = safe_calc_table(calc_tables, "class1_2a")
+    all_rows = [r for r in t5.get("rows", []) if isinstance(r, dict)]
+    unmatched = [r for r in all_rows if not safe_str(r.get("matched_annexure", ""))]
+    if unmatched:
+        flags.append(_quality_flag(
+            "critical", "ingredient_annexure_mismatch",
+            f"{len(unmatched)} composition ingredient(s) did not match any supplier annexure.",
+            {"ingredients": [r.get("ingredient", "") for r in unmatched[:12]]},
+        ))
+
+    mdd_g = safe_float(comp_data.get("mdd_g", 0.0), default=0.0)
+    total_intake = safe_float(t5.get("total_daily_intake", 0.0), default=0.0)
+    if mdd_g > 0 and total_intake > 0 and abs(mdd_g - total_intake) > max(0.05 * mdd_g, 0.05):
+        flags.append(_quality_flag(
+            "warning", "mdd_scaling_mismatch",
+            f"Calculated ingredient daily intake is {total_intake:g} g/day but product MDD is {mdd_g:g} g/day.",
+            {"calculated_daily_intake_g": total_intake, "mdd_g": mdd_g},
+        ))
+
+    high_risk_terms = ("glucose", "dextrose", "talc", "iron oxide", "ferric oxide")
+    sorted_rows = sorted(all_rows, key=lambda r: safe_float(r.get("daily_intake_g", 0.0)), reverse=True)
+    high_mass_names = {safe_str(r.get("ingredient", "")).lower() for r in sorted_rows[:3]}
+    for row in all_rows:
+        ingredient = safe_str(row.get("ingredient", ""))
+        ingredient_l = ingredient.lower()
+        is_high_risk = any(term in ingredient_l for term in high_risk_terms)
+        is_high_mass = ingredient_l in high_mass_names
+        if not (is_high_risk or is_high_mass):
+            continue
+        totals = _numeric_values(list((row.get("total_mass") or {}).values()))
+        if not safe_str(row.get("matched_annexure", "")):
+            flags.append(_quality_flag(
+                "critical", "high_risk_or_mass_unmatched",
+                f"High-mass or high-risk ingredient '{ingredient}' has no matched supplier annexure.",
+                {"ingredient": ingredient, "daily_intake_g": row.get("daily_intake_g")},
+            ))
+        elif not totals:
+            flags.append(_quality_flag(
+                "critical", "high_risk_or_mass_missing_concentrations",
+                f"High-mass or high-risk ingredient '{ingredient}' has no reported concentration values in the calculation.",
+                {"ingredient": ingredient, "matched_annexure": row.get("matched_annexure")},
+            ))
+        elif sum(totals) == 0:
+            flags.append(_quality_flag(
+                "warning", "high_risk_or_mass_zero_exposure",
+                f"High-mass or high-risk ingredient '{ingredient}' contributes zero exposure across reported elements.",
+                {"ingredient": ingredient, "matched_annexure": row.get("matched_annexure")},
+            ))
+        missing_elements = row.get("data_gap_elements") or []
+        if safe_str(row.get("matched_annexure", "")) and missing_elements:
+            flags.append(_quality_flag(
+                "warning", "high_risk_or_mass_partial_concentration_gap",
+                f"High-mass or high-risk ingredient '{ingredient}' is missing reported values for {len(missing_elements)} element(s).",
+                {"ingredient": ingredient, "missing_elements": missing_elements[:12]},
+            ))
+
+    for key in ("class1_2a", "class2b", "class3"):
+        table = safe_calc_table(calc_tables, key)
+        totals = _numeric_values(list((table.get("element_totals") or {}).values()))
+        positive = [round(v, 6) for v in totals if v > 0]
+        if len(positive) >= 4:
+            counts: Dict[float, int] = {}
+            for value in positive:
+                counts[value] = counts.get(value, 0) + 1
+            value, count = max(counts.items(), key=lambda item: item[1])
+            if count >= 3 and count / len(positive) >= 0.5:
+                flags.append(_quality_flag(
+                    "critical", "uniform_element_exposure_totals",
+                    f"{count}/{len(positive)} positive total exposures in {key} are identical ({value:g} ug/day).",
+                    {"table": key, "value": value, "count": count, "total": len(positive)},
+                ))
+
+    return flags
+
+
 def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     """
     Product-agnostic EI calculation.
@@ -804,15 +1264,20 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     mdd_g = total mass of drug product per day in grams
     This works for: oral sachets, injections, tablets, topical, etc.
     """
-    route       = safe_str(comp_data.get("route","oral"))
-    mdd_g       = safe_float(comp_data.get("mdd_g", 1.0), default=1.0)
-    doses_per_day = safe_int(comp_data.get("doses_per_day", 1), default=1)
+    route       = safe_str(comp_data.get("route",""))
+    mdd_g       = safe_float(comp_data.get("mdd_g", 0.0), default=0.0)
+    doses_per_day = safe_int(comp_data.get("doses_per_day", 0), default=0)
+    if not route:
+        raise ValueError("Route of administration is missing; route-specific PDE selection cannot continue.")
+    if doses_per_day <= 0:
+        raise ValueError("doses_per_day is missing or invalid; EI exposure scaling cannot continue.")
 
     # Column keys Claude extracted from the spreadsheet
     ingredient_col  = safe_str(comp_data.get("ingredient_col", ""))
     amount_col      = safe_str(comp_data.get("amount_col", ""))
-    amount_unit_raw = safe_str(comp_data.get("amount_unit", "mg")).lower()
-    amount_per_dose = comp_data.get("amount_per_dose", True)
+    amount_unit_raw = safe_str(comp_data.get("amount_unit", "")).lower()
+    if not amount_unit_raw:
+        raise ValueError("Ingredient amount unit is missing; EI exposure scaling cannot continue.")
 
     def _get_field(row: Dict, col_key: str, fallbacks: List[str]) -> str:
         """Get a value from a row, checking columns dict first, then direct keys."""
@@ -865,8 +1330,7 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
             elif "g" in amount_unit_raw:
                 amount_g = amount_raw
             else:
-                # Best-effort: values > 200 are almost certainly mg
-                amount_g = amount_raw / 1000.0 if amount_raw > 1 else amount_raw
+                raise ValueError(f"Unsupported ingredient amount unit: {amount_unit_raw}")
 
             # ── Scale to daily dose ──────────────────────────────────────────
             # daily_g = per-dose amount in grams × number of doses per day
@@ -888,23 +1352,39 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
     def build_one_table(elements: List[str]) -> Dict:
         rows: List[Dict] = []
         elem_totals: Dict[str, float] = {sym: 0.0 for sym in elements}
+        elem_known_counts: Dict[str, int] = {sym: 0 for sym in elements}
         total_intake = 0.0
         for ing in ingredients:
             if ing["daily_g"] == 0: continue  # strict zero only; tiny values are valid
             ing_concs = _match_ingredient(ing["name"], conc_map)
-            measured: Dict[str, float] = {}
-            total_mass: Dict[str, float] = {}
+            matched_key = ""
+            for key, values in conc_map.items():
+                if values is ing_concs:
+                    matched_key = key
+                    break
+            measured: Dict[str, Optional[float]] = {}
+            total_mass: Dict[str, Optional[float]] = {}
+            missing_elements: List[str] = []
             for sym in elements:
-                conc            = ing_concs.get(sym, 0.0)
-                measured[sym]   = round(conc, 4)
-                mass            = ing["daily_g"] * conc
+                conc = ing_concs.get(sym) if matched_key else None
+                if conc is None:
+                    measured[sym] = None
+                    total_mass[sym] = None
+                    missing_elements.append(sym)
+                    continue
+                measured[sym] = round(conc, 4)
+                mass = ing["daily_g"] * conc
                 total_mass[sym] = round(mass, 6)
-                elem_totals[sym]= round(elem_totals[sym] + mass, 6)
+                elem_totals[sym] = round(elem_totals[sym] + mass, 6)
+                elem_known_counts[sym] += 1
             total_intake += ing["daily_g"]
             rows.append({"ingredient": ing["name"],
                          "daily_intake_g": round(ing["daily_g"], 6),
                          "measured_conc": measured,
-                         "total_mass": total_mass})
+                         "total_mass": total_mass,
+                         "matched_annexure": matched_key,
+                         "data_gap_elements": missing_elements,
+                         "has_concentration_gap": bool(missing_elements)})
 
         # PDE by route
         pde_vals = {sym: get_pde(sym, route) for sym in elements}
@@ -914,17 +1394,23 @@ def calculate_ei_tables(comp_data: Dict, annexure_data: List[Dict]) -> Dict:
             "elements":           elements,
             "rows":               rows,
             "total_daily_intake": round(total_intake, 6),
-            "element_totals":     {sym: round(v, 6) for sym, v in elem_totals.items()},
+            "element_totals":     {sym: (round(elem_totals[sym], 6)
+                                         if elem_known_counts[sym] else None)
+                                   for sym in elements},
+            "element_known_counts": elem_known_counts,
             "pde":                pde_vals,
             "threshold_30pct":    threshold,
             "route":              route,
         }
 
-    return {
+    calc_tables = {
         "class1_2a": build_one_table(TABLE5_ELEMENTS),
         "class2b":   build_one_table(TABLE6_ELEMENTS),
         "class3":    build_one_table(TABLE7_ELEMENTS),
     }
+    calc_tables["data_quality_flags"] = diagnose_ei_data_quality(
+        comp_data, annexure_data, calc_tables)
+    return calc_tables
 
 
 # ── Text section generation ───────────────────────────────────────────────────
@@ -942,8 +1428,8 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
         "observation":"","reference":"NA",
     }
     meta    = ref_structure.get("meta", {}) or {}
-    route   = safe_str(comp_data.get("route","oral"))
-    mdd_g   = safe_float(comp_data.get("mdd_g",1.0))
+    route   = safe_str(comp_data.get("route",""))
+    mdd_g   = safe_float(comp_data.get("mdd_g",0.0))
     doses   = safe_int(comp_data.get("doses_per_day",1))
     toc     = ref_structure.get("toc_entries",[]) or []
 
@@ -963,7 +1449,7 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
         if pde_val and total > pde_val * 0.3:
             rows_with_sym = [r for r in t5.get("rows",[]) if isinstance(r,dict)]
             dominant = max(rows_with_sym,
-                          key=lambda r: r.get("total_mass",{}).get(sym, 0),
+                          key=lambda r: safe_float((r.get("total_mass",{}) or {}).get(sym, 0) or 0),
                           default={})
             crossing[sym] = {
                 "total":               round(total, 4),
@@ -1011,6 +1497,21 @@ def generate_text_sections(ref_structure: Dict, annexure_data: List[Dict],
     return parsed
 
 
+def resolve_report_generator_script() -> Path:
+    script_dir = Path(__file__).parent
+    candidates = [
+        script_dir / "generate_report.js",
+        script_dir / "generate_report(2).js",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    found = sorted(script_dir.glob("generate_report*.js"))
+    if found:
+        return found[0]
+    raise FileNotFoundError("No generate_report*.js script found next to the Streamlit app.")
+
+
 # ── Assemble and invoke Node.js ───────────────────────────────────────────────
 def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
                           figure_pages: List[Dict], annexure_data: List[Dict],
@@ -1052,7 +1553,7 @@ def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
         "composition":       comp_data.get("sections",[]) or [],
         "comp_columns":      comp_data.get("columns",[]) or [],
         "comp_meta":         {"route": comp_data.get("route","oral"),
-                              "mdd_g": comp_data.get("mdd_g",1.0),
+                              "mdd_g": comp_data.get("mdd_g",0.0),
                               "doses_per_day": comp_data.get("doses_per_day",1),
                               "unit": comp_data.get("unit",""),
                               "ingredient_col": comp_data.get("ingredient_col",""),
@@ -1071,12 +1572,12 @@ def assemble_and_generate(ref_structure: Dict, page_images: List[bytes],
     with tempfile.TemporaryDirectory() as tmpdir:
         json_path = Path(tmpdir) / "report_data.json"
         docx_path = Path(tmpdir) / "report.docx"
-        js_script = Path(__file__).parent / "generate_report.js"
+        js_script = resolve_report_generator_script()
         with open(json_path,"w",encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False)
         result = subprocess.run(
             ["node", str(js_script), str(json_path), str(docx_path)],
-            capture_output=True, text=True, timeout=180)
+            capture_output=True, text=True, timeout=180, env=node_runtime_env())
         if result.returncode != 0:
             raise RuntimeError(
                 f"Node.js failed (exit {result.returncode}).\n"
@@ -1111,8 +1612,8 @@ def main() -> None:
     with col3:
         st.subheader("📁 Annexure JSONs")
         annexure_files = st.file_uploader(
-            "Document AI JSONs, one per material",
-            type=["json"], accept_multiple_files=True, key="annexures")
+            "Supplier annexures, one per material (PDF or Document AI JSON)",
+            type=["json","pdf"], accept_multiple_files=True, key="annexures")
 
     st.markdown("---")
 
@@ -1123,9 +1624,8 @@ def main() -> None:
         try:
             # Step 0: Pre-flight
             log.info("🔍 Validating uploads…")
-            annexure_raw = [(af.name, af.getvalue().decode("utf-8","replace"))
-                            for af in annexure_files]
-            errors = validate_inputs(ref_pdf.getvalue(), excel_file.getvalue(), annexure_raw)
+            annexure_uploads = [(af.name, af.getvalue()) for af in annexure_files]
+            errors = validate_inputs(ref_pdf.getvalue(), excel_file.getvalue(), annexure_uploads)
             if errors:
                 for err in errors: st.error(f"❌ {err}")
                 st.stop()
@@ -1184,9 +1684,41 @@ def main() -> None:
             log.info(f"🔬 Processing {len(annexure_files)} annexure(s)…")
             annexure_data: List[Dict] = []
             for i, af in enumerate(sorted(annexure_files, key=lambda f: f.name)):
+                file_bytes = af.getvalue()
+                if af.name.lower().endswith(".pdf"):
+                    log.info(f"Extracting EI table from PDF annexure {af.name}...")
+                    raw_json = extract_annexure_pdf_to_json(file_bytes, af.name, dpi=200)
+                    source = raw_json.get("_source", {}) if isinstance(raw_json, dict) else {}
+                    if source.get("cache_hit"):
+                        st.info(f"  Annexure {i+1} ({af.name}): PDF extraction loaded from SHA-256 cache.")
+                    ann = process_annexure(raw_json, i+1)
+                    annexure_data.append(ann)
+                    els = ann.get("elements", []) or []
+                    concs = [_parse_conc(e.get("concentration_value")) for e in els if isinstance(e, dict)]
+                    numeric_concs = [c for c in concs if isinstance(c, (int, float))]
+                    n_005 = sum(1 for c in numeric_concs if abs(c - 0.05) < 0.001)
+                    n_real = sum(1 for c in numeric_concs if c > 0 and abs(c - 0.05) > 0.001)
+                    has_warn = ann.get("_warning_placeholder_values", False)
+                    status = "WARN" if has_warn else "OK"
+                    st.write(
+                        f"  {status} Annexure {i+1}: "
+                        f"**{ann.get('material_name','?')}** "
+                        f"({ann.get('supplier_name','?')}) - "
+                        f"{len(els)} elements | real: {n_real} | 0.05 placeholders: {n_005}"
+                    )
+                    if has_warn:
+                        st.warning(
+                            f"  Annexure {i+1}: "
+                            f"{n_005}/{len(els)} concentrations = 0.05 (likely placeholder). "
+                            "Check that the supplier annexure contains readable EI table data."
+                        )
+                    progress.progress(42 + int(20*(i+1)/len(annexure_files)))
+                    continue
                 try:
-                    raw_json = json.loads(af.getvalue().decode("utf-8","replace").lstrip("\ufeff"))
+                    raw_json = json.loads(file_bytes.decode("utf-8","replace").lstrip("\ufeff"))
                 except Exception as e:
+                    st.error(f"  Annexure {i+1} ({af.name}): bad JSON - {e}")
+                    st.stop()
                     st.warning(f"  ⚠️ Annexure {i+1} ({af.name}): bad JSON — {e}")
                     annexure_data.append({"annexure_number":i+1,"supplier_name":"N/A",
                                           "material_name":"N/A","elements":[]})
@@ -1194,11 +1726,10 @@ def main() -> None:
                 ann = process_annexure(raw_json, i+1)
                 annexure_data.append(ann)
                 els   = ann.get("elements", []) or []
-                n_005 = sum(1 for e in els if isinstance(e, dict) and
-                            abs(e.get("concentration_value", -1) - 0.05) < 0.001)
-                n_real= sum(1 for e in els if isinstance(e, dict) and
-                            e.get("concentration_value", 0) > 0 and
-                            abs(e.get("concentration_value", 0) - 0.05) > 0.001)
+                concs = [_parse_conc(e.get("concentration_value")) for e in els if isinstance(e, dict)]
+                numeric_concs = [c for c in concs if isinstance(c, (int, float))]
+                n_005 = sum(1 for c in numeric_concs if abs(c - 0.05) < 0.001)
+                n_real= sum(1 for c in numeric_concs if c > 0 and abs(c - 0.05) > 0.001)
                 has_warn = ann.get("_warning_placeholder_values", False)
                 status = "⚠️" if has_warn else "✅"
                 st.write(
@@ -1219,6 +1750,15 @@ def main() -> None:
             log.info("🧮 Calculating EI tables (formula: daily_g × conc_µg/g)…")
             calc_tables = calculate_ei_tables(comp_data, annexure_data)
             t5 = safe_calc_table(calc_tables,"class1_2a")
+            quality_flags = calc_tables.get("data_quality_flags", []) if isinstance(calc_tables, dict) else []
+            for flag in quality_flags:
+                if not isinstance(flag, dict):
+                    continue
+                msg = flag.get("message", "")
+                if flag.get("severity") == "critical":
+                    st.error(f"EI data quality: {msg}")
+                else:
+                    st.warning(f"EI data quality: {msg}")
 
             # Show calculation diagnostics
             n_rows_5 = len(t5.get("rows",[]))
@@ -1249,7 +1789,7 @@ def main() -> None:
 
             crossing = [sym for sym in TABLE5_ELEMENTS
                         if t5["pde"].get(sym) and
-                        t5["element_totals"].get(sym,0) > t5["pde"].get(sym,0)*0.30]
+                        (t5["element_totals"].get(sym,0) or 0) > t5["pde"].get(sym,0)*0.30]
             if crossing:
                 st.warning(f"Elements > 30% PDE: {', '.join(crossing)}")
             else:
@@ -1304,7 +1844,7 @@ This works for **any product**:
 
 if __name__ == "__main__":
     main()
-rrrrr
+#######################################3
 /**
  * generate_report.js — Dr. Reddy's IPDO TSR Generator
  * Fully product-agnostic: oral / parenteral / any formulation
@@ -1984,8 +2524,8 @@ function buildCalcTable(tableNum, tableData, pdeValues) {
       cellL(row.ingredient||"",{w:INGR,size:sz}),
       cell(fmt(row.daily_intake_g!=null?row.daily_intake_g:0,6),{w:DI,size:sz}),
     ];
-    elements.forEach(function(s){ cells.push(cell(fmt(mc[s]!=null?mc[s]:0,4),{w:EW,size:sz})); });
-    elements.forEach(function(s){ cells.push(cell(fmt(tm[s]!=null?tm[s]:0,6),{w:EW,size:sz})); });
+    elements.forEach(function(s){ cells.push(cell(fmt(mc[s],4),{w:EW,size:sz})); });
+    elements.forEach(function(s){ cells.push(cell(fmt(tm[s],6),{w:EW,size:sz})); });
     return new TableRow({children:cells});
   });
 
@@ -2021,6 +2561,34 @@ function buildCalcTable(tableNum, tableData, pdeValues) {
     ]),
   });
   return [lftPara(caption,true,SZ.SM), tbl, blk()];
+}
+
+function buildDataQualityFlags(flags) {
+  flags = Array.isArray(flags) ? flags : [];
+  if (!flags.length) return [];
+  var W = [Math.round(CW*0.16), Math.round(CW*0.24), 0];
+  W[2] = CW - W[0] - W[1];
+  var rows = [
+    new TableRow({children:[
+      cell("Severity",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
+      cell("Check",{bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
+      cell("Finding",{bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
+    ]}),
+  ].concat(flags.map(function(flag){
+    flag = flag || {};
+    var sev = String(flag.severity || "");
+    var fill = sev.toLowerCase() === "critical" ? CLR.EXCEED_BG : CLR.THRESH_BG;
+    return new TableRow({children:[
+      cell(sev,{fill:fill,w:W[0],size:SZ.XS,bold:true}),
+      cellL(flag.code || "",{w:W[1],size:SZ.XS}),
+      cellL(flag.message || "",{w:W[2],size:SZ.XS}),
+    ]});
+  }));
+  return [
+    lftPara("Elemental Impurity Data Quality Flags", true, SZ.SM),
+    new Table({width:{size:CW,type:WidthType.DXA}, columnWidths:W, rows:rows}),
+    blk(),
+  ];
 }
 
 // ── ADDITIONAL TABLES (verbatim from reference PDF) ──────────────────────────
@@ -2245,6 +2813,7 @@ function generateReport(dataPath, outPath) {
     buildCalcTable(5,safeT("class1_2a"),pdeValues).forEach(function(x){ch.push(x);});
     buildCalcTable(6,safeT("class2b"),  pdeValues).forEach(function(x){ch.push(x);});
     buildCalcTable(7,safeT("class3"),   pdeValues).forEach(function(x){ch.push(x);});
+    buildDataQualityFlags(calcTables.data_quality_flags || []).forEach(function(x){ch.push(x);});
     ch.push(pgBrk());
   } catch(err){
     console.error("Calc table error:",err.message);
