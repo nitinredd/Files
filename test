@@ -1,1045 +1,207 @@
-There are two outstanding red flags in the existing Residual Solvent (RS) workflow that must be fixed, plus a new DEG & EG document type to be built. Keep both workflows fully isolated.
+Three fixes needed. Do not merge modules. Do not bleed logic across document types.
 
 ═══════════════════════════════════════════════════════════════
-PART A — RS RED FLAGS TO FIX
+FIX 1 — AUTOMATED ANNEXURE CONVERTER DISPATCH
 ═══════════════════════════════════════════════════════════════
 
-RS RED FLAG 1 — EXCEL INPUT FLEXIBILITY:
-The RS workflow currently supports only unit-composition Excel with strength columns. Extend to support all valid RS Excel types without regressing the existing flow.
+The three existing annexure converter files already exist and are correct:
+- ei_annexure_convertor.py
+- residual_solvent_annexure_convertor.py
+- deg_eg_annexure_convertor.py
 
-Add classifier that auto-detects mode:
-- detailed_rs_calculation
-- unit_composition_strength_columns (current)
-- combined_workbook (both sheets present)
-- component_mdd_only
-- insufficient
+Do NOT rewrite these. Do NOT create new converter workflows. Do NOT modify their
+internal logic. Keep them exactly as they are.
 
-Type A (existing, preserve): unit composition Excel
-  Ingredient | Compendia Status | 40 mg | 20 mg | 10 mg | Stage
-  User provides MDD; system derives no_of_doses and amount_in_maximum_dose.
+Current behavior: user manually converts annexures to JSON in each converter's
+separate Streamlit tool before uploading to the main app.
 
-Type B (add): detailed RS calculation Excel
-  Contains: No. of doses, Components, Quantity / unit (mg), Amount in Maximum Dose (mg),
-  per-solvent Limit (ppm) + Daily Exposure (mg) for Ethanol, Ethylene Glycol, 1,4-Dioxane,
-  Iso Propyl Alcohol, Tertiary butyl alcohol, Heptane, Acetone, Methanol, Toluene,
-  Drug Product row, Total Daily Exposure row (with equivalent ppm + exposure mg),
-  Residual solvent Limit as per current USP <467> row.
-  Behavior: Excel is the primary calculation source. Use Excel values directly for Section 5
-  tables, Drug Product totals, Total Daily Exposure equivalent ppm, USP <467> comparison.
-  Annexures become traceability evidence only. Missing annexure = warning, not blocker.
-  Do not recalculate from annexures. Do not invent missing values. Do not hallucinate.
-  Do not derive 20 mg / 10 mg from 40 mg. Do not over-interpret generic supplier policy
-  statements as material-specific limits. q.s. process solvent rows with numeric quantity
-  in the calculation sheet must be respected (do not silently skip).
+New behavior: automate the dispatch. When user selects a document type in app.py
+and uploads annexure PDFs, the correct converter is invoked automatically based on
+that document type selection. No user intervention. No separate manual conversion
+step.
 
-Type C (add): combined workbook
-  Sheet 1 matches unit-composition pattern (Type A style).
-  Sheet 2 matches detailed RS calculation pattern (Type B style).
-  Optional Sheet 3: cumulative composition by stage.
-  Behavior: Unit composition sheet drives Section 4 Table 2. Detailed RS calculation sheet
-  drives Section 5 tables. Annexures evidence-only.
+app.py acts as orchestrator only. Add a document type registry:
 
-Type D (component_mdd_only): use component-level MDD directly (no strength derivation).
-Insufficient: warn, ask for richer input. Do not silently zero.
+DOCUMENT_WORKFLOWS = {
+  "Elemental Impurity Assessment":     {converter: ei_annexure_convertor, backend, renderer},
+  "Residual Solvent Risk Assessment":  {converter: residual_solvent_annexure_convertor, backend, renderer},
+  "DEG & EG Risk Assessment":          {converter: deg_eg_annexure_convertor, backend, renderer},
+}
 
-Universal calculation rules (preserve):
-- Daily Exposure (mg/day) = Amount in Maximum Dose (mg/day) × Limit (ppm) / 1,000,000.
-- Total equivalent ppm in Total Daily Exposure row = total_exposure_mg × 1,000,000 / Drug_Product_amount_in_maximum_dose_mg.
-- Confirmed no-contribution cells render 0/0. Unresolved cells render blank/NR + warning.
-- Aggregate equivalent materials before calculation (Hydroxypropyl Cellulose ↔ Hydroxy Propyl Cellulose ↔ HPC ↔ Klucel EF; Talc; Triethyl citrate; Polysorbate 80; Yellow Iron Oxide).
+User workflow (fully automatic, no review checkpoints):
+1. Select document type dropdown.
+2. Enter metadata form.
+3. Upload composition Excel + annexure PDFs.
+4. Click "Generate Report".
+5. Under the hood:
+   a. Auto-invoke correct converter based on doc type — no user action.
+   b. Auto-parse Excel.
+   c. Auto-map materials to annexures using identity resolver.
+   d. Auto-build payload.
+   e. Auto-invoke correct renderer.
+6. Download button appears.
 
-RS RED FLAG 2 — ANNEXURE MAPPING REUSE OF EI INJECTION RESOLVER:
-RS annexure mapping must reuse the proven EI injection identity-resolver architecture. Do not rebuild a new fuzzy matcher for RS. The EI injection mapping is currently working perfectly and must be the baseline.
-
-Reuse architecture only:
-- Descriptor stripping (strip generic doc-type words from material_name).
-- Identity pooling from material_name, material_name_candidates, supplier_name, document_title, filename.
-- Brand/family aliases.
-- Canonical normalized tokens.
-- Semantic equivalence (chemical abbreviations, salts, hydrates, brand/trade names).
-- Negative-pair protection.
-- Confidence scoring with auto-accept threshold.
-- Semantic fallback adjudication for ambiguous cases.
-
-Do not reuse EI element/PDE/Q3D logic, EI calculations, EI annexure schema, or any EI scientific constants. Only the identity-resolver architecture is reused; everything else is RS-specific.
-
-Adapt vocabulary for RS materials (in addition to existing EI vocabulary):
-- Sugar Spheres ↔ sugar pellets ↔ nonpareils ↔ nonpareil seeds ↔ sucrose spheres
-- Hypromellose ↔ HPMC ↔ Methocel ↔ CELSENTIAL ↔ hydroxypropyl methylcellulose
-- EUDRAGIT ↔ methacrylic acid copolymer ↔ methacrylate copolymer ↔ L30 D-55
-- Triethyl citrate ↔ TEC
-- ATBC ↔ acetyltributyl citrate
-- Polysorbate 80 ↔ Tween 80
-- Dextrose ↔ glucose ↔ anhydrous dextrose
-- HPC ↔ hydroxypropyl cellulose ↔ Klucel
-- Simethicone ↔ Q7-2243 ↔ Dow Corning Q7
-- Talc ↔ purified talc ↔ talcum ↔ hydrous magnesium silicate ↔ magnesium silicate hydrate
-- Magnesium Stearate ↔ Ligamed ↔ magnesium octadecanoate ↔ vegetable magnesium stearate
-- Crospovidone ↔ Kollidon CL ↔ crosslinked PVP ↔ Polyplasdone
-- Xanthan Gum ↔ xanthan ↔ Xantural ↔ CP Kelco
-- Yellow Iron Oxide ↔ iron oxide yellow ↔ ferric oxide yellow ↔ pigment yellow
-- Citric Acid Anhydrous ↔ anhydrous citric acid
-- Dehydrated Alcohol ↔ ethanol ↔ ethyl alcohol ↔ anhydrous alcohol
-
-Negative-pair protection:
-- TEC must not match ATBC.
-- Generic shared tokens (citrate, acid, oxide, cellulose, glycol, alcohol, stearate, copolymer) must not drive matches alone.
-
-Reject generic material identities (Residual Solvents, Residual Solvent Statement, Statement, Declaration, Product Regulatory Information, Quality Statement, Regulatory Information, Specification, Certificate of Analysis) unless real identity is found elsewhere.
-
-Mapping behavior:
-- Auto-map all components without user confirmation.
-- Show mapping status (Auto-accepted, Low-confidence auto-match, No match) as audit only.
-- Never block report generation.
-- Unmapped/missing/low-confidence → warnings/manual_review_items.
-
-Preserve warning-first validation policy (already implemented). Do not regress.
+Rules:
+- User never picks a converter — dispatch is invisible.
+- Session state namespaced per doc type: rs_*, ei_*, deg_eg_* to avoid cross-contamination.
+- No cross-imports between converter/backend modules.
+- Keep existing converter files untouched.
 
 ═══════════════════════════════════════════════════════════════
-PART B — NEW DOCUMENT TYPE: DEG & EG RISK ASSESSMENT REPORT
+FIX 2 — DEG & EG REPORT BUGS
 ═══════════════════════════════════════════════════════════════
 
-Build a fully isolated DEG & EG (Diethylene Glycol and Ethylene Glycol) Risk Assessment workflow. The reference renderer is provided as generate_deg_eg.js. The renderer is final and product-agnostic. Build only backend logic, annexure conversion, identity mapping, payload assembly, and Streamlit integration. Do not modify the renderer except trivial path/import fixes.
-
-PRODUCT TYPE BEHAVIOR:
-- No calculations.
-- No solvent exposure formula.
-- No MDD × ppm logic.
-- No PDE.
-- No USP <467> matrix.
-- No Total Daily Exposure.
-- Only composition + annexure-driven Yes/No DEG/EG presence + specification limits + observations + conclusion.
-
-INPUTS:
-1. User selects document type = DEG & EG Risk Assessment.
-2. User enters metadata: product_name, document_no, dosage_form, market, department, strength, version, protocol, sop_format_number, title, approved_date.
-3. User uploads composition Excel (same format as RS unit composition).
-4. User uploads annexure JSONs converted via dedicated DEG/EG annexure converter (separate file, not the RS converter, not the EI converter).
-
-COMPOSITION HANDLING:
-- Parse composition Excel (Ingredient, Function, strength columns, Stage).
-- Render directly as Section 4 Table 1.
-- Preserve stages exactly. q.s. rows preserved as-is.
-- No exposure calculations.
-- Output to payload.composition and payload.comp_columns.
-
-DEG/EG ANNEXURE CONVERTER (NEW, SEPARATE):
-- Build dedicated DEG/EG annexure PDF→JSON converter, fully isolated.
-- Do not reuse RS or EI converter prompts directly. Reuse only safe scaffolding (PDF rasterizer, claude_vision, JSON normalizer, schema repair, defensive list/dict guard).
-
-Must avoid all previously seen mistakes:
-- Do not produce EI-style elements[] for DEG/EG documents.
-- Do not output bare list at top-level.
-- Do not treat generic regulatory phrases as material-specific limits.
-- Do not invent numeric DEG/EG limits when none stated.
-- Do not use document title as material_name.
-- Do not lose negative declarations or controlled-by-spec evidence.
-- Always produce top-level object with stable schema.
-- Handle the converter "list object has no attribute get" failure mode defensively.
-- Repair schema when LLM returns wrong shape.
-
-CONVERTER OUTPUT SCHEMA (strict):
-{
-  "annexure_number": int,
-  "filename": str,
-  "supplier_name": str,
-  "material_name": str,
-  "material_name_candidates": [str],
-  "material_name_source": "body|filename_inferred|title",
-  "needs_material_confirmation": bool,
-  "document_title": str,
-  "annexure_type": "supplier_declaration|coa|specification|sds|statement|monograph|other",
-  "deg_eg_evidence": {
-    "deg_present": "Yes|No|Unknown",
-    "deg_specification_limit": str or null,
-    "deg_source": "vendor_coa|vendor_spec|monograph|policy_statement|usp_469|usfda_guidance|excluded_by_process|not_mentioned",
-    "eg_present": "Yes|No|Unknown",
-    "eg_specification_limit": str or null,
-    "eg_source": "vendor_coa|vendor_spec|monograph|policy_statement|usp_469|usfda_guidance|excluded_by_process|not_mentioned",
-    "raw_text": str,
-    "page": int,
-    "confidence": float
-  },
-  "declaration_scopes": [
-    {
-      "scope": str,
-      "raw_text": str,
-      "evidence_type": "negative_declaration|controlled_by_spec|coa_statement|excluded_by_process|policy_statement|usp_469_reference|usfda_guidance_reference",
-      "page": int,
-      "confidence": float
-    }
-  ],
-  "schema_repaired": bool,
-  "_error": bool,
-  "raw_text": str
-}
-
-CONVERTER PROMPT RULES:
-- No solvent_name-style field; only deg_eg_evidence applies.
-- Phrases like Class 1/2/3 solvents, OVI, ICH Q3C solvents, USP <467> solvents, other residual solvents, residual solvents, water are evidence scopes, not DEG/EG limits.
-- "Class 1/2/3 residual solvents excluded by manufacturing process" → declaration_scopes with evidence_type=excluded_by_process; no DEG/EG numeric inference.
-- Generic supplier policy/regulatory discussion (e.g. Merck letter discussing EG PDE updates) must not assign material-specific numeric DEG/EG limits. Use evidence_type=policy_statement; deg_present/eg_present=Unknown unless the named material is explicitly linked to a numeric value.
-- Vendor CoA with explicit numeric EG/DEG (e.g. NMT 620 ppm via USP <469>) is the only valid source for deg_eg_evidence numeric values.
-- USP/NF monographs alone are insufficient unless monograph explicitly states a DEG or EG numeric limit.
-- If body has no material identity, infer material_name from filename, set material_name_source=filename_inferred, needs_material_confirmation=true. Never use document_title as material_name.
-- Generic document titles (Residual Solvents, Residual Solvent Declaration, Quality Statement, Regulatory Information, Certificate of Analysis, Specification) must never become material_name.
-
-ANNEXURE MAPPING (REUSE EI INJECTION RESOLVER):
-- Reuse the EI injection identity resolver architecture exactly because it is the working baseline.
-- Adapt RS/DEG-EG vocabulary (same vocabulary list as Part A above).
-- Negative-pair protection: TEC ≠ ATBC. Generic tokens alone must not drive matches.
-- Reject generic material names unless real identity found elsewhere.
-- Auto-map all components.
-- Mapping confidence is audit info only.
-- Do not require user confirmation.
-- No mapping issue blocks generation.
-
-ASSESSMENT BUILDING:
-- For each composition material (excluding water/q.s. unless explicitly required), build assessment_table row: material_code, ingredient, deg_present, eg_present, specification_limit.
-- Defaults: Unknown (not No), Specification limit = Not applicable.
-- If matched annexure provides explicit numeric evidence → use it.
-- If matched annexure has only policy/regulatory discussion → Unknown.
-- If matched annexure has excluded_by_process or no_source negative declaration → No for both, Specification limit = Not applicable.
-- For any material where deg_present=Yes or eg_present=Yes → create one detail_tables entry with material, intro, caption, columns (USP Monograph, Vendor COA, DRL Specification, DRL Specification No.), rows, inference text.
-- Multi-positive case: multiple detail_tables entries.
-
-PAYLOAD SHAPE (match generate_deg_eg.js):
-{
-  "meta": { product_name, dosage_form, strength, market, department, document_no, version, protocol, sop_format_number, title, approved_date },
-  "logo_b64": str,
-  "logo_type": str,
-  "text_sections": {
-    "abstract": str,
-    "objective": str,
-    "study_location": "Theoretical assessment",
-    "background": str,
-    "risk_analysis_intro": str,
-    "post_assessment_narrative": str,
-    "observations": str,
-    "summary_conclusion": str,
-    "reference": [str] or str
-  },
-  "composition": [ { "name": "Seal coating", "rows": [ { "ingredient": str, "columns": { col: val } } ] } ],
-  "comp_columns": [str],
-  "composition_caption": str,
-  "assessment_table": [ { material_code, ingredient, deg_present, eg_present, specification_limit } ],
-  "assessment_caption": str,
-  "detail_tables": [ { material, intro, caption, columns, rows, inference } ],
-  "revision_history": [ { document_version, changes } ],
-  "signatures": [ { intention, employee_id, user_name, date } ]
-}
-
-NARRATIVE GENERATION:
-- abstract, objective, background, observations, summary_conclusion, reference, risk_analysis_intro, post_assessment_narrative generated by LLM using structured data only.
-- Do not invent numeric DEG/EG values.
-- Conclusion must reflect actual evidence:
-  * No positive risk → "no potential risk of DEG/EG, no drug product testing required".
-  * Positive risk with spec control → "controlled by specification".
-  * Unresolved/Unknown items exist → "manual review required".
-
-VALIDATION POLICY:
-- Warning-first only.
-- Hard-block only on:
-  * Composition Excel parsing failure.
-  * No component rows.
-  * Empty renderer payload.
-- All else (unmapped material, missing annexure evidence, low-confidence mapping, q.s. rows, no DEG/EG mention) → warning + manual_review_item.
-- Report must generate with warnings.
-- Conclusion must not claim full compliance if unresolved warnings exist.
-
-ISOLATION RULES (CRITICAL):
-- New workflow lives in its own modules: deg_eg.py, deg_eg_annexure_converter.py, deg_eg_master.py if needed, uses generate_deg_eg.js renderer.
-- Do not import RS or EI modules.
-- Do not reuse RS solvent master, RS validators, RS payload builder, RS renderer.
-- Do not reuse EI ICH_Q3D constants, EI annexure converter, EI calculations.
-- Only reuse the EI injection identity-resolver architecture for mapping. No EI scientific logic may bleed in.
-- Do not bleed DEG/EG logic into RS or EI workflows.
-- Do not bleed RS calculation engine into DEG/EG (DEG/EG has no calculations).
-
-RENDERER REFERENCE:
-- generate_deg_eg.js is final.
-- A4 Portrait fixed.
-- No page borders.
-- No additional optional sections.
-- Renderer expects the payload shape above.
-- Multi-positive detail_tables supported.
-- Detail tables follow approved-style columns when payload provides them.
-
-ACCEPTANCE CRITERIA:
-- Esomeprazole DEG/EG run: composition table populates 40/20/10 mg from Excel; Table 2 shows all materials with Polysorbate 80 EG=Yes/620 ppm and all others No/No/Not applicable; one detail table for Polysorbate 80; conclusion states no DEG/EG risk and no drug product testing required.
-- Multi-positive product (e.g. Glycerin + Propylene Glycol + Sorbitol): multiple detail tables generated automatically with no code changes.
-- Unmapped material: appears in Table 2 with Unknown; warning recorded; report generates.
-- Generic policy annexure (e.g. Merck Citric Acid policy letter): no numeric DEG/EG limit assigned; recorded as policy_statement evidence.
-- Vendor CoA with NMT 620 ppm via USP <469>: numeric value populated.
-- RS Type B detailed Excel: report generates from Excel values, including correct Drug Product totals and equivalent ppm.
-- RS Type C combined workbook: composition from sheet 1, calculation from sheet 2, traceability from annexures.
-- RS mapping: TEC ↔ Triethyl Citrate NF (not ATBC); EUDRAGIT, METHOCEL, Polysorbate 80, Talc, Magnesium Stearate, Crospovidone, Xanthan Gum, Sugar Spheres, Yellow Iron Oxide all auto-accept.
-- No regression of EI OSD or EI Injection workflows.
-- No cross-document-type leakage.
-
-reference deg_eg_generate_report.js
-"use strict";
-
-var fs    = require("fs");
-var JSZip = require("jszip");
-var docx  = require("docx");
-
-var Document            = docx.Document;
-var Packer              = docx.Packer;
-var Paragraph           = docx.Paragraph;
-var TextRun             = docx.TextRun;
-var Table               = docx.Table;
-var TableRow            = docx.TableRow;
-var TableCell           = docx.TableCell;
-var ImageRun            = docx.ImageRun;
-var Header              = docx.Header;
-var Footer              = docx.Footer;
-var AlignmentType       = docx.AlignmentType;
-var BorderStyle         = docx.BorderStyle;
-var WidthType           = docx.WidthType;
-var ShadingType         = docx.ShadingType;
-var VerticalAlign       = docx.VerticalAlign;
-var PageNumber          = docx.PageNumber;
-var PageBreak           = docx.PageBreak;
-var convertInchesToTwip = docx.convertInchesToTwip;
-
-// ── Page geometry: A4 Portrait (210 × 297 mm) ────────────────────────────────
-var PAGE_W = convertInchesToTwip(8.27);
-var PAGE_H = convertInchesToTwip(11.69);
-var MAR_L  = convertInchesToTwip(0.6);
-var MAR_R  = convertInchesToTwip(0.6);
-var MAR_T  = convertInchesToTwip(0.98);
-var MAR_B  = convertInchesToTwip(0.6);
-var CW     = PAGE_W - MAR_L - MAR_R;
-
-// ── Colors ───────────────────────────────────────────────────────────────────
-var CLR = {
-  BLACK:    "000000",
-  WHITE:    "FFFFFF",
-  HDR_GREY: "D9D9D9",
-  SEC_BLUE: "BDD7EE",
-};
-
-// ── Font & sizes (half-points) ───────────────────────────────────────────────
-var F  = "Times New Roman";
-var SZ = { XXS:10, XS:12, SM:14, TEXT:24, MD:20, LG:22, XL:26 };
-var CHAR_SP = 15;
-
-// ── Borders ──────────────────────────────────────────────────────────────────
-function bdr(sz, clr) {
-  return { style: BorderStyle.SINGLE, size: sz||4, color: clr||CLR.BLACK };
-}
-function allBdr(sz) {
-  var b = bdr(sz);
-  return { top:b, bottom:b, left:b, right:b, insideHorizontal:b, insideVertical:b };
-}
-function shade(fill) { return { fill:fill, type:ShadingType.CLEAR, color:"auto" }; }
-function mg() { return { top:30, right:60, bottom:30, left:60 }; }
-
-// ── Text run helper ──────────────────────────────────────────────────────────
-function run(text, opts) {
-  opts = opts||{};
-  return new TextRun({
-    text:             String(text==null?"":text),
-    bold:             !!opts.bold,
-    size:             opts.size||SZ.TEXT,
-    font:             F,
-    color:            opts.color||CLR.BLACK,
-    italics:          !!opts.italics,
-    characterSpacing: opts.cs||0,
-    noProof:          true,
-  });
-}
-
-// ── Paragraph helpers ────────────────────────────────────────────────────────
-function para(content, opts) {
-  opts = opts||{};
-  var children;
-  if (typeof content==="string") children=[run(content,opts)];
-  else if (Array.isArray(content)) children=content;
-  else if (content) children=[content];
-  else children=[run("",opts)];
-  return new Paragraph({
-    alignment: opts.align||AlignmentType.LEFT,
-    spacing: { before:opts.before==null?40:opts.before,
-               after: opts.after ==null?40:opts.after,
-               line:  opts.line||264 },
-    children: children,
-  });
-}
-function bodyPara(text, opts) {
-  opts = opts||{};
-  return new Paragraph({
-    alignment: AlignmentType.BOTH,
-    spacing: { before:opts.before||20, after:opts.after||20, line:288 },
-    children: [new TextRun({
-      text:String(text==null?"":text), bold:!!opts.bold,
-      size:opts.size||SZ.TEXT, font:F, color:CLR.BLACK,
-      characterSpacing:CHAR_SP, noProof:true,
-    })],
-  });
-}
-function bodyParas(text) {
-  if (text == null) return [];
-  if (Array.isArray(text)) {
-    return text.filter(function(t){return String(t||"").trim();})
-               .map(function(t){return bodyPara(String(t).trim());});
-  }
-  return String(text).trim().split(/\n+/)
-    .filter(function(l){return l.trim();})
-    .map(function(l){return bodyPara(l.trim());});
-}
-function ctrPara(text, bold, size) {
-  return para(text,{align:AlignmentType.CENTER, bold:!!bold, size:size||SZ.TEXT, before:40, after:40});
-}
-function lftPara(text, bold, size) {
-  return para(text,{align:AlignmentType.LEFT, bold:!!bold, size:size||SZ.TEXT, before:20, after:20});
-}
-function blk()  { return para("",{before:20,after:20}); }
-function pgBrk(){ return new Paragraph({children:[new PageBreak()]}); }
-function secHd(text) {
-  return para(text,{align:AlignmentType.LEFT, bold:true, size:SZ.MD, before:80, after:40, line:264});
-}
-
-// ── Cell helpers ─────────────────────────────────────────────────────────────
-function cell(text, opts) {
-  opts = opts||{};
-  return new TableCell({
-    columnSpan:    opts.cs||1,
-    rowSpan:       opts.rs||1,
-    width:         opts.w?{size:opts.w,type:WidthType.DXA}:undefined,
-    borders:       allBdr(4),
-    shading:       opts.fill?shade(opts.fill):undefined,
-    margins:       mg(),
-    verticalAlign: VerticalAlign.CENTER,
-    children:[new Paragraph({
-      alignment:opts.align||AlignmentType.CENTER,
-      spacing:{before:0,after:0},
-      children:[new TextRun({
-        text:String(text==null?"":text), bold:!!opts.bold,
-        size:opts.size||SZ.SM, font:F, color:CLR.BLACK, noProof:true,
-      })],
-    })],
-  });
-}
-function cellL(text, opts) { opts=opts||{}; opts.align=AlignmentType.LEFT; return cell(text,opts); }
-
-// ── PAGE HEADER ──────────────────────────────────────────────────────────────
-function buildHeader(meta, logoB64, logoType) {
-  meta = meta||{};
-  var C1=900, C4=1700, C2=Math.round(CW*0.45), C3=CW-C1-C2-C4;
-  if (C3 < 800) { C2 = Math.max(2000, C2-200); C3 = CW-C1-C2-C4; }
-
-  var logoCell;
-  if (logoB64 && logoB64.length>100) {
-    try {
-      var buf = Buffer.from(logoB64,"base64");
-      var lt  = (logoType||"").indexOf("jpeg")>=0?"jpg":"png";
-      logoCell = new TableCell({
-        width:{size:C4,type:WidthType.DXA},borders:allBdr(4),margins:mg(),
-        verticalAlign:VerticalAlign.CENTER,
-        children:[new Paragraph({alignment:AlignmentType.RIGHT,spacing:{before:0,after:0},
-          children:[new ImageRun({type:lt,data:buf,transformation:{width:110,height:44}})],
-        })],
-      });
-    } catch(e) {
-      logoCell = cell("",{w:C4,align:AlignmentType.RIGHT});
-    }
-  } else {
-    logoCell = cell("",{w:C4,align:AlignmentType.RIGHT});
-  }
-
-  var r1 = new TableRow({children:[
-    cell("IPDO",{bold:true,size:SZ.MD,align:AlignmentType.LEFT,w:C1}),
-    new TableCell({
-      columnSpan:2, width:{size:C2+C3,type:WidthType.DXA},
-      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
-      children:[ctrPara("Technical Summary Report",true,SZ.MD)],
-    }),
-    logoCell,
-  ]});
-
-  function hdrLine(label, value) {
-    return new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
-      children:[
-        new TextRun({text:label,    bold:true,  size:SZ.XS, font:F, noProof:true}),
-        new TextRun({text:" "+value, bold:false, size:SZ.XS, font:F, noProof:true}),
-      ],
-    });
-  }
-
-  var r2 = new TableRow({children:[
-    new TableCell({
-      columnSpan:3, width:{size:C1+C2+C3,type:WidthType.DXA},
-      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
-      children:[new Paragraph({
-        alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
-        children:[new TextRun({text:"Title: "+(meta.title||""),
-                               bold:false,size:SZ.XS,font:F,noProof:true})],
-      })],
-    }),
-    new TableCell({
-      width:{size:C4,type:WidthType.DXA},
-      borders:allBdr(4), margins:mg(), verticalAlign:VerticalAlign.CENTER,
-      children:[
-        hdrLine("Department:", meta.department||""),
-        hdrLine("Strength:",   meta.strength||""),
-        hdrLine("Market:",     meta.market||""),
-        hdrLine("Protocol:",   meta.protocol||""),
-      ],
-    }),
-  ]});
-
-  var w1 = Math.round(CW*0.18), w2 = Math.round(CW*0.35),
-      w3 = Math.round(CW*0.22), w4 = CW-w1-w2-w3;
-  var r3 = new TableRow({children:[
-    cellL("Document No: "+(meta.document_no||""),   {size:SZ.XS,w:w1}),
-    cellL("Product Name: "+(meta.product_name||""), {size:SZ.XS,w:w2}),
-    cellL("Dosage Form: "+(meta.dosage_form||""),   {size:SZ.XS,w:w3}),
-    cellL("Version: "+(meta.version||""),            {size:SZ.XS,w:w4}),
-  ]});
-
-  var tbl = new Table({
-    width:{size:CW,type:WidthType.DXA},
-    columnWidths:[C1,C2,C3,C4],
-    rows:[r1,r2,r3],
-  });
-  return new Header({children:[tbl,blk()]});
-}
-
-// ── PAGE FOOTER ──────────────────────────────────────────────────────────────
-function buildFooter() {
-  return new Footer({children:[new Paragraph({
-    alignment:AlignmentType.CENTER, spacing:{before:0,after:0},
-    children:[
-      new TextRun({text:"Page ",size:SZ.XS,font:F,noProof:true}),
-      new TextRun({children:[PageNumber.CURRENT],size:SZ.XS,font:F}),
-      new TextRun({text:" of ",size:SZ.XS,font:F,noProof:true}),
-      new TextRun({children:[PageNumber.TOTAL_PAGES],size:SZ.XS,font:F}),
-    ],
-  })]});
-}
-
-// ── TITLE PAGE ───────────────────────────────────────────────────────────────
-function buildTitlePage(meta) {
-  meta = meta||{};
-  var sop = meta.sop_format_number || "";
-  var sopRow = new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
-    rows:[new TableRow({children:[new TableCell({
-      borders:allBdr(4), margins:mg(),
-      children:[lftPara("SOP Format Number: "+sop, false, SZ.SM)],
-    })]})],
-  });
-  var titleText = meta.title || "Risk Assessment of Diethylene Glycol and Ethylene Glycol";
-  var titleBox = new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
-    rows:[new TableRow({children:[new TableCell({
-      borders:allBdr(12),
-      margins:{top:600,right:600,bottom:600,left:600},
-      children:[ctrPara(titleText,true,SZ.XL)],
-    })]})],
-  });
-  return [sopRow, blk(), titleBox, pgBrk()];
-}
-
-// ── TABLE OF CONTENTS ────────────────────────────────────────────────────────
-function buildTOC() {
-  var entries = [
-    {no:"1", title:"Abstract",                                         page:""},
-    {no:"2", title:"Objective",                                        page:""},
-    {no:"3", title:"Details of the study location / testing location", page:""},
-    {no:"4", title:"Background",                                       page:""},
-    {no:"5", title:"Observations",                                     page:""},
-    {no:"6", title:"Summary & Conclusion",                             page:""},
-    {no:"7", title:"Reference",                                        page:""},
-    {no:"8", title:"Change History",                                   page:""},
-  ];
-  var W = [600, CW-600-900, 900];
-  var tbl = new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
-    rows:[
-      new TableRow({children:[
-        cell("S. No.",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
-        cell("Title", {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
-        cell("Page#", {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
-      ]}),
-    ].concat(entries.map(function(e){
-      return new TableRow({children:[
-        cell(e.no||"",    {w:W[0],size:SZ.SM}),
-        cellL(e.title||"",{w:W[1],size:SZ.SM}),
-        cell(e.page||"",  {w:W[2],size:SZ.SM}),
-      ]});
-    })),
-  });
-  return [ctrPara("TABLE OF CONTENTS",true,SZ.MD), tbl, pgBrk()];
-}
-
-// ── SECTIONS 1-4 ─────────────────────────────────────────────────────────────
-function buildTextSections(txt) {
-  txt = txt||{};
-  var ch = [];
-  function addSec(num, title, content) {
-    ch.push(secHd(num+". "+title+":"));
-    if (content) bodyParas(content).forEach(function(p){ch.push(p);});
-    ch.push(blk());
-  }
-  addSec(1, "Abstract",                                         txt.abstract       || "");
-  addSec(2, "Objective",                                        txt.objective      || "");
-  addSec(3, "Details of the study location / testing location", txt.study_location || "Theoretical assessment");
-  addSec(4, "Background",                                       txt.background     || "");
-  return ch;
-}
-
-// ── COMPOSITION TABLE (Table 1) ──────────────────────────────────────────────
-function buildCompositionTable(payload) {
-  var sections    = Array.isArray(payload.composition) ? payload.composition : [];
-  var compColumns = Array.isArray(payload.comp_columns) && payload.comp_columns.length
-                      ? payload.comp_columns
-                      : ["Name of Ingredient","Function","mg/unit"];
-  var caption     = payload.composition_caption
-                      || "Table 1: Qualitative and Quantitative composition";
-
-  var N = compColumns.length;
-  var firstW = Math.round(CW * 0.35);
-  var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
-  var colWidths = [firstW];
-  for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
-  if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
-  var sz = N <= 4 ? SZ.SM : (N <= 6 ? SZ.XS : SZ.XXS);
-
-  var hdrRow = new TableRow({children: compColumns.map(function(col, i) {
-    return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
-  })});
-
-  var dataRows = [];
-  for (var si = 0; si < sections.length; si++) {
-    var sec = sections[si];
-    if (!sec || typeof sec !== "object") continue;
-    if (sec.name) {
-      dataRows.push(new TableRow({children:[new TableCell({
-        columnSpan:N, borders:allBdr(4), shading:shade(CLR.SEC_BLUE), margins:mg(),
-        children:[lftPara(sec.name, true, sz)],
-      })]}));
-    }
-    var rArr = Array.isArray(sec.rows) ? sec.rows : [];
-    for (var ri = 0; ri < rArr.length; ri++) {
-      var row = rArr[ri];
-      if (!row || typeof row !== "object") continue;
-      var cells = colWidths.map(function(w, i) {
-        var colName = compColumns[i] || "";
-        var val = "";
-        if (row.columns && typeof row.columns === "object") {
-          val = row.columns[colName] != null ? String(row.columns[colName]) : "";
-          if (!val && i === 0) val = String(row.ingredient || row.name || "");
-        } else {
-          if (i === 0) val = String(row.ingredient || row.name || "");
-          else if (i === 1) val = String(row.function || row.role || "");
-          else val = String(row.amount || row.qty || "");
-        }
-        return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
-      });
-      dataRows.push(new TableRow({children: cells}));
-    }
-  }
-
-  var tbl = new Table({
-    width:{size:CW,type:WidthType.DXA},
-    columnWidths:colWidths,
-    rows:[hdrRow].concat(dataRows),
-  });
-  return [
-    lftPara(caption, true, SZ.SM),
-    blk(),
-    tbl,
-    pgBrk(),
-  ];
-}
-
-// ── TABLE 2: DEG/EG assessment ──────────────────────────────────────────────
-function buildAssessmentTable(payload) {
-  var rows    = Array.isArray(payload.assessment_table) ? payload.assessment_table
-              : Array.isArray(payload.deg_eg_assessment) ? payload.deg_eg_assessment
-              : [];
-  var caption = payload.assessment_caption
-              || "Table 2: Assessment of Diethylene Glycol and Ethylene Glycol in the input API and Excipients";
-  var introTxt = payload.text_sections && payload.text_sections.risk_analysis_intro
-              ? payload.text_sections.risk_analysis_intro
-              : "API and excipients were assessed for the potential presence of Diethylene Glycol and Ethylene Glycol based on the COAs received from the respective manufacturers and in-house specifications, and applicable regulatory guidance. Summary of outcome is tabulated below.";
-  if (rows.length === 0) return [];
-
-  var cols = [
-    "Material code",
-    "Name of Ingredient",
-    "Presence of\nDiethylene Glycol\n(Yes / No)",
-    "Presence of\nEthylene Glycol\n(Yes / No)",
-    "Specification\nlimit"
-  ];
-
-  var W = [
-    Math.round(CW * 0.12),
-    Math.round(CW * 0.30),
-    Math.round(CW * 0.18),
-    Math.round(CW * 0.18),
-    0
-  ];
-  W[4] = CW - W[0] - W[1] - W[2] - W[3];
-  var sz = SZ.SM;
-
-  var hdrRow = new TableRow({children: cols.map(function(col, i) {
-    return cell(col, {bold:true, fill:CLR.HDR_GREY, w:W[i], size:sz});
-  })});
-
-  var dataRows = rows.map(function(row) {
-    var matCode    = String(row.material_code || row.code || "");
-    var ingredient = String(row.ingredient || row.name || "");
-    var degPresent = String(row.deg_present || row.diethylene_glycol || "Unknown");
-    var egPresent  = String(row.eg_present  || row.ethylene_glycol  || "Unknown");
-    var specLimit  = String(row.specification_limit || row.spec_limit || "Not applicable");
-    return new TableRow({children:[
-      cell(matCode,    {w:W[0], size:sz}),
-      cellL(ingredient,{w:W[1], size:sz}),
-      cell(degPresent, {w:W[2], size:sz}),
-      cell(egPresent,  {w:W[3], size:sz}),
-      cell(specLimit,  {w:W[4], size:sz}),
-    ]});
-  });
-
-  var tbl = new Table({
-    width:{size:CW, type:WidthType.DXA},
-    columnWidths: W,
-    rows: [hdrRow].concat(dataRows),
-  });
-  return [
-    secHd("Risk analysis and evaluation for diethylene glycol and ethylene glycol in respective drug substances & excipients:"),
-    bodyPara(introTxt),
-    blk(),
-    lftPara(caption, true, SZ.SM),
-    tbl,
-    blk(),
-  ];
-}
-
-// ── POSITIVE-RISK DETAIL TABLES (one per material) ──────────────────────────
-function buildPositiveRiskDetailTables(payload) {
-  var details = Array.isArray(payload.detail_tables) ? payload.detail_tables : [];
-  if (details.length === 0) return [];
-  var ch = [];
-
-  for (var d = 0; d < details.length; d++) {
-    var item = details[d];
-    if (!item || typeof item !== "object") continue;
-
-    var material  = item.material  || "";
-    var intro     = item.intro     || "";
-    var caption   = item.caption
-                    || (material
-                          ? "Detailed assessment for " + material
-                          : "Detailed assessment");
-    var columns   = Array.isArray(item.columns) ? item.columns : [];
-    var rows      = Array.isArray(item.rows)    ? item.rows    : [];
-    var inference = item.inference || "";
-
-    if (material) ch.push(secHd("Assessment for: " + material));
-    if (intro)    bodyParas(intro).forEach(function(p){ch.push(p);});
-    if (intro)    ch.push(blk());
-
-    if (columns.length > 0 && rows.length > 0) {
-      var N = columns.length;
-      var firstW = Math.round(CW * 0.18);
-      var restW  = N > 1 ? Math.floor((CW - firstW) / (N - 1)) : CW;
-      var colWidths = [firstW];
-      for (var ci = 1; ci < N - 1; ci++) colWidths.push(restW);
-      if (N > 1) colWidths.push(CW - firstW - restW * (N - 2));
-      var sz = N <= 4 ? SZ.SM : (N <= 8 ? SZ.XS : SZ.XXS);
-
-      var hdrRow = new TableRow({children: columns.map(function(col, i) {
-        return cell(String(col||""), {bold:true, fill:CLR.HDR_GREY, w:colWidths[i], size:sz});
-      })});
-
-      var dataRows = rows.map(function(row) {
-        var rowArr = Array.isArray(row) ? row
-                    : (row && typeof row === "object" && row.cells ? row.cells : []);
-        var cells = colWidths.map(function(w, i) {
-          var val = rowArr[i] != null ? String(rowArr[i]) : "";
-          return i === 0 ? cellL(val, {w:w, size:sz}) : cell(val, {w:w, size:sz});
-        });
-        return new TableRow({children: cells});
-      });
-
-      var tbl = new Table({
-        width:{size:CW, type:WidthType.DXA},
-        columnWidths: colWidths,
-        rows: [hdrRow].concat(dataRows),
-      });
-      ch.push(lftPara(caption, true, SZ.SM));
-      ch.push(tbl);
-      ch.push(blk());
-    }
-
-    if (inference) {
-      bodyParas(inference).forEach(function(p){ch.push(p);});
-      ch.push(blk());
-    }
-  }
-  return ch;
-}
-
-// ── SECTION 5: OBSERVATIONS ──────────────────────────────────────────────────
-function buildObservations(txt) {
-  txt = txt||{};
-  var ch = [];
-  ch.push(secHd("5. Observations:"));
-  if (txt.observations) {
-    bodyParas(txt.observations).forEach(function(p){ch.push(p);});
-  }
-  ch.push(blk());
-  return ch;
-}
-
-// ── SECTION 6: SUMMARY & CONCLUSION ──────────────────────────────────────────
-function buildSummary(txt) {
-  txt = txt||{};
-  var ch = [secHd("6. Summary & Conclusion:")];
-  if (txt.summary_conclusion) {
-    bodyParas(txt.summary_conclusion).forEach(function(p){ch.push(p);});
-  } else if (txt.conclusion) {
-    bodyParas(txt.conclusion).forEach(function(p){ch.push(p);});
-  }
-  ch.push(blk());
-  ch.push(pgBrk());
-  return ch;
-}
-
-// ── SECTION 7: REFERENCE ─────────────────────────────────────────────────────
-function buildReference(txt) {
-  txt = txt||{};
-  var ch = [];
-  ch.push(secHd("7. Reference:"));
-  var refs = txt.reference || txt.references || "";
-  if (Array.isArray(refs)) {
-    refs.forEach(function(r, idx) {
-      ch.push(bodyPara((idx+1)+". "+String(r)));
-    });
-  } else if (refs) {
-    bodyParas(refs).forEach(function(p){ch.push(p);});
-  }
-  ch.push(blk());
-  return ch;
-}
-
-// ── SECTION 8: CHANGE HISTORY ────────────────────────────────────────────────
-function buildRevision(revisions) {
-  revisions = Array.isArray(revisions) ? revisions : [];
-  if (revisions.length === 0) return [];
-  var W = [Math.round(CW*0.40), 0]; W[1] = CW - W[0];
-  var tbl = new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
-    rows:[
-      new TableRow({children:[
-        cell("Document & version number",{bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
-        cell("Brief Details of Changes",  {bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
-      ]}),
-    ].concat(revisions.filter(function(r){return r && typeof r==="object";}).map(function(r){
-      return new TableRow({children:[
-        cell(r.document_version||r.version||"",{w:W[0],size:SZ.SM}),
-        cellL(r.changes||r.details||r.brief_details||"",{w:W[1],size:SZ.SM}),
-      ]});
-    })),
-  });
-  return [secHd("8. Change History:"), tbl, pgBrk()];
-}
-
-// ── ELECTRONIC SIGNATURES ────────────────────────────────────────────────────
-function buildSignatures(meta, signatures) {
-  meta = meta||{};
-  var W = [Math.round(CW*0.25),Math.round(CW*0.15),Math.round(CW*0.32),0];
-  W[3] = CW - W[0] - W[1] - W[2];
-
-  var sigs = (Array.isArray(signatures) && signatures.length) ? signatures : [
-    {intention:"Prepared by R&D",employee_id:"",user_name:"",date:""},
-    {intention:"Reviewed by R&D",employee_id:"",user_name:"",date:""},
-    {intention:"Approved by DQA",employee_id:"",user_name:"",date:""},
-  ];
-
-  var titleChildren = [];
-  if (meta.title) {
-    titleChildren.push(new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:0,after:0},
-      children:[new TextRun({text:"Title", bold:true, size:SZ.SM, font:F, noProof:true})],
-    }));
-    titleChildren.push(new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:20,after:0},
-      children:[new TextRun({text:meta.title||"", bold:false, size:SZ.XS, font:F, noProof:true})],
-    }));
-  }
-  if (meta.document_no) {
-    titleChildren.push(new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:40,after:0},
-      children:[
-        new TextRun({text:"Document No  ", bold:true,  size:SZ.SM, font:F, noProof:true}),
-        new TextRun({text:meta.document_no||"", bold:false, size:SZ.SM, font:F, noProof:true}),
-      ],
-    }));
-  }
-  if (meta.version) {
-    titleChildren.push(new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:20,after:0},
-      children:[
-        new TextRun({text:"Version  ", bold:true,  size:SZ.SM, font:F, noProof:true}),
-        new TextRun({text:meta.version||"", bold:false, size:SZ.SM, font:F, noProof:true}),
-      ],
-    }));
-  }
-  if (meta.approved_date) {
-    titleChildren.push(new Paragraph({
-      alignment:AlignmentType.LEFT, spacing:{before:20,after:0},
-      children:[
-        new TextRun({text:"Approved Date  ", bold:true,  size:SZ.SM, font:F, noProof:true}),
-        new TextRun({text:meta.approved_date||"", bold:false, size:SZ.SM, font:F, noProof:true}),
-      ],
-    }));
-  }
-
-  var metaBlock = [];
-  if (titleChildren.length > 0) {
-    var metaTable = new Table({
-      width:{size:CW,type:WidthType.DXA}, columnWidths:[CW],
-      rows:[new TableRow({children:[new TableCell({
-        borders:allBdr(4), margins:mg(),
-        children: titleChildren,
-      })]})],
-    });
-    metaBlock.push(metaTable);
-    metaBlock.push(blk());
-  }
-
-  var sigTbl = new Table({
-    width:{size:CW,type:WidthType.DXA}, columnWidths:W,
-    rows:[
-      new TableRow({children:[
-        cell("Intention",  {bold:true,fill:CLR.HDR_GREY,w:W[0],size:SZ.SM}),
-        cell("Employee ID",{bold:true,fill:CLR.HDR_GREY,w:W[1],size:SZ.SM}),
-        cell("User Name",  {bold:true,fill:CLR.HDR_GREY,w:W[2],size:SZ.SM}),
-        cell("Date",       {bold:true,fill:CLR.HDR_GREY,w:W[3],size:SZ.SM}),
-      ]}),
-    ].concat(sigs.map(function(s){
-      return new TableRow({children:[
-        cellL(s.intention||"",  {w:W[0],size:SZ.SM}),
-        cell(s.employee_id||"", {w:W[1],size:SZ.SM}),
-        cellL(s.user_name||"",  {w:W[2],size:SZ.SM}),
-        cell(s.date||"",        {w:W[3],size:SZ.SM}),
-      ]});
-    })),
-  });
-
-  var result = [ctrPara("ELECTRONIC SIGNATURES",true,SZ.MD), blk()];
-  metaBlock.forEach(function(x){result.push(x);});
-  result.push(sigTbl);
-  return result;
-}
-
-// ── SPELL-OFF INJECTION ──────────────────────────────────────────────────────
-function injectSpellOff(buf) {
-  var spellOff = '<w:hideSpellingErrors/><w:hideGrammaticalErrors/>';
-  return JSZip.loadAsync(buf).then(function(zip){
-    var sf = zip.file("word/settings.xml");
-    var sp;
-    if (sf) {
-      sp = sf.async("string").then(function(sxml){
-        if (!sxml.includes("hideSpellingErrors"))
-          sxml = sxml.replace("</w:settings>", spellOff+"</w:settings>");
-        zip.file("word/settings.xml", sxml);
-      });
-    } else {
-      zip.file("word/settings.xml",
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'+
-        '<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'+
-        spellOff+'</w:settings>');
-      sp = Promise.resolve();
-    }
-    return (sp || Promise.resolve()).then(function(){
-      return zip.generateAsync({type:"nodebuffer",compression:"DEFLATE",
-        compressionOptions:{level:6}});
-    });
-  });
-}
-
-// ── MAIN ASSEMBLY ────────────────────────────────────────────────────────────
-function generateReport(dataPath, outPath) {
-  var raw  = fs.readFileSync(dataPath,"utf-8");
-  var data = JSON.parse(raw);
-
-  var meta       = data.meta             || {};
-  var logoB64    = data.logo_b64         || "";
-  var logoType   = data.logo_type        || "";
-  var txt        = data.text_sections    || {};
-  var revHistory = data.revision_history || [];
-  var signatures = data.signatures       || [];
-
-  var ch = [];
-
-  // Title page
-  buildTitlePage(meta).forEach(function(x){ch.push(x);});
-  // Table of contents
-  buildTOC().forEach(function(x){ch.push(x);});
-  // Sections 1-4: Abstract, Objective, Study Location, Background
-  buildTextSections(txt).forEach(function(x){ch.push(x);});
-  // Table 1: Composition
-  buildCompositionTable(data).forEach(function(x){ch.push(x);});
-  // Risk analysis text + Table 2: DEG/EG assessment per material
-  buildAssessmentTable(data).forEach(function(x){ch.push(x);});
-  // Post-assessment narrative
-  if (txt.post_assessment_narrative) {
-    bodyParas(txt.post_assessment_narrative).forEach(function(p){ch.push(p);});
-    ch.push(blk());
-  }
-  ch.push(pgBrk());
-  // Positive-risk detail tables (Table 3+)
-  buildPositiveRiskDetailTables(data).forEach(function(x){ch.push(x);});
-  // Section 5: Observations
-  buildObservations(txt).forEach(function(x){ch.push(x);});
-  // Section 6: Summary & Conclusion
-  buildSummary(txt).forEach(function(x){ch.push(x);});
-  // Section 7: Reference
-  buildReference(txt).forEach(function(x){ch.push(x);});
-  ch.push(pgBrk());
-  // Section 8: Change History
-  buildRevision(revHistory).forEach(function(x){ch.push(x);});
-  // Electronic Signatures
-  buildSignatures(meta, signatures).forEach(function(x){ch.push(x);});
-
-  var doc = new Document({
-    settings:{hideSpellingErrors:true, hideGrammaticalErrors:true},
-    styles:{default:{document:{run:{font:F,size:SZ.TEXT,color:CLR.BLACK}}}},
-    sections:[{
-      properties:{page:{
-        size:{width:PAGE_W,height:PAGE_H},
-        margin:{top:MAR_T,right:MAR_R,bottom:MAR_B,left:MAR_L,header:360,footer:360},
-      }},
-      headers:{default:buildHeader(meta,logoB64,logoType)},
-      footers:{default:buildFooter()},
-      children:ch,
-    }],
-  });
-
-  return Packer.toBuffer(doc)
-    .then(injectSpellOff)
-    .then(function(finalBuf){
-      fs.writeFileSync(outPath,finalBuf);
-      console.log("DEG/EG Report written: "+outPath+" ("+Math.round(finalBuf.length/1024)+" KB)");
-    });
-}
-
-// ── Entry point ──────────────────────────────────────────────────────────────
-var dp = process.argv[2], op = process.argv[3];
-if (!dp || !op) {
-  console.error("Usage: node generate_deg_eg.js <data.json> <out.docx>");
-  process.exit(1);
-}
-generateReport(dp, op).catch(function(err){
-  console.error("FATAL:", err.message || err);
-  if (err.stack) console.error(err.stack.split("\n").slice(0,8).join("\n"));
-  process.exit(1);
-});
+Assessment values must be Yes or No only. Never Unknown.
+
+Rules:
+- Default = No.
+- Yes only when annexure explicitly confirms DEG or EG presence with numeric evidence
+  (Vendor CoA, DRL Specification, or USP <469> result).
+- Never emit "Unknown" in Table 2, Section 5 Observations, or Section 6 Conclusion.
+
+Filter Table 2:
+- Stage section headers (Seal coating, Drug Loading, Sub Coating, Enteric coating,
+  Lubrication, Inactive granules) must never appear as material rows.
+- Aggregate duplicate materials using identity resolver (Hypromellose 5 cps ↔
+  Hypromellose 5cps; Hydroxypropyl Cellulose ↔ Hydroxy Propyl Cellulose).
+- Use real SAP material codes extracted from annexure CoAs (e.g. 100002851 for
+  Polysorbate 80, 100003411 for Hypromellose, 100007331 for HPC Klucel EF).
+- Never auto-generate M001-M999 fake codes. If no SAP code found, leave blank.
+
+Conclusion narrative — no regulatory verification hedging:
+Remove all mentions of:
+- "manual review required"
+- "assessment incomplete"
+- "unresolved manual-review items"
+- "cannot draw a final conclusion"
+- "material-specific evidence not available"
+- "supplier engagement needed"
+- "USP <469> testing required"
+
+Conclusion must be definitive:
+- If all materials No/No: "Based on the overall assessment, there is no potential
+  risk of Diethylene Glycol and Ethylene Glycol in [Product Name]. Hence, there is
+  no requirement of drug product testing for DEG and EG."
+- If positive with specification control: state specification limit and controlled
+  through specification. State no drug product testing required.
+
+Detail table structure (Table 3+) must exactly match approved format:
+Columns (6 exactly):
+  Excipients | Name | USP Monograph | Vendor COA | DRL Specification | DRL Specification No.
+
+Rows (2 per positive material):
+  Row 1: [material] | Diethylene Glycol (DEG) | NA | [vendor evidence or NA] | [DRL spec or NA] | [spec no]
+  Row 2: [material] | Ethylene Glycol (EG)    | NA | [vendor evidence or NA] | [DRL spec or NA] | [spec no]
+
+Footnote: "*Current version will be considered"
+
+Values:
+- USP Monograph: always "NA" (not extractable from CoA).
+- Vendor COA: extracted numeric limit from annexure (e.g. "NMT 620 ppm") or "NA".
+- DRL Specification: extracted numeric limit from annexure or "NA".
+- DRL Specification No.: extracted spec no from annexure metadata (e.g. "SP-CFTO-003256-3")
+  with "*" suffix, or blank.
+
+Never render:
+- "Refer applicable monograph" (use "NA").
+- "Certificate of Analysis" in DRL Specification No. column (use actual spec no or blank).
+
+Auto-fill:
+- Header Strength field from composition strength columns (40 mg / 20 mg / 10 mg).
+- Title default appends product name when title field only contains generic prefix.
+
+Section 8 Change History must render in body (not just TOC).
+
+═══════════════════════════════════════════════════════════════
+FIX 3 — RS DETAILED CALCULATION EXCEL (TYPE B) BUG
+═══════════════════════════════════════════════════════════════
+
+Problem: workflow still asks for MDD when user uploads a complete detailed RS
+calculation Excel. Excel already contains all values pre-computed.
+
+Fix classifier — detect Type B BEFORE Type A:
+
+Type B signatures:
+- "No. of doses" cell with numeric adjacent value
+- "Quantity / unit (mg)" column
+- "Amount in Maximum Dose (mg)" column
+- Solvent group headers (Ethanol, Methanol, Toluene, Acetone, Isopropyl Alcohol,
+  Ethylene Glycol, 1,4-Dioxane, Heptane, tert-Butyl alcohol)
+- Per-solvent sub-headers "Limit (ppm)" and "Daily Exposure (mg)"
+- "Drug Product (mg)" footer row with numeric values
+- "Total Daily Exposure" footer row
+- "Residual solvent Limit as per current USP <467>" footer row
+
+If 4 or more signatures detected → mode = detailed_rs_calculation.
+
+Type B parser behavior:
+1. Extract No. of doses from the "No. of doses" cell.
+2. Extract component rows with: component, quantity_per_unit_mg,
+   amount_in_maximum_dose_mg, per-solvent {limit_ppm, daily_exposure_mg}.
+3. Extract drug_product_row (quantity_total, amount_total).
+4. Extract total_daily_exposure_row (per-solvent equivalent ppm + exposure mg).
+5. Extract usp_467_limits_row (per-solvent limit ppm + PDE mg).
+6. Skip MDD prompt.
+7. Skip strength selection UI.
+8. Skip no-of-doses derivation.
+
+Type B calculation behavior:
+- No calculations. Excel is authoritative.
+- Pass Excel values directly into payload.
+- Do not recalculate. Do not derive. Do not modify.
+
+Payload structure for Section 5:
+Group solvents into 3-per-table approved-style structure:
+  Table 4: Ethanol, Ethylene Glycol, 1,4-Dioxane
+  Table 5: Iso Propyl Alcohol, Tertiary butyl alcohol, Heptane
+  Table 6: Acetone, Methanol, Toluene
+
+Each table contains:
+- Component rows with quantity/unit + amount in max dose + per-solvent limit + exposure
+- Drug Product row (from Excel)
+- Total Daily Exposure row (equivalent ppm + exposure mg, from Excel)
+- USP <467> limits row (from Excel)
+
+Type B annexure role:
+- Annexures = supporting evidence only.
+- Annexures populate supplier declaration table (Table 3).
+- Annexures do NOT override Excel solvent values.
+- Missing annexure = warning, not blocker.
+
+Type B conclusion:
+- Definitive. No hedging.
+- If all totals below USP <467> limits: "compliant with USP <467> Option 2 and ICH Q3C".
+- No "assessment incomplete" language.
+
+Acceptance test:
+Upload the detailed RS calculation Excel. System must:
+- Auto-detect mode = detailed_rs_calculation.
+- Not ask for MDD, strength, or no. of doses.
+- Generate report immediately after annexure upload.
+- Section 5 tables replicate Excel values exactly:
+    Ethanol total: 59.13 / 1.2219
+    Ethylene Glycol total: 0.198 / 0.004092
+    1,4-Dioxane total: 0.003194 / 0.000066
+    Iso Propyl Alcohol total: 80.93 / 1.6725
+    tert-Butyl alcohol total: 5.29 / 0.10935
+    Heptane total: 5.29 / 0.10935
+    Acetone total: 69.89 / 1.44435
+    Methanol total: 54.73 / 1.131
+    Toluene total: 11.50 / 0.23763
+    Drug Product: 3444.39 / 20666.34
+- Polysorbate 80 EG shows 620 ppm / 0.004092 from Excel.
+- Dehydrated Alcohol shows 275 / 1650 / Methanol 200 ppm / 0.33 from Excel.
+- Conclusion definitive: USP <467> Option 2 / ICH Q3C compliance.
+
+═══════════════════════════════════════════════════════════════
+GLOBAL RULES
+═══════════════════════════════════════════════════════════════
+
+- No regulatory hedging in any document conclusion.
+- No "Unknown" status in DEG/EG. Only Yes/No.
+- Excel authoritative in RS Type B. Annexures are supporting evidence only.
+- Session state namespaced per doc type.
+- Zero cross-document logic bleeding.
+- Fully automatic workflow. No user review checkpoint.
+- Report content built solely from Excel + annexures + LLM narrative on that basis.
+- Do not rewrite existing annexure converter files.
