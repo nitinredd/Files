@@ -1,94 +1,2407 @@
-DEG/EG converter multi-page bug — CONFIRMED critical.
+#!/usr/bin/env python3
+"""
+Residual Solvent Annexure PDF → JSON Converter
+Dr. Reddy's IPDO | USP <467> / ICH Q3C
 
-Evidence: Croda Polysorbate 80 CoA (RCQR00022Polysorbate80NF...pdf) has:
-- Page 2: "12.1 Ethylene Glycol Not more than 620 ppm PASS"
-- Page 4: "LS710360 ETHYLENE GLYCOL (USP/NF 469) 620 PPM MAX Pass"
+Standalone Streamlit tool. Upload one or more vendor residual-solvent annexure
+PDFs (supplier declarations, COAs, specifications, regulatory statements, SDS).
+Claude Vision reads every page, extracts the MATERIAL identity and SOLVENT
+declarations / limits, and outputs one JSON per PDF. All JSONs are zipped for
+download and plug directly into the Residual Solvent workflow in app.py.
 
-Extractor output: eg_present=Unknown, spec_limit=null (both wrong)
-Root cause: multi-page extraction reads only page 1, doesn't merge pages 2-6.
+COMPLETELY SEPARATE from the EI annexure converter (annexure_converter.py):
+this tool extracts SOLVENTS and solvent limits, never elemental impurities
+(Pb/As/Cd/…). It shares no EI element registry or EI prompts.
 
-Fix in convert_deg_eg_pdf_to_json:
-1. Rasterize ALL pages of every uploaded PDF (not just page 1)
-2. Send each page individually through claude_vision extraction
-3. Merge results into unified annexure record:
-   - deg_eg_evidence: use HIGHEST-confidence entry with real numeric limit
-     across all pages
-   - raw_text: concatenate content from all pages
-   - material_name: prefer first page with material identity in body
-   - drl_specification_no: extract from any page containing "SP-CFT-XXXX"
-   - material_code: extract from any page containing "SAP CODE:" pattern
-4. Priority override: if any later page has real numeric limit or 
-   vendor_coa source, OVERRIDE page-1 defaults for that glycol
+Schema guarantee: every converted annexure is a consistent top-level OBJECT,
+never a bare list. If the model returns a list, it is wrapped under
+extracted_items with schema_repaired=true. Extraction failures return a
+structured error object; nothing crashes the run.
+"""
+import os, json, base64, logging, time, zipfile, re
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-Specific extraction rules for CoAs:
-- "Not more than X ppm" → converted_ppm = X, evidence_type = "nmt"
-- "X PPM MAX" → converted_ppm = X, evidence_type = "nmt"
-- "≤ X ppm" → converted_ppm = X, evidence_type = "nmt"
-- Result labeled "PASS" → confirmed batch testing done per USP <469> 
-  → Tier 1 (present = Yes)
-- Result labeled "FAIL" → material rejected, still present but out of spec
+import streamlit as st
+import fitz                         # PyMuPDF
+from anthropic import AnthropicVertex
 
-For USP <469> based testing patterns:
-- Any mention of "USP <469>" or "USP/NF 469" or "USP/NF <469>" indicates 
-  per-batch testing for DEG/EG
-- Confidence should be 0.90+ when USP <469> reference is present with 
-  numeric result
+# Shared RS logic (evidence typing, ppm conversion, schema-safe normalisation,
+# material-name extraction). This is the SAME logic used at ingestion time in
+# app.py, so the converter output and the report ingester stay perfectly aligned.
+import residual_solvent as RS
+import residual_solvent_master as RSM
 
-Acceptance test:
-Reprocess RCQR00022Polysorbate80NF_20240724054617.251_X.pdf.
-Expected JSON:
-{
-  "material_name": "Polysorbate 80 NF",
-  "material_code": "100002851",
-  "drl_specification_no": "SP-CFTO-003256-3",
-  "deg_eg_evidence": {
-    "eg_present": "Yes",
-    "eg_specification_limit": "NMT 620 ppm",
-    "eg_source": "vendor_coa",
-    "raw_text": "[content from pages 2 and 4 concatenated]",
-    "page": 2,
-    "confidence": 0.95
-  }
+# ── Vertex AI — identical config to app.py ────────────────────────────────────
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+GCP_PROJECT = "prj-thematic-analysis-dev"
+GCP_REGION  = "us-east5"
+MODEL       = "claude-opus-4-6-20250514"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
+except Exception as _e:          # allow import without credentials (e.g. tests)
+    client = None
+    logger.warning(f"AnthropicVertex not initialised: {_e}")
+
+
+# ── Claude helpers ────────────────────────────────────────────────────────────
+def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
+    if client is None:
+        return ""
+    for attempt in range(3):
+        try:
+            r = client.messages.create(
+                model=MODEL, max_tokens=max_tokens, messages=messages
+            )
+            return "".join(b.text for b in r.content if hasattr(b, "text"))
+        except Exception as e:
+            logger.warning(f"Claude attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return ""
+
+
+def claude_vision(image_bytes: bytes, prompt: str) -> str:
+    if not image_bytes:
+        return ""
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    return call_claude([{
+        "role": "user",
+        "content": [
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+            {"type": "text", "text": prompt},
+        ],
+    }])
+
+
+def _s(v: Any, default: str = "") -> str:
+    return str(v).strip() if v is not None else default
+
+
+# ── PDF rasterization ─────────────────────────────────────────────────────────
+def rasterize_pdf(pdf_bytes: bytes, dpi: int = 250) -> List[bytes]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pages: List[bytes] = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+        pages.append(pix.tobytes("png"))
+    doc.close()
+    return pages
+
+
+# ── Per-page solvent prompt ───────────────────────────────────────────────────
+def make_rs_page_prompt(page_number: int, total_pages: int) -> str:
+    return (
+        f"This is page {page_number} of {total_pages} of a residual-solvent "
+        "annexure. Extract ANY residual-solvent statements or limits on THIS page. "
+        "Solvent statements may be numeric (NMT X ppm, X ppm, X%), BDL/ND, or "
+        "textual (e.g. 'solvents listed in USP <467> are not used', 'water is the "
+        "only solvent used', 'no source for residual solvents', 'testing not "
+        "required because solvent is not used', 'ethyl alcohol may be present up to "
+        "0.5% maximum', 'controlled by vendor specification').\n\n"
+        "TABULAR ROWS: when a test row is labelled by a peak/impurity id with the "
+        "chemical in parentheses ('Impurity B (Acetone)', 'Impurity A "
+        "(Chloroform)', 'RS-3 (Toluene)'), the solvent_name is the parenthesized "
+        "chemical: 'Impurity B (Acetone)' → solvent_name='Acetone'.\n\n"
+        "ALSO capture material IDENTITY if THIS page shows it (RF6: a CoA header "
+        "or material block often sits on page 2+). material_name is the SUBSTANCE "
+        "the document is about (e.g. 'Sodium chloride low in endotoxins EMPROVE'), "
+        "never a document title/descriptor. supplier_name is the manufacturer. "
+        "Leave these empty if this page does not show them.\n\n"
+        "Return ONLY valid JSON (an OBJECT, never a bare array):\n"
+        "{\n"
+        '  "material_name": "", "material_name_candidates": [], "supplier_name": "",\n'
+        '  "solvents": [\n'
+        '    {"solvent_name":"", "raw_text":"", "raw_value":"", "raw_unit":"ppm|%|none",\n'
+        '     "evidence_type":"numerical_limit|percentage_limit|nmt|negative_declaration|'
+        'no_source|controlled_by_spec|coa_statement|ambiguous",\n'
+        f'     "page":{page_number}, "confidence":0.0}}\n'
+        "  ],\n"
+        '  "negative_declaration": false,\n'
+        '  "page_text_excerpt": ""\n'
+        "}"
+    )
+
+
+def _merge_rs_pages(meta_obj: Any, page_objs: List[Dict]) -> Dict:
+    """Deterministically merge the page-1 metadata object with the per-page sweep
+    results (RF6). Pure/testable — no vision calls. It:
+      • concatenates solvent evidence across ALL pages (dedup by name + raw_text),
+      • backfills material_name / supplier_name from the FIRST page that carries a
+        real one when page 1 was silent (CoA header on page 2+),
+      • unions material_name_candidates,
+      • concatenates page text across pages into raw_text,
+      • ORs negative_declaration across pages.
+    The final NMT/compendial/spec-over-batch dedup happens later in
+    residual_solvent.process_rs_annexure (single source of truth)."""
+    merged: Dict = dict(meta_obj) if isinstance(meta_obj, dict) else {}
+    pages = [p for p in ([meta_obj] + list(page_objs)) if isinstance(p, dict)]
+
+    # Identity: keep a page-1 value; else first later page that has a real one.
+    for fld in ("material_name", "supplier_name"):
+        if not _s(merged.get(fld)):
+            for p in pages:
+                if _s(p.get(fld)):
+                    merged[fld] = _s(p.get(fld))
+                    break
+
+    # material_name_candidates: order-preserving union across pages.
+    cand: List[str] = []
+    for p in pages:
+        cs = p.get("material_name_candidates")
+        if isinstance(cs, list):
+            for c in cs:
+                if _s(c) and _s(c) not in cand:
+                    cand.append(_s(c))
+    if cand:
+        merged["material_name_candidates"] = cand
+
+    # Solvents: page-1 base + every sweep page, dedup by (name, raw_text head).
+    base = merged.get("solvents") if isinstance(merged.get("solvents"), list) else []
+    extra: List[Dict] = []
+    for p in page_objs:
+        if isinstance(p, dict):
+            for sv in (p.get("solvents") or []):
+                if isinstance(sv, dict) and _s(sv.get("solvent_name")):
+                    extra.append(sv)
+    seen = set()
+    all_solvents: List[Dict] = []
+    for sv in list(base) + extra:
+        if not isinstance(sv, dict):
+            continue
+        key = (_s(sv.get("solvent_name")).lower(), _s(sv.get("raw_text")).lower()[:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        all_solvents.append(sv)
+    merged["solvents"] = all_solvents
+
+    # raw_text: page-1 raw_text + each page's excerpt, concatenated (RF6).
+    chunks: List[str] = []
+    if _s(merged.get("raw_text")):
+        chunks.append(_s(merged.get("raw_text")))
+    for p in pages:
+        exc = _s(p.get("page_text_excerpt"))
+        if exc and exc not in chunks:
+            chunks.append(exc)
+    if chunks:
+        merged["raw_text"] = "\n".join(chunks)
+
+    # negative_declaration: OR across pages.
+    if any(bool(p.get("negative_declaration")) for p in pages):
+        merged["negative_declaration"] = True
+
+    return merged
+
+
+# ── Convert one PDF → RS annexure JSON ────────────────────────────────────────
+def convert_rs_pdf_to_json(pdf_bytes: bytes, filename: str, index: int,
+                           progress_callback=None) -> Dict:
+    """
+    Convert one residual-solvent annexure PDF to a structured JSON object.
+
+    Steps:
+      1. Rasterize all pages
+      2. Extract material identity + solvent evidence from page 1 (RS meta prompt)
+      3. Sweep remaining pages for additional solvent statements
+      4. Merge + normalise via residual_solvent.process_rs_annexure (consistent
+         object schema, ppm conversion, evidence typing, material-not-descriptor)
+
+    Always returns a consistent top-level OBJECT. Never raises.
+    """
+    def _progress(msg: str, pct: float = 0.0):
+        if progress_callback:
+            progress_callback(msg, pct)
+        logger.info(f"[{filename}] {msg}")
+
+    # Structured error object on rasterization failure (never crash the run)
+    _progress("Rasterizing PDF pages…", 0.05)
+    try:
+        page_images = rasterize_pdf(pdf_bytes, dpi=250)
+    except Exception as e:
+        err = RS.process_rs_annexure(
+            {"_error": True, "extraction_notes": f"PDF rasterization failed: {e}"},
+            index)
+        err["filename"] = filename
+        return err
+
+    if not page_images:
+        err = RS.process_rs_annexure(
+            {"_error": True, "extraction_notes": "PDF had no readable pages."}, index)
+        err["filename"] = filename
+        return err
+
+    n_pages = len(page_images)
+    _progress(f"PDF has {n_pages} page(s). Extracting material + solvents…", 0.12)
+
+    # Step 2: page-1 metadata + solvents using the shared RS annexure prompt
+    meta_raw = claude_vision(page_images[0], RS.rs_annexure_prompt())
+    meta_obj = RS.rs_safe_json(meta_raw, want="dict")      # shape-safe (list → wrapped)
+
+    # Step 3: sweep remaining pages for additional solvent statements AND for a
+    # material/supplier identity that may live on page 2+ (RF6).
+    page_objs: List[Dict] = []
+    for pi in range(1, n_pages):
+        pct = 0.12 + 0.70 * (pi / max(1, n_pages))
+        _progress(f"Reading page {pi + 1}/{n_pages}…", pct)
+        page_raw = claude_vision(page_images[pi], make_rs_page_prompt(pi + 1, n_pages))
+        page_obj = RS.rs_safe_json(page_raw, want="dict")
+        if isinstance(page_obj, dict):
+            page_objs.append(page_obj)
+
+    # Merge page-1 metadata with every sweep page (solvents + identity + text).
+    merged = _merge_rs_pages(meta_obj, page_objs)
+
+    _progress("Normalising material + solvent evidence…", 0.88)
+
+    # Step 4: normalise through the SAME ingestion logic used by the report
+    result = RS.process_rs_annexure(merged, index)
+    result["filename"] = filename
+
+    # Build a short human-readable extraction note
+    notes = []
+    if result.get("schema_repaired"):
+        notes.append("schema repaired (list root wrapped)")
+    if result.get("negative_declaration"):
+        notes.append("negative declaration (no USP <467> solvents / water only)")
+    n_num = sum(1 for s in result.get("solvents", [])
+                if s.get("converted_ppm") is not None)
+    notes.append(f"{len(result.get('solvents', []))} solvent statement(s), "
+                 f"{n_num} with numeric ppm")
+    result.setdefault("extraction_notes", "; ".join(notes))
+
+    _progress("Done.", 1.0)
+    return result
+
+
+# ── Packaging ─────────────────────────────────────────────────────────────────
+def build_zip(results: List[Dict]) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = []
+        for r in results:
+            num = r.get("annexure_number", "?")
+            base = re.sub(r"[^A-Za-z0-9_\-]", "_",
+                          _s(r.get("material_name")) or f"annexure_{num}")[:50]
+            fname = f"RS_annexure_{num}_{base}.json"
+            zf.writestr(fname, json.dumps(r, indent=2, ensure_ascii=False))
+            manifest.append({
+                "annexure_number": num,
+                "filename": fname,
+                "source_pdf": r.get("filename", ""),
+                "material_name": r.get("material_name", ""),
+                "supplier_name": r.get("supplier_name", ""),
+                "negative_declaration": r.get("negative_declaration", False),
+                "n_solvents": len(r.get("solvents", [])),
+                "error": r.get("_error", False),
+            })
+        zf.writestr("_manifest.json", json.dumps(manifest, indent=2))
+    return buf.getvalue()
+
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config(page_title="RS Annexure Converter", layout="wide")
+    st.title("🧴 Residual Solvent Annexure PDF → JSON Converter")
+    st.caption("USP <467> / ICH Q3C | Dr. Reddy's IPDO | Separate from the EI "
+               "annexure converter — extracts SOLVENTS, not elemental impurities.")
+    st.markdown("Upload vendor residual-solvent annexures (declarations, COAs, "
+                "specifications, statements). Each PDF becomes one JSON that plugs "
+                "into the Residual Solvent workflow.")
+    st.markdown("---")
+
+    uploaded = st.file_uploader("Upload annexure PDF(s)", type=["pdf"],
+                                accept_multiple_files=True)
+    if not uploaded:
+        st.info("📁 Upload one or more residual-solvent annexure PDFs to begin.")
+        with st.expander("ℹ️ What this extracts"):
+            st.markdown(
+                "- **Material identity** (the subject, not the document title)\n"
+                "- **Supplier name**, document title, annexure type\n"
+                "- **Solvent statements**: numeric (NMT X ppm, X ppm, X%), BDL/ND, "
+                "or textual negative declarations\n"
+                "- **Evidence type** per solvent + **converted ppm** (0.5% → 5000 ppm)\n"
+                "- Source page, raw text, confidence, calculation basis")
+        return
+
+    st.markdown(f"**{len(uploaded)} file(s) selected:**")
+    for f in uploaded:
+        st.write(f"  📄 {f.name} ({len(f.getvalue())/1024:.0f} KB)")
+    st.markdown("---")
+
+    if st.button("🚀 Convert All PDFs", type="primary"):
+        results: List[Dict] = []
+        overall = st.progress(0.0)
+        for idx, uf in enumerate(uploaded):
+            status = st.empty()
+            def cb(msg, pct, _s=status):
+                _s.info(f"📄 {uf.name}: {msg}")
+            try:
+                res = convert_rs_pdf_to_json(uf.getvalue(), uf.name, idx + 1, cb)
+            except Exception as e:
+                logger.exception("RS conversion error")
+                res = RS.process_rs_annexure(
+                    {"_error": True, "extraction_notes": f"Unexpected error: {e}"},
+                    idx + 1)
+                res["filename"] = uf.name
+            results.append(res)
+
+            # Per-file summary
+            if res.get("_error"):
+                status.error(f"❌ {uf.name}: {res.get('extraction_notes','failed')}")
+            else:
+                mat = res.get("material_name") or "(material not resolved)"
+                sols = res.get("solvents", [])
+                if res.get("negative_declaration") and not sols:
+                    status.success(f"✅ {uf.name}: {mat} — negative declaration "
+                                   "(no USP <467> solvents / water only)")
+                else:
+                    status.success(f"✅ {uf.name}: {mat} — {len(sols)} solvent "
+                                   "statement(s)")
+                with st.expander(f"🔎 {uf.name} — extracted detail"):
+                    st.json({
+                        "material_name": res.get("material_name"),
+                        "material_name_candidates": res.get("material_name_candidates"),
+                        "supplier_name": res.get("supplier_name"),
+                        "document_title": res.get("document_title"),
+                        "annexure_type": res.get("annexure_type"),
+                        "negative_declaration": res.get("negative_declaration"),
+                        "solvents": res.get("solvents"),
+                        "schema_repaired": res.get("schema_repaired", False),
+                    })
+            overall.progress((idx + 1) / len(uploaded))
+
+        st.markdown("---")
+        n_ok = sum(1 for r in results if not r.get("_error"))
+        st.success(f"Conversion complete: {n_ok}/{len(results)} succeeded.")
+        st.download_button("📥 Download all JSON (ZIP)",
+            data=build_zip(results),
+            file_name=f"RS_annexures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip")
+
+
+if __name__ == "__main__":
+    main()
+#####################
+#!/usr/bin/env python3
+"""
+deg_eg.py — Diethylene Glycol (DEG) & Ethylene Glycol (EG) Risk Assessment.
+
+FULLY ISOLATED workflow. No imports of residual_solvent or any EI module.
+NO calculations, NO exposure formula, NO MDD×ppm, NO PDE, NO USP <467> matrix,
+NO Total Daily Exposure. Only:
+  - composition parsing (Section 4 Table 1, stage-wise, q.s. preserved)
+  - annexure-driven Yes/No DEG/EG presence + specification limits
+  - per-material detail tables for positive findings
+  - narrative + warning-first validation
+
+The ONLY thing reused from the EI injection workflow is the identity-resolver
+*architecture* (descriptor stripping, identity pooling, brand/family aliases,
+canonical tokens, negative-pair protection, confidence scoring). It is ported
+here with DEG/EG-appropriate material vocabulary; no EI scientific logic.
+"""
+import re
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# ════════════════════════════════════════════════════════════════════════════
+# Basic helpers (self-contained; no shared imports)
+# ════════════════════════════════════════════════════════════════════════════
+def _s(v: Any, default: str = "") -> str:
+    return str(v).strip() if v is not None else default
+
+
+def _f(v: Any) -> Optional[float]:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def deg_eg_safe_json(text: str, want: str = "dict") -> Any:
+    """Parse model output defensively. Repairs bare-list roots; never raises.
+    Mirrors the safe-JSON scaffolding used elsewhere but is self-contained."""
+    if isinstance(text, (dict, list)):
+        obj = text
+    else:
+        s = _s(text)
+        if not s:
+            return {} if want == "dict" else []
+        s = s.replace("```json", "").replace("```", "").strip()
+        # find the outermost JSON object/array
+        start = min([i for i in (s.find("{"), s.find("[")) if i >= 0] or [-1])
+        if start > 0:
+            s = s[start:]
+        try:
+            obj = json.loads(s)
+        except Exception:
+            # try to locate a trailing-brace-balanced object
+            try:
+                obj = json.loads(s[: s.rfind("}") + 1])
+            except Exception:
+                return {"_error": True, "extraction_notes": "unparseable JSON"} \
+                    if want == "dict" else []
+    if want == "dict":
+        if isinstance(obj, dict):
+            return obj
+        if isinstance(obj, list):
+            # schema repair: wrap a bare list
+            return {"_list_root": True, "extracted_items": obj, "schema_repaired": True}
+        return {"_error": True, "extraction_notes": "unexpected JSON shape"}
+    return obj if isinstance(obj, list) else [obj]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# COMPOSITION PARSING (same Excel shape as RS unit composition; stage-wise)
+# Self-contained openpyxl reader — does not import residual_solvent.
+# ════════════════════════════════════════════════════════════════════════════
+_STRENGTH_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*mg\s*$", re.IGNORECASE)
+_COMP_HINTS = ("ingredient", "component", "material", "name of ingredient", "name")
+_FUNCTION_HINTS = ("function", "role", "category")
+_COMPENDIA_HINTS = ("compendia", "compendial", "status", "grade")
+_STAGE_HINTS = ("stage", "step", "process step", "manufacturing stage")
+_QS_HINTS = ("q.s", "qs to", "q.s.", "water", "purified water")
+
+# Stage / process section labels that sometimes appear as full-width header rows
+# in composition Excels. These must NEVER be treated as material (ingredient) rows
+# in the Table 2 assessment.
+_STAGE_LABEL_RE = re.compile(
+    r"^\s*(seal\s*coat(ing)?|drug\s*load(ing)?|drug\s*layer(ing)?|sub\s*coat(ing)?|"
+    r"enteric\s*coat(ing)?|film\s*coat(ing)?|lubricat(ion|ing)?|inactive\s*granul\w*|"
+    r"intra\s*granular|extra\s*granular|blend(ing)?|core|coating|granulation|"
+    r"mixing|dispensing|compression|encapsulation|barrier\s*coat(ing)?)\s*:?\s*$",
+    re.IGNORECASE)
+
+
+def _is_stage_header_row(name: str, strength_cells: List[str]) -> bool:
+    """A row is a stage/section header (not a material) when its ingredient text
+    matches a known stage label AND it carries no quantitative strength value."""
+    if not _STAGE_LABEL_RE.match(_s(name)):
+        return False
+    for v in strength_cells:
+        sv = _s(v)
+        if sv and re.search(r"\d", sv):
+            return False
+    return True
+
+
+def _add_or_merge_material(materials: List[Dict], seen_keys: set, name: str,
+                           is_qs: bool, function: str) -> None:
+    """Append a material unless an identity-equivalent one already exists, in which
+    case merge (keep first display name, record the alias). Uses family / distinctive
+    tokens with negative-pair protection (defined later in this module)."""
+    exact = name.strip().lower()
+    if exact in seen_keys:
+        return
+    cid = _identity(name)
+    fam = cid.get("family", "")
+    dist = _distinctive(cid.get("tokens", set()))
+    for m in materials:
+        if m.get("is_qs") != is_qs:
+            continue
+        mid = _identity(m["name"])
+        mfam = mid.get("family", "")
+        if _pair_blocked(fam, mfam):
+            continue
+        merged = False
+        if fam and mfam and fam == mfam:
+            merged = True
+        elif not fam and not mfam:
+            mdist = _distinctive(mid.get("tokens", set()))
+            if dist and mdist and dist == mdist:
+                merged = True
+        if merged:
+            m.setdefault("aliases", []).append(name)
+            seen_keys.add(exact)
+            return
+    seen_keys.add(exact)
+    materials.append({"name": name, "is_qs": is_qs, "function": function,
+                      "aliases": []})
+
+
+def _is_qs_value(cell_value: str) -> bool:
+    s = _s(cell_value).lower().strip()
+    if not s:
+        return False
+    s_norm = re.sub(r"[^a-z0-9 ]+", "", s)
+    if s_norm in ("qs", "q s", "qsto", "q s to"):
+        return True
+    return bool(re.search(r"\bq\.?\s*s\.?\b", s))
+
+
+def _col_index(header: List[str], hints: Tuple[str, ...]) -> Optional[int]:
+    for i, h in enumerate(header):
+        hl = h.lower().strip()
+        if any(hint in hl for hint in hints):
+            return i
+    return None
+
+
+def _strength_columns(header: List[str]) -> List[Tuple[int, str, float]]:
+    out = []
+    for i, h in enumerate(header):
+        if _STRENGTH_RE.match(h or ""):
+            m = re.search(r"\d+(?:\.\d+)?", h)
+            if m:
+                out.append((i, h.strip(), float(m.group(0))))
+    return out
+
+
+def read_excel_grid(excel_bytes: bytes, max_rows: int = 400) -> List[Dict]:
+    import openpyxl
+    from io import BytesIO
+    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
+    sheets = []
+    for ws in wb.worksheets:
+        grid = []
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            grid.append(["" if c is None else str(c).strip() for c in row])
+            if i > max_rows:
+                break
+        if not grid:
+            continue
+        header_idx, best = 0, -1
+        for idx in range(min(len(grid), 15)):
+            cells = grid[idx]
+            nonempty = [c for c in cells if c]
+            if not nonempty:
+                continue
+            low = " | ".join(c.lower() for c in nonempty)
+            score = len(nonempty)
+            if any(h in low for h in _COMP_HINTS):
+                score += 5
+            if any(_STRENGTH_RE.match(c) for c in nonempty):
+                score += 5
+            if score > best:
+                best, header_idx = score, idx
+        sheets.append({"sheet": ws.title, "header": grid[header_idx],
+                       "rows": grid[header_idx + 1:], "header_idx": header_idx})
+    wb.close()
+    return sheets
+
+
+def parse_deg_eg_composition(excel_bytes: bytes) -> Dict:
+    """
+    Parse the composition Excel into stage-wise display rows for Section 4 Table 1.
+    NO calculations. q.s. rows preserved. Returns composition sections + columns +
+    the distinct material list for assessment.
+    Hard-fails (via _error) only when the workbook can't be read or has no rows.
+    """
+    try:
+        sheets = read_excel_grid(excel_bytes)
+    except Exception as e:
+        return {"_error": True, "error": f"Excel read failed: {e}",
+                "composition": [], "comp_columns": [], "materials": []}
+    if not sheets:
+        return {"_error": True, "error": "Empty workbook",
+                "composition": [], "comp_columns": [], "materials": []}
+
+    # Pick the sheet that looks most like a composition (has a component column)
+    sheet = None
+    for sh in sheets:
+        if _col_index(sh["header"], _COMP_HINTS) is not None:
+            sheet = sh
+            break
+    sheet = sheet or sheets[0]
+    header = sheet["header"]
+    rows = sheet["rows"]
+    comp_idx = _col_index(header, _COMP_HINTS)
+    if comp_idx is None:
+        return {"_error": True, "error": "No ingredient/component column found",
+                "composition": [], "comp_columns": [], "materials": []}
+
+    func_idx = _col_index(header, _FUNCTION_HINTS)
+    compendia_idx = _col_index(header, _COMPENDIA_HINTS)
+    stage_idx = _col_index(header, _STAGE_HINTS)
+    strengths = _strength_columns(header)
+
+    # Display columns (verbatim, in approved order)
+    display_columns = [header[comp_idx]]
+    if func_idx is not None:
+        display_columns.append(header[func_idx])
+    if compendia_idx is not None:
+        display_columns.append(header[compendia_idx])
+    display_columns += [lbl for (_i, lbl, _mg) in strengths]
+    if stage_idx is not None:
+        display_columns.append(header[stage_idx])
+
+    # Build stage-grouped sections (preserve stage order)
+    sections: List[Dict] = []
+    section_index: Dict[str, Dict] = {}
+    materials: List[Dict] = []
+    seen_materials = set()
+
+    for r in rows:
+        if comp_idx >= len(r):
+            continue
+        name = _s(r[comp_idx])
+        if not name:
+            continue
+        # Skip full-width stage/section header rows (e.g. "Seal coating",
+        # "Drug Loading") so they never become material rows in Table 2.
+        _strength_cells = [_s(r[si]) if si < len(r) else "" for (si, _l, _m) in strengths]
+        if _is_stage_header_row(name, _strength_cells):
+            continue
+        stage = _s(r[stage_idx]) if (stage_idx is not None and stage_idx < len(r)) else ""
+        is_qs = any(h in name.lower() for h in _QS_HINTS)
+        # also q.s. from any strength cell value
+        for (si, _lbl, _mg) in strengths:
+            if si < len(r) and _is_qs_value(_s(r[si])):
+                is_qs = True
+                break
+
+        disp = {header[comp_idx]: name}
+        if func_idx is not None and func_idx < len(r):
+            disp[header[func_idx]] = _s(r[func_idx])
+        if compendia_idx is not None and compendia_idx < len(r):
+            disp[header[compendia_idx]] = _s(r[compendia_idx])
+        for (si, lbl, _mg) in strengths:
+            disp[lbl] = _s(r[si]) if si < len(r) else ""
+        if stage_idx is not None and stage_idx < len(r):
+            disp[header[stage_idx]] = stage
+
+        sec_key = stage or "Composition"
+        if sec_key not in section_index:
+            sec = {"name": sec_key if stage else "", "rows": []}
+            section_index[sec_key] = sec
+            sections.append(sec)
+        section_index[sec_key]["rows"].append({"ingredient": name, "columns": disp})
+
+        # Distinct material list with IDENTITY-BASED aggregation so synonymous /
+        # grade-variant names collapse to one assessment identity (e.g.
+        # "Hypromellose 5 cps" ↔ "Hypromellose 5cps"; "Hydroxypropyl Cellulose" ↔
+        # "Hydroxy Propyl Cellulose"). Negative-pair protection prevents unrelated
+        # materials that share weak generic tokens from merging.
+        func_val = disp.get(header[func_idx]) if func_idx is not None else ""
+        _add_or_merge_material(materials, seen_materials, name, is_qs, func_val)
+
+    if not materials:
+        return {"_error": True, "error": "No component rows parsed",
+                "composition": sections, "comp_columns": display_columns, "materials": []}
+
+    return {
+        "_error": False,
+        "composition": sections,
+        "comp_columns": display_columns,
+        "materials": materials,
+        "sheet": sheet["sheet"],
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# IDENTITY RESOLVER (ported architecture; DEG/EG + RS material vocabulary)
+# ════════════════════════════════════════════════════════════════════════════
+_NOISE = {
+    # descriptors only – NEVER chemistry identity words
+    "usp", "nf", "ep", "bp", "jp", "ip", "pheur", "eur", "ph",
+    "grade", "purified", "for", "of", "the", "and", "a", "an", "c",
+    "cas", "no", "number", "lva", "dispersion", "coating", "premium",
+    "cps", "cp", "mesh", "rs", "json", "annexure", "datasheet", "data", "sheet",
+    "regulatory", "product", "operations", "gmbh", "inc", "llc", "ltd", "limited",
+    "co", "company", "residual", "solvents", "solvent", "committee",
+    "harmonization", "harmonisation", "statement", "declaration", "summary",
+    "information", "quality", "spec", "specification", "type", "pharma",
+    "pharmaceutical", "material", "supplier", "certificate", "analysis",
+    "monograph", "ih", "coa", "ligamed", "powder", "report", "final", "copy",
+    "batch", "lot", "code", "sds", "msds",
+}
+_GENERIC_TOKENS = {
+    "citrate", "acid", "oxide", "cellulose", "glycol", "alcohol", "acetate",
+    "stearate", "phosphate", "chloride", "sodium", "calcium", "potassium",
+    "magnesium", "dioxide", "copolymer", "ester", "water", "spheres", "sphere",
+    "gum", "silicate",
 }
 
-Then in Esomeprazole DEG/EG report:
-- Polysorbate 80 Table 2 row: DEG=No, EG=Yes, Spec limit="620 ppm" ✓
-- Detail table generated for Polysorbate 80
-- Approved TSR alignment achieved
+# Salt / hydrate / purity descriptors captured as WEAK ALIASES (extras). They
+# never drive identity by themselves, but are preserved in the token pool so
+# containment/overlap tiers see them when needed.
+_SALT_SUFFIXES = (
+    "hcl", "hbr", "sulfate", "sulphate", "phosphate", "acetate", "citrate",
+    "tartrate", "mesylate", "tosylate", "besylate", "maleate", "fumarate",
+    "hydrochloride", "hydrobromide", "2hcl", "3hcl", "dihydrochloride",
+    "trihydrochloride",
+)
+_HYDRATE_SUFFIXES = (
+    "anhydrous", "monohydrate", "dihydrate", "trihydrate", "tetrahydrate",
+    "pentahydrate", "heptahydrate", "hemihydrate", "hydrate",
+)
+_PURITY_DESCRIPTORS_RE = re.compile(
+    r"\b(pyrogen[\s\-]*free|endotoxin[\s\-]*controlled|endotoxin[\s\-]*free|"
+    r"sterile|apyrogenic|non[\s\-]*pyrogenic|"
+    r"free\s+from\s+endotoxins?)\b",
+    re.IGNORECASE,
+)
+
+# Descriptor phrases stripped at the STRING level before identity normalization.
+_DESCRIPTOR_PHRASE_PATTERNS = [
+    r"\bih\s*spec(?:ification)?\s*[a-z]?\d+\w*\b",
+    r"\bih\s*spec(?:ification)?\b",
+    r"\bspec(?:ification)?\s*[a-z]?\d+\w*\b",
+    r"\bspec(?:ification)?\b",
+    r"\bgrade\s*[a-z0-9]*\b",
+    r"\btype\s*[iv0-9]+\b",
+    r"\busp[/\-\s]*nf\b",
+    r"\bph\.?\s*eur\.?\b",
+    r"\bcertificate\s+of\s+analysis\b",
+    r"\bresidual\s+solvents?\b",
+    r"\bdeg\s*&?\s*eg\b",
+    r"\bmonograph\b",
+    r"\bproduct\s+regulatory\s+information\b",
+    r"\bquality\s+statement\b",
+]
+_DESCRIPTOR_PHRASE_RE = re.compile("|".join(_DESCRIPTOR_PHRASE_PATTERNS),
+                                   re.IGNORECASE)
+# Generic document identities that must never be accepted as a material name.
+_GENERIC_MATERIAL_NAMES = {
+    "residual solvents", "residual solvent statement", "statement", "declaration",
+    "product regulatory information", "quality statement", "regulatory information",
+    "specification", "certificate of analysis", "residual solvent declaration",
+    "coa", "monograph", "product quality statement",
+}
+
+_FAMILY_RULES: Dict[str, Dict[str, Any]] = {
+    "sugar_sphere": {"family": "sugar sphere",
+        "aliases": ["sugar sphere", "sugar spheres", "sugar pellet", "sugar pellets",
+                    "nonpareil", "nonpareils", "nonpareil seed", "nonpareil seeds",
+                    "sucrose sphere", "sucrose spheres"]},
+    "hypromellose": {"family": "hypromellose",
+        "aliases": ["hypromellose", "hpmc", "methocel", "celsential",
+                    "hydroxypropyl methylcellulose", "hydroxypropylmethylcellulose",
+                    "hydroxypropyl methyl cellulose", "hydroxy propyl methyl cellulose"]},
+    "eudragit": {"family": "methacrylic acid copolymer",
+        "aliases": ["eudragit", "eudragit l30 d-55", "eudragit l 30 d-55", "l30 d-55",
+                    "l 30 d-55", "methacrylic acid copolymer", "methacrylate copolymer"]},
+    "triethyl_citrate": {"family": "triethyl citrate",
+        "aliases": ["triethyl citrate", "triethylcitrate", "tec"]},
+    "atbc": {"family": "acetyltributyl citrate",
+        "aliases": ["acetyltributyl citrate", "acetyl tributyl citrate", "atbc"]},
+    "polysorbate80": {"family": "polysorbate 80",
+        "aliases": ["polysorbate 80", "polysorbate80", "tween 80", "tween80",
+                    "polyoxyethylene sorbitan monooleate"]},
+    "dextrose": {"family": "dextrose",
+        "aliases": ["dextrose", "glucose", "anhydrous dextrose", "dextrose monohydrate"]},
+    "hpc": {"family": "hydroxypropyl cellulose",
+        "aliases": ["hydroxypropyl cellulose", "hydroxypropylcellulose", "hpc",
+                    "klucel", "hydroxy propyl cellulose"]},
+    "simethicone": {"family": "simethicone",
+        "aliases": ["simethicone", "simeticone", "q7-2243", "q7 2243", "dow corning q7"]},
+    "macrogol": {"family": "macrogol",
+        "aliases": ["macrogol", "polyethylene glycol", "peg", "carbowax"]},
+    "talc": {"family": "talc",
+        "aliases": ["talc", "purified talc", "talcum", "hydrous magnesium silicate",
+                    "magnesium silicate hydrate"]},
+    "magnesium_stearate": {"family": "magnesium stearate",
+        "aliases": ["magnesium stearate", "ligamed", "magnesium octadecanoate",
+                    "vegetable magnesium stearate"]},
+    "crospovidone": {"family": "crospovidone",
+        "aliases": ["crospovidone", "kollidon cl", "kollidon", "crosslinked pvp",
+                    "cross linked pvp", "polyplasdone"]},
+    "xanthan_gum": {"family": "xanthan gum",
+        "aliases": ["xanthan gum", "xanthan", "xantural", "cp kelco"]},
+    "yellow_iron_oxide": {"family": "yellow iron oxide",
+        "aliases": ["yellow iron oxide", "iron oxide yellow", "ferric oxide yellow",
+                    "pigment yellow"]},
+    "citric_acid_anhydrous": {"family": "anhydrous citric acid",
+        "aliases": ["citric acid anhydrous", "anhydrous citric acid"]},
+    "dehydrated_alcohol": {"family": "ethanol",
+        "aliases": ["dehydrated alcohol", "ethanol", "ethyl alcohol",
+                    "anhydrous alcohol", "absolute alcohol"]},
+    # DEG/EG-relevant positive-risk excipients
+    "glycerin": {"family": "glycerin",
+        "aliases": ["glycerin", "glycerine", "glycerol"]},
+    "propylene_glycol": {"family": "propylene glycol",
+        "aliases": ["propylene glycol", "propane-1,2-diol", "pg", "1,2-propanediol"]},
+    "sorbitol": {"family": "sorbitol",
+        "aliases": ["sorbitol", "sorbitol solution", "d-glucitol"]},
+    "peg_diol": {"family": "polyethylene glycol",
+        "aliases": ["polyethylene glycol", "peg 400", "peg400", "peg 4000"]},
+    # ── PRODUCT-AGNOSTIC excipient / API families (broad vocabulary) ──────────
+    "croscarmellose": {"family": "croscarmellose",
+        "aliases": ["croscarmellose sodium", "croscarmellose",
+                    "ac-di-sol", "ac di sol", "acdisol", "ac-di-sol sd-711",
+                    "ac di sol sd 711", "crosslinked sodium carboxymethylcellulose",
+                    "cross-linked cmc sodium", "crosslinked cmc sodium"]},
+    "mavacamten": {"family": "mavacamten",
+        "aliases": ["mavacamten"]},
+    "mannitol": {"family": "mannitol",
+        "aliases": ["mannitol", "d-mannitol", "pearlitol", "pearlitol 50c",
+                    "pearlitol 100sd", "pearlitol 200sd", "pearlitol mannitol"]},
+    "mcc": {"family": "microcrystalline cellulose",
+        "aliases": ["microcrystalline cellulose", "mcc", "avicel",
+                    "avicel ph 101", "avicel ph 102", "avicel ph101", "avicel ph102",
+                    "cellulose microcrystalline"]},
+    "sodium_chloride": {"family": "sodium chloride",
+        "aliases": ["sodium chloride", "nacl", "saline"]},
+    "hydrochloric_acid": {"family": "hydrochloric acid",
+        "aliases": ["hydrochloric acid", "hcl", "hydrogen chloride"]},
+    "sodium_hydroxide": {"family": "sodium hydroxide",
+        "aliases": ["sodium hydroxide", "naoh", "caustic soda"]},
+    "water_family": {"family": "water",
+        "aliases": ["water for injection", "purified water", "wfi",
+                    "water usp", "water ip", "water"]},
+    "nitrogen_family": {"family": "nitrogen",
+        "aliases": ["nitrogen", "n2", "nitrogen gas"]},
+    "sofosbuvir": {"family": "sofosbuvir",
+        "aliases": ["sofosbuvir"]},
+    "velpatasvir": {"family": "velpatasvir",
+        "aliases": ["velpatasvir", "velpatasvir premix"]},
+    "colloidal_sio2": {"family": "colloidal silicon dioxide",
+        "aliases": ["colloidal silicon dioxide", "aerosil", "aerosil 200",
+                    "silica colloidal anhydrous", "silicon dioxide colloidal",
+                    "colloidal anhydrous silica"]},
+    "sodium_stearyl_fumarate": {"family": "sodium stearyl fumarate",
+        "aliases": ["sodium stearyl fumarate", "pruv"]},
+    "opadry": {"family": "opadry",
+        "aliases": ["opadry", "opadry ii", "opadry white",
+                    "opadry ii 85f580019", "opadry ii 85f580019 white"]},
+    "chlorobutanol": {"family": "chlorobutanol",
+        "aliases": ["chlorobutanol", "chlorobutanol hemihydrate", "chlorbutol"]},
+    "sodium_metabisulphite": {"family": "sodium metabisulphite",
+        "aliases": ["sodium metabisulphite", "sodium metabisulfite",
+                    "sodium disulfite", "sodium pyrosulfite"]},
+    "trilaciclib": {"family": "trilaciclib",
+        "aliases": ["trilaciclib", "trilaciclib 2hcl", "trilaciclib dihydrochloride"]},
+    "epinephrine": {"family": "epinephrine",
+        "aliases": ["epinephrine", "adrenaline", "adrenalin"]},
+    "citric_acid_broad": {"family": "citric acid",
+        "aliases": ["citric acid", "citric acid anhydrous",
+                    "citric acid monohydrate", "anhydrous citric acid"]},
+}
+
+_NEGATIVE_FAMILY_PAIRS: List[Tuple[str, str]] = [
+    ("triethyl citrate", "acetyltributyl citrate"),
+    ("dextrose", "sugar sphere"),
+    ("hypromellose", "hydroxypropyl cellulose"),
+    ("polysorbate 80", "macrogol"),
+    ("talc", "magnesium stearate"),
+    ("glycerin", "propylene glycol"),
+    ("glycerin", "sorbitol"),
+    ("propylene glycol", "sorbitol"),
+]
+
+_ALIAS_TO_FAMILY: Dict[str, str] = {}
+_ALIAS_TO_KEY: Dict[str, str] = {}
+for _k, _rule in _FAMILY_RULES.items():
+    for _al in _rule["aliases"]:
+        _ALIAS_TO_FAMILY[_al.lower()] = _rule["family"]
+        _ALIAS_TO_KEY[_al.lower()] = _k
+
+_DOC_DESCRIPTOR_RE = re.compile(
+    r"^(residual\s+solvent[s]?|deg\s*&?\s*eg|coa|certificate\s+of\s+analysis|"
+    r"specification|quality\s+statement|regulatory\s+information|declaration|"
+    r"statement|safety\s+data\s+sheet|sds|monograph)\b", re.IGNORECASE)
 
 
-Bug: NMT vs batch actual dedup within same annexure.
+def strip_descriptor(name: str) -> str:
+    """Recover the material subject from '<descriptor> for <material>' phrasing."""
+    s = _s(name)
+    m = re.search(r"\bfor\s+(.+)$", s, re.IGNORECASE)
+    if m and _DOC_DESCRIPTOR_RE.search(s):
+        return m.group(1).strip()
+    return s
 
-The Chlorobutanol annexure has both entries for the same canonical solvent:
-- Impurity Acetone (USP/NF): NMT 5000 ppm ← should pick this
-- Batch actual Acetone: 159 ppm ← AI is picking this instead
 
-- Impurity A Chloroform (USP/NF): NMT 60 ppm ← should pick this
-- Batch actual Chloroform: 24 ppm ← AI is picking this instead
+def is_generic_material_name(name: str) -> bool:
+    s = _s(name).lower().strip()
+    s = re.sub(r"[^a-z0-9 ]+", "", s).strip()
+    return s in _GENERIC_MATERIAL_NAMES
 
-Fix in process_rs_annexure dedup priority:
 
-Priority order (highest to lowest):
-1. NMT USP or USP/NF spec limit
-2. NMT Ph.Eur or EP spec limit  
-3. NMT JP spec limit
-4. NMT ASMF or in-house spec limit
-5. Batch actual test results (LOWEST — never pick over spec)
+def _norm(text: str) -> str:
+    s = _s(text).lower().replace("\u00ae", " ").replace("\u2122", " ").replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-Detection patterns:
-- "NMT X ppm" / "Not more than X ppm" / "≤ X ppm" → spec_limit
-- Bare number without NMT / labeled "Result" / "Actual" / "Analysis" → batch_actual
-- Column labeled "Specification" / "Limit" / "NMT" → spec_limit
-- Column labeled "Test result" / "Actual" / "Batch" → batch_actual
 
-For USP <467> worst-case exposure assessment, always use spec limit values.
-Batch actuals are stored in audit trail but never used for exposure calculation.
+def _canonical_tokens(text: str) -> set:
+    return {t for t in _norm(text).split() if len(t) > 1 and t not in _NOISE}
 
-Rationale: batch actuals are always ≤ spec limits. Using them under-reports 
-worst-case exposure and defeats the purpose of the assessment.
 
-Acceptance for Chlorobutanol:
-- Acetone: converted_ppm = 5000 (NMT USP/NF, not 159 batch actual)
-- Chloroform: converted_ppm = 60 (NMT USP/NF, not 24 batch actual)
-- Downstream: Total Acetone = 0.044 + 0.210 = 0.254 mg / 31.75 ppm
-- Downstream: Total Chloroform = 0.003 mg / 0.375 ppm
+def _strip_descriptor_phrases(text: str) -> str:
+    """String-level strip of specification / grade / pharmacopoeia / purity
+    phrases before identity tokenization. Product-agnostic: strips descriptors
+    only, never chemistry identity words."""
+    if not text:
+        return ""
+    s = _s(text)
+    s = _DESCRIPTOR_PHRASE_RE.sub(" ", s)
+    s = _PURITY_DESCRIPTORS_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _paren_tokens(text: str) -> set:
+    """Extract tokens from parenthesized content and return them as extras.
+    'Mannitol (Pearlitol 50C)' \u2192 {pearlitol, 50c}."""
+    extras: set = set()
+    for m in re.finditer(r"\(([^)]+)\)", _s(text)):
+        for t in _norm(m.group(1)).split():
+            if len(t) > 1 and t not in _NOISE:
+                extras.add(t)
+    return extras
+
+
+def _extras_from_name(text: str) -> set:
+    """Return salt / hydrate / purity descriptor extras from a name.
+    'Trilaciclib 2HCl' \u2192 {2hcl, hcl}, 'Citric acid monohydrate' \u2192 {monohydrate}."""
+    extras: set = set()
+    low = _s(text).lower()
+    for sfx in _SALT_SUFFIXES + _HYDRATE_SUFFIXES:
+        if re.search(rf"\b{re.escape(sfx)}\b", low):
+            extras.add(sfx)
+    for m in _PURITY_DESCRIPTORS_RE.finditer(text):
+        extras.add(re.sub(r"\s+", "_", m.group(0).lower().strip()))
+    return extras
+
+
+def _identity_norm(text: str) -> str:
+    """Fully-stripped normalized identity STRING for exact-match tests.
+
+    Removes: parenthesized content, descriptor phrases, salt/hydrate suffixes,
+    purity descriptors, noise words, standalone digits. Returns a sorted
+    token-set string so equivalent inputs (in any order, any pharmacopoeia
+    suffix) produce the same key. Product-agnostic \u2014 never strips chemistry
+    identity words.
+    """
+    if not text:
+        return ""
+    s = _s(text)
+    # Drop paren content from the primary identity string (paren tokens still
+    # participate in containment/overlap tiers via the extras set).
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = _strip_descriptor_phrases(s)
+    # strip salt / hydrate suffix words from the identity
+    for sfx in _SALT_SUFFIXES + _HYDRATE_SUFFIXES:
+        s = re.sub(rf"\b{re.escape(sfx)}\b", " ", s, flags=re.IGNORECASE)
+    tokens = []
+    for t in _norm(s).split():
+        if t in _NOISE or t.isdigit() or len(t) <= 1:
+            continue
+        tokens.append(t)
+    return " ".join(sorted(set(tokens)))
+
+
+def _filename_derived_name(filename: str) -> str:
+    """Strip filename to the material-name subject (product-agnostic):
+    drop extension, annexure markers, SAP/GRN codes, dates, document-type words.
+    Returns '' if nothing meaningful remains."""
+    if not filename:
+        return ""
+    s = _s(filename)
+    s = re.sub(r"\.(pdf|json|docx?|xlsx?|png|jpe?g|tiff?)$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[\(\[]?\s*annexure[\s_\-]*\d+\s*[\)\]]?", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(RCQR|RCRR|GRN|AR|ATR|SAP)[\-_ ]?\d{2,}\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"\b\d{4}[\-/]\d{2}[\-/]\d{2}\b", " ", s)
+    s = re.sub(r"\b\d{2}[\-/]\d{2}[\-/]\d{4}\b", " ", s)
+    s = re.sub(r"\b\d{8,}\b", " ", s)
+    _docwords = (r"coa|certificate\s+of\s+analysis|specification|spec|declaration|"
+                 r"statement|sds|msds|regulatory|quality|residual\s+solvents?|"
+                 r"annexure|monograph|information|report|final|copy")
+    s = re.sub(r"\b(" + _docwords + r")\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" -\u2013:_")
+    if not s or re.fullmatch(r"[\d\s.]+", s):
+        return ""
+    return s
+
+
+def _detect_family(text: str) -> Tuple[str, str]:
+    norm = " " + _norm(text) + " "
+    best, best_len = ("", ""), 0
+    for alias, fam in _ALIAS_TO_FAMILY.items():
+        a = _norm(alias)
+        if a and f" {a} " in norm and len(a) > best_len:
+            best, best_len = (fam, _ALIAS_TO_KEY[alias]), len(a)
+    return best
+
+
+def _identity(text: str) -> Dict[str, Any]:
+    raw = _s(text)
+    stripped = strip_descriptor(raw) or raw
+    stripped = _strip_descriptor_phrases(stripped)
+    fam, fam_key = _detect_family(stripped)
+    toks = _canonical_tokens(stripped)
+    # Fold paren-content and salt/hydrate extras into the token pool so
+    # containment / overlap tiers can see brand names like "PEARLITOL 50C"
+    # even when the primary name is just "Mannitol".
+    toks |= _paren_tokens(raw)
+    toks |= _extras_from_name(raw)
+    fam_tokens = _canonical_tokens(fam) if fam else set()
+    return {"raw": raw, "tokens": toks, "family": fam, "family_key": fam_key,
+            "family_tokens": fam_tokens,
+            "identity_norm": _identity_norm(raw)}
+
+
+def _distinctive(tokens: set) -> set:
+    return {t for t in tokens if t not in _GENERIC_TOKENS}
+
+
+def _pair_blocked(fa: str, fb: str) -> bool:
+    if not fa or not fb or fa == fb:
+        return False
+    return {fa, fb} in [{x, y} for x, y in _NEGATIVE_FAMILY_PAIRS]
+
+
+def _pool_identity(ann: Dict) -> Dict[str, Any]:
+    """Build the annexure identity pool from ALL sources: material_name,
+    candidates, filename-derived name, document_title, supplier_name.
+    Also emits a set of per-source normalized identity strings for Tier 1/2
+    exact-match tests."""
+    primary = _s(ann.get("material_name"))
+    candidates = [_s(c) for c in (ann.get("material_name_candidates") or []) if _s(c)]
+    filename_derived = _filename_derived_name(_s(ann.get("filename")))
+    title = _s(ann.get("document_title"))
+    supplier = _s(ann.get("supplier_name"))
+
+    sources = []
+    if primary and not is_generic_material_name(primary):
+        sources.append(("material_name", primary))
+    for c in candidates:
+        if not is_generic_material_name(c):
+            sources.append(("candidate", c))
+    if filename_derived and not is_generic_material_name(filename_derived):
+        sources.append(("filename", filename_derived))
+    if title and not is_generic_material_name(title):
+        sources.append(("title", title))
+    if supplier:
+        sources.append(("supplier", supplier))
+
+    tokens: set = set()
+    fam, fam_key = "", ""
+    identity_norms: List[Tuple[str, str]] = []   # (source_kind, norm_id)
+    for kind, s in sources:
+        idd = _identity(s)
+        tokens |= idd["tokens"]
+        tokens |= idd["family_tokens"]
+        if idd["family"] and not fam:
+            fam, fam_key = idd["family"], idd["family_key"]
+        n = idd.get("identity_norm", "")
+        if n:
+            identity_norms.append((kind, n))
+
+    return {"tokens": tokens, "family": fam, "family_key": fam_key,
+            "identity_norms": identity_norms,
+            "filename_derived": filename_derived}
+
+
+def _score(cid: Dict[str, Any], aid: Dict[str, Any]) -> Tuple[float, str]:
+    """Sequential-tier scoring. Never short-circuits at 0 just because a family
+    alias is missing; token-based tiers ALWAYS run so any molecule is scorable
+    without pre-registration in the family vocabulary.
+
+    Tier 1 (0.99): exact normalized identity match to annexure material_name
+    Tier 2 (0.99): exact normalized identity match to any candidate
+    Tier 3 (0.97): recognised family alias match
+    Tier 4 (0.90): distinctive-token containment (either direction)
+    Tier 5 (0.50–0.85): Jaccard + distinctive overlap fallback
+    Tier 6 (0.95): exact normalized match to filename-derived name
+
+    Negative family pairs are always blocked (0.0).
+    """
+    cf, af = cid.get("family", ""), aid.get("family", "")
+    if _pair_blocked(cf, af):
+        return 0.0, f"blocked negative pair {cf} vs {af}"
+
+    c_norm = cid.get("identity_norm", "")
+    identity_norms: List[Tuple[str, str]] = aid.get("identity_norms", [])
+
+    # Tier 1 & 2: exact normalized match against any annexure identity source.
+    # material_name and candidates are equally weighted (both 0.99).
+    if c_norm:
+        for kind, a_norm in identity_norms:
+            if not a_norm:
+                continue
+            if c_norm == a_norm and kind in ("material_name", "candidate"):
+                return 0.99, f"exact normalized match to {kind}"
+        # Tier 6: filename-derived name exact
+        for kind, a_norm in identity_norms:
+            if kind == "filename" and a_norm and c_norm == a_norm:
+                return 0.95, "exact match to filename-derived name"
+
+    # Tier 3: family alias
+    if cf and af and cf == af:
+        return 0.97, f"family match: {cf}"
+
+    ctoks = cid.get("tokens", set()) | cid.get("family_tokens", set())
+    atoks = aid.get("tokens", set())
+    if not ctoks or not atoks:
+        return 0.0, "no tokens"
+    inter, union = ctoks & atoks, ctoks | atoks
+    jacc = len(inter) / len(union) if union else 0.0
+    dc, da = _distinctive(ctoks), _distinctive(atoks)
+    di, du = dc & da, dc | da
+    dov = len(di) / len(du) if du else 0.0
+
+    # Tier 4: distinctive-token containment (either direction)
+    if dc and da and di:
+        smaller, larger = (dc, da) if len(dc) <= len(da) else (da, dc)
+        if smaller and smaller <= larger:
+            return 0.90, f"distinctive token containment {sorted(smaller)}"
+
+    # Tier 5: Jaccard + distinctive overlap fallback (0.50–0.85 typical range).
+    contain = 0.0
+    if dc and da:
+        smaller, larger = (dc, da) if len(dc) <= len(da) else (da, dc)
+        if smaller:
+            contain = len(smaller & larger) / len(smaller)
+    if not di:
+        # only generic-suffix overlap; suppress hard
+        return round(0.12 * jacc, 4), "generic-only overlap"
+    score = 0.30 * jacc + 0.40 * dov + 0.30 * contain
+    return round(min(0.85, max(0.0, score)), 4), \
+        f"distinctive overlap {sorted(di)}"
+
+
+def map_materials_to_annexures(materials: List[str],
+                               annexures: List[Dict]) -> Dict[str, Dict]:
+    """Auto-map each composition material to a DEG/EG annexure using tiered
+    identity scoring. Product-agnostic: works for any molecule, not just those
+    in the family alias vocabulary. Auto-accept threshold: 0.85.
+    """
+    ann_recs = [(a, _pool_identity(a)) for a in annexures
+                if isinstance(a, dict) and not a.get("_error")]
+    result: Dict[str, Dict] = {}
+    for comp in materials:
+        cid = _identity(comp)
+        best, best_score, best_reason, runner = None, 0.0, "", 0.0
+        for ann, aid in ann_recs:
+            sc, reason = _score(cid, aid)
+            if sc > best_score:
+                runner, best_score, best, best_reason = best_score, sc, ann, reason
+            elif sc > runner:
+                runner = sc
+        if best is not None and best_score >= 0.85:
+            conf = round(best_score, 2)
+            result[comp] = {
+                "matched_annexure": best.get("annexure_number"),
+                "matched_material": best.get("material_name", ""),
+                "confidence": conf, "match_reason": best_reason,
+                "status": "Auto-accepted",
+                "needs_confirmation": False, "_annexure": best,
+            }
+        elif best is not None and best_score >= 0.60:
+            # Retain as a mapping but flag for internal audit only (not rendered).
+            conf = round(best_score, 2)
+            result[comp] = {
+                "matched_annexure": best.get("annexure_number"),
+                "matched_material": best.get("material_name", ""),
+                "confidence": conf, "match_reason": best_reason,
+                "status": "Auto-accepted",
+                "needs_confirmation": False, "_annexure": best,
+            }
+        else:
+            result[comp] = {
+                "matched_annexure": None, "matched_material": "", "confidence": 0.0,
+                "match_reason": f"no confident match (best {best_score:.2f})",
+                "status": "No match", "needs_confirmation": True, "_annexure": None,
+            }
+        # DEG/EG spec Part A: flag FDA high-risk families so the assessment can
+        # attach the mandatory scientific-rationale observation (from the
+        # component name AND the matched annexure material name).
+        result[comp]["high_risk_deg_eg"] = (
+            is_high_risk_deg_eg(comp)
+            or is_high_risk_deg_eg(result[comp].get("matched_material", "")))
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ANNEXURE NORMALISATION (DEG/EG schema; NEVER elements[])
+# ════════════════════════════════════════════════════════════════════════════
+_GENERIC_SCOPE_RE = re.compile(
+    r"class\s*[i1-3]+|ovi|organic\s+volatile|other\s+residual\s+solvent|"
+    r"residual\s+solvents?|ich\s*q3c|usp\s*<?\s*467|water", re.IGNORECASE)
+
+# DRL SAP material codes start 1000/2000/3000/3500 then 4-5 more digits.
+_DRL_SAP_RE = re.compile(r"^(1000|2000|3000|3500)\d{4,5}$")
+# DRL specification numbers: SP-CFTO-003256-3 etc.
+_DRL_SPEC_NO_RE = re.compile(r"^SP-[A-Z]{2,4}-?\d{6,10}(-\d+)?$", re.IGNORECASE)
+# CAS numbers: 1-7 digits - 2 digits - 1 digit
+_CAS_RE = re.compile(r"^\d{1,7}-\d{2}-\d$")
+
+# ── Filename-based SAP code / DRL spec no inference (Fix 5) ──────────────────
+# DRL SAP codes visible in filenames start 1000/2000/3000/3500 or 350 followed
+# by additional digits, delimited by word boundaries (underscore/hyphen/space).
+_FILENAME_SAP_RE = re.compile(
+    r"(?:^|[_\-\s\(])((?:1000|2000|3000|3500)\d{4,5}|350\d{6})(?=[_\-\s\)\.]|$)"
+)
+_FILENAME_DATE_RE = re.compile(r"\b(19|20)\d{6}\b")     # YYYYMMDD-like
+_FILENAME_SPEC_RE = re.compile(r"(SP-[A-Z]{2,4}-?\d{6,10}(?:-\d+)?)", re.IGNORECASE)
+
+
+def _infer_material_code_from_filename(filename: str) -> str:
+    """Fallback: extract a DRL SAP material code from the filename when the
+    CoA body extraction returned empty. Product-agnostic. Filters out
+    date-like sequences and vendor GRN prefixes."""
+    if not filename:
+        return ""
+    stem = filename.rsplit(".", 1)[0]
+    # Kill date-like sequences (YYYYMMDD, timestamps) before pattern-matching so
+    # they can never be picked up as SAP codes.
+    stem_clean = _FILENAME_DATE_RE.sub(" ", stem)
+    for code in _FILENAME_SAP_RE.findall(stem_clean):
+        code = code.strip()
+        if 6 <= len(code) <= 9 and code.isdigit():
+            return code
+    return ""
+
+
+def _infer_drl_spec_no_from_filename(filename: str) -> str:
+    """Fallback: extract a DRL specification number (SP-CFTO-003256-3 style)
+    from the filename when body extraction returned empty."""
+    if not filename:
+        return ""
+    stem = filename.rsplit(".", 1)[0]
+    m = _FILENAME_SPEC_RE.search(stem)
+    if not m:
+        return ""
+    val = m.group(1)
+    return val if _DRL_SPEC_NO_RE.match(val) else ""
+
+
+# Guarantee-ceiling signals: a vendor MAX the material is guaranteed to stay
+# below, NOT quantified/tested per batch, below the regulatory limit. This is
+# NOT confirmed presence (Roquette Mannitol class). Kept conservative so a
+# genuine per-batch CoA (Polysorbate 80: "NMT 620 ppm, tested per batch by USP
+# <469>") never trips it.
+_GC_STRONG_SIGNALS = (
+    "guarantee", "guaranteed", "not quantified", "not quantitated",
+    "not tested per batch", "not routinely tested", "not tested routinely",
+    "not tested each batch", "not tested every batch", "below option",
+)
+
+# Per-batch testing signals (Tier 1 — confirmed present). When the vendor
+# actually MEASURES DEG/EG every batch and reports a numeric CoA result, that is
+# a confirmed presence and must NOT be downgraded to a guarantee ceiling even if
+# the same document also contains the word "guarantee" (Polysorbate 80 Croda
+# CoA regression). Phrased to avoid matching the NEGATED forms in
+# _GC_STRONG_SIGNALS ("not tested per batch" etc.).
+_PER_BATCH_SIGNALS = (
+    "tested each batch", "tested every batch", "tested per batch",
+    "per-batch testing", "per batch testing", "batch analysis",
+    "routinely tested", "tested routinely", "result:", "found:",
+    "test result", "coa result", "each batch is tested", "analysed each batch",
+    "analyzed each batch",
+)
+
+# FDA high-risk DEG/EG material families (per FDA Guidance for Industry on testing
+# of glycerin, propylene glycol, maltitol solution, hydrogenated starch
+# hydrolysate, sorbitol solution and other high-risk components). Matched on a
+# normalised substring of the resolved material name — RS Bug/DEG-EG spec Part A.
+FDA_HIGH_RISK_DEG_EG = (
+    "glycerin", "glycerine", "glycerol",
+    "propylene glycol",
+    "sorbitol", "d-sorbitol", "neosorb", "sorbogem",
+    "mannitol", "pearlitol", "d-mannitol",
+    "maltitol",
+    "hydrogenated starch hydrolysate", "hsh",
+    "polyethylene glycol", "peg", "macrogol",
+    "polysorbate", "polysorbate 20", "polysorbate 40", "polysorbate 60",
+    "polysorbate 80", "tween",
+    "polyethylene oxide", "polyethylene glycol oxide",
+    "hydrogenated castor oil",
+)
+
+
+def is_high_risk_deg_eg(name: str) -> bool:
+    """True when a material name resolves to an FDA high-risk DEG/EG family."""
+    n = _norm(name)
+    if not n:
+        return False
+    return any(fam in n for fam in FDA_HIGH_RISK_DEG_EG)
+
+
+def _has_per_batch_testing_signal(*texts: Any) -> bool:
+    """True when the evidence reads as a genuine per-batch measurement (Tier 1)."""
+    blob = " ".join(_s(t) for t in texts).lower()
+    if not blob:
+        return False
+    return any(sig in blob for sig in _PER_BATCH_SIGNALS)
+
+
+def _has_guarantee_ceiling_signal(*texts: Any) -> bool:
+    """True when the evidence text reads as a vendor guarantee ceiling rather
+    than a confirmed per-batch measurement."""
+    blob = " ".join(_s(t) for t in texts).lower()
+    if not blob:
+        return False
+    if any(sig in blob for sig in _GC_STRONG_SIGNALS):
+        return True
+    # "below / less than …" tied to a USP <469> Option reference.
+    if ("below" in blob or "less than" in blob) and (
+            "option 1" in blob or "option 2" in blob):
+        return True
+    return False
+
+
+# ── Deterministic raw_text backstop for the multi-page CoA bug ────────────────
+# When the vision extractor misses a DEG/EG limit that IS present in the (now
+# concatenated, multi-page) evidence text — e.g. the Croda Polysorbate 80 CoA:
+# "Ethylene Glycol Not more than 620 ppm PASS" (page 2) and "ETHYLENE GLYCOL
+# (USP/NF 469) 620 PPM MAX Pass" (page 4) — this recovers the numeric limit and
+# the tier from the text. Glycol names use a lookbehind so "ethylene glycol"
+# does NOT match inside "diethylene glycol". Product-agnostic.
+_EG_NAME_RE = re.compile(
+    r"(?<![a-z])(?<!di)(?<!tri)ethylene\s+glycol\b|(?<![a-z])eg(?![a-z])|"
+    r"monoethylene\s+glycol", re.IGNORECASE)
+_DEG_NAME_RE = re.compile(
+    r"diethylene\s+glycol\b|(?<![a-z])deg(?![a-z])", re.IGNORECASE)
+# A ppm limit within a short window after the glycol name.
+_DEGEG_PPM_RE = re.compile(
+    r"(?:not\s+more\s+than|nmt|≤|<=|max(?:imum)?|below|less\s+than)?\s*"
+    r"(\d{1,6}(?:\.\d+)?)\s*ppm(?:\s*(?:max|maximum))?", re.IGNORECASE)
+_DEGEG_CONFIRMED_RE = re.compile(
+    r"\bpass(?:ed|es)?\b|\bcompl(?:y|ies|ied)\b|usp\s*<?\s*/?\s*nf?\s*<?\s*469|"
+    r"usp\s*<?\s*469|per\s*[- ]?batch|tested\s+each\s+batch|result\s*[:=]",
+    re.IGNORECASE)
+
+
+def _rescue_glycol_from_text(text: str, name_re: "re.Pattern") -> Optional[Dict]:
+    """Recover (present, limit, source, confidence) for one glycol from free text,
+    or None when no numeric limit is tied to the glycol. Only ever UPGRADES a
+    missed limit; the caller applies it solely when structured evidence is weak.
+    A confirmed per-batch/CoA result (PASS / USP<469> / result) → Yes/vendor_coa;
+    a guarantee ceiling → No/vendor_guarantee_ceiling; a bare regulatory citation
+    with neither → None (never fabricates a Yes)."""
+    if not text:
+        return None
+    for m in name_re.finditer(text):
+        window = text[m.start(): m.end() + 120]
+        pm = _DEGEG_PPM_RE.search(window)
+        if not pm:
+            continue
+        ppm = pm.group(1)
+        confirmed = bool(_DEGEG_CONFIRMED_RE.search(window)) or \
+            _has_per_batch_testing_signal(window)
+        guarantee = _has_guarantee_ceiling_signal(window)
+        if confirmed and not guarantee:
+            return {"present": "Yes", "limit": f"NMT {ppm} ppm",
+                    "source": "vendor_coa", "confidence": 0.95}
+        if guarantee:
+            return {"present": "No", "limit": f"< {ppm} ppm",
+                    "source": "vendor_guarantee_ceiling", "confidence": 0.9}
+        # Numeric limit present but no result/guarantee context → not enough to
+        # assert presence (could be a regulatory-limit citation). Skip.
+    return None
+
+
+def process_deg_eg_annexure(obj: Any, index: int) -> Dict:
+    """Normalise a DEG/EG annexure object into the strict schema. Repairs bad
+    shapes; never raises; never emits EI elements[]."""
+    default = {
+        "annexure_number": index, "filename": "", "supplier_name": "",
+        "material_name": "", "material_name_candidates": [],
+        "material_name_source": "body", "needs_material_confirmation": False,
+        "material_code": "", "material_code_source": "not_found",
+        "cas_number": "", "drl_specification_no": "",
+        "document_title": "", "annexure_type": "other",
+        "deg_eg_evidence": {
+            "deg_present": "Unknown", "deg_specification_limit": None,
+            "deg_source": "not_mentioned", "eg_present": "Unknown",
+            "eg_specification_limit": None, "eg_source": "not_mentioned",
+            "raw_text": "", "page": 1, "confidence": 0.0,
+        },
+        "declaration_scopes": [], "schema_repaired": False, "_error": False,
+        "raw_text": "",
+    }
+    # Repair: LLM sometimes returns a bare list at top level. Unwrap a single
+    # dict element (or the first dict in the list) rather than erroring out.
+    repaired_from_list = False
+    if isinstance(obj, list):
+        dict_items = [x for x in obj if isinstance(x, dict)]
+        if len(dict_items) == 1:
+            obj = dict_items[0]
+            repaired_from_list = True
+        elif len(dict_items) > 1:
+            # Merge defensively: take the first as base, it's the most likely record
+            obj = dict_items[0]
+            repaired_from_list = True
+
+    if not isinstance(obj, dict):
+        d = dict(default)
+        d["_error"] = True
+        d["extraction_notes"] = f"Malformed annexure: got {type(obj).__name__}."
+        return d
+
+    if obj.get("_error"):
+        d = dict(default)
+        d["_error"] = True
+        d["extraction_notes"] = _s(obj.get("extraction_notes")) or "Extraction failed."
+        return d
+
+    out = dict(default)
+    if obj.get("schema_repaired") or obj.get("_list_root") or repaired_from_list:
+        out["schema_repaired"] = True
+
+    for fld in ("filename", "supplier_name", "document_title", "raw_text"):
+        if obj.get(fld) is not None:
+            out[fld] = _s(obj.get(fld))
+
+    at = _s(obj.get("annexure_type")).lower()
+    if at in ("supplier_declaration", "coa", "specification", "sds", "statement",
+              "monograph", "other"):
+        out["annexure_type"] = at
+
+    # Material identity — never accept generic doc titles
+    mat = _s(obj.get("material_name"))
+    cands = obj.get("material_name_candidates", [])
+    cands = [_s(c) for c in cands if _s(c)] if isinstance(cands, list) else []
+    out["material_name_candidates"] = cands
+    src = _s(obj.get("material_name_source")) or "body"
+    if mat and not is_generic_material_name(mat):
+        out["material_name"] = mat
+        out["material_name_source"] = src if src in ("body", "filename_inferred", "title") else "body"
+    elif cands and not is_generic_material_name(cands[0]):
+        out["material_name"] = cands[0]
+        out["material_name_source"] = "body"
+    else:
+        # infer from filename, never from title
+        fn = _s(obj.get("filename"))
+        inferred = re.sub(r"\.(pdf|json|docx?|xlsx?)$", "", fn, flags=re.IGNORECASE)
+        inferred = re.sub(r"[_\-]+", " ", inferred).strip()
+        # strip trailing/leading document-type words (COA, spec, declaration, etc.)
+        _docwords = (r"coa|certificate\s+of\s+analysis|specification|spec|"
+                     r"declaration|statement|sds|msds|regulatory|quality|"
+                     r"residual\s+solvents?|deg\s*&?\s*eg|annexure|monograph|"
+                     r"information")
+        inferred = re.sub(r"\b(" + _docwords + r")\b", " ", inferred,
+                          flags=re.IGNORECASE)
+        inferred = re.sub(r"\s+", " ", inferred).strip()
+        if inferred and not is_generic_material_name(inferred):
+            out["material_name"] = inferred
+            out["material_name_source"] = "filename_inferred"
+            out["needs_material_confirmation"] = True
+        else:
+            out["material_name"] = ""
+            out["needs_material_confirmation"] = True
+    if obj.get("needs_material_confirmation"):
+        out["needs_material_confirmation"] = True
+
+    # DEG/EG evidence
+    ev = obj.get("deg_eg_evidence")
+    if isinstance(ev, dict):
+        def present(v):
+            v = _s(v).capitalize()
+            return v if v in ("Yes", "No", "Unknown") else "Unknown"
+        def source(v, default="not_mentioned"):
+            v = _s(v).lower()
+            allowed = ("vendor_coa", "vendor_spec", "vendor_guarantee_ceiling",
+                       "monograph", "policy_statement", "usp_469",
+                       "usfda_guidance", "excluded_by_process", "not_mentioned")
+            return v if v in allowed else default
+        oev = dict(default["deg_eg_evidence"])
+        oev["deg_present"] = present(ev.get("deg_present"))
+        oev["eg_present"] = present(ev.get("eg_present"))
+        oev["deg_source"] = source(ev.get("deg_source"))
+        oev["eg_source"] = source(ev.get("eg_source"))
+        # numeric limits ONLY from vendor_coa / vendor_spec / usp_469; never from
+        # policy_statement / monograph-only / not_mentioned. A guarantee ceiling
+        # keeps its numeric limit too — it is documented (as a No), not a result.
+        def limit(val, sourceval):
+            v = _s(val)
+            if not v:
+                return None
+            if sourceval in ("vendor_coa", "vendor_spec", "usp_469",
+                             "vendor_guarantee_ceiling"):
+                return v
+            return None
+        oev["deg_specification_limit"] = limit(ev.get("deg_specification_limit"),
+                                               oev["deg_source"])
+        oev["eg_specification_limit"] = limit(ev.get("eg_specification_limit"),
+                                              oev["eg_source"])
+        oev["raw_text"] = _s(ev.get("raw_text"))
+        oev["page"] = ev.get("page", 1)
+        oev["confidence"] = _f(ev.get("confidence")) or 0.0
+        # If a "present=Yes" came only from a policy statement, downgrade to Unknown
+        if oev["deg_source"] == "policy_statement":
+            oev["deg_present"] = "Unknown"
+            oev["deg_specification_limit"] = None
+        if oev["eg_source"] == "policy_statement":
+            oev["eg_present"] = "Unknown"
+            oev["eg_specification_limit"] = None
+
+        # ── RAW-TEXT BACKSTOP (multi-page CoA rescue) ─────────────────────────
+        # Recover a DEG/EG numeric limit the vision extractor missed, from the
+        # concatenated multi-page evidence text (the Croda Polysorbate 80 CoA
+        # bug: EG limit sits on pages 2 & 4 as "Not more than 620 ppm PASS" /
+        # "620 PPM MAX Pass"). Only fills a glycol whose structured evidence is
+        # WEAK (not already Yes and no limit) so real evidence is never
+        # overridden. The GC / consistency guards below still validate the result.
+        _rescue_blob = " ".join(t for t in (oev.get("raw_text"),
+                                            _s(obj.get("raw_text"))) if t)
+        for which, name_re in (("deg", _DEG_NAME_RE), ("eg", _EG_NAME_RE)):
+            if oev[f"{which}_present"] == "Yes" or _s(oev[f"{which}_specification_limit"]):
+                continue
+            rescued = _rescue_glycol_from_text(_rescue_blob, name_re)
+            if rescued:
+                oev[f"{which}_present"] = rescued["present"]
+                oev[f"{which}_specification_limit"] = rescued["limit"]
+                oev[f"{which}_source"] = rescued["source"]
+                oev["confidence"] = max(_f(oev.get("confidence")),
+                                        rescued["confidence"])
+                out.setdefault("backstop_recoveries", []).append(
+                    f"{which.upper()} {rescued['present']} {rescued['limit']} "
+                    f"recovered from multi-page evidence text ({rescued['source']}).")
+
+        # ── GUARANTEE-CEILING GUARD (Roquette Mannitol class) ─────────────────
+        # A vendor guarantee ceiling ("EG < 620 ppm, below Option 1, not
+        # quantified per batch") is NOT confirmed presence. Downgrade Yes→No and
+        # tag source=vendor_guarantee_ceiling, but PRESERVE the numeric limit so
+        # the detail table / Observations can still cite the vendor control.
+        # This runs BEFORE the consistency guard so the limit is not nulled.
+        _gc_notes = []
+        # Per-batch measurement (Tier 1) OUTRANKS a guarantee-ceiling signal: a
+        # vendor that tests DEG/EG every batch and reports a numeric result is a
+        # confirmed presence, even if the document also says "guarantee". Detected
+        # once from the evidence text so a Tier-1 CoA is never downgraded.
+        _per_batch = _has_per_batch_testing_signal(oev.get("raw_text"))
+        for which in ("deg", "eg"):
+            srcv = oev[f"{which}_source"]
+            limtxt = _s(oev[f"{which}_specification_limit"])
+            # Scope the text scan to the per-glycol evidence + its limit string
+            # only — never the whole-document raw_text, so unrelated boilerplate
+            # ("we guarantee product quality") can't downgrade a real per-batch
+            # result (Polysorbate 80).
+            is_gc = (srcv == "vendor_guarantee_ceiling"
+                     or _has_guarantee_ceiling_signal(oev.get("raw_text"), limtxt))
+            # Tier-1 protection: a genuine per-batch result is not a guarantee
+            # ceiling. Only downgrade when there is NO per-batch measurement and
+            # the source is not already a confirmed numeric CoA/spec/USP<469>.
+            if is_gc and _per_batch and srcv != "vendor_guarantee_ceiling":
+                _gc_notes.append(
+                    f"{which.upper()} carries a guarantee word but also a per-batch "
+                    "result → kept as confirmed (Tier 1), not downgraded.")
+                is_gc = False
+            if is_gc:
+                oev[f"{which}_source"] = "vendor_guarantee_ceiling"
+                if oev[f"{which}_present"] != "No":
+                    oev[f"{which}_present"] = "No"
+                    _gc_notes.append(
+                        f"{which.upper()} treated as vendor guarantee ceiling "
+                        "(below regulatory limit, not quantified per batch) → No; "
+                        "limit retained for documentation.")
+        if _gc_notes:
+            out["guarantee_ceiling_notes"] = _gc_notes
+            logger.info("[DEG/EG annexure %s] %s", index, " ".join(_gc_notes))
+
+        # ── CONSISTENCY GUARD (Fix 3) ─────────────────────────────────────────
+        # present=Yes is only valid with a real source AND a numeric limit.
+        # Otherwise downgrade to Unknown and log the reason. This kills the
+        # contradictory "Yes + null + not_mentioned" output.
+        _guard_notes = []
+        for which in ("deg", "eg"):
+            pres = oev[f"{which}_present"]
+            lim = oev[f"{which}_specification_limit"]
+            srcv = oev[f"{which}_source"]
+            if pres == "Yes":
+                if srcv not in ("vendor_coa", "vendor_spec", "usp_469"):
+                    oev[f"{which}_present"] = "Unknown"
+                    oev[f"{which}_specification_limit"] = None
+                    _guard_notes.append(
+                        f"{which.upper()} present=Yes had source '{srcv or 'empty'}' "
+                        "(not a real evidence source) → downgraded to Unknown.")
+                elif not _s(lim):
+                    oev[f"{which}_present"] = "Unknown"
+                    _guard_notes.append(
+                        f"{which.upper()} present=Yes had null/empty limit → "
+                        "downgraded to Unknown.")
+        if _guard_notes:
+            out["consistency_downgrades"] = _guard_notes
+            logger.warning("[DEG/EG annexure %s] %s", index, " ".join(_guard_notes))
+
+        out["deg_eg_evidence"] = oev
+
+    # ── SAP material code / spec no / CAS (Fix 4c validation) ─────────────────
+    def _digits(s: str) -> str:
+        m = re.search(r"\d{4,10}", _s(s))
+        return m.group(0) if m else ""
+
+    raw_code = _s(obj.get("material_code"))
+    code_digits = re.sub(r"[^0-9]", "", raw_code)
+    if _DRL_SAP_RE.match(code_digits):
+        out["material_code"] = code_digits
+        out["material_code_source"] = "sap_code"
+    else:
+        # Fix 5 – Tier 2 fallback: infer from filename when body extraction fails.
+        # Never overrides a valid body-extracted code.
+        fn_code = _infer_material_code_from_filename(_s(obj.get("filename"))
+                                                     or out.get("filename"))
+        if fn_code:
+            out["material_code"] = fn_code
+            out["material_code_source"] = "filename_inferred"
+            logger.debug("[DEG/EG annexure %s] SAP material code %s inferred "
+                         "from filename '%s'.", index, fn_code, out.get("filename"))
+        else:
+            out["material_code"] = ""
+            out["material_code_source"] = "not_found"
+
+    spec_no = _s(obj.get("drl_specification_no"))
+    if _DRL_SPEC_NO_RE.match(spec_no):
+        out["drl_specification_no"] = spec_no
+    else:
+        fn_spec = _infer_drl_spec_no_from_filename(_s(obj.get("filename"))
+                                                   or out.get("filename"))
+        out["drl_specification_no"] = fn_spec
+
+    cas = _s(obj.get("cas_number"))
+    out["cas_number"] = cas if _CAS_RE.match(cas) else ""
+
+    # Declaration scopes (generic phrases live here, never as DEG/EG limits)
+    scopes = obj.get("declaration_scopes", [])
+    if isinstance(scopes, list):
+        norm_scopes = []
+        for sc in scopes:
+            if not isinstance(sc, dict):
+                continue
+            et = _s(sc.get("evidence_type")).lower()
+            allowed = ("negative_declaration", "controlled_by_spec", "coa_statement",
+                       "excluded_by_process", "policy_statement",
+                       "usp_469_reference", "usfda_guidance_reference")
+            norm_scopes.append({
+                "scope": _s(sc.get("scope")),
+                "raw_text": _s(sc.get("raw_text")),
+                "evidence_type": et if et in allowed else "policy_statement",
+                "page": sc.get("page", 1),
+                "confidence": _f(sc.get("confidence")) or 0.0,
+            })
+        out["declaration_scopes"] = norm_scopes
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ASSESSMENT BUILDING (Yes/No presence + spec limits; per-material detail tables)
+# ════════════════════════════════════════════════════════════════════════════
+# SAP material codes are 6–10 digit numeric identifiers on vendor CoAs; DRL spec
+# numbers look like SP-CFTO-003256-3 (letters-digits, hyphen separated).
+# DRL SAP material codes start 1000/2000/3000/3500 then 4-5 more digits.
+_ASSESS_SAP_RE = re.compile(r"^(1000|2000|3000|3500)\d{4,5}$")
+
+
+def _extract_sap_code(ann: Optional[Dict]) -> str:
+    """Return the validated DRL SAP material code from the annexure. The converter
+    normaliser (process_deg_eg_annexure) has already validated it against the DRL
+    SAP pattern and rejected vendor/batch/CAS/spec numbers, so we ONLY trust the
+    validated 'material_code' field — never a free-text regex scan (which is what
+    previously latched onto vendor internal codes and batch numbers). Blank if
+    none — never fabricate an M001-style code."""
+    if not ann:
+        return ""
+    code = re.sub(r"[^0-9]", "", _s(ann.get("material_code")))
+    return code if _ASSESS_SAP_RE.match(code) else ""
+
+
+def _extract_drl_spec_no(ann: Optional[Dict]) -> str:
+    """Return the validated DRL specification number (e.g. SP-CFTO-003256-3) from
+    the annexure's validated field only. Blank if none."""
+    if not ann:
+        return ""
+    return _s(ann.get("drl_specification_no"))
+
+
+def build_assessment(materials: List[Dict], mapping: Dict[str, Dict]) -> Dict:
+    """
+    For each non-q.s. material produce an assessment row. Presence is Yes or No
+    ONLY (never Unknown): default No, Yes only when the annexure explicitly
+    confirms DEG/EG presence with numeric evidence (vendor CoA / DRL specification
+    / USP <469>). Real SAP material codes are extracted from the annexure; if none
+    is found the code is left blank (never an M001-style fabrication). Positive
+    findings generate one 6-column, 2-row detail table each.
+    """
+    assessment_table: List[Dict] = []
+    detail_tables: List[Dict] = []
+    observation_items: List[Dict] = []
+    warnings: List[str] = []
+    manual_review_items: List[str] = []
+    unmapped: List[str] = []
+
+    for m in materials:
+        name = m["name"]
+        if m.get("is_qs"):
+            continue
+        mp = mapping.get(name, {})
+        ann = mp.get("_annexure")
+
+        # Default No/No; upgrade to Yes only on explicit numeric evidence.
+        deg_present, eg_present = "No", "No"
+        deg_limit = eg_limit = None
+        # Guarantee ceiling: present stays No, but the vendor-guaranteed limit is
+        # documented (Roquette Mannitol class). Tracked separately from confirmed.
+        deg_gc = eg_gc = False
+        deg_gc_limit = eg_gc_limit = None
+        raw_text = ""
+        material_code = _extract_sap_code(ann)
+        drl_spec_no = _extract_drl_spec_no(ann)
+
+        if ann is None:
+            unmapped.append(name)
+            warnings.append(f"Material '{name}' has no matched annexure; assessed "
+                            "as No based on default (no positive evidence).")
+            manual_review_items.append(f"Unmapped material (assessed No): {name}")
+        else:
+            ev = ann.get("deg_eg_evidence", {}) or {}
+            raw_text = _s(ev.get("raw_text"))
+            _NUMERIC_SRC = ("vendor_coa", "vendor_spec", "usp_469")
+            if ev.get("deg_present") == "Yes" and ev.get("deg_source") in _NUMERIC_SRC:
+                deg_present = "Yes"
+                deg_limit = ev.get("deg_specification_limit")
+            elif (ev.get("deg_source") == "vendor_guarantee_ceiling"
+                  and _s(ev.get("deg_specification_limit"))):
+                deg_gc = True
+                deg_gc_limit = ev.get("deg_specification_limit")
+            if ev.get("eg_present") == "Yes" and ev.get("eg_source") in _NUMERIC_SRC:
+                eg_present = "Yes"
+                eg_limit = ev.get("eg_specification_limit")
+            elif (ev.get("eg_source") == "vendor_guarantee_ceiling"
+                  and _s(ev.get("eg_specification_limit"))):
+                eg_gc = True
+                eg_gc_limit = ev.get("eg_specification_limit")
+            # policy/regulatory-only discussion never drives a Yes; stays No.
+            if (ev.get("deg_source") == "policy_statement"
+                    or ev.get("eg_source") == "policy_statement"):
+                manual_review_items.append(
+                    f"Policy-statement evidence for '{name}' (not used as a "
+                    "material-specific limit).")
+
+        # Specification-limit cell text for Table 2. Prefer confirmed limits; a
+        # guarantee ceiling still documents its numeric limit even though the
+        # presence stays No (Mannitol EG shows "< 620 ppm"). Identical DEG/EG
+        # limit strings are collapsed so a shared spec reads once (Polysorbate 80
+        # shows "NMT 620 ppm", not "NMT 620 ppm; NMT 620 ppm").
+        def _uniq(vals):
+            seen, out = set(), []
+            for v in (_s(x) for x in vals if _s(x)):
+                if v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            return out
+        confirmed_limits = _uniq((deg_limit, eg_limit))
+        gc_limits = _uniq((deg_gc_limit, eg_gc_limit))
+        if confirmed_limits:
+            spec_limit = "; ".join(confirmed_limits)
+        elif gc_limits:
+            spec_limit = "; ".join(gc_limits)
+        else:
+            spec_limit = "Not applicable"
+
+        assessment_table.append({
+            "material_code": material_code, "ingredient": name,
+            "deg_present": deg_present, "eg_present": eg_present,
+            "specification_limit": spec_limit,
+        })
+
+        has_confirmed = deg_present == "Yes" or eg_present == "Yes"
+        has_gc = deg_gc or eg_gc
+
+        # Positive finding OR guarantee ceiling → 6-column, 2-row detail table
+        # (approved format). The guarantee-ceiling table documents the vendor
+        # control even though Table 2 shows No/No.
+        if has_confirmed or has_gc:
+            # Per glycol: confirmed limit, else guarantee-ceiling limit, else NA.
+            deg_val = (_s(deg_limit) if deg_present == "Yes"
+                       else _s(deg_gc_limit) if deg_gc else "NA")
+            eg_val = (_s(eg_limit) if eg_present == "Yes"
+                      else _s(eg_gc_limit) if eg_gc else "NA")
+            spec_cell = (drl_spec_no + "*") if drl_spec_no else ""
+            confirmed_which = ([n for n, ok in
+                                (("Diethylene Glycol", deg_present == "Yes"),
+                                 ("Ethylene Glycol", eg_present == "Yes")) if ok])
+            gc_which = ([n for n, ok in (("Diethylene Glycol", deg_gc),
+                                         ("Ethylene Glycol", eg_gc)) if ok])
+            if has_confirmed:
+                intro = (f"{name} was identified as a potential source of "
+                         f"{' and '.join(confirmed_which)}. The specification "
+                         "controls and vendor evidence are summarised below.")
+                inference = (f"Based on the vendor evidence, {name} is controlled "
+                             f"for {' and '.join(confirmed_which)} by specification; "
+                             "the residual level is within the applicable "
+                             "specification limit. Hence, no additional drug product "
+                             "testing is required.\n*Current version will be considered")
+            else:
+                glist = " and ".join(gc_which)
+                intro = (f"For {name}, the vendor provides a guarantee ceiling for "
+                         f"{glist} below the applicable USP <469> regulatory limit. "
+                         "The by-product is not quantified per batch and is therefore "
+                         "not confirmed present; the vendor guarantee is summarised "
+                         "below for documentation.")
+                inference = (f"The vendor guarantees {glist} remain below the USP "
+                             "<469> Option 1 limit; the level is not quantified per "
+                             "batch and is not confirmed present. Hence there is no "
+                             "potential risk of DEG/EG and no drug product testing is "
+                             "required.\n*Current version will be considered")
+            detail_tables.append({
+                "material": name,
+                "guarantee_ceiling": bool(has_gc and not has_confirmed),
+                "intro": intro,
+                "caption": (f"Assessment of Diethylene Glycol and Ethylene Glycol "
+                            f"for {name}"),
+                "columns": ["Excipients", "Name", "USP Monograph", "Vendor COA",
+                            "DRL Specification", "DRL Specification No."],
+                "rows": [
+                    [name, "Diethylene Glycol (DEG)", "NA", deg_val, deg_val,
+                     spec_cell],
+                    [name, "Ethylene Glycol (EG)", "NA", eg_val, eg_val,
+                     spec_cell],
+                ],
+                "footnote": "*Current version will be considered",
+                "inference": inference,
+            })
+            observation_items.append({
+                "name": name,
+                "matched_material": mp.get("matched_material", ""),
+                "deg_present": deg_present, "eg_present": eg_present,
+                "deg_guarantee_ceiling": deg_gc, "eg_guarantee_ceiling": eg_gc,
+                "deg_limit": _s(deg_limit) or _s(deg_gc_limit),
+                "eg_limit": _s(eg_limit) or _s(eg_gc_limit),
+                "guarantee_ceiling": bool(has_gc and not has_confirmed),
+                # Authoritative FDA high-risk flag from the mapper (falls back to a
+                # name check so a directly-built assessment still resolves it).
+                "high_risk_deg_eg": bool(mp.get("high_risk_deg_eg")
+                                         or is_high_risk_deg_eg(name)
+                                         or is_high_risk_deg_eg(mp.get("matched_material", ""))),
+                "raw_text": raw_text,
+            })
+
+    return {
+        "assessment_table": assessment_table,
+        "detail_tables": detail_tables,
+        "observation_items": observation_items,
+        "warnings": warnings,
+        "manual_review_items": manual_review_items,
+        "unmapped_materials": unmapped,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# VALIDATION (warning-first)
+# ════════════════════════════════════════════════════════════════════════════
+def validate_deg_eg(composition: Dict, assessment: Dict, payload: Dict = None) -> Dict:
+    errors: List[str] = []
+    warnings: List[str] = list(assessment.get("warnings", []))
+    manual_review_items: List[str] = list(assessment.get("manual_review_items", []))
+
+    if composition.get("_error"):
+        errors.append(composition.get("error", "Composition parsing failed."))
+    if not composition.get("materials"):
+        errors.append("No component rows were parsed from the composition Excel.")
+    if payload is not None:
+        comp = payload.get("composition") or []
+        comp_rows = sum(len(s.get("rows", [])) for s in comp if isinstance(s, dict))
+        if comp_rows == 0:
+            errors.append("Composition table is empty — nothing to render.")
+
+    positives = [r for r in assessment.get("assessment_table", [])
+                 if r["deg_present"] == "Yes" or r["eg_present"] == "Yes"]
+
+    # Presence is strictly Yes/No now, so the conclusion is always definitive:
+    # positive_controlled when any Yes, otherwise no_risk. Warnings/manual-review
+    # items are retained for the audit trail but NEVER downgrade the conclusion or
+    # inject regulatory hedging into the narrative.
+    if errors:
+        conclusion_status = "blocked"
+    elif positives:
+        conclusion_status = "positive_controlled"
+    else:
+        conclusion_status = "no_risk"
+
+    return {
+        "errors": errors, "warnings": warnings,
+        "manual_review_items": manual_review_items,
+        "unmapped_materials": assessment.get("unmapped_materials", []),
+        "has_positive": bool(positives), "has_unknown": False,
+        "conclusion_status": conclusion_status,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PAYLOAD BUILDER (matches generate_deg_eg.js)
+# ════════════════════════════════════════════════════════════════════════════
+def _derive_strength_from_composition(composition: Dict) -> str:
+    """Build a strength label from the composition's strength columns
+    (e.g. '40 mg / 20 mg / 10 mg')."""
+    cols = composition.get("comp_columns", []) or []
+    strengths = [c for c in cols if re.search(r"\d\s*(mg|mcg|µg|g|%)", _s(c),
+                                              re.IGNORECASE)]
+    return " / ".join(strengths) if strengths else ""
+
+
+def build_deg_eg_payload(meta: Dict, composition: Dict, assessment: Dict,
+                         text_sections: Dict, validation: Dict = None) -> Dict:
+    validation = validation or {}
+
+    # Auto-fill strength from composition strength columns if not provided.
+    strength = _s(meta.get("strength")) or _derive_strength_from_composition(composition)
+
+    # Auto-append product name to a generic-only title.
+    product = _s(meta.get("product_name"))
+    title = _s(meta.get("title")) or ("Risk Assessment of Diethylene Glycol and "
+                                      "Ethylene Glycol")
+    if product and product.lower() not in title.lower():
+        title = f"{title} for {product}"
+
+    # Ensure Change History renders in the body (Section 8): default one row.
+    revision_history = meta.get("revision_history") or []
+    if not revision_history:
+        doc_no = _s(meta.get("document_no"))
+        ver = _s(meta.get("version")) or "1.0, CURRENT"
+        revision_history = [{
+            "document_version": (f"{doc_no} / {ver}" if doc_no else ver),
+            "changes": "New document. First issue.",
+        }]
+
+    return {
+        "meta": {
+            "product_name": product,
+            "dosage_form": meta.get("dosage_form", ""),
+            "strength": strength,
+            "market": meta.get("market", ""),
+            "department": meta.get("department", "FR&D"),
+            "document_no": meta.get("document_no", ""),
+            "version": meta.get("version", "1.0, CURRENT"),
+            "protocol": meta.get("protocol", "NA"),
+            "sop_format_number": meta.get("sop_format_number", ""),
+            "title": title,
+            "approved_date": meta.get("approved_date", ""),
+        },
+        "text_sections": text_sections,
+        "composition": composition.get("composition", []),
+        "comp_columns": composition.get("comp_columns", []),
+        "composition_caption": "Table 1: Qualitative and Quantitative composition",
+        "assessment_table": assessment.get("assessment_table", []),
+        "assessment_caption": ("Table 2: Assessment of Diethylene Glycol and "
+                               "Ethylene Glycol in the input API and Excipients"),
+        "detail_tables": assessment.get("detail_tables", []),
+        "revision_history": revision_history,
+        "signatures": meta.get("signatures", []),
+        # ── audit channels — all "_" prefixed so the JS renderer ignores them.
+        # Never lands in the rendered document. Kept for internal telemetry only.
+        "_verification_audit": {
+            "conclusion_status": validation.get("conclusion_status", ""),
+            "validation_warnings": validation.get("warnings", []),
+            "manual_review_items": validation.get("manual_review_items", []),
+            "unmapped_materials": validation.get("unmapped_materials", []),
+        },
+    }
+###############
+#!/usr/bin/env python3
+"""
+deg_eg_annexure_converter.py — DEG/EG Annexure PDF → JSON Converter.
+
+Dedicated, FULLY ISOLATED converter for the DEG & EG Risk Assessment workflow.
+Does NOT reuse the RS or EI converter prompts. Reuses only safe scaffolding
+(PDF rasterizer, Claude Vision call, JSON normaliser, schema repair, defensive
+list/dict guard). Extracts DEG/EG evidence — never elements[], never solvent_name.
+
+Output is normalised through deg_eg.process_deg_eg_annexure so the converter
+output and the report ingester stay perfectly aligned (strict object schema).
+"""
+import os, json, base64, logging, time, zipfile, re
+from io import BytesIO
+from datetime import datetime
+from typing import Any, Dict, List
+
+import streamlit as st
+import fitz                          # PyMuPDF
+from anthropic import AnthropicVertex
+
+import deg_eg as DE                  # shared normaliser (same workflow only)
+
+# ── Vertex AI config (identical to other converters) ─────────────────────────
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+GCP_PROJECT = "prj-thematic-analysis-dev"
+GCP_REGION  = "us-east5"
+MODEL       = "claude-opus-4-6-20250514"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
+except Exception as _e:
+    client = None
+    logger.warning(f"AnthropicVertex not initialised: {_e}")
+
+
+def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
+    if client is None:
+        return ""
+    for attempt in range(3):
+        try:
+            r = client.messages.create(model=MODEL, max_tokens=max_tokens,
+                                       messages=messages)
+            return "".join(b.text for b in r.content if hasattr(b, "text"))
+        except Exception as e:
+            logger.warning(f"Claude attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return ""
+
+
+def claude_vision(image_bytes: bytes, prompt: str) -> str:
+    if not image_bytes:
+        return ""
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    return call_claude([{
+        "role": "user",
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                         "data": b64}},
+            {"type": "text", "text": prompt},
+        ],
+    }])
+
+
+def _s(v: Any) -> str:
+    return str(v).strip() if v is not None else ""
+
+
+def rasterize_pdf(pdf_bytes: bytes, dpi: int = 250) -> List[bytes]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pages = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+        pages.append(pix.tobytes("png"))
+    doc.close()
+    return pages
+
+
+# ── DEG/EG-specific prompt (no solvent_name; only deg_eg_evidence) ───────────
+def deg_eg_meta_prompt() -> str:
+    return (
+        "You are reading an annexure for a DEG/EG (Diethylene Glycol & Ethylene "
+        "Glycol) risk assessment of a pharmaceutical raw material. Extract the "
+        "MATERIAL IDENTITY (the substance the document is ABOUT, never the "
+        "document's title), the DRL SAP material code, and any DEG/EG evidence.\n\n"
+        "CRITICAL RULES:\n"
+        "- This is NOT a residual-solvent or elemental-impurity document. Do NOT "
+        "emit a solvents[] array, a solvent_name field, or an elements[] array.\n"
+        "- Numeric DEG or EG limits are VALID ONLY from a vendor Certificate of "
+        "Analysis, a vendor specification, or an explicit USP <469> result "
+        "(e.g. 'NMT 620 ppm by USP <469>'). Set the matching source accordingly.\n"
+        "- A USP/NF monograph alone is insufficient unless it explicitly states a "
+        "numeric DEG or EG limit.\n"
+        "- Generic supplier policy or regulatory discussion (e.g. a letter "
+        "discussing EG PDE updates) must NOT assign a material-specific numeric "
+        "limit. Use evidence_type=policy_statement and deg_present/eg_present="
+        "Unknown unless the named material is explicitly tied to a numeric value.\n"
+        "- Category phrases (Class 1/2/3 solvents, OVI, ICH Q3C solvents, USP <467> "
+        "solvents, other residual solvents, water) are declaration scopes, NOT "
+        "DEG/EG limits. Put them in declaration_scopes.\n"
+        "- 'Class 1/2/3 residual solvents excluded by manufacturing process' → a "
+        "declaration_scope with evidence_type=excluded_by_process; do NOT infer a "
+        "numeric DEG/EG value.\n"
+        "- If the body has no material identity, leave material_name empty (the "
+        "system will infer it from the filename). NEVER use the document title as "
+        "material_name. Generic titles (Residual Solvents, Quality Statement, "
+        "Regulatory Information, Certificate of Analysis, Specification) are NEVER "
+        "material names.\n"
+        "- Do not invent values. If DEG/EG is not mentioned, deg_present/eg_present "
+        "= Unknown and source = not_mentioned.\n\n"
+        "THREE TIERS — classify every glycol into exactly one (do not confuse):\n"
+        "  TIER 1 — CONFIRMED PRESENT: the vendor MEASURES the glycol every batch "
+        "and reports a numeric CoA/spec RESULT (e.g. 'EG: 45 ppm', 'DEG 0.02%', "
+        "'NMT 620 ppm, tested each batch by USP <469>'). → present=Yes, "
+        "source=vendor_coa|vendor_spec|usp_469, spec_limit = the numeric value.\n"
+        "  A CoA line pairing a numeric DEG/EG limit with a PASS / COMPLIES "
+        "verdict, or a 'USP <469>' / 'USP/NF 469' / 'USP/NF <469>' reference, IS a "
+        "confirmed per-batch test → TIER 1, present=Yes, source=vendor_coa, "
+        "confidence ≥ 0.90. Examples that are Tier 1 (not Unknown): 'Ethylene "
+        "Glycol Not more than 620 ppm PASS', 'ETHYLENE GLYCOL (USP/NF 469) 620 PPM "
+        "MAX Pass'. Emit spec_limit='NMT 620 ppm' and eg_present='Yes'.\n"
+        "  TIER 2 — GUARANTEE CEILING: the vendor GUARANTEES the glycol stays "
+        "below a limit but does NOT test it per batch — e.g. 'EG < 620 ppm (below "
+        "USP <469> Option 1, not quantified per batch)', 'guaranteed below 1000 "
+        "ppm DEG'. → present=No, source=vendor_guarantee_ceiling, and STILL fill "
+        "the numeric spec_limit (kept for documentation, NOT confirmed presence).\n"
+        "  TIER 3 — NOT PRESENT: not used in manufacturing, excluded by process, "
+        "not tested, or not mentioned at all. → present=No, spec_limit=null.\n"
+        "A document that says BOTH 'guarantee' AND reports a per-batch RESULT is "
+        "TIER 1 (the per-batch measurement wins — do not downgrade to Tier 2).\n"
+        "- Guarantee-ceiling signal phrases (Tier 2): 'guarantee'/'guaranteed', "
+        "'below Option 1/2/the limit', 'not quantified'/'not tested per batch'.\n"
+        "- For an FDA high-risk material (glycerin, propylene glycol, sorbitol, "
+        "mannitol, maltitol, HSH, PEG, polysorbate, polyethylene oxide and their "
+        "brands e.g. Pearlitol/Neosorb), CAPTURE the vendor's stated MECHANISM "
+        "verbatim into raw_text (e.g. 'Ethylene Glycol may occur as a by-product "
+        "of the hydrogenation step') — it feeds the Observations rationale. Do "
+        "NOT invent a mechanism that the document does not state.\n"
+        "- Guarantee-ceiling signal phrases: 'guarantee'/'guaranteed', 'below "
+        "Option 1'/'below Option 2'/'below the limit', 'not quantified'/'not "
+        "tested per batch'/'not routinely tested', 'less than X ppm' tied to a "
+        "regulatory-limit reference, 'by-product ... below X ppm'.\n"
+        "- Also No: declared not used in manufacturing, excluded by process, "
+        "N/A. When genuinely ambiguous, default to No (conservative practice).\n\n"
+        "STRICT CONSISTENCY (never violate):\n"
+        "- present=Yes REQUIRES source in (vendor_coa, vendor_spec, usp_469) with "
+        "a confirmed/per-batch RESULT.\n"
+        "- present=Yes REQUIRES a non-null numeric limit string.\n"
+        "- NEVER output Yes with limit=null or source=not_mentioned. If you cannot "
+        "extract a numeric limit after scanning ALL pages, output Unknown.\n"
+        "- Scan for numeric patterns: 'Not more than X ppm', 'NMT X ppm', "
+        "'X PPM MAX', '≤ X ppm', '0.X%' (convert 0.5% = 5000 ppm).\n"
+        "- Look inside sections titled 'Residual solvents', '12. Residual solvents' "
+        "and numbered subsections, 'Impurities', 'Specifications', 'Tests'.\n\n"
+        "DRL SAP MATERIAL CODE (strict priority):\n"
+        "1. Label 'SAP CODE:' / 'SAP Code:' followed by a 6-9 digit number.\n"
+        "2. Label 'Material Code:' followed by a number starting 10000/20000/"
+        "30000/35000 (DRL SAP pattern).\n"
+        "3. Label 'Product Code:' followed by a 6-9 digit DRL-style number.\n"
+        "NEVER use as material_code: vendor internal codes (Ashland / CP Kelco / "
+        "Roquette material numbers), batch/lot/order/delivery numbers, customer "
+        "material numbers, GRN / A.R. / ATR numbers, specification numbers "
+        "(SP-CFTO-… → drl_specification_no), or CAS numbers (→ cas_number). If no "
+        "SAP CODE label is found, leave material_code EMPTY — never substitute. "
+        "SAP codes may sit in a footer block or on page 2+.\n\n"
+        "Return ONLY valid JSON (an OBJECT, never a bare array):\n"
+        "{\n"
+        '  "supplier_name": "",\n'
+        '  "material_name": "",\n'
+        '  "material_name_candidates": [],\n'
+        '  "material_code": "",\n'
+        '  "material_code_source": "sap_code|not_found",\n'
+        '  "cas_number": "",\n'
+        '  "drl_specification_no": "",\n'
+        '  "document_title": "",\n'
+        '  "annexure_type": "supplier_declaration|coa|specification|sds|statement|monograph|other",\n'
+        '  "deg_eg_evidence": {\n'
+        '    "deg_present": "Yes|No|Unknown", "deg_specification_limit": null,\n'
+        '    "deg_source": "vendor_coa|vendor_spec|vendor_guarantee_ceiling|monograph|policy_statement|usp_469|usfda_guidance|excluded_by_process|not_mentioned",\n'
+        '    "eg_present": "Yes|No|Unknown", "eg_specification_limit": null,\n'
+        '    "eg_source": "vendor_coa|vendor_spec|vendor_guarantee_ceiling|monograph|policy_statement|usp_469|usfda_guidance|excluded_by_process|not_mentioned",\n'
+        '    "raw_text": "", "page": 1, "confidence": 0.0\n'
+        "  },\n"
+        '  "declaration_scopes": [],\n'
+        '  "raw_text": ""\n'
+        "}"
+    )
+
+
+def deg_eg_page_prompt(page_no: int, total: int) -> str:
+    return (
+        f"This is page {page_no} of {total} of a DEG/EG annexure. Extract any "
+        "ADDITIONAL DEG or EG statements, and any DRL SAP material code / CAS "
+        "number / DRL specification number visible on THIS page only.\n"
+        "Same rules: numeric DEG/EG limits ONLY from vendor CoA / vendor spec / "
+        "USP <469>; policy statements are not material-specific limits; category "
+        "phrases go to declaration_scopes; never emit solvents[] or elements[].\n"
+        "STRICT: present=Yes REQUIRES a real source (vendor_coa/vendor_spec/"
+        "usp_469) AND a non-null numeric limit AND a confirmed per-batch/CoA "
+        "RESULT. Never Yes with null limit.\n"
+        "A numeric DEG/EG limit shown with a PASS/COMPLIES verdict or a "
+        "'USP <469>'/'USP/NF 469' reference IS a confirmed per-batch result → "
+        "present=Yes, source=vendor_coa, confidence ≥ 0.90, spec_limit='NMT X "
+        "ppm'. E.g. 'Ethylene Glycol Not more than 620 ppm PASS' and 'ETHYLENE "
+        "GLYCOL (USP/NF 469) 620 PPM MAX Pass' → eg_present=Yes, 'NMT 620 ppm'.\n"
+        "GUARANTEE CEILING (not confirmed presence): a max the vendor guarantees "
+        "the material stays below, not quantified per batch, below the regulatory "
+        "limit ('EG < 620 ppm, below Option 1, not quantified per batch', "
+        "'guaranteed below X ppm') → present=No, source=vendor_guarantee_ceiling, "
+        "keep the numeric limit for documentation.\n"
+        "Scan patterns: 'Not more than X ppm', 'NMT X ppm', 'X PPM MAX', "
+        "'≤ X ppm', '0.X%' (0.5% = 5000 ppm). Look in 'Residual solvents', "
+        "numbered subsections, 'Impurities', 'Specifications', 'Tests'.\n"
+        "SAP code ONLY from a 'SAP CODE:' / 'Material Code:' (10000/20000/30000/"
+        "35000…) / 'Product Code:' label. Never a vendor/batch/lot/order number.\n\n"
+        "Return ONLY JSON (object, not array):\n"
+        "{\n"
+        '  "material_code": "", "material_code_source": "sap_code|not_found",\n'
+        '  "cas_number": "", "drl_specification_no": "",\n'
+        '  "deg_eg_evidence": {"deg_present":"Yes|No|Unknown","deg_specification_limit":null,'
+        '"deg_source":"vendor_coa|vendor_spec|vendor_guarantee_ceiling|usp_469|not_mentioned",'
+        '"eg_present":"Yes|No|Unknown","eg_specification_limit":null,'
+        '"eg_source":"vendor_coa|vendor_spec|vendor_guarantee_ceiling|usp_469|not_mentioned",'
+        f'"raw_text":"","page":{page_no},"confidence":0.0}},\n'
+        '  "declaration_scopes": []\n'
+        "}"
+    )
+
+
+def convert_deg_eg_pdf_to_json(pdf_bytes: bytes, filename: str, index: int,
+                               progress=None) -> Dict:
+    """Convert one DEG/EG annexure PDF → strict JSON object. Never raises."""
+    def _p(msg, pct=0.0):
+        if progress:
+            progress(msg, pct)
+        logger.info(f"[{filename}] {msg}")
+
+    _p("Rasterizing PDF…", 0.05)
+    try:
+        pages = rasterize_pdf(pdf_bytes, dpi=250)
+    except Exception as e:
+        err = DE.process_deg_eg_annexure(
+            {"_error": True, "extraction_notes": f"PDF rasterization failed: {e}"},
+            index)
+        err["filename"] = filename
+        return err
+    if not pages:
+        err = DE.process_deg_eg_annexure(
+            {"_error": True, "extraction_notes": "PDF had no readable pages."}, index)
+        err["filename"] = filename
+        return err
+
+    n = len(pages)
+    _p(f"{n} page(s). Extracting material + DEG/EG evidence…", 0.12)
+    meta_raw = claude_vision(pages[0], deg_eg_meta_prompt())
+    meta = DE.deg_eg_safe_json(meta_raw, want="dict")
+    if not isinstance(meta, dict):
+        meta = {"_list_root": True, "schema_repaired": True}
+    meta.setdefault("filename", filename)
+
+    _REAL_SOURCES = ("vendor_coa", "vendor_spec", "usp_469")
+    raw_texts = []
+    mev0 = meta.get("deg_eg_evidence") or {}
+    if _s(mev0.get("raw_text")):
+        raw_texts.append(_s(mev0.get("raw_text")))
+
+    # page sweep merges additional evidence + scopes across ALL pages. A later
+    # page that carries a real numeric limit OR a real source overrides the
+    # page-1 defaults for that glycol — even if page 1 already claimed Yes with a
+    # null limit / 'not_mentioned' source (the canonical Polysorbate-80 bug).
+    for pi in range(1, n):
+        _p(f"Reading page {pi+1}/{n}…", 0.12 + 0.7 * pi / max(1, n))
+        praw = claude_vision(pages[pi], deg_eg_page_prompt(pi + 1, n))
+        pobj = DE.deg_eg_safe_json(praw, want="dict")
+        if not isinstance(pobj, dict):
+            continue
+        pev = pobj.get("deg_eg_evidence") or {}
+        mev = meta.get("deg_eg_evidence") or {}
+        for which in ("deg", "eg"):
+            p_present = pev.get(f"{which}_present")
+            p_limit = pev.get(f"{which}_specification_limit")
+            p_source = pev.get(f"{which}_source")
+            has_real_limit = bool(_s(p_limit))
+            has_real_source = p_source in _REAL_SOURCES
+            m_present = mev.get(f"{which}_present")
+            m_has_real = (bool(_s(mev.get(f"{which}_specification_limit")))
+                          and mev.get(f"{which}_source") in _REAL_SOURCES)
+            # Override when: this page upgrades presence to Yes, OR this page
+            # supplies real evidence that the current merged record lacks.
+            if p_present == "Yes" and (has_real_limit or has_real_source):
+                if m_present != "Yes" or not m_has_real:
+                    mev[f"{which}_present"] = "Yes"
+                    if has_real_limit:
+                        mev[f"{which}_specification_limit"] = p_limit
+                    if has_real_source:
+                        mev[f"{which}_source"] = p_source
+                    if pobj.get("page") or pi + 1:
+                        mev["page"] = pobj.get("page") or (pi + 1)
+            elif (m_present != "Yes" and (has_real_limit or has_real_source)
+                  and p_present in ("Yes", "Unknown", "No")):
+                # page provides evidence though presence wasn't a clean Yes
+                if has_real_limit and has_real_source:
+                    mev[f"{which}_present"] = "Yes"
+                    mev[f"{which}_specification_limit"] = p_limit
+                    mev[f"{which}_source"] = p_source
+                    mev["page"] = pobj.get("page") or (pi + 1)
+        if _s(pev.get("raw_text")):
+            raw_texts.append(_s(pev.get("raw_text")))
+        if mev:
+            meta["deg_eg_evidence"] = mev
+        for sc in (pobj.get("declaration_scopes") or []):
+            meta.setdefault("declaration_scopes", []).append(sc)
+        # merge SAP/spec/CAS from any page if page 1 lacked them
+        for fld in ("material_code", "material_code_source", "cas_number",
+                    "drl_specification_no"):
+            if not _s(meta.get(fld)) and _s(pobj.get(fld)):
+                meta[fld] = pobj.get(fld)
+
+    # concatenate raw_text across pages so the evidence trail is preserved
+    if raw_texts:
+        mev = meta.get("deg_eg_evidence") or {}
+        mev["raw_text"] = " ".join(raw_texts)[:2000]
+        meta["deg_eg_evidence"] = mev
+
+    _p("Normalising…", 0.9)
+    result = DE.process_deg_eg_annexure(meta, index)
+    result["filename"] = filename
+    _p("Done.", 1.0)
+    return result
+
+
+def build_zip(results: List[Dict]) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = []
+        for r in results:
+            num = r.get("annexure_number", "?")
+            base = re.sub(r"[^A-Za-z0-9_\-]", "_",
+                          _s(r.get("material_name")) or f"annexure_{num}")[:50]
+            fname = f"DEGEG_annexure_{num}_{base}.json"
+            zf.writestr(fname, json.dumps(r, indent=2, ensure_ascii=False))
+            ev = r.get("deg_eg_evidence", {})
+            manifest.append({"annexure_number": num, "filename": fname,
+                             "material_name": r.get("material_name", ""),
+                             "supplier_name": r.get("supplier_name", ""),
+                             "deg_present": ev.get("deg_present"),
+                             "eg_present": ev.get("eg_present"),
+                             "error": r.get("_error", False)})
+        zf.writestr("_manifest.json", json.dumps(manifest, indent=2))
+    return buf.getvalue()
+
+
+def main() -> None:
+    st.set_page_config(page_title="DEG/EG Annexure Converter", layout="wide")
+    st.title("🧪 DEG & EG Annexure PDF → JSON Converter")
+    st.caption("Diethylene Glycol & Ethylene Glycol Risk Assessment | Dr. Reddy's "
+               "IPDO | Separate from the RS and EI converters — extracts DEG/EG "
+               "evidence only.")
+    st.markdown("Upload vendor annexures (CoA, specifications, declarations, SDS, "
+                "policy letters). Each PDF becomes one strict-schema JSON.")
+    st.markdown("---")
+
+    uploaded = st.file_uploader("Upload annexure PDF(s)", type=["pdf"],
+                                accept_multiple_files=True)
+    if not uploaded:
+        st.info("📁 Upload one or more DEG/EG annexure PDFs to begin.")
+        return
+
+    if st.button("🚀 Convert All PDFs", type="primary"):
+        results = []
+        overall = st.progress(0.0)
+        for idx, uf in enumerate(uploaded):
+            status = st.empty()
+            def cb(msg, pct, _s=status):
+                _s.info(f"📄 {uf.name}: {msg}")
+            try:
+                res = convert_deg_eg_pdf_to_json(uf.getvalue(), uf.name, idx + 1, cb)
+            except Exception as e:
+                logger.exception("DEG/EG conversion error")
+                res = DE.process_deg_eg_annexure(
+                    {"_error": True, "extraction_notes": f"Unexpected error: {e}"},
+                    idx + 1)
+                res["filename"] = uf.name
+            results.append(res)
+            if res.get("_error"):
+                status.error(f"❌ {uf.name}: {res.get('extraction_notes','failed')}")
+            else:
+                ev = res.get("deg_eg_evidence", {})
+                mat = res.get("material_name") or "(material inferred / not resolved)"
+                status.success(f"✅ {uf.name}: {mat} — DEG={ev.get('deg_present')} / "
+                               f"EG={ev.get('eg_present')}")
+                with st.expander(f"🔎 {uf.name} — extracted detail"):
+                    st.json({k: res.get(k) for k in
+                             ("material_name", "material_name_source",
+                              "needs_material_confirmation", "supplier_name",
+                              "annexure_type", "deg_eg_evidence",
+                              "declaration_scopes", "schema_repaired")})
+            overall.progress((idx + 1) / len(uploaded))
+
+        n_ok = sum(1 for r in results if not r.get("_error"))
+        st.success(f"Conversion complete: {n_ok}/{len(results)} succeeded.")
+        st.download_button("📥 Download all JSON (ZIP)", data=build_zip(results),
+            file_name=f"DEGEG_annexures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip")
+
+
+if __name__ == "__main__":
+    main()
