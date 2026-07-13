@@ -1,647 +1,73 @@
-DEG/EG classification bug for Mannitol (and similar vendor-guarantee cases).
-
-Bug: AI marks Mannitol DEG=Yes, EG=Yes because Roquette's declaration includes 
-numeric limits <1000 ppm DEG and <620 ppm EG. But the approved TSR marks both 
-as No because Roquette's statement is a GUARANTEE CEILING (not quantified per 
-batch, below Option 1 USP <469> limits), not confirmed presence.
-
-Root cause: Extraction prompt treats any numeric limit as "confirmed present".
-Reality: Yes = confirmed presence via batch measurement or routine testing.
-No = declared not used, excluded by process, or guarantee ceiling 
-below regulatory limit without per-batch quantification.
-
-Fix 1 — Update deg_eg_meta_prompt with distinction between:
-- CONFIRMED PRESENT (Yes): batch test result, spec with routine testing, 
-numeric result in CoA
-- NOT CONFIRMED PRESENT (No): guarantee ceiling below limit, not used in 
-manufacturing, excluded by process, not tested per batch
-
-Signal keywords for guarantee ceiling (not confirmed present):
-- "guarantee" / "guaranteed"
-- "below the limit" / "below Option 1" / "below Option 2"
-- "not quantified" / "not tested per batch" / "not routinely"
-- "less than" (when combined with reference to regulatory limit)
-- "by-product ... below X ppm" when not tested per batch
-
-Default when ambiguous: No (conservative regulatory practice)
-
-Fix 2 — Add source type:
-deg_source / eg_source can now include "vendor_guarantee_ceiling"
-
-Fix 3 — process_deg_eg_annexure post-process:
-If present=Yes and raw_text contains guarantee-ceiling signals, downgrade to 
-No, set source=vendor_guarantee_ceiling, preserve limit for documentation.
-
-Fix 4 — Detail table for Mannitol should still appear (evidence trail is 
-useful), but marked as guarantee-based control rather than confirmed presence.
-
-Fix 5 — Observations section paragraph must explain vendor mechanism when 
-material has any DEG/EG-relevant evidence, even No cases with guarantee 
-ceilings. Extract the mechanism from annexure raw_text.
-
-Acceptance test — Mavacamten Mannitol:
-Roquette declaration: "EG < 620 ppm (below Option 1, not quantified per batch)"
-Expected: 
-- Table 2 Mannitol row: DEG=No, EG=No, Spec limit=<1000 ppm; <620 ppm
-- Detail table for Mannitol still generated, cites Roquette guarantee
-- Observations paragraph mentions: (a) D-Sorbitol as basis for FDA high-risk 
-category, (b) EG as hydrogenation by-product, (c) vendor guarantee below 
-Option 1 limit, (d) not quantified per batch
-- Conclusion: "no potential risk of DEG/EG, no drug product testing required"
-
-Regression: Polysorbate 80 (Croda CoA with NMT 620 ppm EG measured per batch) 
-must remain EG=Yes / 620 ppm — that IS confirmed presence with batch testing.
-The Mannitol vs Polysorbate distinction demonstrates the fix works correctly.
-
-
-When multiple annexures dedupe to the same (material, supplier) after 
-normalization, retain the record with MORE solvents[] entries. If tied, 
-prefer entries with higher-confidence extraction (batch actuals over spec 
-mentions). Merge non-conflicting solvent evidence across duplicates before 
-choosing the winner. This ensures no loss of solvent data during dedup.
-
-
-CONSOLIDATED RED FLAG FIXES — DEG/EG AND RESIDUAL SOLVENT WORKFLOWS
-
-Do not rewrite modules. Patch only affected functions. Do not regress
-Esomeprazole (RS + DEG/EG baseline). Verify against Trilaciclib, Epinephrine,
-Mavacamten test cases.
-
 ═══════════════════════════════════════════════════════════════
-PART A — DEG/EG WORKFLOW RED FLAGS
+DAILY EXPOSURE CALCULATION FORMULA (CANONICAL)
 ═══════════════════════════════════════════════════════════════
 
-DEG/EG RED FLAG 1 — Mapper token-fallback broken:
-Bug: mapper only works when material has family alias in hardcoded vocabulary.
-Non-vocabulary materials (Mavacamten, Croscarmellose, Mannitol) fail even
-when composition name equals annexure material_name exactly.
-
-Fix identity resolver:
-- Remove family-gate returning 0 when both sides lack family alias
-- Build identity pool from ALL sources: material_name, material_name_candidates,
-filename (after stripping), document_title, supplier_name
-- Exact normalized match → 0.99 auto-accept (regardless of family)
-- Normalized candidate match → 0.99 auto-accept
-- Token containment fallback → 0.90
-- Partial family containment → 0.90 (Yellow Iron Oxide ↔ Iron Oxide, Anhydrous
-Citric Acid ↔ Citric Acid, Purified Talc ↔ Talc)
-- Distinctive-token overlap → 0.50-0.85 via Jaccard + distinctive weighting
-- Filename inference match → 0.85
-
-Reduce noise vocabulary — do NOT strip chemistry identity:
-- Strip only pure descriptors: spec, specification, grade, ih, pharma, coa,
-certificate, analysis, usp, nf, ep, jp, ph, eur, ip, bp, ligamed, powder,
-monograph, statement, declaration, regulatory, information, product
-- Keep all chemistry names, brand names, molecule identifiers
-
-Salt/hydrate suffix stripping (product-agnostic):
-- "Trilaciclib 2HCl" → base "trilaciclib" + alias "2hcl"
-- "Citric acid monohydrate" → base "citric acid" + alias "monohydrate"
-- Same for HCl, HBr, sulfate, phosphate, mesylate, tosylate, hydrochloride,
-dihydrate, trihydrate, tetrahydrate, hemihydrate, anhydrous
-
-Add DEG/EG synonym families (product-agnostic):
-- Mavacamten = Mavacamten IH = Mavacamten IH Spec
-- Mannitol = Pearlitol = Pearlitol 50C = Pearlitol Mannitol Powder = D-Mannitol
-- Croscarmellose Sodium = Ac-Di-Sol = Ac-Di-Sol SD-711 = crosslinked sodium
-carboxymethylcellulose
-- MCC = microcrystalline cellulose = Avicel = Avicel PH 101 = Avicel PH 102
-- Sodium Chloride = NaCl = saline
-- HCl = Hydrochloric acid = hydrogen chloride
-- NaOH = sodium hydroxide = caustic soda
-- Sofosbuvir = Sofosbuvir IH
-- Velpatasvir = Velpatasvir Premix
-- Colloidal Silicon Dioxide = Aerosil = Aerosil 200 = silica colloidal
-anhydrous = silicon dioxide colloidal
-- Sodium Stearyl Fumarate = Pruv
-- Opadry = Opadry II = Opadry White = Opadry II 85F580019
-- Trilaciclib = Trilaciclib 2HCl = Trilaciclib dihydrochloride
-- Epinephrine = adrenaline
-- Chlorobutanol Hemihydrate = chlorobutanol = chlorbutol
-- Sodium Metabisulphite = sodium metabisulfite = sodium disulfite
-
-Negative-pair protection: Triethyl citrate ≠ ATBC. Generic tokens alone
-(citrate, acid, oxide, cellulose, glycol, alcohol) must not drive matches.
-
-Reject generic material identities (Residual Solvents, Statement, Declaration,
-Product Regulatory Information, Quality Statement, Regulatory Information,
-Specification, Certificate of Analysis) unless real identity is found
-elsewhere.
-
-Mapping behavior:
-- Auto-map all components, no user confirmation blocking
-- Mapping confidence is audit info only
-- Never block generation
-- Unmapped/missing/low-confidence become warnings/manual_review_items
-
-DEG/EG RED FLAG 2 — material_code extraction not working:
-Bug: material_code column blank for most materials even when SAP codes visible
-in CoA or filename. Ashland internal number (431216) wrongly used instead of
-DRL SAP code (100007331). Filename SAP fallback also not applied.
-
-Fix converter prompt (deg_eg_meta_prompt) with strict SAP rules:
-Priority 1: "SAP CODE:" or "SAP Code:" label followed by 6-9 digit number
-Priority 2: "Material Code:" followed by number starting with 10000/20000/
-30000/35000/350 (DRL SAP prefixes)
-Priority 3: "Product Code:" with DRL-style 6-9 digit number
-
-Never use as material_code:
-- Vendor internal codes (Ashland Material Number, CP Kelco Material Number,
-Roquette Material Code, etc.) when they don't match DRL prefix
-- Batch/Lot/Order/Delivery numbers, Customer Material Numbers, GRN, A.R. No,
-ATR No
-- CAS numbers (goes to cas_number field)
-- Specification numbers (goes to drl_specification_no field)
-- Timestamps, dates, long random numeric IDs
-
-If no valid SAP CODE label found in body, leave material_code empty. Then
-apply filename fallback.
-
-Fix filename fallback for material_code:
-Add _infer_material_code_from_filename(filename) helper.
-Pattern: r"(?:^|[_\-\s\(])((?:1000|2000|3000|3500)\d{4,5}|350\d{6})(?=[_\-\s\)\.]|$)"
-- 6-9 digits, starts with 1000/2000/3000/3500/350
-- Must be at word boundary
-- Reject date-like sequences (YYYYMMDD) or GRN prefixes (RCQR, RCRR, RCSA)
-
-Priority order:
-Tier 1: material_code from CoA body (existing logic)
-Tier 2: material_code inferred from filename (NEW fallback)
-Tier 3: blank + material_code_source="not_found"
-
-Post-processing validation in process_deg_eg_annexure:
-- material_code must match ^(1000|2000|3000|3500)\d{4,5}$ or ^350\d{6}$
-- material_code_source separate field, never contains numeric code
-- If they got swapped (material_code empty + source has digits), fix:
-if material_code=="" and material_code_source is numeric:
-material_code = material_code_source
-material_code_source = "sap_code"
-- drl_specification_no separate: ^SP-[A-Z]{2,4}-?\d{6,10}(-\d+)?$
-- cas_number separate: ^\d{1,7}-\d{2}-\d$
-
-Wire material_code into Table 2 assessment_table rows. Wire drl_specification_no
-into detail_tables "DRL Specification No." column (with * suffix).
-
-Expected extractions for Esomeprazole DEG/EG:
-- 100003346 Sugar Spheres, 100003411 Hypromellose, 100003479 Triethyl citrate,
-100003477 Talc, 350009077 Esomeprazole Mg, 100002851 Polysorbate 80,
-100008729 Simethicone, 100007331 HPC Klucel EF, 100003440 Mg Stearate,
-100002215 Eudragit L 30 D-55, 100003399 Glyceryl Monostearate,
-100003425 Iron Oxide Yellow, 100002940 Dextrose Anhydrous C,
-100001162 Citric Acid Anhydrous, 100011236 Xanthan Gum, 100002572 Crospovidone
-- HPC row must show 100007331 (not 431216 Ashland internal number)
-
-DEG/EG RED FLAG 3 — Guarantee-ceiling vs confirmed-presence extraction:
-Bug: vendor guarantee ceilings ("EG < 620 ppm, below Option 1, not quantified
-per batch") wrongly extracted as confirmed presence with Yes. Example: Roquette
-Mannitol declared No/No in approved TSR but AI reported Yes/Yes.
-
-Fix extraction prompt distinguishing:
-
-CONFIRMED PRESENT (present=Yes):
-- Batch test result: "EG: 45 ppm (tested)"
-- Spec with routine per-batch testing: "NMT 620 ppm, tested each batch"
-- Explicit numeric CoA result column
-
-NOT CONFIRMED PRESENT (present=No):
-- Guarantee ceiling: "EG < 620 ppm, below Option 1, not quantified per batch"
-- Manufacturing declaration: "not used in manufacturing"
-- Excluded by process: "residual solvents excluded by manufacturing process"
-- By-product mention with control below regulatory threshold: "EG may occur
-as by-product but guaranteed below X ppm"
-- Not tested, not applicable, N/A
-
-Signal keywords for guarantee ceiling (downgrade to No):
-- "guarantee" / "guaranteed"
-- "below the limit" / "below Option 1" / "below Option 2"
-- "not quantified" / "not tested per batch" / "not routinely tested"
-- "less than" combined with regulatory limit reference
-
-Default when ambiguous: No (conservative practice).
-
-Add source enum "vendor_guarantee_ceiling" (present=No, but keep numeric
-limit for documentation).
-
-Post-processing consistency guard in process_deg_eg_annexure:
-- If present=Yes and raw_text contains guarantee-ceiling signals → downgrade
-to No, set source=vendor_guarantee_ceiling, preserve specification_limit
-- If present=Yes but source=not_mentioned → downgrade to Unknown then No
-- If present=Yes but no numeric limit → downgrade to Unknown then No
-
-Regression: Polysorbate 80 (Croda CoA NMT 620 ppm via USP <469> per-batch
-testing) must remain EG=Yes/620 ppm.
-
-DEG/EG RED FLAG 4 — Multi-page extraction incomplete:
-Bug: page 2+ of vendor CoAs not read. Polysorbate 80 CoA has EG NMT 620 ppm
-on page 2, initially extracted with contradictory Yes+null+not_mentioned.
-
-Fix convert_deg_eg_pdf_to_json:
-- Rasterize ALL pages, process each via deg_eg_page_prompt
-- When later pages return real limit or real vendor source, OVERRIDE page-1
-defaults per glycol
-- Merge declaration_scopes across pages
-- Consolidate raw_text across pages
-
-Fix deg_eg_meta_prompt and deg_eg_page_prompt strictness:
-- present=Yes REQUIRES real source (vendor_coa, vendor_spec, usp_469)
-- present=Yes REQUIRES non-null numeric limit string
-- Never emit Yes with limit=null or source=not_mentioned
-- If limit cannot be extracted after ALL pages scanned, output Unknown
-- Search patterns: "Not more than X ppm", "NMT X ppm", "X PPM MAX",
-"≤ X ppm", "0.X%" (convert 0.5%=5000 ppm)
-- Sections: "Residual solvents", "12. Residual solvents", numbered subsections,
-"Impurities", "Specifications", "Tests"
-
-DEG/EG RED FLAG 5 — Final rendered document leaks internal warnings:
-Remove from DOCX output:
-- "Unknown" status (extraction may use Unknown, but final Table 2 shows only
-Yes/No; Unknown at final stage → No default)
-- "Manual review required"
-- "Assessment incomplete", "unresolved manual-review items"
-- "Cannot draw final conclusion"
-- "Material-specific evidence not available"
-- Any regulatory hedging language
-
-Table 2 defaults:
-- If annexure evidence confirms presence with numeric limit → Yes + limit
-- Otherwise → No + "Not applicable"
-- Never Unknown in final document
-
-Detail table structure (Table 3+) exact match with approved:
-6 columns: Excipients | Name | USP Monograph | Vendor COA | DRL Specification
-| DRL Specification No.
-2 rows per positive material (DEG row + EG row).
-Footnote: "*Current version will be considered"
-
-Values:
-- USP Monograph: "NA" (not extractable from CoA)
-- Vendor COA: from annexure numeric limit or "NA"
-- DRL Specification: from annexure numeric limit or "NA"
-- DRL Specification No.: from drl_specification_no + "*" suffix, or blank
-- Never "Refer applicable monograph" (use "NA")
-- Never "Certificate of Analysis" in DRL Specification No. column
-
-Conclusion narrative — definitive:
-- All materials No/No: "No potential risk of DEG/EG. No drug product testing
-required."
-- Positive with specification control: "Controlled by specification (X ppm).
-No additional drug product testing required."
-- Never hedging language.
-
-DEG/EG RED FLAG 6 — Scientific rationale for positive materials missing:
-Bug: when material is positive (e.g., Polysorbate 80), Observations section
-just says "identified as potential source" without vendor mechanism or FDA
-guidance context.
-
-Fix: when any material has present=Yes, Observations MUST explain:
-- Whether material is on FDA high-risk list (Glycerin, Propylene Glycol,
-Maltitol, HSH, Sorbitol, Polysorbate 80, etc.)
-- Vendor's stated mechanism (e.g., "by-product of hydrogenation",
-"manufacturing process residue")
-- Vendor's control strategy (spec limit, per-batch testing)
-
-Extract mechanism from annexure raw_text or declaration_scopes.
-
-═══════════════════════════════════════════════════════════════
-PART B — RESIDUAL SOLVENT WORKFLOW RED FLAGS
-═══════════════════════════════════════════════════════════════
-
-RS RED FLAG 1 — MDD input methodology (critical):
-Current bug: system asks "number of doses per day" defaults to 1. Fails for
-BSA-dosed (Trilaciclib: multiplier=1.44) and volume-dosed (Epinephrine:
-multiplier=8) products. Every calculation off by the multiplier.
-
-Fix single_strength_unit_composition mode UI to ONE question:
-"Maximum Daily Dose (MDD) of API in mg/day"
-
-Auto-detect API row (function contains "Active", "API", "Drug Substance").
-Compute multiplier = MDD_mg / api_qty_per_unit_mg.
-Apply to all components: amount_in_max_dose[i] = qty_per_unit[i] × multiplier.
-
-Optional advanced — salt/base conversion:
-When API is salt but MDD label is free-base:
-salt_factor input (default 1.0)
-Adjusted API amount = MDD × salt_factor (for internal calculations)
-
-Drug product mass by dosage form:
-- Solid (vial/tablet/capsule/sachet): sum of non-qs component amounts
-- Liquid (mL): drug_product_mass_mg = multiplier × 1000 × density_g_per_mL
-(default density 1.0 g/mL, user override). Do NOT sum dissolved solids.
-
-Acceptance:
-- Trilaciclib injection: MDD=432, salt_factor=1.163 → multiplier=1.44,
-amounts 0.503/0.432/0.109/1.043 g match approved
-- Epinephrine injection: MDD=8 → multiplier=8, amounts 0.0088/0.06/0.042/
-0.004 g and drug product 8.0-8.8 g match approved
-- Esomeprazole (regression): MDD=240 → multiplier=6, no change
-
-RS RED FLAG 2 — Non-USP <467> solvent silent drop:
-Bug: solvents with numeric evidence but no canonical match dropped from
-report. Trilaciclib loses CPME (1500 ppm) and TFA (3400 ppm). Epinephrine
-loses Chloroform (60 ppm from Chlorobutanol annexure).
-
-Fix in process_rs_annexure:
-When solvent has numeric evidence (numerical_limit/nmt/percentage_limit)
-but RSM.resolve_solvent() returns None:
-- Keep in solvents[] with canonical=None, is_non_usp_solvent=true
-- Do NOT push to declaration_scopes
-
-Fix in _annexure_solvent_universe:
-- Include solvents where canonical=None but converted_ppm not None
-- Use raw solvent_name title-cased as display
-
-Fix in calculate_rs_exposures and payload builder:
-For non-USP solvents:
-- Compute exposure = amount × ppm / 1,000,000 normally
-- USP <467> comparison row shows "N/A"
-- cell_status = "value" (not blank)
-
-RS RED FLAG 3 — Policy letter false extraction:
-Bug: Annexure 3 HCl generic Merck policy letter had negative_declaration=true
-and could produce false numeric extractions like 610 ppm ethylene glycol from
-regulatory discussion text.
-
-Fix rs_annexure_prompt with regulatory-context rejection rules:
-Numeric values in these contexts are REGULATORY REFERENCES, not material
-limits:
-- "PDE value of X mg/day"
-- "concentration limit of X ppm"
-- "based on information of USP and EDQM"
-- "will not be implemented"
-- "reverted back to"
-- "the guideline states"
-- "ICH Q3C (R7) updated"
-- "in accordance with the above-mentioned guideline"
-Store as declaration_scopes with evidence_type="policy_statement".
-Do NOT emit as solvents[] with numerical_limit.
-
-Fix in process_rs_annexure post-processing:
-When material_name empty AND document_title matches generic policy pattern
-("Residual Solvents" without material qualifier):
-- Move solvents[] with policy-context raw_text to declaration_scopes
-- Clear solvents[]
-- Set negative_declaration=false (policy letter is not a negative declaration
-for any specific material)
-- Downstream: material gets "NA" cells (not "0/0")
-
-RS RED FLAG 4 — negative_declaration over-triggers:
-Bug: set to true even when solvents[] has positive limit entries.
-Trilaciclib annexure: 7 real solvents but flag=true because "Class 1: None"
-detected.
-
-Fix rules:
-- Set true ONLY when solvents[] is empty AND declaration covers all residual
-solvents globally
-- If solvents[] has any numeric limit → negative_declaration=false
-- Per-class negatives go to declaration_scopes with scope_text="Class 1
-solvents (none present)", not global flag
-
-RS RED FLAG 5 — Cell rendering three-state model:
-Add third state "not_applicable" for q.s. rows.
-
-cell_status values:
-- "value" → real numeric ("0.044")
-- "confirmed_zero" → 0 backed by negative declaration ("0" or "0.000")
-- "not_applicable" → q.s. row, variable amount ("NA")
-- "unresolved" → no evidence, blank + warning
-
-Approved convention (from Epinephrine TSR):
-- Quantifiable material with negative declaration (Sodium Chloride):
-Limit="NA", Exposure="0.000" (Amount is real; solvent is confirmed absent)
-- q.s. material (Hydrochloric Acid, Water for Injection):
-Limit="NA", Exposure="NA" (Amount variable; not applicable)
-
-Fix in build_rs_payload solvent_matrix_tables:
-- Include q.s. rows in table_rows (currently excluded)
-- Show raw q.s. text in Quantity/Amount columns ("q.s.", "q.s. to 8 mL")
-- Set cell_status="not_applicable" for all solvent cells
-- Exclude from Total Daily Exposure sums
-- Exclude from Drug Product mass for solid dosage
-- Liquid dosage: q.s. water absorbed via volume×density, no double count
-
-Fix in generate_residual_solvent.js:
-- Render "NA" for not_applicable
-- Render "0" or "0.000" for confirmed_zero
-- Render "0.044" etc for value
-- Render blank for unresolved (with warning in UI, not DOCX)
-
-RS RED FLAG 6 — Metadata polish for injection/liquid:
-6a. Strength field pollution — currently shows column header
-("Qty. (mg/Vial)", "Quantity (mg/mL)"). Fix:
-- Solid: strength = "[api_qty] mg/[unit]" (e.g., "349 mg/vial")
-- Liquid: strength = "[api_qty_per_mL] mg/mL" (e.g., "1 mg/mL")
-
-6b. Dosage form auto-inference:
-- unit basis "vial" → "Injection" or "Sterile Injection"
-- unit basis "mL" → "Injection" or "Solution for Injection"
-- unit basis "tablet" → "Tablet"
-- unit basis "capsule" → "Capsule"
-- unit basis "sachet" → "Oral Suspension" or "Sachet"
-
-6c. MDD label clarity in Table 1:
-- "Maximum Daily Dose (API): [MDD] mg/day"
-- "Total Drug Product Mass per Daily Dose: [mass] mg/day"
-
-RS RED FLAG 7 — Excel classifier robustness:
-7a. Instructions sheet false detection: multi-sheet workbooks with Instructions
-tab trigger detailed_rs_calculation because instructions text contains RS
-keywords. Fix _detailed_rs_signatures:
-- Skip sheets named instruction/note/readme/help/guide/manual/info
-- Reject sheets with long prose cells (>80 chars, count >3 = prose sheet)
-Fix classify_rs_excel: sort detailed candidates by signature count, pick
-highest (not first).
-
-7b. Quantity column hints too narrow — expand _QTY_HINTS:
-"quantity / unit", "quantity/unit", "qty/unit", "quantity per unit",
-"mg/unit", "quantity", "qty.", "qty ", "qty (", "quantity (",
-"mg/vial", "mg/ml", "mg / vial", "mg / ml", "mg/tablet", "mg/capsule",
-"mg/sachet", "mg/dose", "per unit", "per vial", "per ml", "per tablet",
-"amount per unit", "amount/unit"
-
-7c. q.s. detection completeness:
-- Ingredient name ending "@"
-- Cell values: "Qs to", "Q.s", "-", "N/A", "n/a", ""
-- Footnote markers "*", "#", "†", "‡", "§" stripped before numeric parse
-- Nitrogen, Argon, process aids classified as q.s. by name
-
-RS RED FLAG 8 — Annexure list dedup:
-Bug: same material + supplier appears multiple times (Trilaciclib Annexure 1
-and 6).
-
-Fix dedup key: (normalized_material_name, normalized_supplier_name).
-On collision retain record with more solvents[] entries. Log to _dup_warnings
-(UI audit only, not DOCX).
-
-RS RED FLAG 9 — Supplier declaration table completeness:
-Bug: q.s. components with valid annexures filtered from Table 3.
-
-Fix: q.s. status affects only SOLVENT MATRIX (Tables 4-6), not Table 3.
-Every material with matched annexure appears in Table 3.
-
-RS RED FLAG 10 — Rendered document must not leak internal warnings:
-Remove from DOCX body:
-- "Manual review required", "(unmapped — manual review)"
-- "Manual Review / Validation Warnings" section
-- "Conclusion status: incomplete_manual_review"
-- Bullet lists of unmapped/low_confidence/aggregation warnings
-- Regulatory hedging language
-
-Payload changes (build_rs_payload):
-- Supplier declaration: "-" for unmapped (not "Manual review")
-- Risk summary table: always "No action required, negligible risk"
-- Do NOT emit as top-level renderer-visible keys: validation_warnings,
-manual_review_items, unmapped_components, low_confidence_mappings,
-missing_annexure_evidence, conclusion_status, duplicate_annexures,
-annexure_numbering_mismatches
-- Keep validation data under "_verification_audit" prefixed keys only
-
-generate_residual_solvent.js: do not read "_" prefixed keys.
-
-_rs_generate_text conclusion narrative — definitive:
-- All exposures below limits → USP <467> Option 2 / ICH Q3C compliance
-- No compliance data → general supplier-declaration assessment
-- Never: "manual review", "assessment incomplete", "unresolved items",
-"cannot draw conclusion", "supplier engagement needed"
-
-RS RED FLAG 11 — Annexure mapping token-fallback (same as DEG/EG RF 1):
-Apply the SAME identity resolver architecture fix to RS mapper. The bugs and
-solutions are architecturally identical — RS mapper has the same broken
-token-fallback path as DEG/EG. Confirm by testing with materials not in
-Esomeprazole family vocabulary. Apply same fixes:
-- Remove family gate
-- Pool all identity sources including candidates
-- Exact/candidate normalized match → 0.99
-- Token containment → 0.90
-- Partial family containment → 0.90
-- Reduce noise vocab
-- Salt/hydrate stripping
-- Filename fallback for material_name
-- Product-agnostic synonym families (add same list as DEG/EG plus RS-specific:
-Sugar Spheres, Hypromellose, EUDRAGIT, Triethyl citrate/TEC, Polysorbate 80,
-Dextrose, HPC/Klucel, Simethicone/Q7-2243, Talc, Magnesium Stearate/Ligamed,
-Crospovidone/Kollidon CL, Xanthan Gum, Yellow Iron Oxide, Citric Acid,
-Dehydrated Alcohol/Ethanol, Chlorobutanol, Sodium Metabisulfite)
-- Negative-pair protection (TEC ≠ ATBC)
-
-RS RED FLAG 12 — Multi-page extraction incomplete (confirmed via Epinephrine
-Annexure 4 Chlorobutanol):
-Bug: Annexure 4 CoA has 3 pages. Page 3 contains real solvent test data
-(Acetone USP/NF 159 ppm actual, NMT 5000 ppm spec; Chloroform USP/NF 24 ppm
-actual, NMT 60 ppm spec). AI extracted solvents=[] because only page 1
-processed.
-
-Fix RS annexure converter:
-1. Rasterize EVERY page (not just page 1)
-2. Send each page through claude_vision extraction
-3. Merge results into unified solvents[]
-4. raw_text concatenates across pages
-5. Do not stop after finding content on page 1
-
-Fix tabular structure with "Impurity B (Acetone)" style naming:
-Extract solvent_name from parenthesized chemical name in the row label.
-"Impurity B (Acetone)" → solvent_name="Acetone".
-"Impurity A (Chloroform)" → solvent_name="Chloroform".
-
-RS RED FLAG 13 — Filename fallback for material_name missing:
-Bug: Annexures 2 (Sodium Chloride) and 3 (HCl) have empty material_name
-despite filenames clearly identifying material.
-
-Fix in process_rs_annexure:
-After all body-based extraction returns empty, apply
-_infer_material_from_filename(filename). Strip:
-- Extension (.pdf, .xlsx, .docx)
-- Prefix "Annexure N_"
-- Common phrases: "Residual solvent declaration of", "Statement of",
-"Certificate of", "CoA of"
-- SAP codes, GRN prefixes, dates
-
-Set material_name_source="filename_inferred",
-needs_material_confirmation=true.
-
-Expected:
-- Annexure 2: filename "Annexure 2_Residual solvent declaration of Sodium
-Chloride.pdf" → material_name="Sodium Chloride"
-- Annexure 3: filename "Annexure 3_Residual solvent declaration of HCL 37.pdf"
-→ material_name="HCL 37" or "Hydrochloric Acid"
-
-RS RED FLAG 14 — Duplicate solvent entries in extraction:
-Bug: Annexure 1 (Epinephrine) has Methanol captured 5 times with different
-values (spec 3000, batch actuals 237, 463, 463, generic mention). Same for
-other solvents.
-
-Fix in process_rs_annexure post-processing:
-Deduplicate solvents[] by (canonical_solvent_name, evidence_class) where
-evidence_class categorizes as spec_limit / batch_actual / generic_mention.
-Priority within each canonical:
-1. Prefer numerical_limit with converted_ppm (batch-specific actual)
-2. Prefer nmt with converted_ppm (spec limit)
-3. Fallback to no_source with mention only
-
-For exposure calculation, use spec limit (nmt) value not batch actual, for
-worst-case conservative estimate. Keep highest-confidence entry per unique
-(canonical, source_type).
-
-RS RED FLAG 15 — BDL/BQL handling wrong:
-Bug: Annexure 1 has Acetone/IPA/DCM/tBME with raw_value="BDL" and
-converted_ppm=null. Calculator treats as unresolved → 0 exposure. Approved TSR
-uses spec limit for worst-case exposure calculation of BDL entries.
-
-Fix in process_rs_annexure:
-When raw_value in ("BDL", "BQL", "ND", "Not detected", "< LOD", "< LOQ"):
-- If entry has associated NMT/spec limit in raw_text, use that spec limit as
-converted_ppm
-- Set evidence_type="nmt", calculation_basis="nmt_conservative_bdl"
-- Add audit note: "BDL result; using spec limit for worst-case exposure"
-
-Expected: Acetone BDL with NMT 5000 → converted_ppm=5000. DCM BDL with NMT
-600 → converted_ppm=600. IPA BQL with NMT 5000 → converted_ppm=5000.
-
-RS RED FLAG 16 — MTBE canonical mapping error:
-Bug: solvent_name="tert-butyl methyl ether" → canonical="Ethyl ether" in
-RSM master. Chemically wrong — MTBE (CAS 1634-04-4) ≠ diethyl ether
-(CAS 60-29-7).
-
-Fix RSM alias table:
-MTBE aliases → canonical "tert-Butyl methyl ether" (or "MTBE" if in master):
-- "methyl tert-butyl ether"
-- "tert-butyl methyl ether"
-- "tert-butylmethyl ether"
-- "MTBE", "t-Butyl methyl ether"
-
-Diethyl ether aliases (separate) → canonical "Diethyl ether":
-- "diethyl ether"
-- "ethyl ether"
-- "Et2O"
-
-Never conflate MTBE with ethyl ether.
-
-═══════════════════════════════════════════════════════════════
-GLOBAL RULES (apply to both workflows)
-═══════════════════════════════════════════════════════════════
-
-- Do not rewrite modules. Patch only affected functions.
-- Do not bleed RS logic into DEG/EG or EI. Do not bleed DEG/EG logic into
-RS or EI.
-- Do not regress Esomeprazole RS or DEG/EG baseline.
-- No regulatory hedging in any final document conclusion.
-- No "Unknown" / "Manual review required" language in rendered DOCX body.
-- Internal validation signals stay in Streamlit UI or "_" prefixed payload
-keys only.
-- Excel is authoritative in RS Type B (detailed calculation) mode.
-- Annexures are supporting evidence only in Type B.
-- Filename inference for material_name is strictly a fallback when body
-extraction fails.
-
-Acceptance regression:
-- Esomeprazole RS: no math changes, same output
-- Esomeprazole DEG/EG: no changes, same output
-- Trilaciclib injection: MDD=432, salt=1.163, 9 solvents including CPME/TFA,
-amounts and exposures match approved TSR
-- Epinephrine injection: MDD=8, 7 solvents including Chloroform, all page-3
-Chlorobutanol data captured, q.s. rows show NA cells in Tables 4-6
-- Mavacamten DEG/EG: all 6 materials auto-mapped including Mavacamten,
-Croscarmellose, Mannitol via token-fallback; Mannitol correctly shows
-No/No (guarantee ceiling not confirmed presence)
-- Sofosbuvir tablet, Trilaciclib injection Excel formats classify correctly
-as single_strength_unit_composition mode
-
+For every component row and every solvent column in Section 5 solvent matrix 
+tables, calculate Daily Exposure using:
+
+  Daily Exposure (mg/day) = Amount in Max Dose (mg) × Limit (ppm) / 1,000,000
+
+Where:
+- Amount in Max Dose = component quantity_per_unit × MDD_multiplier
+  (per fix in RS Red Flag 1: multiplier = MDD_API / api_qty_per_unit)
+- Limit (ppm) = ppm value from annexure evidence
+  (per fixes in RS Red Flags 2, 12, 14, 15: dedup selects highest-confidence 
+   spec limit; BDL entries use spec limit; non-USP solvents preserved; 
+   multi-page extraction complete)
+
+For the API row when salt/base conversion applies (RS API salt row rule):
+  Amount in Max Dose = salt-adjusted API amount (Trilaciclib: 502.56 mg not 
+  432 mg)
+
+For q.s. rows:
+  Amount = NA. Daily Exposure = NA. Do not compute exposure. Do not include 
+  in Total Daily Exposure sum.
+
+For components with matched annexure that has no material-specific solvent 
+evidence (e.g., generic policy letter, negative declaration only):
+  Daily Exposure cells = 0 (confirmed_zero rendering)
+  Do include contribution of 0 in Total Daily Exposure sum
+
+For components with no matched annexure at all:
+  Daily Exposure cells = blank (unresolved)
+  Do not include in Total Daily Exposure sum
+  Add manual_review_item
+
+Total Daily Exposure row calculation (bottom of each solvent matrix table):
+  Total Daily Exposure (mg/day) for solvent = sum of Daily Exposure (mg) 
+  contributions from ALL component rows (excluding q.s. and unresolved rows)
+
+  Equivalent ppm shown in Total row = Total Daily Exposure (mg) × 1,000,000 
+  / Drug Product Amount in Max Dose (mg)
+
+Drug Product row (bottom of each table):
+  Drug Product Amount in Max Dose:
+  - Solid dosage: sum of Amount in Max Dose from all non-q.s. quantitative rows
+  - Liquid dosage: multiplier × 1000 mg/mL × density (default 1.0 g/mL)
+
+USP <467> Comparison row (below Total Daily Exposure):
+  For canonical solvents: show USP <467> Option 2 concentration limit (ppm) 
+  and PDE (mg/day) from master
+  For non-USP solvents (is_non_usp_solvent=true): show "N/A" for both
+
+Verification arithmetic (Trilaciclib example):
+- MDD = 432, salt_factor = 1.163 → multiplier = 1.44
+- Trilaciclib 2HCl salt-adjusted amount = 349 × 1.44 = 502.56 mg = 0.503 g
+- Methanol Daily Exposure from API = 0.503 g × 3000 ppm / 1000 = 1.509 mg
+- Total Methanol Daily Exposure = 1.509 mg (only API contributes)
+- Equivalent ppm in Total = 1.509 × 1000 / 1.043 = 1446.8 ppm
+- USP <467> Methanol PDE = 30 mg/day. 1.509 << 30, therefore compliant.
+
+Verification arithmetic (Epinephrine example):
+- MDD = 8 mg → multiplier = 8
+- Chlorobutanol Amount = 5.25 × 8 = 42 mg = 0.042 g
+- Acetone Daily Exposure from Chlorobutanol = 0.042 g × 5000 ppm / 1000 = 0.21 mg
+- Acetone Daily Exposure from API (Epinephrine) = 0.0088 × 5000 / 1000 = 0.044 mg
+- Total Acetone Daily Exposure = 0.044 + 0.210 = 0.254 mg
+- Equivalent ppm in Total = 0.254 × 1000 / 8.8 = 28.86 ppm (approved shows 31.25 
+  including density variation, close match)
+- USP <467> Acetone PDE = 50 mg/day. 0.254 << 50, therefore compliant.
+
+Verification arithmetic (Esomeprazole regression — must not change):
+- MDD = 240 mg → multiplier = 6 (240/40)
+- Existing exposures unchanged.
