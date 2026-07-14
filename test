@@ -1,297 +1,3958 @@
-RS Sofosbuvir/Velpatasvir failure — critical math bug in vendor content extraction.
+"""
+residual_solvent.py — Residual Solvent Risk Assessment backend (USP <467> / ICH Q3C).
 
-═══════════════════════════════════════════════════════════════
-NEW BUG — Vendor content ppm vs USP master limit
-═══════════════════════════════════════════════════════════════
+COMPLETELY ISOLATED from the Elemental Impurity (EI) workflow. This module does
+NOT import or reuse EI element classes, ICH_PDE / ICH_Q3D constants, EI annexure
+schema, EI mapping, EI 30%-PDE logic, or the EI renderer. It contains:
 
-Bug: Ingredient content ppm cells are being filled with USP <467> master 
-regulatory limits instead of vendor-reported actual content from annexure.
+  • rs_excel_prompt() / parse_rs_excel(raw) — detailed + basic Excel parser with a
+        daily-intake hierarchy that normalises everything to
+        component_amount_in_maximum_dose_mg.
+  • rs_annexure_prompt() / process_rs_annexure(obj) — solvent-declaration converter
+        with a consistent top-level schema (never a bare list), evidence typing,
+        ppm conversion, and material-name (not document-descriptor) extraction.
+  • map_components_to_annexures(...) — general identity resolver (no product rules).
+  • calculate_rs_exposures(...) — exposure = amount_mg × limit_ppm / 1e6.
+  • validate_rs(...) — strict gate that prevents false compliance / false zeros.
+  • build_rs_payload(...) — clean payload for generate_residual_solvent.js.
 
-Evidence (Sofosbuvir IH row):
-- Methanol: AI=3000 ppm, Approved=29 ppm (103× off)
-- DCM: AI=600 ppm, Approved=99 ppm (6× off)
-- Toluene: AI=890 ppm, Approved=9 ppm (99× off)
-- Chlorobenzene: AI=360 ppm, Approved=9 ppm (40× off)
-- NMP: AI=530 ppm, Approved=39 ppm (14× off)
-- n-Hexane: AI=290 ppm, Approved=30 ppm (10× off)
-- THF: AI=720 ppm, Approved=22 ppm (33× off)
+Exposure formula (NOT the EI formula):
+    Daily Exposure (mg/day) = Amount in Maximum Dose (mg/day) × Limit (ppm) / 1,000,000
+"""
 
-Every AI value = USP master limit. Every approved value = vendor content.
+from __future__ import annotations
+import re
+import json
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
-Root cause: pipeline confused two different data sources:
-- Column A: Vendor content ppm (what the batch actually contains)
-- Column B: USP <467> regulatory limit ppm (what's allowed)
-- AI used Column B for ingredient rows AND comparison row.
+import residual_solvent_master as RSM
 
-Column A goes in ingredient rows (component × solvent cells).
-Column B goes in the final comparison row (Limit as per USP <467>).
-
-Fix — Content ppm extraction priority (highest to lowest):
-For ingredient row Content/Limit ppm cell:
-1. Vendor-reported actual content from annexure (e.g., "Methanol: 29 ppm 
-measured")
-2. Vendor NMT spec from annexure (e.g., "Methanol NMT 100 ppm")
-3. Compendial spec ONLY if annexure explicitly cites USP/NF, EP, JP
-4. NEVER fall back to USP <467> master regulatory limit
-5. If no vendor evidence exists for that solvent in the annexure: render "NA"
-(component has annexure but no specific evidence)
-
-For final USP <467> comparison row:
-- ALWAYS use USP <467> master regulatory limit
-- Do not use vendor content values
-- Do not use vendor spec values
-
-Detection rules for content extraction from annexure:
-- Text patterns for actual content: "X ppm", "X.Y ppm", "measured X ppm",
-"actual X ppm", "content X ppm", "found X ppm"
-- Text patterns for spec limit: "NMT X ppm", "Not more than X ppm", "≤ X ppm"
-- Text patterns for compendial reference: "as per USP/NF X ppm", "EP X ppm",
-"USP <467> X ppm"
-
-When both actual and spec exist for same solvent in same annexure:
-- Prefer actual content value (Column A priority)
-- If actual is BDL/BQL/ND: use spec limit as worst-case (previously locked fix)
-
-Absolute rule:
-Ingredient row content cells and Comparison row cells must come from 
-different data sources. Never confuse them. Never fall back from vendor 
-content to USP master limit.
-
-Acceptance for Sofosbuvir/Velpatasvir:
-Sofosbuvir IH row content values from vendor annexure:
-- Methanol: 29 ppm (not 3000)
-- DCM: 99 ppm (not 600)
-- n-Hexane: 30 ppm (not 290)
-- THF: 22 ppm (not 720)
-- Toluene: 9 ppm (not 890)
-- Chlorobenzene: 9 ppm (not 360)
-- NMP: 39 ppm (not 530)
-
-Daily exposures recalculate with correct content values:
-- Sofosbuvir Methanol: 29 × 0.4 / 1000 = 0.0116 mg (not 1.2 mg)
-- Sofosbuvir DCM: 99 × 0.4 / 1000 = 0.0396 mg (not 0.24 mg)
-- Sofosbuvir Toluene: 9 × 0.4 / 1000 = 0.0036 mg (not 0.356 mg)
-- All match approved TSR
-
-Opadry II row content values from vendor annexure:
-- Methanol: 4000 ppm
-- Ethylene glycol: 101 ppm
-- 1,4-Dioxane: 1 ppm
-- Methyl acetate: 4000 ppm
-
-Velpatasvir Premix row content values from vendor annexure:
-- Nitromethane: 25 ppm → 0.005 mg
-- 1-Propanol: 500 ppm → 0.1 mg
-(previously missed because mapping failed — see Fix 2 below)
-
-Final Comparison row uses USP <467> master limits:
-- Methanol: 3000 / 30
-- DCM: 600 / 6
-- n-Hexane: 290 / 2.9
-- THF: 720 / 7.2
-- Toluene: 890 / 8.9
-- Chlorobenzene: 360 / 3.6
-- NMP: 530 / 5.3
-- Ethylene glycol: 620 / 6.2
-- 1,4-Dioxane: 380 / 3.8
-- Nitromethane: 50 / 0.5
-- Class 3 solvents: typically 5000 / 50 (Ethanol, IPA, Ethyl acetate, MTBE, 
-Acetic acid, Triethylamine, Methyl acetate, 1-Propanol)
-
-═══════════════════════════════════════════════════════════════
-SUPPORTING FIXES for Sofosbuvir/Velpatasvir
-═══════════════════════════════════════════════════════════════
-
-Fix 2 — Multi-API combination product handling:
-Approved product: "Sofosbuvir and Velpatasvir Tablets 400 mg/100 mg"
-AI treated as single-API "Sofosbuvir".
-
-Extend metadata handling:
-- Detect multi-API from composition (multiple rows with function="Active 
-Pharmaceutical Ingredient")
-- Product name: use combination name if provided
-- Strength: use "X mg/Y mg" format (e.g., "400 mg/100 mg")
-- MDD basis: one highest-strength unit/day (multiplier = 1 for 400/100 tablet)
-- Both APIs get their own rows in ingredient tables
+logger = logging.getLogger(__name__)
 
 
-
-Fix 6 — Total row semantics for theoretical subtype:
-For this subtype, Total row = sum-of-content, NOT equivalent ppm.
-
-For each solvent column:
-- Total Content ppm = sum of ingredient content ppm values
-- Total Daily Exposure mg/day = sum of ingredient daily exposures
-
-Example Methanol (Sofosbuvir + Opadry contributing):
-- Sofosbuvir: 29 ppm / 0.0116 mg
-- Opadry: 4000 ppm / 0.1164 mg
-- Total: 4029 ppm / 0.128 mg
-
-Do NOT compute equivalent ppm = total exposure × 1e6 / DP mass for this 
-subtype. Only the generic matrix subtype uses equivalent ppm.
+# ── tiny self-contained helpers (no EI dependency) ────────────────────────────
+def _s(v: Any) -> str:
+    return str(v).strip() if v is not None else ""
 
 
-═══════════════════════════════════════════════════════════════
-UNIVERSAL RULE — Product-agnostic separation of data sources
-═══════════════════════════════════════════════════════════════
+def _f(v: Any, default: float = 0.0) -> float:
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(re.sub(r"[^0-9.\-eE]", "", str(v)))
+    except Exception:
+        return default
 
-For ANY RS report, ANY product, ANY subtype:
 
-Ingredient content column:
-- Source: matched annexure content or vendor spec
-- Never: USP <467> master regulatory limit as fallback
+def _num_or_none(v: Any) -> Optional[float]:
+    s = _s(v)
+    if not s:
+        return None
+    m = re.search(r"-?[0-9]*\.?[0-9]+", s.replace(",", ""))
+    return float(m.group(0)) if m else None
 
-Final comparison row:
-- Source: USP <467> master regulatory limit
-- Never: vendor content values
 
-These two data sources exist in different tables and must never be swapped.
+def _seq_in(needle: List[str], haystack: List[str]) -> bool:
+    """True if the token list `needle` appears as a contiguous run in `haystack`.
+    Used for precise solvent-name matching so 'ethanol' does not match inside
+    'methanol' (whole-token comparison, not substring)."""
+    if not needle:
+        return False
+    n = len(needle)
+    for i in range(0, len(haystack) - n + 1):
+        if haystack[i:i + n] == needle:
+            return True
+    # single-token exact membership fallback
+    if n == 1:
+        return needle[0] in haystack
+    return False
 
-Acceptance verification across products:
-- Esomeprazole: content values from vendor CoAs (existing behavior)
-- Trilaciclib: content values from Olon vendor annexure
-- Epinephrine: content values from vendor CoAs (Chlorobutanol NMT 5000 
-because that's the vendor spec, not because USP master says 5000)
-- Sofosbuvir/Velpatasvir: content values from vendor annexures (29, 99, 22, 9, 
-etc. — not 3000, 600, 720, 890)
-- Any future product: content from vendor annexure only
 
-RS annexure converter — content ppm extraction logic fix (product-agnostic). This is an annexure level issue too which u never solved or addressed
+# ── Generic residual-solvent CATEGORY / declaration-scope filter (Red Flag 1) ─
+# These are declaration scopes or category labels, NOT real solvent entities.
+# They must never become calculation columns. They are kept as evidence /
+# declaration_scope text only.
+_SOLVENT_CATEGORY_PATTERNS = [
+    r"^\s*class\s*[i1]{1,3}\b", r"^\s*class\s*[i1v]{1,4}\b",
+    r"\bclass\s*1\b", r"\bclass\s*2\b", r"\bclass\s*3\b",
+    r"\bclass\s*i\b", r"\bclass\s*ii\b", r"\bclass\s*iii\b",
+    r"\borganic\s+volatile\s+impurit", r"\bovi\b",
+    r"\bother\s+residual\s+solvent", r"^\s*residual\s+solvents?\s*$",
+    r"\bich\s*q3c\b", r"\busp\s*<?\s*467\s*>?\b",
+    r"solvents?\s+listed\s+in\s+usp", r"\bclass\s*1\s*,?\s*2",
+    r"^\s*water\s*$", r"^\s*purified\s+water\s*$",
+    r"\bvolatile\s+impurit", r"^\s*solvents?\s*$",
+]
+_SOLVENT_CATEGORY_RE = re.compile("|".join(_SOLVENT_CATEGORY_PATTERNS), re.IGNORECASE)
 
-Bug at converter level: converted_ppm is unreliable when raw_text contains
-both a batch actual value and a spec limit. Converter behavior is
-inconsistent across compendia and vendors, sometimes picking actual, sometimes
-picking spec. Downstream cannot recover correct value if converter emits
-wrong number.
 
-Universal logical rule for converter ppm extraction:
+def is_generic_solvent_category(name: str) -> bool:
+    """True when `name` is a declaration scope / category, not a real solvent."""
+    s = _s(name).lower()
+    if not s:
+        return True
+    return bool(_SOLVENT_CATEGORY_RE.search(s))
 
-Every extracted solvent statement should be classified into ONE of these
-evidence categories, based on raw_text content only (not on vendor identity
-or compendial context):
 
-Category A — Spec limit only:
-- Raw text contains "NMT", "Not more than", "≤", "no más de", "maximum",
-or explicit limit language WITHOUT a paired lower measured value
-- converted_ppm = the numeric spec limit
-- evidence_type = "nmt"
+def rs_safe_json(text: str, want: str = "dict") -> Any:
+    """Shape-aware JSON parse. Never lets a bare list become a dict-expecting
+    value (the EI 'list has no attribute get' failure mode)."""
+    default: Any = {} if want == "dict" else []
+    if not text:
+        return default
+    parsed = None
+    for fn in (lambda t: json.loads(t),
+               lambda t: json.loads(t[t.find("{"):t.rfind("}") + 1]),
+               lambda t: json.loads(t[t.find("["):t.rfind("]") + 1])):
+        try:
+            parsed = fn(text)
+            break
+        except Exception:
+            parsed = None
+    if parsed is None:
+        return default
+    if want == "dict" and isinstance(parsed, list):
+        # Wrap a bare array so callers can still use .get()
+        return {"extracted_items": parsed, "schema_repaired": True}
+    if want == "dict" and not isinstance(parsed, dict):
+        return default
+    return parsed
 
-Category B — Batch actual only:
-- Raw text contains a single numeric value with no NMT context
-- Optional labels: "Actual", "Result", "Content", "Found", "Measured"
-- converted_ppm = the numeric value
-- evidence_type = "batch_actual"
 
-Category C — Batch actual + spec limit both present:
-- Raw text contains two numeric values in a range pattern
-- Common formats: "X - Y", "X to Y", "X ppm - Y ppm", "X (< Y)", "X < Y",
-tabular "Actual | Spec" columns rendered as "X | NMT Y"
-- Convention: smaller value = batch actual, larger value = spec limit
-- Rule: converted_ppm = spec limit (larger value) for worst-case exposure
-- Preserve actual_measured_ppm = smaller value for audit
-- evidence_type = "nmt"
-- calculation_basis = "nmt_with_batch_actual"
+# ════════════════════════════════════════════════════════════════════════════
+# 1. EXCEL PARSER (detailed + basic) — normalises to amount_in_maximum_dose_mg
+# ════════════════════════════════════════════════════════════════════════════
+def rs_excel_prompt() -> str:
+    return (
+        "You are extracting a RESIDUAL SOLVENT composition/calculation spreadsheet "
+        "for a drug product. Extract EXACTLY as printed; do not compute.\n\n"
+        "Return JSON with:\n"
+        "1. no_of_doses: integer if a 'No. of doses' value is present, else null.\n"
+        "2. component_col: exact header of the component/ingredient column.\n"
+        "3. quantity_col: exact header of the 'Quantity / unit (mg)' column if present.\n"
+        "4. amount_col: exact header of 'Amount in Maximum Dose (mg)' if present.\n"
+        "5. mdi_col: exact header of a 'Maximum Daily Intake (g)' or 'MDD (g)' or "
+        "'MDD (mg)' column if present, else ''.\n"
+        "6. solvents: list of every solvent column group name (e.g. Ethanol, "
+        "Ethylene Glycol, 1,4-Dioxane, Iso Propyl Alcohol, Tertiary butyl alcohol, "
+        "Heptane, Acetone, Methanol, Toluene). For each solvent the sheet usually "
+        "has 'Limit (ppm)' and 'Daily Exposure (mg)' subcolumns.\n"
+        "7. columns: ALL column headers in order.\n"
+        "8. rows: list of {component, columns:{header:value}} for every component "
+        "row, including any 'Drug Product' and 'Total Daily Exposure' / 'Residual "
+        "solvent Limit' rows kept verbatim.\n"
+        "9. has_calculated_values: true if 'Daily Exposure (mg)' values are already "
+        "filled in, false if only composition is present.\n"
+        "Return ONLY valid JSON, no markdown."
+    )
 
-Category D — BDL/BQL/ND with associated spec:
-- Raw text contains "BDL", "BQL", "ND", "Not detected", "< LOD", "< LOQ"
-paired with an NMT spec elsewhere in same statement
-- converted_ppm = the spec limit for worst-case
-- evidence_type = "nmt_conservative_bdl"
-- Add note: "BDL result; using spec limit for worst-case exposure"
 
-Category E — BDL/BQL/ND without spec:
-- BDL/BQL/ND with no spec available in raw_text
-- converted_ppm = null
-- evidence_type = "unresolved_bdl"
-- Add manual review flag
+# Identify the special footer rows in a detailed sheet
+_TOTAL_ROW_HINTS = ("total daily exposure", "total exposure")
+_LIMIT_ROW_HINTS = ("residual solvent limit", "usp <467>", "usp467", "limit as per")
+_DRUGPRODUCT_HINTS = ("drug product",)
+_QS_HINTS = ("q.s", "qs to", "q.s.", "water", "purified water")
 
-Category F — Negative declaration:
-- Raw text contains "not used", "excluded", "0 ppm", "none present",
-"no source", "not employed"
-- converted_ppm = 0
-- evidence_type = "negative_declaration"
 
-Category G — Ambiguous:
-- Cannot classify into A-F reliably
-- converted_ppm = null
-- evidence_type = "ambiguous"
-- Add manual review flag
+def _is_qs_value(cell_value: str) -> bool:
+    """True when a cell value denotes a q.s. (quantum satis) quantity rather than
+    a number — e.g. 'q.s.', 'qs', 'q.s', 'q s', 'QS to volume'. Calculation-
+    exempt but display-valid (Red Flag 3)."""
+    s = _s(cell_value).lower().strip()
+    if not s:
+        return False
+    s_norm = re.sub(r"[^a-z0-9 ]+", "", s)
+    if s_norm in ("qs", "q s", "qsto", "q s to"):
+        return True
+    return bool(re.search(r"\bq\.?\s*s\.?\b", s))
 
-Universal extraction algorithm (product-agnostic, vendor-agnostic,
-compendium-agnostic):
 
-Step 1: Extract all numeric values from raw_text (with units when adjacent).
-Step 2: Detect keyword context:
-- NMT context: "NMT", "Not more than", "maximum", "≤", "at most"
-- Actual context: "Actual", "Result", "Content", "Found", "Measured",
-"Analysis", "Test result"
-- BDL context: "BDL", "BQL", "ND", "Not detected", "< LOD", "< LOQ"
-- Negative context: "not used", "excluded", "0 ppm", "not present"
-- Range delimiters: "-", "to", "|", "/", "<"
+def _is_footer_row(name: str) -> Optional[str]:
+    n = name.lower()
+    if any(h in n for h in _TOTAL_ROW_HINTS):
+        return "total"
+    if any(h in n for h in _LIMIT_ROW_HINTS):
+        return "limit"
+    if any(h in n for h in _DRUGPRODUCT_HINTS):
+        return "drug_product"
+    return None
 
-Step 3: Apply classification:
-- Zero numeric values + negative context → Category F
-- Zero numeric values + BDL context → Category E
-- One numeric value + NMT context → Category A
-- One numeric value + no context → Category B
-- One numeric value + BDL context → Category D (search for paired spec)
-- Two numeric values + range delimiter → Category C
-- Two numeric values without range delimiter → analyze which has NMT context
-- More than two numeric values → identify primary spec limit, treat others
-as audit only
 
-Step 4: Set converted_ppm per category rules.
+# ════════════════════════════════════════════════════════════════════════════
+# DETERMINISTIC EXCEL READING + MODE CLASSIFICATION
+# These read the workbook directly (no LLM-shape dependency) so unit-composition
+# and component-MDD Excels are parsed reliably and product-agnostically.
+# ════════════════════════════════════════════════════════════════════════════
+_STRENGTH_RE = re.compile(r"^\s*\d+(?:\.\d+)?\s*mg\s*$", re.IGNORECASE)
+_AMOUNT_HINTS = ("amount in maximum dose", "amount in max dose", "amount in maximum")
+_MDD_HINTS = ("maximum daily intake", "max daily intake", "mdd", "maximum daily dose",
+              "daily intake")
+_QTY_HINTS = (
+    # multi-word patterns FIRST so they win the header hint scan
+    "quantity / unit", "quantity/unit", "qty/unit", "quantity per unit",
+    "mg / vial", "mg / ml", "mg / tablet", "mg / capsule", "mg / sachet",
+    "mg/vial", "mg/ml", "mg/tablet", "mg/capsule", "mg/sachet", "mg/dose",
+    "amount per unit", "amount/unit",
+    "per unit", "per vial", "per ml", "per tablet", "per capsule", "per sachet",
+    "quantity mg", "amount mg", "quantity (", "qty (", "qty.",
+    # broad fallbacks – checked last
+    "mg/unit", "quantity", "qty ", "amount",
+)
 
-Step 5: Preserve full audit trail:
-{
-converted_ppm: [selected value],
-actual_measured_ppm: [batch actual if extracted, else null],
-spec_limit_ppm: [spec limit if extracted, else null],
-evidence_type: [category label],
-raw_text: [original text],
-extraction_notes: [algorithm reasoning]
+# Unit-basis hints — recognised in the qty column header to drive the dose
+# basis prompt (mg/Vial, mg/mL, mg/tablet, mg/sachet, mg/dose, mg/capsule).
+_UNIT_BASIS_PATTERNS = [
+    (re.compile(r"mg\s*[/\(]\s*vial", re.IGNORECASE), "vial"),
+    (re.compile(r"mg\s*[/\(]\s*ml", re.IGNORECASE), "ml"),
+    (re.compile(r"mg\s*[/\(]\s*tablet", re.IGNORECASE), "tablet"),
+    (re.compile(r"mg\s*[/\(]\s*capsule", re.IGNORECASE), "capsule"),
+    (re.compile(r"mg\s*[/\(]\s*sachet", re.IGNORECASE), "sachet"),
+    (re.compile(r"mg\s*[/\(]\s*dose", re.IGNORECASE), "dose"),
+    (re.compile(r"per\s+vial", re.IGNORECASE), "vial"),
+    (re.compile(r"per\s+ml", re.IGNORECASE), "ml"),
+    (re.compile(r"per\s+tablet", re.IGNORECASE), "tablet"),
+    (re.compile(r"per\s+capsule", re.IGNORECASE), "capsule"),
+    (re.compile(r"per\s+sachet", re.IGNORECASE), "sachet"),
+]
+
+
+def _infer_unit_basis(header_label: str) -> str:
+    if not header_label:
+        return "unit"
+    for rx, basis in _UNIT_BASIS_PATTERNS:
+        if rx.search(header_label):
+            return basis
+    return "unit"
+_COMP_HINTS = ("component", "ingredient", "material", "name of ingredient", "name")
+_COMPENDIA_HINTS = ("compendia", "compendial", "status", "grade")
+_STAGE_HINTS = ("stage", "step", "process step", "manufacturing stage")
+_SOLVENT_HINTS = ("limit (ppm)", "daily exposure", "ppm", "residual solvent")
+
+# Named residual solvents that headline a detailed RS calculation sheet.
+_RS_SOLVENT_NAMES = (
+    "ethanol", "methanol", "toluene", "acetone", "isopropyl alcohol",
+    "iso propyl alcohol", "ethylene glycol", "1,4-dioxane", "1,4 dioxane",
+    "heptane", "tert-butyl alcohol", "tertiary butyl alcohol", "t-butyl alcohol",
+    "dehydrated alcohol", "dichloromethane", "n-hexane", "hexane",
+    "ethyl acetate", "methylene chloride",
+)
+
+
+def _detailed_rs_signatures(sheet: Dict) -> int:
+    """Count how many detailed-RS-calculation signatures are present in a sheet.
+    Scans the header AND the whole grid (footers included) so signatures such as
+    'Drug Product', 'Total Daily Exposure' and 'Residual solvent Limit as per
+    current USP <467>' are detected even when they sit in footer rows. A sheet
+    with >= 4 signatures is a detailed RS calculation sheet (Type B)."""
+    header = sheet.get("header", []) or []
+    rows = sheet.get("rows", []) or []
+    # Flatten all cell text (header + body) into one lowercased blob.
+    cells: List[str] = [_s(h).lower() for h in header]
+    for r in rows:
+        if isinstance(r, list):
+            cells.extend(_s(c).lower() for c in r)
+        elif isinstance(r, dict):
+            cells.extend(_s(c).lower() for c in r.values())
+    blob = " | ".join(cells)
+
+    sig = 0
+    # 1. "No. of doses"
+    if re.search(r"no\.?\s*of\s*doses", blob):
+        sig += 1
+    # 2. "Quantity / unit (mg)"
+    if any(h in blob for h in ("quantity / unit", "quantity/unit",
+                               "quantity per unit", "qty/unit")):
+        sig += 1
+    # 3. "Amount in Maximum Dose (mg)"
+    if any(h in blob for h in _AMOUNT_HINTS):
+        sig += 1
+    # 4. Named solvent group headers (count as one signature if >= 1 present)
+    if any(nm in blob for nm in _RS_SOLVENT_NAMES):
+        sig += 1
+    # 5. Per-solvent sub-headers "Limit (ppm)" and "Daily Exposure (mg)"
+    if "limit (ppm)" in blob or re.search(r"limit\s*\(?\s*ppm", blob):
+        sig += 1
+    if "daily exposure" in blob:
+        sig += 1
+    # 6. "Drug Product" footer row
+    if "drug product" in blob:
+        sig += 1
+    # 7. "Total Daily Exposure" footer row
+    if "total daily exposure" in blob:
+        sig += 1
+    # 8. "Residual solvent Limit as per current USP <467>" footer row
+    if re.search(r"residual\s+solvent.*usp\s*<?\s*467", blob) or \
+       re.search(r"usp\s*<?\s*467", blob):
+        sig += 1
+    return sig
+
+
+def read_excel_grid(excel_bytes: bytes, max_rows: int = 400) -> List[Dict]:
+    """
+    Read every worksheet into a list of {sheet, header, rows} using openpyxl.
+    Header = the first row that looks like column labels. Deterministic; no LLM.
+    """
+    import openpyxl
+    from io import BytesIO
+    wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
+    sheets = []
+    for ws in wb.worksheets:
+        grid = []
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            grid.append(["" if c is None else str(c).strip() for c in row])
+            if i > max_rows:
+                break
+        if not grid:
+            continue
+        # Find the header row: the row with the most non-empty, text-ish cells
+        # that also contains a component-like or strength-like or amount-like label.
+        header_idx = 0
+        best_score = -1
+        for idx in range(min(len(grid), 15)):
+            cells = grid[idx]
+            nonempty = [c for c in cells if c]
+            if not nonempty:
+                continue
+            low = " | ".join(c.lower() for c in nonempty)
+            score = len(nonempty)
+            if any(h in low for h in _COMP_HINTS):
+                score += 5
+            if any(_STRENGTH_RE.match(c) for c in nonempty):
+                score += 5
+            if any(h in low for h in _AMOUNT_HINTS + _MDD_HINTS):
+                score += 4
+            if score > best_score:
+                best_score = score
+                header_idx = idx
+        header = grid[header_idx]
+        data_rows = grid[header_idx + 1:]
+        sheets.append({"sheet": ws.title, "header": header,
+                       "rows": data_rows, "header_idx": header_idx,
+                       "full_grid": grid})
+    wb.close()
+    return sheets
+
+
+def parse_flat_detailed_rs_excel(excel_bytes: bytes) -> Dict:
+    """
+    Deterministically parse a FLAT single-header detailed RS calculation Excel
+    (no LLM). Emits a raw dict compatible with parse_rs_excel(): component rows
+    with a 'columns' map, plus footer rows (Drug Product / Total Daily Exposure /
+    USP <467> limit) tagged so parse_rs_excel classifies them.
+
+    Handles:
+      - a 'No. of doses' cell (row 1) with the numeric value in an adjacent cell
+      - a single-row header with 'Components', 'Quantity / unit (mg)',
+        'Amount in Maximum Dose (mg)' and per-solvent 'X Limit (ppm)' /
+        'X Daily Exposure (mg)' columns
+      - solvent columns auto-detected via _RS_SOLVENT_NAMES
+      - footer rows via _is_footer_row
+
+    Returns {} (empty) if it cannot find a usable component header + rows, so the
+    caller can fall back to the Claude extraction path.
+    """
+    try:
+        import openpyxl
+        from io import BytesIO
+        wb = openpyxl.load_workbook(BytesIO(excel_bytes), data_only=True)
+    except Exception:
+        return {}
+
+    best: Dict[str, Any] = {}
+    for ws in wb.worksheets:
+        grid = []
+        for row in ws.iter_rows(values_only=True):
+            grid.append(["" if c is None else str(c).strip() for c in row])
+        if not grid:
+            continue
+
+        # ── Find 'No. of doses' anywhere in the grid ─────────────────────────
+        no_of_doses = None
+        for r_i, row in enumerate(grid):
+            for c_i, cell in enumerate(row):
+                if re.search(r"no\.?\s*of\s*doses", cell.lower()):
+                    # numeric value in an adjacent cell (right, then below)
+                    for (rr, cc) in ((r_i, c_i + 1), (r_i + 1, c_i),
+                                     (r_i, c_i + 2)):
+                        if rr < len(grid) and cc < len(grid[rr]):
+                            v = _num_or_none(grid[rr][cc])
+                            if v:
+                                no_of_doses = int(v)
+                                break
+                if no_of_doses:
+                    break
+            if no_of_doses:
+                break
+
+        # ── Find the component header row ────────────────────────────────────
+        header_idx = None
+        comp_col_idx = None
+        for idx in range(min(len(grid), 25)):
+            row = grid[idx]
+            low = [c.lower() for c in row]
+            for ci, c in enumerate(low):
+                if any(h == c or h in c for h in ("components", "component",
+                                                  "ingredient", "name of ingredient")):
+                    comp_col_idx = ci
+                    break
+            if comp_col_idx is not None:
+                # confirm this row also has quantity/amount or a solvent name
+                joined = " | ".join(low)
+                if (any(h in joined for h in _QTY_HINTS + _AMOUNT_HINTS)
+                        or any(nm in joined for nm in _RS_SOLVENT_NAMES)
+                        or "ppm" in joined or "daily exposure" in joined):
+                    header_idx = idx
+                    break
+                comp_col_idx = None
+        if header_idx is None:
+            continue
+
+        header = grid[header_idx]
+        # Some detailed sheets use TWO header rows (solvent name on row N,
+        # 'Limit (ppm)'/'Daily Exposure (mg)' on row N+1). Merge them so each
+        # column has a full 'Ethanol Limit (ppm)' style label.
+        merged_header = list(header)
+        if header_idx + 1 < len(grid):
+            sub = grid[header_idx + 1]
+            sub_low = " | ".join(s.lower() for s in sub)
+            if ("limit" in sub_low and "ppm" in sub_low) or "daily exposure" in sub_low:
+                # carry the last seen solvent/group label forward across blanks
+                last_group = ""
+                combined = []
+                for i in range(max(len(header), len(sub))):
+                    top = header[i] if i < len(header) else ""
+                    bot = sub[i] if i < len(sub) else ""
+                    if top:
+                        last_group = top
+                    label = (f"{last_group} {bot}".strip() if bot else top or last_group)
+                    combined.append(label.strip())
+                merged_header = combined
+                data_start = header_idx + 2
+            else:
+                data_start = header_idx + 1
+        else:
+            data_start = header_idx + 1
+
+        # ── Detect solvent columns via _RS_SOLVENT_NAMES ─────────────────────
+        solvents: List[str] = []
+        for h in merged_header:
+            hl = h.lower()
+            for nm in _RS_SOLVENT_NAMES:
+                if nm in hl:
+                    # display name = the solvent portion (strip role words)
+                    disp = re.sub(r"\b(limit|ppm|daily|exposure|mg|\(.*?\))\b", " ", h,
+                                  flags=re.IGNORECASE)
+                    disp = re.sub(r"[^A-Za-z0-9,\- ]+", " ", disp)
+                    disp = re.sub(r"\s+", " ", disp).strip()
+                    if disp and disp not in solvents:
+                        solvents.append(disp)
+                    break
+
+        # locate quantity / amount columns
+        def _find_col(hints):
+            for i, h in enumerate(merged_header):
+                if any(hint in h.lower() for hint in hints):
+                    return i, merged_header[i]
+            return None, ""
+        _qi, quantity_col = _find_col(_QTY_HINTS)
+        _ai, amount_col = _find_col(_AMOUNT_HINTS)
+        component_col = merged_header[comp_col_idx] if comp_col_idx < len(merged_header) else "Components"
+
+        # ── Build rows (component + footer) as {columns:{label:value}} ───────
+        out_rows: List[Dict] = []
+        for r in grid[data_start:]:
+            if comp_col_idx >= len(r):
+                continue
+            name = _s(r[comp_col_idx])
+            if not name:
+                # a row with values but no name in the component column is skipped
+                if not any(_s(x) for x in r):
+                    continue
+            cols_map = {}
+            for i, label in enumerate(merged_header):
+                if not label:
+                    continue
+                val = _s(r[i]) if i < len(r) else ""
+                cols_map[label] = val
+            # ensure the component label carries the name
+            if component_col:
+                cols_map[component_col] = name
+            out_rows.append({"columns": cols_map})
+
+        if not out_rows or not solvents:
+            continue
+
+        raw = {
+            "no_of_doses": no_of_doses,
+            "component_col": component_col or "Components",
+            "quantity_col": quantity_col,
+            "amount_col": amount_col,
+            "solvents": solvents,
+            "columns": [h for h in merged_header if h],
+            "has_calculated_values": True,
+            "rows": out_rows,
+            "_parser": "flat_deterministic",
+        }
+        # Prefer the sheet with the most component rows / solvents
+        if (not best) or (len(out_rows) > len(best.get("rows", []))):
+            best = raw
+
+    wb.close()
+    return best
+
+
+def _col_index(header: List[str], hints: Tuple[str, ...]) -> Optional[int]:
+    """Return the index of the first header cell matching any hint.
+
+    Hints are scanned in ORDER, so earlier hints win. When matching the generic
+    'material' hint, cells with 'code'/'no.' are skipped so a 'Material code'
+    column never masquerades as the component (ingredient) column.
+    """
+    for hint in hints:
+        for i, h in enumerate(header):
+            hl = h.lower().strip()
+            if hint == "material" and any(
+                    bad in hl for bad in ("code", "no.", "no ", "no.")):
+                continue
+            if hint in hl:
+                return i
+    return None
+
+
+def _strength_columns(header: List[str]) -> List[Tuple[int, str, float]]:
+    """Return [(col_index, label, mg_value)] for every strength column like '40 mg'."""
+    out = []
+    for i, h in enumerate(header):
+        if _STRENGTH_RE.match(h or ""):
+            m = re.search(r"\d+(?:\.\d+)?", h)
+            if m:
+                out.append((i, h.strip(), float(m.group(0))))
+    return out
+
+
+# Instruction / notes / guidance tabs must never be classified as a calculation
+# sheet — their prose contains RS keywords that falsely trip signatures (RF7a).
+_INSTRUCTION_SHEET_TOKENS = (
+    "instruction", "instructions", "note", "notes", "readme", "read me",
+    "help", "guide", "guidance", "manual", "info", "information", "legend",
+    "key", "cover", "index", "how to use", "definitions", "glossary",
+)
+
+
+def _is_instruction_sheet(sh: Dict) -> bool:
+    """True for an instructions/notes/guidance tab, or any sheet dominated by
+    long free-text prose cells (>80 chars, more than 3 of them)."""
+    name = _s(sh.get("sheet")).lower().strip()
+    name_tokens = set(re.split(r"[\s_\-]+", name))
+    for tok in _INSTRUCTION_SHEET_TOKENS:
+        if name == tok or tok in name_tokens or name.startswith(tok + " "):
+            return True
+    header = sh.get("header", []) or []
+    rows = sh.get("rows", []) or []
+    cells: List[str] = list(header)
+    for r in rows:
+        if isinstance(r, list):
+            cells.extend(r)
+        elif isinstance(r, dict):
+            cells.extend(r.values())
+    long_cells = sum(1 for c in cells if len(_s(c)) > 80)
+    return long_cells > 3
+
+
+def classify_rs_excel(excel_bytes: bytes) -> Dict:
+    """
+    Classify the Excel into one of:
+      - detailed_rs_calculation
+      - unit_composition_strength_columns
+      - combined_workbook         (a unit-composition sheet AND a detailed sheet)
+      - component_mdd_only
+      - insufficient_material_names_only
+    Returns a dict with mode, the chosen sheet, detected columns, and strengths.
+    Deterministic and product-agnostic.
+    """
+    sheets = read_excel_grid(excel_bytes)
+    if not sheets:
+        return {"mode": "insufficient_material_names_only", "reason": "empty workbook",
+                "sheets": []}
+
+    # Classify each sheet's role independently first.
+    sheet_roles = []        # (role, info)
+    detailed_candidates = []   # RF7a: choose the highest-signature detailed sheet
+    detailed_info = None
+    unit_info = None
+    mdd_info = None
+    single_info = None
+    for sh in sheets:
+        # RF7a: never classify an instructions / notes / prose sheet.
+        if _is_instruction_sheet(sh):
+            continue
+        header = sh["header"]
+        low_join = " | ".join(h.lower() for h in header)
+        has_solvent = any(h in low_join for h in _SOLVENT_HINTS)
+        has_amount = _col_index(header, _AMOUNT_HINTS) is not None
+        has_mdd = _col_index(header, _MDD_HINTS) is not None
+        qty_idx = _col_index(header, _QTY_HINTS)
+        has_qty = qty_idx is not None
+        strengths = _strength_columns(header)
+        comp_idx = _col_index(header, _COMP_HINTS)
+
+        info = {
+            "sheet": sh["sheet"], "header": header, "rows": sh["rows"],
+            "comp_idx": comp_idx, "has_solvent": has_solvent,
+            "has_amount": has_amount, "has_mdd": has_mdd, "has_qty": has_qty,
+            "qty_idx": qty_idx, "strengths": strengths,
+        }
+
+        # Type B (detailed RS calculation) is detected FIRST, via a robust
+        # signature count that scans header + footers. >= 4 signatures ⇒ detailed.
+        # This ensures a complete pre-computed Excel is never misread as a unit-
+        # composition sheet (which would wrongly prompt for MDD / strength).
+        n_sig = _detailed_rs_signatures(sh)
+        info["detailed_signatures"] = n_sig
+        if n_sig >= 4:
+            info["mode"] = "detailed_rs_calculation"
+            sheet_roles.append(("detailed", info))
+            detailed_candidates.append(info)
+        elif has_solvent and (has_amount or has_qty):
+            info["mode"] = "detailed_rs_calculation"
+            sheet_roles.append(("detailed", info))
+            detailed_candidates.append(info)
+        elif strengths and comp_idx is not None and not has_amount and not has_mdd:
+            info["mode"] = "unit_composition_strength_columns"
+            sheet_roles.append(("unit", info))
+            unit_info = unit_info or info
+        elif (has_amount or has_mdd) and comp_idx is not None:
+            info["mode"] = "component_mdd_only"
+            sheet_roles.append(("mdd", info))
+            mdd_info = mdd_info or info
+        elif (has_qty and comp_idx is not None and not strengths
+              and not has_solvent):
+            # Single-strength unit composition: one quantity column with a
+            # unit basis (mg/vial, mg/mL, mg/tablet, mg/sachet, mg/dose).
+            info["mode"] = "single_strength_unit_composition"
+            info["unit_basis"] = _infer_unit_basis(
+                header[qty_idx] if qty_idx is not None and qty_idx < len(header) else "")
+            info["qty_col_label"] = (header[qty_idx] if qty_idx is not None
+                                     and qty_idx < len(header) else "")
+            sheet_roles.append(("single", info))
+            single_info = single_info or info
+        else:
+            info["mode"] = "insufficient_material_names_only"
+            sheet_roles.append(("insufficient", info))
+
+    # RF7a: among all detailed candidates, keep the one with the most signatures
+    # (a full calculation sheet beats a thin one that merely mentions a solvent).
+    if detailed_candidates:
+        detailed_info = max(detailed_candidates,
+                            key=lambda i: i.get("detailed_signatures", 0))
+
+    # Combined workbook: BOTH a unit-composition sheet AND a detailed sheet exist.
+    if unit_info is not None and detailed_info is not None:
+        return {"mode": "combined_workbook",
+                "sheet": unit_info["sheet"],
+                "unit_sheet": unit_info, "detailed_sheet": detailed_info,
+                "header": unit_info["header"], "rows": unit_info["rows"],
+                "comp_idx": unit_info["comp_idx"], "strengths": unit_info["strengths"],
+                "sheets": sheets}
+
+    # Single-role priority: detailed > unit > mdd > single > insufficient
+    if detailed_info is not None:
+        return {**detailed_info, "sheets": sheets}
+    if unit_info is not None:
+        return {**unit_info, "sheets": sheets}
+    if mdd_info is not None:
+        return {**mdd_info, "sheets": sheets}
+    if single_info is not None:
+        return {**single_info, "sheets": sheets}
+    return {"mode": "insufficient_material_names_only",
+            **(sheet_roles[0][1] if sheet_roles else {}), "sheets": sheets,
+            "mode_override": "insufficient_material_names_only"}
+
+
+def _clean_num(v: Any) -> Optional[float]:
+    return _num_or_none(v)
+
+
+def parse_unit_composition_excel(classified: Dict, mdd_mg_day: float,
+                                 selected_strength: Optional[float] = None) -> Dict:
+    """
+    Mode B parser. Strength-column unit composition:
+        Ingredient | Compendia Status | 40 mg | 20 mg | 10 mg | Stage
+    Auto-selects the MAX strength column (unless one is passed), derives
+    no_of_doses = MDD / selected_strength, and computes
+        amount_in_maximum_dose_mg = quantity_per_unit(max strength) × no_of_doses.
+    Duplicate components across stages are aggregated for the quantitative total
+    while stage rows are preserved for display.
+    """
+    header = classified["header"]
+    rows = classified["rows"]
+    comp_idx = classified.get("comp_idx")
+    strengths = classified.get("strengths", [])
+    compendia_idx = _col_index(header, _COMPENDIA_HINTS)
+    stage_idx = _col_index(header, _STAGE_HINTS)
+
+    if comp_idx is None or not strengths:
+        return {"mode": "unit_composition_strength_columns", "rows": [],
+                "needs_dose_basis": True, "error": "missing component or strength columns"}
+
+    # Select max strength
+    if selected_strength is None:
+        sel = max(strengths, key=lambda x: x[2])
+    else:
+        sel = min(strengths, key=lambda x: abs(x[2] - selected_strength))
+    sel_idx, sel_label, sel_mg = sel
+
+    no_of_doses = None
+    if mdd_mg_day and sel_mg > 0:
+        no_of_doses = mdd_mg_day / sel_mg
+
+    # Build display columns (verbatim) and quantitative aggregation
+    display_columns = [header[comp_idx]]
+    if compendia_idx is not None:
+        display_columns.append(header[compendia_idx])
+    display_columns += [lbl for (_i, lbl, _mg) in strengths]
+    if stage_idx is not None:
+        display_columns.append(header[stage_idx])
+
+    display_rows: List[Dict] = []
+    agg: Dict[str, Dict] = {}    # component -> aggregated quantity at selected strength
+    order: List[str] = []
+
+    for r in rows:
+        if comp_idx >= len(r):
+            continue
+        name = _s(r[comp_idx])
+        if not name:
+            continue
+        # Display row (verbatim)
+        disp = {header[comp_idx]: name}
+        if compendia_idx is not None and compendia_idx < len(r):
+            disp[header[compendia_idx]] = _s(r[compendia_idx])
+        for (si, lbl, _mg) in strengths:
+            disp[lbl] = _s(r[si]) if si < len(r) else ""
+        if stage_idx is not None and stage_idx < len(r):
+            disp[header[stage_idx]] = _s(r[stage_idx])
+        display_rows.append({"ingredient": name, "columns": disp})
+
+        is_qs = any(h in name.lower() for h in _QS_HINTS)
+        # Enhanced q.s. detection: ingredient hints (@ suffix, gases, process
+        # aids) and non-numeric quantity cells are also q.s. rows.
+        if _is_qs_ingredient(name):
+            is_qs = True
+        sel_cell_val = _s(r[sel_idx]) if sel_idx < len(r) else ""
+        if _is_qs_quantity(sel_cell_val):
+            is_qs = True
+        qty = _clean_num(_strip_footnote_markers(sel_cell_val)) if sel_idx < len(r) else None
+
+        key = name.strip().lower()
+        if key not in agg:
+            agg[key] = {"component": name, "qty_per_unit": 0.0, "_is_qs": is_qs,
+                        "had_qty": False}
+            order.append(key)
+        if qty is not None:
+            agg[key]["qty_per_unit"] += qty
+            agg[key]["had_qty"] = True
+        if is_qs:
+            agg[key]["_is_qs"] = True
+
+    comp_rows: List[Dict] = []
+    for key in order:
+        a = agg[key]
+        qty_unit = a["qty_per_unit"] if a["had_qty"] else None
+        amount_mg = None
+        basis = "none"
+        if (not a["_is_qs"]) and qty_unit is not None and no_of_doses:
+            amount_mg = round(qty_unit * no_of_doses, 6)
+            basis = "max_strength_column_times_derived_doses"
+        comp_rows.append({
+            "component": a["component"],
+            "quantity": round(qty_unit, 6) if qty_unit is not None else None,
+            "amount_in_maximum_dose_mg": amount_mg,
+            "amount_basis": basis,
+            "_is_qs": a["_is_qs"],
+            "solvents": {},          # no Excel solvent columns in this mode
+            "columns": {},
+        })
+
+    needs_dose_basis = any((not c["_is_qs"]) and c["amount_in_maximum_dose_mg"] is None
+                           for c in comp_rows)
+    product_mdd = round(mdd_mg_day, 6) if mdd_mg_day else None
+
+    return {
+        "mode": "unit_composition_strength_columns",
+        "no_of_doses": no_of_doses,
+        "selected_strength_mg": sel_mg,
+        "selected_strength_label": sel_label,
+        "detected_strengths": [(lbl, mg) for (_i, lbl, mg) in strengths],
+        "component_col": header[comp_idx],
+        "quantity_col": "Quantity / unit (mg)",
+        "amount_col": "Amount in Maximum Dose (mg)",
+        "mdi_col": "", "mdi_unit": "",
+        "columns": ["Components", "Quantity / unit (mg)", "Amount in Maximum Dose (mg)"],
+        "solvents_display": [],
+        "solvent_canon": {},
+        "rows": comp_rows,
+        "footer_total": {}, "footer_limit": {}, "drug_product_row": {},
+        "has_calculated_values": False,
+        "needs_dose_basis": needs_dose_basis,
+        "product_mdd_mg": product_mdd,
+        "mdd_source": "user_mdd_over_max_strength",
+        "_display_columns": display_columns,
+        "_display_sections": [{"name": "Composition", "rows": display_rows}],
+        "audit": {"selected_strength": sel_label, "no_of_doses": no_of_doses,
+                  "mdd_mg_day": mdd_mg_day},
+        "warnings": [],
+    }
+
+
+_QS_QUANTITY_STRINGS = {"", "-", "n/a", "na", "tbd", "q.s", "qs", "q s", "qs to",
+                        "q.s.", "qsto", "q s to", "as required", "adjust ph"}
+_QS_INGREDIENT_HINTS = ("nitrogen", "n2", "argon", "process aid", "process-aid",
+                        "processing aid", "sparging gas")
+
+_FOOTNOTE_MARKER_RE = re.compile(r"[\*#†‡§¶\^]+")
+
+
+def _strip_footnote_markers(s: str) -> str:
+    """Remove trailing footnote markers ('349*', '5.25#', '†', '‡', '§') so the
+    numeric parse succeeds. Non-marker characters are preserved."""
+    if not s:
+        return s
+    return _FOOTNOTE_MARKER_RE.sub("", s).strip()
+
+
+# RS Bug 2: salt-form APIs carry an asterisk footnote reconciling the formulation
+# (salt) weight with the label (free-base) strength, e.g. Trilaciclib 2HCl
+# "349 mg dihydrochloride ≡ 300 mg base". The dose multiplier must use the BASE
+# weight (432/300 = 1.44), NOT the salt weight (432/349 = 1.238). A different
+# asterisk footnote encodes an OVERAGE ("10% overage") and is handled separately
+# (multiplier uses the nominal strength). This parser classifies + extracts both.
+_SALT_WORDS = (
+    "2hcl", "3hcl", "hcl", "dihydrochloride", "trihydrochloride", "hydrochloride",
+    "hydrobromide", "hbr", "sulfate", "sulphate", "bisulfate", "hemisulfate",
+    "tartrate", "bitartrate", "mesylate", "methanesulfonate", "tosylate",
+    "tosilate", "besylate", "besilate", "phosphate", "diphosphate", "maleate",
+    "fumarate", "succinate", "acetate", "citrate", "sodium", "potassium",
+    "calcium", "magnesium", "hydrate", "monohydrate", "dihydrate", "trihydrate",
+    "salt",
+)
+_OVERAGE_RE_A = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*(?:w\s*/?\s*w\s*)?over\s*age", re.I)
+_OVERAGE_RE_B = re.compile(r"over\s*age\D{0,15}?(\d+(?:\.\d+)?)\s*%", re.I)
+_MG_NUM_RE = re.compile(r"(\d+(?:\.\d+)?)\s*mg\b", re.I)
+_BASE_CTX_RE = re.compile(r"\b(?:free[\s-]*)?base\b", re.I)
+
+
+def parse_salt_base_footnote(text: str) -> Optional[Dict]:
+    """Classify an asterisk footnote and extract its conversion (RS Bug 2).
+
+    Returns None when nothing salt/base/overage is recognised, else a dict:
+      kind='overage'   → {'overage_pct': fraction, 'salt_factor': 1.0}
+      kind='salt_base' → {'salt_weight', 'base_weight',
+                          'salt_factor'=salt/base (>1), 'overage_pct': 0.0}
+    The multiplier is later computed as MDD × salt_factor / api_qty, so a
+    free-base MDD applied to a salt formulation weight yields MDD / base_weight
+    (Trilaciclib: 432 × (349/300) / 349 = 1.44)."""
+    t = _s(text)
+    if not t:
+        return None
+    # Replace footnote markers (*, #, †…) with a space so a glued '349* mg'
+    # still parses; '=' and '≡' connectives are preserved (not markers).
+    low = _FOOTNOTE_MARKER_RE.sub(" ", t.lower())
+
+    # Overage first (distinct footnote content; must not be read as salt/base).
+    om = _OVERAGE_RE_A.search(low) or _OVERAGE_RE_B.search(low)
+    if om:
+        try:
+            pct = float(om.group(1))
+        except (TypeError, ValueError):
+            pct = 0.0
+        return {"kind": "overage", "overage_pct": pct / 100.0, "salt_factor": 1.0,
+                "salt_weight": None, "base_weight": None, "raw": t}
+
+    has_salt = any(w in low for w in _SALT_WORDS)
+    has_base = bool(_BASE_CTX_RE.search(low))
+    equiv = bool(re.search(
+        r"equivalent|equals?|corresponds?|is\s+equal|provid|deliver|contain|[=≡]",
+        low))
+    if not (equiv and (has_base or has_salt)):
+        return None
+
+    nums = [(float(m.group(1)), m.start(), m.end()) for m in _MG_NUM_RE.finditer(low)]
+    if len(nums) < 2:
+        return None
+
+    # base = the mg-number sitting CLOSEST *before* a "base" token (e.g. the 300
+    # in "…= 300 mg base"). Picking the nearest preceding number avoids a greedy
+    # window tagging the leading salt weight as the base on short strings.
+    base_val = None
+    best_gap = 26                      # cap: ignore far-away "base" mentions
+    for bm in _BASE_CTX_RE.finditer(low):
+        bpos = bm.start()
+        for val, _s0, e in nums:
+            if e <= bpos and (bpos - e) < best_gap:
+                base_val, best_gap = val, (bpos - e)
+    salt_val = None
+    if base_val is not None:
+        others = [v for v, _s0, _e in nums if v != base_val]
+        if others:
+            salt_val = max(others)     # the salt is the heavier partner
+    if base_val is None or salt_val is None:
+        # Fallback: two distinct weights → salt is heavier, base is lighter.
+        vals = sorted({v for v, _s0, _e in nums}, reverse=True)
+        if len(vals) >= 2:
+            salt_val, base_val = vals[0], vals[1]
+
+    if not salt_val or not base_val or base_val <= 0 or salt_val < base_val:
+        return None
+    return {"kind": "salt_base", "salt_weight": salt_val, "base_weight": base_val,
+            "salt_factor": round(salt_val / base_val, 6), "overage_pct": 0.0, "raw": t}
+
+
+_SALT_EQUIV_CUE_RE = re.compile(
+    r"equivalent|equals?|corresponds?|as\s+(?:the\s+)?(?:free\s+)?base|"
+    r"provid\w*|calculated\s+as|expressed\s+as", re.IGNORECASE)
+
+
+def _footnote_base_weight(text: str) -> Optional[float]:
+    """Extract the free-BASE weight (mg) from a salt/base footnote that may carry
+    ONLY the base number — the salt weight then lives in the API Qty cell (the
+    common Trilaciclib format: Qty '349*' + footnote '* equivalent to 300 mg
+    base'). Returns the base mg value, or None. Requires both a base cue and a
+    salt/equivalence cue so plain excipient masses never match."""
+    t = _s(text)
+    if not t:
+        return None
+    low = _FOOTNOTE_MARKER_RE.sub(" ", t.lower())
+    if not _BASE_CTX_RE.search(low):
+        return None
+    if not (_SALT_EQUIV_CUE_RE.search(low) or any(w in low for w in _SALT_WORDS)):
+        return None
+    nums = [(float(m.group(1)), m.start(), m.end()) for m in _MG_NUM_RE.finditer(low)]
+    if not nums:
+        return None
+    # base = the mg-number sitting CLOSEST before a 'base' token.
+    base_val = None
+    best_gap = 40
+    for bm in _BASE_CTX_RE.finditer(low):
+        bpos = bm.start()
+        for val, _s0, e in nums:
+            if e <= bpos and (bpos - e) < best_gap:
+                base_val, best_gap = val, (bpos - e)
+    if base_val is None:
+        # 'base' present but not adjacent to a number → take the value right after
+        # an equivalence cue ("equivalent to 300 mg", "as 300 mg").
+        m = re.search(r"(?:equivalent to|equals?|as|corresponds? to|provid\w*|"
+                      r"calculated as|expressed as)\D{0,14}(\d+(?:\.\d+)?)\s*mg", low)
+        if m:
+            base_val = float(m.group(1))
+    return base_val
+
+
+def _iter_classified_cells(cls: Dict):
+    """Yield every non-empty cell string across a classified Excel (all sheets +
+    the chosen sheet's rows/header), so a footnote below the composition table is
+    reachable regardless of which sheet it sits on."""
+    seen_ids = set()
+    def _emit_rows(header, rows):
+        for cell in (header or []):
+            s = _s(cell)
+            if s:
+                yield s
+        for r in (rows or []):
+            for cell in (r or []):
+                s = _s(cell)
+                if s:
+                    yield s
+    for sh in (cls.get("sheets") or []):
+        if not isinstance(sh, dict):
+            continue
+        seen_ids.add(id(sh.get("rows")))
+        yield from _emit_rows(sh.get("header"), sh.get("rows"))
+    # The chosen sheet's rows may be a distinct list (unit/detailed info copy).
+    if id(cls.get("rows")) not in seen_ids:
+        yield from _emit_rows(cls.get("header"), cls.get("rows"))
+
+
+def detect_salt_base_from_classified(cls: Dict) -> Optional[Dict]:
+    """Scan a classified Excel for an asterisk salt/base (or overage) footnote and
+    return the parsed conversion (RS Bug 2), else None. A salt/base match wins
+    over an overage match. Product-agnostic — any salt-form API footnote resolves
+    the same way (Trilaciclib 2HCl 349 mg ≡ 300 mg base → salt_factor 1.1633)."""
+    if not isinstance(cls, dict):
+        return None
+    overage_hit = None
+    for cell in _iter_classified_cells(cls):
+        low = cell.lower()
+        # Cheap pre-filter: only parse cells that look like a conversion/overage
+        # footnote (must mention mg + a salt/base cue, or an overage percentage).
+        looks_saltbase = ("mg" in low and ("base" in low
+                          or any(w in low for w in _SALT_WORDS)))
+        looks_overage = "overage" in low
+        if not (looks_saltbase or looks_overage):
+            continue
+        r = parse_salt_base_footnote(cell)
+        if not r:
+            continue
+        if r["kind"] == "salt_base":
+            return r
+        if r["kind"] == "overage" and overage_hit is None:
+            overage_hit = r
+
+    # Fallback: a footnote that gives ONLY the base weight ("* equivalent to 300 mg
+    # base") while the salt weight sits in a marked Qty cell ("349*"). Pair the
+    # base number with the largest marked quantity above it (RS Bug 2 — real
+    # Trilaciclib format that the two-number parser above misses).
+    base_w = None
+    for cell in _iter_classified_cells(cls):
+        bw = _footnote_base_weight(cell)
+        if bw:
+            base_w = bw
+            break
+    if base_w:
+        salt_w = None
+        for cell in _iter_classified_cells(cls):
+            if _FOOTNOTE_MARKER_RE.search(cell):
+                n = _num_or_none(_strip_footnote_markers(cell))
+                if n and n > base_w and (salt_w is None or n > salt_w):
+                    salt_w = n
+        if salt_w:
+            return {"kind": "salt_base", "salt_weight": salt_w, "base_weight": base_w,
+                    "salt_factor": round(salt_w / base_w, 6), "overage_pct": 0.0,
+                    "raw": f"{salt_w:g} mg salt equivalent to {base_w:g} mg base"}
+    return overage_hit
+
+
+def _is_qs_ingredient(name: str) -> bool:
+    """Return True when the ingredient name signals q.s. handling.
+    Product-agnostic: '@' suffix, gases, process aids."""
+    s = _s(name).lower().strip()
+    if not s:
+        return False
+    if s.endswith("@") or s.rstrip().endswith("@"):
+        return True
+    for hint in _QS_INGREDIENT_HINTS:
+        if hint in s:
+            return True
+    return False
+
+
+def _is_qs_quantity(cell_value: str) -> bool:
+    """Enhanced q.s. quantity detection. Handles textual markers and any value
+    that cannot be numerically parsed after footnote stripping."""
+    if cell_value is None:
+        return True
+    s = _s(cell_value).lower().strip()
+    if not s:
+        return True
+    s_norm = re.sub(r"[^a-z0-9 ]+", "", s).strip()
+    if s_norm in _QS_QUANTITY_STRINGS or s in _QS_QUANTITY_STRINGS:
+        return True
+    if _is_qs_value(s):
+        return True
+    # If numeric extraction after footnote stripping fails, treat as q.s.
+    cleaned = _strip_footnote_markers(_s(cell_value))
+    if _num_or_none(cleaned) is None:
+        # If the raw cell has NO digits at all, it's q.s.-like text
+        if not re.search(r"\d", cleaned):
+            return True
+    return False
+
+
+_API_FUNC_RE = re.compile(r"active|drug\s+substance|\bapi\b|a\.?p\.?i\.?",
+                          re.IGNORECASE)
+_DOSAGE_BY_BASIS = {
+    # RS Bug 6a: a mg/mL basis defaults to "Injection" (user may override to an
+    # oral solution/suspension in the UI).
+    "vial": "Sterile Injection", "ml": "Injection",
+    "tablet": "Tablet", "capsule": "Capsule", "sachet": "Oral Suspension",
+    "dose": "", "unit": "",
 }
 
-Multi-compendial handling within one annexure (existing rule, preserved):
-When multiple entries exist for same canonical solvent from same annexure:
-- Priority 1: USP/USP-NF variant
-- Priority 2: Ph.Eur/EP variant
-- Priority 3: JP variant
-- Priority 4: ASMF/in-house variant
-Store non-primary entries in _superseded array for audit.
-Each _superseded entry also follows Category A-G classification.
 
-Universal test cases (must all pass regardless of vendor/product):
+def parse_single_strength_unit_composition(classified: Dict,
+                                           mdd_mg_day: Optional[float] = None,
+                                           unit_basis: Optional[str] = None,
+                                           salt_factor: float = 1.0,
+                                           density_g_per_ml: float = 1.0,
+                                           api_component: Optional[str] = None,
+                                           no_of_doses: Optional[int] = None,
+                                           dose_volume_ml: Optional[float] = None,
+                                           overage_pct: float = 0.0) -> Dict:
+    """Single-strength unit composition parser (RS RF1).
 
-Test 1: "NMT 5000 ppm" → Category A → converted_ppm = 5000
-Test 2: "Not more than 3000 ppm" → Category A → converted_ppm = 3000
-Test 3: "≤ 620 ppm" → Category A → converted_ppm = 620
-Test 4: "159 ppm" (no context) → Category B → converted_ppm = 159
-Test 5: "Actual: 45 ppm" → Category B → converted_ppm = 45
-Test 6: "159 - 5000 ppm" → Category C → converted_ppm = 5000, actual = 159
-Test 7: "0.00 - 1000 ppm" → Category C → converted_ppm = 1000, actual = 0.00
-Test 8: "159 ppm - < 5000 ppm" → Category C → converted_ppm = 5000, actual = 159
-Test 9: "BDL (spec: NMT 5000 ppm)" → Category D → converted_ppm = 5000
-Test 10: "BDL" alone → Category E → converted_ppm = null
-Test 11: "not used in manufacturing" → Category F → converted_ppm = 0
-Test 12: "Impurity Acetone, (acc. to USP/NF) ppm 159 - 5000" → Category C
-→ converted_ppm = 5000, actual = 159
-Test 13: "Impurity A Chloroform (acc. to USP/NF) ppm 24 - 60" → Category C
-→ converted_ppm = 60, actual = 24
-Test 14: "Impurity B (Acetone, acc. to (EP)) ppm 0.00 - 1000" → Category C
-→ converted_ppm = 1000, actual = 0.00
-Test 15: "Impurity Acetone, (acc. to ASMF) Nmt 1000 ppm - < 1000" → Category A
-→ converted_ppm = 1000
+    Composition has ONE quantity column with a unit basis (mg/vial, mg/mL,
+    mg/tablet, mg/sachet, mg/dose). The API row is auto-detected (its
+    Function/Role cell reads Active / API / Drug Substance, else the first
+    non-q.s. numeric row) and its per-unit quantity yields the dose multiplier.
 
-Downstream impact:
-When converter emits correct converted_ppm per this logic, downstream
-ingredient row content ppm is automatically correct across all products.
+    Solids (mg/vial, mg/tablet, …): the user supplies the API's Maximum Daily
+    Dose (MDD, mg/day) and
+
+        multiplier               = MDD_mg_day × salt_factor / api_qty_per_unit
+
+    Volume-dosed liquids (mg/mL basis — RS Bug 1): the user supplies the daily
+    dose VOLUME (mL/day) and the multiplier IS that volume directly — it is not
+    derived from MDD ÷ strength, so a formulation strength that bakes in an API
+    overage (e.g. 1.1 mg/mL for a 1 mg/mL label with 10% overage) does not skew
+    the dose. In both cases:
+
+        amount_in_maximum_dose_mg[i] = quantity_per_unit[i] × multiplier
+
+    overage_pct (0.0 = none) only affects the DISPLAYED label strength (RS Bug
+    6b): effective strength = api_qty / (1 + overage_pct); component amounts keep
+    using the formulation strength as printed in the composition.
+
+    salt_factor (default 1.0) reconciles a salt composition with a free-base MDD
+    label. Drug-product mass: liquids use multiplier × 1000 × density (no summing
+    of dissolved solids); solids sum the non-q.s. component amounts. A legacy
+    no_of_doses path is retained only when MDD/volume are not supplied.
+    """
+    header = classified["header"]
+    rows = classified["rows"]
+    comp_idx = classified.get("comp_idx")
+    qty_idx = classified.get("qty_idx")
+    if qty_idx is None:
+        qty_idx = _col_index(header, _QTY_HINTS)
+    unit_basis = unit_basis or classified.get("unit_basis") or "unit"
+    salt_factor = float(salt_factor) if salt_factor else 1.0
+    density_g_per_ml = float(density_g_per_ml) if density_g_per_ml else 1.0
+    overage_pct = float(overage_pct) if overage_pct else 0.0
+    dose_volume_ml = float(dose_volume_ml) if dose_volume_ml else None
+    is_liquid = unit_basis == "ml"
+
+    if comp_idx is None or qty_idx is None:
+        return {"mode": "single_strength_unit_composition", "rows": [],
+                "needs_dose_basis": True,
+                "error": "missing component or quantity column"}
+
+    # Optional display columns
+    matcode_idx = _col_index(header, ("material code", "mat code", "material_code",
+                                      "sap code", "sap_code"))
+    func_idx = _col_index(header, ("function", "role", "category"))
+    stage_idx = _col_index(header, _STAGE_HINTS)
+    compendia_idx = _col_index(header, _COMPENDIA_HINTS)
+
+    qty_label = header[qty_idx]
+    comp_label = header[comp_idx]
+
+    display_columns = []
+    if matcode_idx is not None:
+        display_columns.append(header[matcode_idx])
+    display_columns.append(comp_label)
+    if func_idx is not None:
+        display_columns.append(header[func_idx])
+    if compendia_idx is not None:
+        display_columns.append(header[compendia_idx])
+    display_columns.append(qty_label)
+    if stage_idx is not None:
+        display_columns.append(header[stage_idx])
+
+    # ── Pre-scan: locate the API row + its per-unit quantity ──────────────────
+    prescan: List[Tuple[str, Optional[float], bool, str]] = []
+    for r in rows:
+        if comp_idx >= len(r):
+            continue
+        nm_raw = _s(r[comp_idx])
+        if not nm_raw or _is_footer_row(nm_raw):
+            continue
+        nm = re.sub(r"\s*@\s*$", "", nm_raw).strip()
+        raw_q = _s(r[qty_idx]) if qty_idx < len(r) else ""
+        isqs = _is_qs_ingredient(nm_raw) or _is_qs_quantity(raw_q)
+        q = _num_or_none(_strip_footnote_markers(raw_q)) if not isqs else None
+        fv = _s(r[func_idx]) if (func_idx is not None and func_idx < len(r)) else ""
+        prescan.append((nm, q, isqs, fv))
+
+    api_name, api_qty = "", None
+    if api_component:                       # explicit user/caller choice
+        for nm, q, isqs, fv in prescan:
+            if q and _rs_norm(nm) == _rs_norm(api_component):
+                api_name, api_qty = nm, q
+                break
+    if api_qty is None and func_idx is not None:   # Function/Role = Active/API
+        for nm, q, isqs, fv in prescan:
+            if q and _API_FUNC_RE.search(fv):
+                api_name, api_qty = nm, q
+                break
+    if api_qty is None:                     # fallback: first non-q.s. numeric row
+        for nm, q, isqs, fv in prescan:
+            if (not isqs) and q:
+                api_name, api_qty = nm, q
+                break
+
+    # RS Bug 2: auto-reconcile a salt-form API with a free-base MDD label. When the
+    # caller did not pass a salt factor, derive it from a base-equivalent asterisk
+    # footnote: salt_factor = api_qty(salt) / base_weight. This covers the common
+    # Trilaciclib format where the footnote gives only the base weight ("* 349 mg
+    # dihydrochloride equivalent to 300 mg base" OR just "* equivalent to 300 mg
+    # base") and the salt weight (349) is the API's Qty cell. Without this the
+    # multiplier wrongly used the salt weight (432/349 = 1.238 instead of 1.44).
+    salt_auto_applied = False
+    if abs(salt_factor - 1.0) < 1e-9 and api_qty and api_qty > 0:
+        for cell in _iter_classified_cells(classified):
+            bw = _footnote_base_weight(cell)
+            if bw and 0 < bw < api_qty:
+                salt_factor = round(api_qty / bw, 6)
+                salt_auto_applied = True
+                break
+
+    # ── Dose multiplier ───────────────────────────────────────────────────────
+    # Volume-dosed liquids (RS Bug 1): the daily dose is a VOLUME (mL/day); the
+    # multiplier IS that volume — never MDD ÷ strength — so an API overage baked
+    # into the mg/mL strength does not inflate it.
+    # Solids (RF2): multiplier = MDD × salt × (1 + overage) / api_qty. When the
+    # solid strength is inclusive of a manufacturing overage, the number of units
+    # per day = MDD_label ÷ effective_strength = MDD ÷ (api_qty / (1+overage)).
+    # overage_pct = 0 (default) leaves the classic MDD ÷ api_qty behaviour intact
+    # (no regression for Esomeprazole / Trilaciclib).
+    if is_liquid and dose_volume_ml and dose_volume_ml > 0:
+        multiplier = float(dose_volume_ml)
+        mult_basis = "dose_volume_ml"
+    elif mdd_mg_day and api_qty and api_qty > 0:
+        multiplier = (float(mdd_mg_day) * salt_factor * (1.0 + overage_pct)) / float(api_qty)
+        mult_basis = "mdd_over_api_qty"
+    elif no_of_doses:
+        multiplier = float(no_of_doses)
+        mult_basis = "no_of_doses_legacy"
+    else:
+        multiplier = 1.0
+        mult_basis = "default_multiplier_1"
+
+    comp_rows: List[Dict] = []
+    display_rows: List[Dict] = []
+    for r in rows:
+        if comp_idx >= len(r):
+            continue
+        name_raw = _s(r[comp_idx])
+        if not name_raw:
+            continue
+        # Skip Total / Drug Product / Limit footer rows
+        if _is_footer_row(name_raw):
+            continue
+
+        # display name: strip trailing '@' so the report reads cleanly
+        name = re.sub(r"\s*@\s*$", "", name_raw).strip()
+
+        # q.s. determination — name/quantity/ingredient hints
+        raw_qty_cell = _s(r[qty_idx]) if qty_idx < len(r) else ""
+        is_qs = (_is_qs_ingredient(name_raw)
+                 or _is_qs_quantity(raw_qty_cell))
+
+        cleaned_qty = _strip_footnote_markers(raw_qty_cell)
+        qty = _num_or_none(cleaned_qty) if not is_qs else None
+
+        amount_mg = None
+        basis = "qs"
+        if not is_qs and qty is not None and qty > 0:
+            amount_mg = round(qty * multiplier, 6)
+            basis = f"qty_times_multiplier_per_{unit_basis}"
+
+        row_cols = {}
+        if matcode_idx is not None and matcode_idx < len(r):
+            mc = _s(r[matcode_idx])
+            row_cols[header[matcode_idx]] = "" if mc in ("-", "—") else mc
+        row_cols[comp_label] = name
+        if func_idx is not None and func_idx < len(r):
+            row_cols[header[func_idx]] = _s(r[func_idx])
+        if compendia_idx is not None and compendia_idx < len(r):
+            row_cols[header[compendia_idx]] = _s(r[compendia_idx])
+        row_cols[qty_label] = raw_qty_cell
+        if stage_idx is not None and stage_idx < len(r):
+            row_cols[header[stage_idx]] = _s(r[stage_idx])
+
+        comp_rows.append({
+            "component": name,
+            "quantity": qty if qty is not None else None,
+            "amount_in_maximum_dose_mg": amount_mg,
+            "amount_basis": basis,
+            "_is_qs": is_qs,
+            "solvents": {},
+            "columns": row_cols,
+        })
+        display_rows.append({"ingredient": name, "columns": row_cols})
+
+    known = [c["amount_in_maximum_dose_mg"] for c in comp_rows
+             if (not c["_is_qs"]) and c["amount_in_maximum_dose_mg"] is not None]
+    solid_mass = round(sum(known), 6) if known else None
+    needs_dose_basis = any((not c["_is_qs"])
+                           and c["amount_in_maximum_dose_mg"] is None
+                           for c in comp_rows)
+
+    # Drug-product mass per daily dose. Liquids (mL basis): the daily dose is a
+    # VOLUME — mass = multiplier(mL/day) × 1000 × density; never sum dissolved
+    # solids. Solids: sum of the non-q.s. component amounts. (is_liquid computed
+    # once, up front.)
+    if is_liquid:
+        drug_product_mass_mg = round(multiplier * 1000.0 * density_g_per_ml, 6)
+    else:
+        drug_product_mass_mg = solid_mass
+    # The API's own amount in the maximum daily dose (salt basis).
+    api_amount_mg = (round(api_qty * multiplier, 6)
+                     if api_qty is not None else None)
+
+    # RF6 metadata: strength string + inferred dosage form (never a column header).
+    # RS Bug 6b: for an overage product the DISPLAYED strength is the EFFECTIVE
+    # (label) strength = api_qty / (1 + overage), e.g. 1.1 mg/mL → "1 mg/mL"; a
+    # footnote records the overage. Component amounts still use the formulation
+    # strength as printed. The API name is included for liquids per the approved
+    # convention ("1 mg/mL Epinephrine").
+    strength_note = ""
+    if api_qty is not None:
+        # Effective LABEL strength backs out (a) any manufacturing overage and
+        # (b) a salt-form conversion, so the displayed strength is the free-base
+        # label value, never the salt formulation weight (RS Bug 2 — Trilaciclib
+        # 349 mg dihydrochloride → 300 mg base). salt_factor/overage default to
+        # neutral, so Esomeprazole and other free-base APIs are unchanged (RF9).
+        _sf = salt_factor if salt_factor else 1.0
+        eff_qty = api_qty / (1.0 + overage_pct) / _sf
+        if is_liquid:
+            strength_label = f"{eff_qty:g} mg/mL"
+            if api_name:
+                strength_label = f"{strength_label} {api_name}"
+        else:
+            strength_label = f"{eff_qty:g} mg/{unit_basis}"
+        if abs(_sf - 1.0) > 1e-9:
+            # Salt-form footnote takes precedence: it records the salt weight and
+            # its free-base equivalent (memory acceptance point 6).
+            strength_note = (f"* {api_qty:g} mg {api_name or 'salt'} equivalent to "
+                             f"{eff_qty:g} mg base")
+        elif overage_pct:
+            strength_note = (f"* API strength inclusive of {overage_pct * 100:g}% "
+                             "overage")
+    else:
+        strength_label = ""
+    dosage_form_inferred = _DOSAGE_BY_BASIS.get(unit_basis, "")
+
+    return {
+        "mode": "single_strength_unit_composition",
+        "no_of_doses": round(multiplier, 6),   # kept for legacy display only
+        "multiplier": round(multiplier, 6),
+        "multiplier_basis": mult_basis,
+        "mdd_mg_day": (float(mdd_mg_day) if mdd_mg_day else None),
+        "salt_factor": salt_factor,
+        "density_g_per_ml": density_g_per_ml,
+        "api_component": api_name,
+        "api_qty_per_unit": api_qty,
+        "api_amount_mg": api_amount_mg,
+        "unit_basis": unit_basis,
+        "component_col": comp_label,
+        "quantity_col": qty_label,
+        "amount_col": "Amount in Maximum Dose (mg)",
+        "mdi_col": "", "mdi_unit": "",
+        "columns": [comp_label, qty_label, "Amount in Maximum Dose (mg)"],
+        "solvents_display": [],
+        "solvent_canon": {},
+        "rows": comp_rows,
+        "footer_total": {}, "footer_limit": {}, "drug_product_row": {},
+        "has_calculated_values": False,
+        "needs_dose_basis": needs_dose_basis,
+        # Nominal MDD (mg/day): solids use the supplied MDD; a volume-dosed liquid
+        # uses the label dose = effective strength × volume (e.g. 1 mg/mL × 8 mL =
+        # 8 mg/day), never the sum of dissolved solids.
+        "product_mdd_mg": (
+            float(mdd_mg_day) if mdd_mg_day
+            else round((api_qty / (1.0 + overage_pct) if overage_pct else api_qty)
+                       * multiplier, 6)
+            if (is_liquid and mult_basis == "dose_volume_ml" and api_qty is not None)
+            else solid_mass),
+        "drug_product_mass_mg": drug_product_mass_mg,
+        "mdd_source": ("dose_volume_ml" if mult_basis == "dose_volume_ml"
+                       else "mdd_over_api_qty" if mdd_mg_day else "legacy_doses"),
+        "dose_volume_ml": dose_volume_ml,
+        "overage_pct": overage_pct,
+        "strength_label": strength_label,
+        "strength_note": strength_note,
+        "dosage_form_inferred": dosage_form_inferred,
+        "_display_columns": display_columns,
+        "_display_sections": [{"name": "Composition", "rows": display_rows}],
+        "audit": {"unit_basis": unit_basis, "multiplier": round(multiplier, 6),
+                  "api_component": api_name, "api_qty_per_unit": api_qty,
+                  "mdd_mg_day": mdd_mg_day, "salt_factor": salt_factor},
+        "warnings": [],
+    }
 
 
-calculation regardless of vendor CoA format. When both batch actual and spec
-limit are present, spec limit wins for exposure math; batch actual survives
-as audit trail. This rule applies to Chlorobutanol, Sofosbuvir, Trilaciclib,
-Epinephrine, and any future product from any vendor with any CoA format.
+def parse_component_mdd_only_excel(classified: Dict) -> Dict:
+    """
+    Mode C parser. Component name + a direct daily-amount column
+    (Amount in Maximum Dose, or MDD/Maximum Daily Intake). Uses it directly,
+    converting g→mg when needed. No strength / no_of_doses required.
+    """
+    header = classified["header"]
+    rows = classified["rows"]
+    comp_idx = classified.get("comp_idx")
+    amount_idx = _col_index(header, _AMOUNT_HINTS)
+    mdd_idx = _col_index(header, _MDD_HINTS)
+    use_idx = amount_idx if amount_idx is not None else mdd_idx
+    if comp_idx is None or use_idx is None:
+        return {"mode": "component_mdd_only", "rows": [], "needs_dose_basis": True}
+
+    use_label = header[use_idx].lower()
+    unit = "mg"
+    if re.search(r"\(\s*g\s*\)|\bgram", use_label) and not re.search(r"mg|µg|mcg|ug", use_label):
+        unit = "g"
+    elif re.search(r"µg|mcg|ug", use_label):
+        unit = "ug"
+
+    comp_rows = []
+    display_rows = []
+    for r in rows:
+        if comp_idx >= len(r):
+            continue
+        name = _s(r[comp_idx])
+        if not name:
+            continue
+        is_qs = any(h in name.lower() for h in _QS_HINTS)
+        if _is_qs_ingredient(name):
+            is_qs = True
+        raw_val = _s(r[use_idx]) if use_idx < len(r) else ""
+        if _is_qs_quantity(raw_val):
+            is_qs = True
+        val = _clean_num(_strip_footnote_markers(raw_val)) if use_idx < len(r) else None
+        amount_mg = None
+        basis = "none"
+        if not is_qs and val is not None and val > 0:
+            if unit == "g":
+                amount_mg = val * 1000.0; basis = "mdi_grams"
+            elif unit == "ug":
+                amount_mg = val / 1000.0; basis = "mdi_micrograms"
+            else:
+                amount_mg = val; basis = "component_mdd_mg"
+        comp_rows.append({
+            "component": name, "quantity": None,
+            "amount_in_maximum_dose_mg": amount_mg, "amount_basis": basis,
+            "_is_qs": is_qs, "solvents": {}, "columns": {header[comp_idx]: name,
+                                                         header[use_idx]: _s(r[use_idx])},
+        })
+        display_rows.append({"ingredient": name,
+                             "columns": {header[comp_idx]: name,
+                                         header[use_idx]: _s(r[use_idx])}})
+
+    needs = any((not c["_is_qs"]) and c["amount_in_maximum_dose_mg"] is None for c in comp_rows)
+    known = [c["amount_in_maximum_dose_mg"] for c in comp_rows
+             if (not c["_is_qs"]) and c["amount_in_maximum_dose_mg"] is not None]
+    return {
+        "mode": "component_mdd_only", "no_of_doses": None,
+        "component_col": header[comp_idx], "quantity_col": "",
+        "amount_col": "Amount in Maximum Dose (mg)", "mdi_col": header[use_idx],
+        "mdi_unit": unit,
+        "columns": ["Components", "Amount in Maximum Dose (mg)"],
+        "solvents_display": [], "solvent_canon": {},
+        "rows": comp_rows, "footer_total": {}, "footer_limit": {},
+        "drug_product_row": {}, "has_calculated_values": False,
+        "needs_dose_basis": needs,
+        "product_mdd_mg": round(sum(known), 6) if known else None,
+        "mdd_source": "component_mdd_direct",
+        "_display_columns": [header[comp_idx], header[use_idx]],
+        "_display_sections": [{"name": "Composition", "rows": display_rows}],
+        "audit": {"amount_unit": unit}, "warnings": [],
+    }
 
 
+def parse_rs_excel(raw: Dict, no_of_doses_override: int = 0) -> Dict:
+    """
+    Convert the raw extracted RS spreadsheet into a structured model.
+
+    Implements the daily-intake hierarchy, normalising every quantitative
+    component to `amount_in_maximum_dose_mg`:
+      1. Amount in Maximum Dose (mg)            → use directly
+      2. Maximum Daily Intake (g) / MDD (g)     → ×1000 → mg
+      3. MDD (mg) / component daily amount (mg) → use directly
+      4. Quantity/unit (mg) × No. of doses      → compute
+      5. none of the above                      → needs_dose_basis = True
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+    audit: Dict[str, Any] = {}
+    warnings: List[str] = []
+
+    component_col = _s(raw.get("component_col"))
+    quantity_col  = _s(raw.get("quantity_col"))
+    amount_col    = _s(raw.get("amount_col"))
+    mdi_col       = _s(raw.get("mdi_col"))
+    columns       = [_s(c) for c in (raw.get("columns") or []) if _s(c)]
+    solvents_raw  = [_s(s) for s in (raw.get("solvents") or []) if _s(s)]
+    has_calc      = bool(raw.get("has_calculated_values"))
+
+    no_of_doses = no_of_doses_override or _num_or_none(raw.get("no_of_doses")) or 1
+    no_of_doses = int(no_of_doses) if no_of_doses else 1
+
+    # Determine mdi unit from header
+    mdi_unit = ""
+    if mdi_col:
+        h = mdi_col.lower()
+        if re.search(r"\(\s*g\s*\)|\bgram", h) and not re.search(r"mg|µg|mcg|ug", h):
+            mdi_unit = "g"
+        elif re.search(r"µg|mcg|ug", h):
+            mdi_unit = "ug"
+        else:
+            mdi_unit = "mg"
+
+    # Canonicalise solvent names against the master
+    solvents: List[str] = []
+    solvent_canon: Dict[str, str] = {}
+    for s in solvents_raw:
+        canon = RSM.resolve_solvent(s) or s
+        solvents.append(s)             # preserve the sheet's display label
+        solvent_canon[s] = canon
+
+    def cell(row: Dict, col: str, fallbacks: List[str] = None) -> str:
+        cols = row.get("columns", {})
+        if isinstance(cols, dict):
+            if col and col in cols:
+                return _s(cols[col])
+            for fb in (fallbacks or []):
+                for k, v in cols.items():
+                    if fb.lower() in k.lower():
+                        return _s(v)
+        # Also check top-level row keys (some LLM outputs flatten the row)
+        if col and col in row:
+            return _s(row[col])
+        for fb in (fallbacks or []):
+            for k, v in row.items():
+                if k == "columns":
+                    continue
+                if fb.lower() in str(k).lower():
+                    return _s(v)
+        return ""
+
+    # Walk rows: classify footer rows, build component rows
+    comp_rows: List[Dict] = []
+    footer_total: Dict[str, Any] = {}
+    footer_limit: Dict[str, Any] = {}
+    drug_product_row: Dict[str, Any] = {}
+
+    for r in (raw.get("rows") or []):
+        if not isinstance(r, dict):
+            continue
+        name = (_s(r.get("component"))
+                or _s(r.get("ingredient"))
+                or _s(r.get("name"))
+                or cell(r, component_col, ["component", "name", "ingredient", "material"]))
+        kind = _is_footer_row(name)
+
+        # Per-solvent subvalues for this row.
+        # IMPORTANT: match the solvent name to the column's solvent portion with
+        # word boundaries, because some solvent names are substrings of others
+        # (e.g. "Ethanol" ⊂ "Methanol"). Without this, Methanol's column would
+        # wrongly satisfy a naive "ethanol in header" test.
+        solvent_vals: Dict[str, Dict[str, Any]] = {}
+        cols = r.get("columns", {})
+        cols = cols if isinstance(cols, dict) else {}
+        for disp in solvents:
+            limit_v = None
+            de_v = None
+            d_low = disp.lower().strip()
+            for k, v in cols.items():
+                kl = str(k).lower()
+                # Strip the role words to isolate the solvent portion of the header
+                solvent_part = re.sub(
+                    r"\b(limit|ppm|daily|exposure|mg|\(.*?\))\b", " ", kl)
+                solvent_part = re.sub(r"[^a-z0-9 ]+", " ", solvent_part)
+                tokens = solvent_part.split()
+                # Match only if the solvent name appears as a whole token sequence
+                disp_tokens = re.sub(r"[^a-z0-9 ]+", " ", d_low).split()
+                is_match = disp_tokens and _seq_in(disp_tokens, tokens)
+                if not is_match:
+                    continue
+                if "limit" in kl or "ppm" in kl:
+                    limit_v = _num_or_none(v)
+                elif "exposure" in kl or "daily" in kl:
+                    de_v = _num_or_none(v)
+            solvent_vals[disp] = {"limit": limit_v, "daily_exposure": de_v}
+
+        if kind == "total":
+            footer_total = {disp: solvent_vals[disp] for disp in solvents}
+            continue
+        if kind == "limit":
+            footer_limit = {disp: solvent_vals[disp] for disp in solvents}
+            continue
+        if kind == "drug_product":
+            drug_product_row = {
+                "component": name,
+                "quantity": _num_or_none(cell(r, quantity_col, ["quantity"])),
+                "amount_max_dose": _num_or_none(cell(r, amount_col, ["amount in maximum", "amount"])),
+                "solvents": solvent_vals,
+            }
+            continue
+        if not name:
+            continue
+
+        is_qs = any(h in name.lower() for h in _QS_HINTS)
+        if _is_qs_ingredient(name):
+            is_qs = True
+        # If ALL three quantity cells (amount/qty/mdi) are q.s.-like, force q.s.
+        raw_amount = cell(r, amount_col, ["amount in maximum", "amount"])
+        raw_qty = cell(r, quantity_col, ["quantity"])
+        raw_mdi = cell(r, mdi_col, ["maximum daily intake", "mdd"]) if mdi_col else ""
+        _qs_cells = [raw_amount, raw_qty, raw_mdi]
+        if all(_is_qs_quantity(v) for v in _qs_cells if v):
+            is_qs = True
+
+        # ── daily-intake hierarchy → amount_in_maximum_dose_mg ───────────────
+        amount_mg: Optional[float] = None
+        basis = "none"
+        amt = _num_or_none(_strip_footnote_markers(raw_amount))
+        qty = _num_or_none(_strip_footnote_markers(raw_qty))
+        mdi = (_num_or_none(_strip_footnote_markers(raw_mdi))
+               if mdi_col else None)
+
+        if is_qs:
+            pass                        # calc-exempt
+        elif amt is not None and amt > 0:
+            amount_mg = amt
+            basis = "amount_in_maximum_dose"
+        elif mdi is not None and mdi > 0:
+            if mdi_unit == "g":
+                amount_mg = mdi * 1000.0
+                basis = "mdi_grams"
+            elif mdi_unit == "ug":
+                amount_mg = mdi / 1000.0
+                basis = "mdi_micrograms"
+            else:
+                amount_mg = mdi
+                basis = "mdd_mg"
+        elif qty is not None and qty > 0:
+            amount_mg = qty * no_of_doses
+            basis = "qty_times_doses"
+
+        comp_rows.append({
+            "component": name,
+            "quantity": qty,
+            "amount_in_maximum_dose_mg": amount_mg,
+            "amount_basis": basis,
+            "_is_qs": is_qs,
+            "solvents": solvent_vals,     # sheet-provided limits/exposures (detailed mode)
+            "columns": dict(r.get("columns", {})) if isinstance(r.get("columns"), dict) else {},
+        })
+
+    # Determine whether any quantitative row lacks a dose basis
+    needs_dose_basis = any(
+        (not cr["_is_qs"]) and cr["amount_in_maximum_dose_mg"] is None
+        for cr in comp_rows
+    )
+
+    mode = "detailed" if (has_calc and solvents) else "basic"
+
+    # ── Infer product-level Maximum Daily Dose from the Excel (no user input) ──
+    # Priority: an explicit "Drug Product" total row → else the sum of component
+    # amounts in maximum dose. This is shown on the verification screen and is
+    # editable, mirroring the injection workflow (no forced MDD/strength entry).
+    product_mdd_mg: Optional[float] = None
+    mdd_source = "not_determinable"
+    dp_amt = None
+    if drug_product_row:
+        dp_amt = drug_product_row.get("amount_max_dose")
+    if dp_amt is not None and dp_amt > 0:
+        product_mdd_mg = float(dp_amt)
+        mdd_source = "excel_drug_product_row"
+    else:
+        known = [cr["amount_in_maximum_dose_mg"] for cr in comp_rows
+                 if (not cr["_is_qs"]) and cr["amount_in_maximum_dose_mg"] is not None]
+        if known:
+            product_mdd_mg = round(sum(known), 6)
+            mdd_source = "sum_of_component_amounts"
+
+    return {
+        "mode": mode,
+        "no_of_doses": no_of_doses,
+        "component_col": component_col,
+        "quantity_col": quantity_col,
+        "amount_col": amount_col,
+        "mdi_col": mdi_col,
+        "mdi_unit": mdi_unit,
+        "columns": columns,
+        "solvents_display": solvents,
+        "solvent_canon": solvent_canon,
+        "rows": comp_rows,
+        "footer_total": footer_total,
+        "footer_limit": footer_limit,
+        "drug_product_row": drug_product_row,
+        "has_calculated_values": has_calc,
+        "needs_dose_basis": needs_dose_basis,
+        "product_mdd_mg": product_mdd_mg,
+        "mdd_source": mdd_source,
+        "audit": audit,
+        "warnings": warnings,
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. ANNEXURE CONVERTER — solvent declarations (consistent schema, evidence typing)
+# ════════════════════════════════════════════════════════════════════════════
+def rs_annexure_prompt() -> str:
+    return (
+        "You are reading a pharmaceutical annexure for a RESIDUAL SOLVENT risk "
+        "assessment (USP <467> / ICH Q3C). The document may be a supplier "
+        "declaration, COA, specification, regulatory statement, or SDS.\n\n"
+        "Identify the MATERIAL the document is about, distinguishing it from the "
+        "DOCUMENT TYPE. Generic phrases like 'Product Quality Statement', "
+        "'Quality and Regulatory Information Summary', 'Product Regulatory "
+        "Information', 'Safety Data Sheet', 'Material Characterization', 'Residual "
+        "Solvents Statement', 'Regulatory Information' are document types, NOT "
+        "material names. The material is the SUBJECT, usually found after patterns "
+        "like 'for:', 'Product Name:', 'Product identifier:', 'Subject:', 'RE:', "
+        "'Product / Manufacturing plant:', 'Supplier product number and name:'.\n\n"
+        "Extract solvent evidence. Solvent statements may be numeric (NMT X ppm, "
+        "X ppm, X%), BDL/ND, or textual ('solvents listed in USP <467> are not "
+        "used', 'water is the only solvent used', 'no source for residual "
+        "solvents', 'testing not required because solvent is not used', 'ethyl "
+        "alcohol may be present up to 0.5% maximum', 'controlled by vendor "
+        "specification').\n\n"
+        "IMPORTANT: A solvent_name must be a SPECIFIC chemical solvent (e.g. "
+        "Ethanol, Methanol, Acetone, Toluene, Isopropyl alcohol, Ethylene glycol, "
+        "1,4-Dioxane, Heptane). NEVER put a category or declaration scope as a "
+        "solvent_name — phrases like 'Class 1/2/3 solvents', 'Class I/II/III "
+        "solvents', 'OVI', 'Organic Volatile Impurities', 'other residual "
+        "solvents', 'residual solvents', 'ICH Q3C solvents', 'USP <467> solvents', "
+        "'solvents listed in USP <467>', and 'water' are scopes, NOT solvents. "
+        "Record those only via negative_declaration=true and raw_text.\n\n"
+        "TABULAR ROWS: when a row is labelled by a peak/impurity id with the "
+        "chemical in parentheses ('Impurity B (Acetone)', 'Impurity A "
+        "(Chloroform)'), the solvent_name is the parenthesized chemical → "
+        "'Acetone', 'Chloroform'.\n\n"
+        "REGULATORY-CONTEXT NUMBERS (critical — do NOT extract as material "
+        "limits): a number that appears next to guideline/policy language is a "
+        "REFERENCE, not this material's limit. Treat as evidence_type="
+        "policy_statement (never numerical_limit/nmt) when the surrounding text "
+        "says any of: 'PDE value of X mg/day', 'concentration limit of X ppm', "
+        "'based on information of USP and EDQM', 'will not be implemented', "
+        "'reverted back to', 'the guideline states', 'ICH Q3C (R7) updated', "
+        "'in accordance with the above-mentioned guideline'. A generic residual-"
+        "solvent policy letter (no specific material subject) must yield NO "
+        "numeric solvents[] — only policy_statement scope entries.\n"
+        "A non-USP-<467> solvent that DOES carry a genuine measured/spec value "
+        "(e.g. CPME 1500 ppm, TFA 3400 ppm) IS a real solvent — keep it in "
+        "solvents[] with its number; do not discard it.\n"
+        "For a below-detection result, put the marker (BDL/BQL/ND/<LOD/<LOQ) in "
+        "raw_value AND include the spec limit ('NMT 5000 ppm') in raw_text.\n\n"
+        "BOTH A RESULT AND A SPEC LIMIT (critical — never drop the spec): many "
+        "CoAs show a measured result AND its specification/limit for the SAME "
+        "solvent — a 'Result | Specification' or 'Actual | Limit' table, a range "
+        "'159 - 5000', '24 to 60', '0.00 - 1000', a form '159 (NMT 5000)', or "
+        "'result 29 ppm, spec NMT 3000 ppm'. In every such case you MUST capture "
+        "BOTH numbers: set raw_value to the SPEC LIMIT (the larger, NMT value) and "
+        "put the COMPLETE evidence VERBATIM in raw_text including the measured "
+        "result AND the spec (e.g. raw_text='159 - 5000 ppm' or 'result 159 ppm; "
+        "specification NMT 5000 ppm'). Set evidence_type='nmt'. NEVER return only "
+        "the measured result and silently discard the spec limit, and NEVER return "
+        "only the spec and discard the measured result — raw_text must contain "
+        "both so the worst-case can be selected downstream.\n"
+        "If ONLY a measured result is given (no spec/NMT anywhere for that "
+        "solvent), report just that value (raw_value=the result, "
+        "evidence_type='coa_statement'); do NOT invent a spec limit.\n\n"
+        "Return ONLY valid JSON (an OBJECT, never a bare array):\n"
+        "{\n"
+        '  "supplier_name": "",\n'
+        '  "material_name": "",\n'
+        '  "material_name_candidates": [],\n'
+        '  "document_title": "",\n'
+        '  "annexure_type": "supplier_declaration | coa | specification | sds | statement | other",\n'
+        '  "solvents": [\n'
+        '    {"solvent_name":"", "raw_text":"", "raw_value":"", "raw_unit":"ppm|%|none",\n'
+        '     "evidence_type":"numerical_limit|percentage_limit|nmt|negative_declaration|'
+        'no_source|controlled_by_spec|coa_statement|policy_statement|ambiguous", "page":1}\n'
+        "  ],\n"
+        '  "negative_declaration": false,\n'
+        '  "raw_text": ""\n'
+        "}"
+    )
+
+
+# Document-descriptor stripping (reuse the RS-specific list)
+_RS_DOC_DESCRIPTORS = [
+    "product quality statement", "quality and regulatory information summary",
+    "product regulatory information", "regulatory information", "safety data sheet",
+    "material characterization", "material characterisation", "residual solvents statement",
+    "residual solvent statement", "certificate of analysis", "specification",
+    "technical data sheet", "quality statement", "declaration", "statement",
+    "insights from the experts", "residual solvents", "residual solvent",
+]
+_RS_CONNECTORS = (" for ", " of ", " on ", ":", " - ", " – ", " re ")
+
+
+def rs_strip_descriptor(name: str) -> str:
+    if not name:
+        return ""
+    s = " ".join(_s(name).split())
+    low = s.lower()
+    for desc in _RS_DOC_DESCRIPTORS:
+        if low.startswith(desc):
+            rest = s[len(desc):]
+            rl = rest.lower()
+            for conn in _RS_CONNECTORS:
+                if rl.startswith(conn):
+                    subj = rest[len(conn):].strip(" :-–").strip()
+                    sl = subj.lower()
+                    if sl in _RS_DOC_DESCRIPTORS or \
+                       any(sl.startswith(d) for d in _RS_DOC_DESCRIPTORS) or \
+                       "insights" in sl or "experts" in sl:
+                        return ""
+                    return subj
+            if not rest.strip(" :-–"):
+                return ""
+    if low in _RS_DOC_DESCRIPTORS:
+        return ""
+    return s
+
+
+def _percent_to_ppm(v: float) -> float:
+    return v * 10000.0       # 0.5% → 5000 ppm
+
+
+def _convert_to_ppm(raw_value: Any, raw_unit: str) -> Optional[float]:
+    v = _num_or_none(raw_value)
+    if v is None:
+        return None
+    u = (raw_unit or "").strip().lower()
+    if u in ("%", "percent", "w/w%", "percentage"):
+        return _percent_to_ppm(v)
+    if u in ("ppm", "mg/kg", "µg/g", "ug/g", "mg/l", ""):
+        return v
+    if u in ("ppb", "µg/kg", "ug/kg"):
+        return v / 1000.0
+    return v
+
+
+def _infer_material_from_filename(filename: str) -> str:
+    """Infer a material name from an annexure filename as a STRICT LAST RESORT.
+    Strips: extension, '(Annexure N)' / '_annexure_N' patterns, SAP/GRN prefixes
+    (RCQR/RCRR/GRN + digits), dates (YYYY-MM-DD or DDMMYYYY), long numeric IDs
+    (6+ digits), and document-type words. Returns '' if nothing meaningful remains.
+    Example: 'Citric acid (Annexure 14).pdf' → 'Citric acid'."""
+    if not filename:
+        return ""
+    s = _s(filename)
+    s = re.sub(r"\.(pdf|json|docx?|xlsx?|png|jpe?g|tiff?)$", "", s, flags=re.IGNORECASE)
+    # "(Annexure 14)" or "_annexure_14" or "annexure-14"
+    s = re.sub(r"[\(\[]?\s*annexure[\s_\-]*\d+\s*[\)\]]?", " ", s, flags=re.IGNORECASE)
+    # SAP/GRN/AR style prefixes: RCQR00022, RCRR123, GRN456
+    s = re.sub(r"\b(RCQR|RCRR|GRN|AR|ATR|SAP)[\-_ ]?\d{2,}\b", " ", s, flags=re.IGNORECASE)
+    # separators → spaces (before numeric strips so _-bounded IDs are seen)
+    s = re.sub(r"[_\-]+", " ", s)
+    # dates YYYY-MM-DD, DD-MM-YYYY, DDMMYYYY, YYYYMMDD
+    s = re.sub(r"\b\d{4}[\-/]\d{2}[\-/]\d{2}\b", " ", s)
+    s = re.sub(r"\b\d{2}[\-/]\d{2}[\-/]\d{4}\b", " ", s)
+    s = re.sub(r"\b\d{8}\b", " ", s)
+    # long numeric IDs (6+ digits)
+    s = re.sub(r"\b\d{6,}\b", " ", s)
+    # strip document-type words
+    _docwords = (r"coa|certificate\s+of\s+analysis|specification|spec|declaration|"
+                 r"statement|sds|msds|regulatory|quality|residual\s+solvents?|"
+                 r"annexure|monograph|information|report|final|copy")
+    s = re.sub(r"\b(" + _docwords + r")\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" -–:_")
+    # strip a leading connector left over from "... declaration of <material>"
+    s = re.sub(r"^(?:of|for|on|re|the)\s+", "", s, flags=re.IGNORECASE).strip()
+    # reject if what remains is empty or a pure number
+    if not s or re.fullmatch(r"[\d\s.]+", s):
+        return ""
+    return s
+
+
+# ── BDL / spec-limit / policy / dedup helpers (RS RF3, RF14, RF15) ────────────
+# Below-detection markers: the result is not a number, so a per-batch actual is
+# unavailable — the spec limit (NMT) is used for a worst-case exposure (RF15).
+_RS_BDL_VALUES = {
+    "bdl", "bql", "nd", "not detected", "notdetected", "< lod", "<lod",
+    "< loq", "<loq", "below detection", "below detection limit",
+    "below quantification", "below quantitation", "not quantifiable", "absent",
+}
+# Numeric spec limit inside free text: "NMT 5000 ppm", "Not more than 600 ppm",
+# "≤ 3000 ppm", "limit 5000 ppm", "0.5 %". Trailing form "5000 ppm max" too.
+_RS_NMT_TEXT_RE = re.compile(
+    r"(?:nmt|not\s+more\s+than|max(?:imum)?|≤|<=|limit(?:\s+of)?|spec(?:ification)?"
+    r"(?:\s+limit)?)\s*[:=]?\s*(\d+(?:\.\d+)?)\s*(ppm|%|mg/kg)?",
+    re.IGNORECASE)
+_RS_NMT_TRAILING_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(ppm|%)\s*(?:max|maximum)\b", re.IGNORECASE)
+
+# Regulatory-context phrases: a number appearing next to these is a guideline
+# REFERENCE, not a material limit (policy-letter false extraction — RF3).
+_RS_POLICY_CONTEXT_RE = re.compile(
+    r"pde\s+value|permitted\s+daily\s+exposure|concentration\s+limit\s+of|"
+    r"based\s+on\s+information\s+of\s+usp|will\s+not\s+be\s+implemented|"
+    r"reverted\s+back|the\s+guideline\s+states|ich\s*q3c|edqm|"
+    r"in\s+accordance\s+with\s+the\s+above|as\s+per\s+the\s+(?:above\s+)?guideline",
+    re.IGNORECASE)
+# Generic policy-letter titles (no specific material qualifier).
+_RS_POLICY_TITLE_RE = re.compile(
+    r"^(residual\s+solvents?|ich\s*q3c|regulatory\s+(?:information|update|position)|"
+    r"quality\s+(?:and\s+regulatory\s+)?(?:information|statement)|policy)\b",
+    re.IGNORECASE)
+
+
+def _extract_nmt_ppm_from_text(text: str) -> Optional[float]:
+    """Pull a spec limit (worst-case, largest) in ppm from free text, converting
+    percentages (0.5 % → 5000 ppm). Returns None when no NMT-style number found."""
+    if not text:
+        return None
+    best: Optional[float] = None
+    for rx, unit_grp in ((_RS_NMT_TEXT_RE, 2), (_RS_NMT_TRAILING_RE, 2)):
+        for m in rx.finditer(text):
+            try:
+                val = float(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            unit = (m.group(unit_grp) or "ppm").lower()
+            ppm = _percent_to_ppm(val) if unit == "%" else val
+            if best is None or ppm > best:
+                best = ppm
+    return best
+
+
+def _rs_is_policy_context(raw_text: str) -> bool:
+    return bool(raw_text) and bool(_RS_POLICY_CONTEXT_RE.search(raw_text))
+
+
+# ── RS content-ppm classifier (Categories A–G) ────────────────────────────────
+# The vendor CoA converter emits an inconsistent converted_ppm when a statement
+# carries BOTH a batch-actual value and a spec limit (a "159 - 5000" range, an
+# "Actual | NMT" column pair, etc.) — sometimes it keeps the actual, sometimes
+# the spec. This classifier makes converted_ppm DETERMINISTIC from raw text alone
+# (vendor / product / compendium-agnostic):
+#   A spec-limit only      → converted = the spec limit            (evidence "nmt")
+#   B batch-actual only    → converted = the measured value        (evidence actual)
+#   C actual + spec (range)→ converted = spec (worst-case); actual preserved
+#   D BDL/BQL/ND + spec    → converted = spec (worst-case, BDL note)
+#   E BDL/BQL/ND, no spec  → converted = None (needs review)
+#   F negative declaration → handled by the caller (converted = 0)
+#   G ambiguous            → converted = None (needs review)
+# A batch actual is ≤ its spec by definition, so taking the spec never understates
+# exposure. The smaller (actual) value is preserved for the audit trail.
+_RS_BDL_TEXT_RE = re.compile(
+    r"\b(bdl|bql|\bnd\b|not\s+detected|below\s+(?:detection|quantr?[ai]tation|"
+    r"quantification)|<\s*lo[dq])\b", re.IGNORECASE)
+# Two numbers joined by a range/pair delimiter (-, –, to, <, |, /, ~), the 2nd
+# optionally prefixed by </NMT/"not more than". Anchored on digits so a solvent
+# name like "1,4-Dioxane" (no digit after the hyphen) does not false-match.
+_RS_RANGE_PAIR_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:ppm|%|mg/kg)?\s*(?:-|–|—|<|\||/|~|to|~to)\s*"
+    r"(?:<|≤|<=|nmt\s+|not\s+more\s+than\s+)?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE)
+
+
+def _rs_text_is_bdl(text: str) -> bool:
+    return bool(text) and bool(_RS_BDL_TEXT_RE.search(text))
+
+
+def _classify_solvent_ppm(raw_value: Any, raw_unit: str, raw_text: str,
+                          is_bdl: bool = False) -> Dict[str, Any]:
+    """Classify a solvent statement into Categories A–G and return
+    {converted_ppm, actual_measured_ppm, spec_limit_ppm, category,
+     calculation_basis, note}. Decides on text content only."""
+    unit = (_s(raw_unit) or "").strip().lower()
+    blob = f"{_s(raw_value)} {_s(raw_text)}".strip()
+
+    def _to_ppm(v: float, u: Optional[str] = None) -> float:
+        uu = (u or unit or "ppm").lower()
+        if uu in ("%", "percent", "percentage", "w/w%"):
+            return _percent_to_ppm(v)
+        if uu in ("ppb", "µg/kg", "ug/kg"):
+            return v / 1000.0
+        return v  # ppm, mg/kg, µg/g, mg/l, none
+
+    out = {"converted_ppm": None, "actual_measured_ppm": None,
+           "spec_limit_ppm": None, "category": "G",
+           "calculation_basis": "ambiguous", "note": ""}
+
+    is_bdl = is_bdl or _rs_text_is_bdl(raw_text)
+    nmt_ppm = _extract_nmt_ppm_from_text(blob)     # largest NMT-context number
+    has_pct = "%" in blob
+
+    # Category C — a numeric range (actual … spec). Worst-case = the larger value;
+    # the smaller is the batch actual. Skipped when both sides are equal.
+    m = _RS_RANGE_PAIR_RE.search(blob)
+    if m and not is_bdl:
+        try:
+            a = _to_ppm(float(m.group(1)), "%" if has_pct else None)
+            b = _to_ppm(float(m.group(2)), "%" if has_pct else None)
+        except (TypeError, ValueError):
+            a = b = None
+        if a is not None and b is not None and a != b:
+            lo, hi = sorted((a, b))
+            out.update({"converted_ppm": hi, "actual_measured_ppm": lo,
+                        "spec_limit_ppm": hi, "category": "C",
+                        "calculation_basis": "nmt_with_batch_actual",
+                        "note": "range: spec limit taken for worst-case exposure; "
+                                "batch actual preserved"})
+            return out
+
+    # Categories D / E — below-detection result.
+    if is_bdl:
+        if nmt_ppm is not None:
+            out.update({"converted_ppm": nmt_ppm, "spec_limit_ppm": nmt_ppm,
+                        "category": "D", "calculation_basis": "nmt_conservative_bdl",
+                        "note": "BDL result; using spec limit for worst-case exposure"})
+        else:
+            out.update({"category": "E", "calculation_basis": "unresolved_bdl",
+                        "note": "BDL result with no spec limit; manual review"})
+        return out
+
+    primary = _convert_to_ppm(raw_value, raw_unit)   # the value the model emitted
+
+    # Category A — a spec limit is present (NMT/≤/limit wording).
+    if nmt_ppm is not None:
+        actual = primary if (primary is not None and primary < nmt_ppm) else None
+        out.update({"converted_ppm": nmt_ppm, "spec_limit_ppm": nmt_ppm,
+                    "actual_measured_ppm": actual, "category": "A",
+                    "calculation_basis": "nmt_conservative",
+                    "note": ("spec limit; lower actual preserved"
+                             if actual is not None else "spec limit")})
+        return out
+
+    # Category B — a single measured value with no spec context.
+    if primary is not None:
+        out.update({"converted_ppm": primary, "actual_measured_ppm": primary,
+                    "category": "B", "calculation_basis": "batch_actual",
+                    "note": "measured content (no spec limit in text)"})
+        return out
+
+    # Category G — nothing numeric could be resolved.
+    return out
+
+
+# RS Bug 3: compendial-variant detection for same-solvent dedup. A USP <467>
+# assessment must prefer the USP/NF limit when an annexure lists the same solvent
+# under several compendia (e.g. Acetone: EP NMT 1000 ppm vs USP/NF NMT 5000 ppm).
+# Priority USP/NF > Ph.Eur/EP > JP > ASMF/in-house/other. Detected from the
+# solvent name + its evidence raw_text; absence of any descriptor scores 0 so it
+# never perturbs the existing worst-case ranking (no regression for annexures
+# that do not tag a compendium).
+_COMPENDIAL_USP_RE = re.compile(
+    r"\b(usp(?:\s*[/\-]?\s*nf)?|u\.?s\.?p\.?|national\s+formulary|nf)\b", re.IGNORECASE)
+_COMPENDIAL_EP_RE = re.compile(
+    r"\b(ph\.?\s*eur\.?|eur\.?\s*ph\.?|european\s+pharmacop(?:o)?eia|ep)\b", re.IGNORECASE)
+_COMPENDIAL_JP_RE = re.compile(
+    r"\b(jp|japanese\s+pharmacop(?:o)?eia)\b", re.IGNORECASE)
+_COMPENDIAL_OTHER = ("asmf", "in-house", "in house", "dmf", "cep")
+
+# RS Bug 1: the priority order among compendial variants depends on the project's
+# assessment framework (chosen at project start; USP <467> is the default and the
+# US-market default). Each framework maps a detected compendium category to a
+# rank (higher = preferred). Category "OTHER" = ASMF/in-house/DMF/CEP. A missing
+# category scores 0 so it never perturbs the worst-case ppm ranking (no
+# regression for annexures that do not tag a compendium).
+DEFAULT_RS_FRAMEWORK = "USP <467>"
+_RS_FRAMEWORK_PRIORITY: Dict[str, Dict[str, int]] = {
+    # USP <467> / plain USP / ICH Q3C: USP/NF > Ph.Eur/EP > JP > ASMF/other
+    "USP <467>": {"USP": 4, "EP": 3, "JP": 2, "OTHER": 1},
+    "USP":       {"USP": 4, "EP": 3, "JP": 2, "OTHER": 1},
+    "ICH Q3C":   {"USP": 4, "EP": 3, "JP": 2, "OTHER": 1},
+    # Ph.Eur: Ph.Eur/EP > USP/NF > JP > ASMF/other
+    "Ph.Eur":    {"EP": 4, "USP": 3, "JP": 2, "OTHER": 1},
+    # JP: JP > USP/NF > Ph.Eur > ASMF/other
+    "JP":        {"JP": 4, "USP": 3, "EP": 2, "OTHER": 1},
+}
+
+
+def normalize_rs_framework(framework: Optional[str]) -> str:
+    """Map free-text project metadata to a known framework key, else the default."""
+    f = _s(framework).strip().lower()
+    if not f:
+        return DEFAULT_RS_FRAMEWORK
+    if "ph" in f and "eur" in f:
+        return "Ph.Eur"
+    if f in ("ep", "pheur", "ph eur", "european pharmacopoeia"):
+        return "Ph.Eur"
+    if f == "jp" or "japan" in f:
+        return "JP"
+    if "ich" in f or "q3c" in f:
+        return "ICH Q3C"
+    if "usp" in f or "467" in f or "nf" in f:
+        return "USP <467>"
+    return DEFAULT_RS_FRAMEWORK
+
+
+def _compendium_category(sv: Dict) -> Optional[str]:
+    """Detect which compendium an entry is tagged with, else None."""
+    blob = (_s(sv.get("solvent_name")) + " " + _s(sv.get("raw_text"))).lower()
+    if not blob.strip():
+        return None
+    if _COMPENDIAL_USP_RE.search(blob):
+        return "USP"
+    if _COMPENDIAL_EP_RE.search(blob):
+        return "EP"
+    if _COMPENDIAL_JP_RE.search(blob):
+        return "JP"
+    if any(t in blob for t in _COMPENDIAL_OTHER):
+        return "OTHER"
+    return None
+
+
+def _compendial_rank(sv: Dict, framework: str = DEFAULT_RS_FRAMEWORK) -> int:
+    """Higher = preferred for the given assessment framework. 0 = no compendial
+    descriptor (falls through to the worst-case ppm ranking, preserving legacy
+    behaviour). Default USP <467> reproduces the original USP/NF>EP>JP>other order."""
+    cat = _compendium_category(sv)
+    if cat is None:
+        return 0
+    table = _RS_FRAMEWORK_PRIORITY.get(framework, _RS_FRAMEWORK_PRIORITY[DEFAULT_RS_FRAMEWORK])
+    return table.get(cat, 0)
+
+
+# RS RF3: an NMT specification limit outranks a batch-actual test result for a
+# worst-case USP <467> exposure (a batch actual is ≤ its spec by definition, so
+# using it under-states exposure). Detect a batch-actual entry from its evidence
+# type / column label / wording.
+_RS_BATCH_ACTUAL_RE = re.compile(
+    r"\b(test\s+result|batch\s+(?:result|actual|analysis|value)|actual\s+"
+    r"(?:value|result|content)|analysis\s+result|as\s+found|found\s*[:=]|"
+    r"observed|result\s*[:=])\b", re.IGNORECASE)
+_RS_SPEC_WORDING_RE = re.compile(
+    r"\b(nmt|not\s+more\s+than|≤|<=|max(?:imum)?|limit|specification|spec)\b",
+    re.IGNORECASE)
+
+
+def _is_batch_actual(sv: Dict) -> bool:
+    """True when a solvent entry is a measured batch RESULT rather than a spec
+    limit. Spec-limit evidence types and NMT/limit wording are never batch
+    actuals; explicit result wording (or a plain measured value) is."""
+    et = _s(sv.get("evidence_type")).lower()
+    if et in ("nmt", "numerical_limit", "percentage_limit", "controlled_by_spec"):
+        return False
+    blob = (_s(sv.get("solvent_name")) + " " + _s(sv.get("raw_text"))).lower()
+    if _RS_SPEC_WORDING_RE.search(blob):
+        return False
+    if _RS_BATCH_ACTUAL_RE.search(blob):
+        return True
+    return et in ("coa_statement", "batch_result", "result", "measured", "actual")
+
+
+def _dedup_rs_solvents(solvents: List[Dict],
+                       framework: str = DEFAULT_RS_FRAMEWORK) -> List[Dict]:
+    """Collapse duplicate solvent rows (RF14). Group by canonical name (non-USP by
+    lowercased raw name). Keep ONE representative per group: prefer the
+    framework's highest-priority compendial variant (default USP <467> → USP/NF
+    first — RS Bug 1/3); when no compendium is tagged, fall back to worst-case —
+    an entry that carries a converted ppm, then the LARGEST ppm (spec limit ≥
+    batch actual → conservative), then NMT source, then highest confidence.
+    Confidence is carried as the group max so no evidence strength is lost."""
+    groups: Dict[str, List[Dict]] = {}
+    order: List[str] = []
+    for sv in solvents:
+        canon = sv.get("canonical")
+        key = canon if canon else ("~" + _s(sv.get("solvent_name")).lower())
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(sv)
+    out: List[Dict] = []
+    for key in order:
+        grp = groups[key]
+        if len(grp) == 1:
+            out.append(grp[0])
+            continue
+
+        def _rank(sv: Dict):
+            ppm = sv.get("converted_ppm")
+            has_ppm = ppm is not None
+            return (
+                not _is_batch_actual(sv),      # RF3: NMT spec beats batch actual
+                _compendial_rank(sv, framework),  # RS Bug 1: framework priority
+                has_ppm,
+                float(ppm) if has_ppm else -1.0,
+                sv.get("evidence_type") == "nmt",
+                _f(sv.get("confidence", 0.0)),
+            )
+        win = max(grp, key=_rank)
+        best = dict(win)
+        best["confidence"] = max(_f(s.get("confidence", 0.0)) for s in grp)
+        # Preserve the superseded entries (e.g. batch actuals) for the audit trail
+        # (RF3) without letting them drive the exposure calculation.
+        supers = [{"solvent_name": s.get("solvent_name"),
+                   "converted_ppm": s.get("converted_ppm"),
+                   "evidence_type": s.get("evidence_type"),
+                   "raw_text": _s(s.get("raw_text"))[:200]}
+                  for s in grp if s is not win]
+        if supers:
+            best["_superseded"] = supers
+        out.append(best)
+    return out
+
+
+def _annexure_richness(ann: Dict) -> Tuple[int, int, float]:
+    """Rank an annexure record by evidence richness for dedup (RF8): number of
+    solvent entries first, then how many carry a numeric ppm, then the best
+    confidence. Used to keep the fuller record when two dedupe to the same key."""
+    solv = ann.get("solvents") or []
+    numeric = sum(1 for s in solv if s.get("converted_ppm") is not None)
+    conf = max((_f(s.get("confidence", 0.0)) for s in solv), default=0.0)
+    return (len(solv), numeric, conf)
+
+
+def _pick_richer_annexure(a: Dict, b: Dict) -> Dict:
+    return a if _annexure_richness(a) >= _annexure_richness(b) else b
+
+
+def dedup_rs_annexures(annexures: List[Dict],
+                       framework: str = DEFAULT_RS_FRAMEWORK) -> Tuple[List[Dict], List[str]]:
+    """Dedup annexures by (normalized material, normalized supplier) BEFORE
+    mapping (RF8), so the merged/richer record feeds both the mapper and the
+    exposure calc — no solvent evidence is lost. Records with no resolved
+    material never merge. Returns (deduped, dup_warnings)."""
+    deduped: List[Dict] = []
+    key_to_idx: Dict[Tuple[str, ...], int] = {}
+    warnings: List[str] = []
+    for ann in annexures:
+        if not isinstance(ann, dict) or ann.get("_error"):
+            deduped.append(ann)
+            continue
+        mat = _rs_norm(_s(ann.get("material_name")))
+        sup = _rs_norm(_s(ann.get("supplier_name")))
+        key = (mat, sup) if mat else ("~unresolved", str(ann.get("annexure_number")))
+        if mat and key in key_to_idx:
+            idx = key_to_idx[key]
+            kept = deduped[idx]
+            merged = _dedup_rs_solvents(
+                (kept.get("solvents") or []) + (ann.get("solvents") or []), framework)
+            winner = dict(_pick_richer_annexure(kept, dict(ann)))
+            winner["solvents"] = merged
+            if any(s.get("converted_ppm") is not None for s in merged):
+                winner["negative_declaration"] = False
+            mf = list(kept.get("_merged_from", []))
+            for num in (kept.get("annexure_number"), ann.get("annexure_number")):
+                if (num is not None and num != winner.get("annexure_number")
+                        and num not in mf):
+                    mf.append(num)
+            if mf:
+                winner["_merged_from"] = mf
+            deduped[idx] = winner
+            warnings.append(
+                f"Duplicate annexure for '{_s(ann.get('material_name'))}' / "
+                f"'{_s(ann.get('supplier_name'))}' (Annexure "
+                f"{ann.get('annexure_number','?')}) merged; solvent evidence combined.")
+        else:
+            key_to_idx[key] = len(deduped)
+            deduped.append(dict(ann))
+    return deduped, warnings
+
+
+# Tabular CoAs label a solvent row by peak/impurity id with the real chemical in
+# parentheses: "Impurity B (Acetone)" / "RS-3 (Chloroform)" (RF12). When the
+# outer label is a generic peak/impurity tag, use the parenthesized chemical.
+_RS_PAREN_NAME_RE = re.compile(r"\(([^)]+)\)")
+_RS_PEAK_LABEL_RE = re.compile(
+    r"^\s*(?:impurit(?:y|ies)|imp|peak|rs|rrt|residual\s+solvents?|solvent|"
+    r"unknown|compound|component|[a-z])\b", re.IGNORECASE)
+
+
+def _rs_clean_solvent_name(sname: str) -> str:
+    """Prefer the parenthesized chemical name when the row label is a generic
+    peak/impurity tag ('Impurity B (Acetone)' → 'Acetone'). Names that already
+    lead with a real chemical ('Isopropyl alcohol (IPA)') are left intact."""
+    s = _s(sname)
+    if not s or "(" not in s:
+        return s
+    if _RS_PEAK_LABEL_RE.match(s):
+        m = _RS_PAREN_NAME_RE.search(s)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return s
+
+
+def process_rs_annexure(obj: Any, index: int,
+                        framework: str = DEFAULT_RS_FRAMEWORK) -> Dict:
+    """
+    Normalise one converted RS annexure into a CONSISTENT top-level object,
+    even when no solvent table / no numerical values are present, or when the
+    model returned a list (schema_repaired). Never raises.
+
+    framework selects the compendial dedup priority (RS Bug 1); it defaults to
+    USP <467>, which reproduces the original behaviour.
+    """
+    default: Dict = {
+        "annexure_number": index,
+        "supplier_name": "",
+        "material_name": "",
+        "material_name_candidates": [],
+        "material_name_source": "body",
+        "needs_material_confirmation": False,
+        "document_title": "",
+        "annexure_type": "other",
+        "solvents": [],
+        "negative_declaration": False,
+        "schema_repaired": False,
+        "_error": False,
+    }
+
+    if not isinstance(obj, dict):
+        if isinstance(obj, list):
+            d = dict(default)
+            d["extracted_items"] = obj
+            d["schema_repaired"] = True
+            logger.warning(f"RS annexure {index}: root was a list — wrapped.")
+            return d
+        d = dict(default)
+        d["_error"] = True
+        d["extraction_notes"] = f"Malformed annexure: got {type(obj).__name__}."
+        return d
+
+    out = dict(default)
+    # Honor an explicit upstream error (e.g. PDF rasterization failure) so the
+    # structured error object propagates instead of being reset to a clean record.
+    if obj.get("_error"):
+        out["_error"] = True
+        out["extraction_notes"] = _s(obj.get("extraction_notes")) or "Extraction failed."
+        return out
+    for fld in ("supplier_name", "material_name", "document_title", "annexure_type",
+                "raw_text", "filename"):
+        if obj.get(fld) is not None:
+            out[fld] = _s(obj.get(fld))
+    cands = obj.get("material_name_candidates", [])
+    if isinstance(cands, list):
+        out["material_name_candidates"] = [_s(c) for c in cands if _s(c)]
+    if obj.get("schema_repaired"):
+        out["schema_repaired"] = True
+    if obj.get("extracted_items") is not None:
+        out["extracted_items"] = obj.get("extracted_items")
+
+    # Material-name: strip document descriptors, recover from candidates
+    out["material_name"] = rs_strip_descriptor(out["material_name"])
+    out["material_name_candidates"] = [
+        c for c in (rs_strip_descriptor(x) for x in out["material_name_candidates"]) if c
+    ]
+    if not out["material_name"] and out["material_name_candidates"]:
+        out["material_name"] = out["material_name_candidates"][0]
+    if not out["material_name"] and out["document_title"]:
+        recovered = rs_strip_descriptor(out["document_title"])
+        if recovered:
+            out["material_name"] = recovered
+
+    # STRICT filename fallback (B3): only when ALL body-based paths yielded
+    # nothing. Never overrides a valid body-extracted material_name. Fixes the
+    # case where the body/title is generic ("Residual Solvents") but the filename
+    # names the material — e.g. "Citric acid (Annexure 14).pdf" → "Citric acid".
+    if not out["material_name"]:
+        inferred = _infer_material_from_filename(_s(obj.get("filename")))
+        if inferred:
+            out["material_name"] = inferred
+            out["material_name_source"] = "filename_inferred"
+            out["needs_material_confirmation"] = True
+    else:
+        out.setdefault("material_name_source", "body")
+
+    out["negative_declaration"] = bool(obj.get("negative_declaration"))
+
+    # Is this a generic regulatory/policy letter (no specific material subject)?
+    # Numbers in such a document are guideline references, not material limits.
+    # Require a genuinely UNRESOLVED material — a filename-inferred material with
+    # real per-batch data must NOT be cleared (that is a real CoA, not a policy
+    # letter). Stray policy-context numbers are still rejected per-solvent below.
+    doc_title = out.get("document_title", "")
+    is_policy_letter = (not out["material_name"]) and bool(
+        _RS_POLICY_TITLE_RE.search(doc_title))
+
+    # Normalise solvent evidence
+    solvents_in = obj.get("solvents", [])
+    norm_solvents: List[Dict] = []
+    declaration_scopes: List[Dict] = []
+    if isinstance(solvents_in, list):
+        for sv in solvents_in:
+            if not isinstance(sv, dict):
+                continue
+            sname = _rs_clean_solvent_name(_s(sv.get("solvent_name")))
+            etype = _s(sv.get("evidence_type")) or "ambiguous"
+            raw_value = sv.get("raw_value")
+            raw_unit = _s(sv.get("raw_unit"))
+            raw_text = _s(sv.get("raw_text"))
+            # Resolve once. A vendor/specialty solvent (class None — e.g. TFA)
+            # still gets a canonical name so its abbreviation and full name merge
+            # into ONE entry (RS Bug 4), but is treated as non-USP below.
+            sinfo = RSM.get_solvent_info(sname) if sname else None
+            canon = sinfo["canonical_name"] if sinfo else None
+
+            # (a) Generic category / declaration-scope phrases are NOT solvents
+            # (Class 1/2/3, OVI, "residual solvents", water) → scope evidence.
+            if not sname or is_generic_solvent_category(sname):
+                declaration_scopes.append({
+                    "scope_text": sname,
+                    "raw_text": raw_text or sname,
+                    "evidence_type": etype if etype in (
+                        "negative_declaration", "no_source", "controlled_by_spec",
+                        "coa_statement") else "declaration_scope",
+                    "page": sv.get("page", 1),
+                })
+                continue
+
+            # (b) RF3: a real solvent name whose evidence is a policy/guideline
+            # reference (PDE value, ICH Q3C discussion) is NOT a material limit.
+            if etype == "policy_statement" or _rs_is_policy_context(raw_text):
+                declaration_scopes.append({
+                    "scope_text": sname,
+                    "raw_text": raw_text or sname,
+                    "evidence_type": "policy_statement",
+                    "page": sv.get("page", 1),
+                })
+                continue
+
+            # Convert to ppm via the deterministic A–G classifier so a statement
+            # carrying BOTH a batch actual and a spec limit (a "159 - 5000" range,
+            # an "Actual | NMT" pair, or a BDL result) always resolves to the same
+            # worst-case value regardless of vendor/CoA format. The smaller actual
+            # is preserved for audit. (Sofosbuvir/Velpatasvir extraction fix.)
+            converted_ppm = None
+            calc_basis = etype
+            audit_note = ""
+            actual_ppm = None
+            spec_ppm = None
+            rv_norm = _s(raw_value).strip().lower()
+            is_bdl = (rv_norm in _RS_BDL_VALUES) or _rs_text_is_bdl(raw_text)
+            if etype in ("numerical_limit", "percentage_limit", "nmt"):
+                cls = _classify_solvent_ppm(raw_value, raw_unit, raw_text, is_bdl)
+                converted_ppm = cls["converted_ppm"]
+                actual_ppm = cls["actual_measured_ppm"]
+                spec_ppm = cls["spec_limit_ppm"]
+                calc_basis = cls["calculation_basis"] or calc_basis
+                audit_note = cls["note"]
+            elif etype in ("negative_declaration", "no_source"):
+                calc_basis = "negative_declaration"
+            # BDL under a non-numeric etype: still recover the spec limit from text.
+            if converted_ppm is None and is_bdl:
+                nmt_ppm = _extract_nmt_ppm_from_text(raw_text)
+                if nmt_ppm is not None:
+                    converted_ppm = nmt_ppm
+                    spec_ppm = nmt_ppm
+                    calc_basis = "nmt_conservative_bdl"
+                    audit_note = ("BDL result; using spec limit for worst-case "
+                                  "exposure")
+
+            # Non-USP = not an ICH Q3C-classed solvent. A vendor solvent (class
+            # None) resolves to a canonical name but is still non-USP, so the RF2
+            # numeric-evidence gate below (and NA limit display) still applies.
+            is_non_usp = (sinfo is None) or (sinfo.get("class") is None)
+            entry = {
+                "solvent_name": sname,
+                "canonical": canon,
+                "is_non_usp_solvent": is_non_usp,
+                "raw_text": raw_text,
+                "raw_value": raw_value,
+                "raw_unit": raw_unit,
+                "converted_ppm": converted_ppm,
+                "evidence_type": etype,
+                "calculation_basis": calc_basis,
+                "page": sv.get("page", 1),
+                "confidence": _f(sv.get("confidence", 0.6)) or 0.6,
+            }
+            if audit_note:
+                entry["audit_note"] = audit_note
+            # Audit trail: preserve both the batch actual and the spec limit so a
+            # reviewer can see the worst-case selection (RS content-extraction fix).
+            if actual_ppm is not None:
+                entry["actual_measured_ppm"] = actual_ppm
+            if spec_ppm is not None:
+                entry["spec_limit_ppm"] = spec_ppm
+
+            # RF2: keep a NON-USP solvent only when it carries numeric evidence
+            # (CPME 1500 ppm, TFA 3400 ppm). A non-USP name with no number is a
+            # declaration scope, not a calculation column.
+            if is_non_usp and converted_ppm is None:
+                declaration_scopes.append({
+                    "scope_text": sname,
+                    "raw_text": raw_text or sname,
+                    "evidence_type": "declaration_scope",
+                    "page": sv.get("page", 1),
+                })
+                continue
+            norm_solvents.append(entry)
+
+    # RF14: collapse duplicate rows (Methanol × 5 → one worst-case entry).
+    norm_solvents = _dedup_rs_solvents(norm_solvents, framework)
+    out["solvents"] = norm_solvents
+    out["declaration_scopes"] = declaration_scopes
+
+    # RF3: a generic policy letter must not contribute material-specific limits.
+    # Everything it carried becomes scope evidence and its flag stays false.
+    if is_policy_letter and norm_solvents:
+        for sv in norm_solvents:
+            declaration_scopes.append({
+                "scope_text": sv.get("solvent_name", ""),
+                "raw_text": sv.get("raw_text", ""),
+                "evidence_type": "policy_statement",
+                "page": sv.get("page", 1),
+            })
+        norm_solvents = []
+        out["solvents"] = []
+        out["declaration_scopes"] = declaration_scopes
+
+    # RF4: negative_declaration is the GLOBAL "no residual solvents present" flag.
+    # It is true ONLY when there are no numeric solvent limits. Any numeric limit
+    # forces it false; per-class negatives live in declaration_scopes, not here.
+    has_numeric = any(sv.get("converted_ppm") is not None for sv in norm_solvents)
+    if has_numeric or is_policy_letter:
+        out["negative_declaration"] = False
+    elif not norm_solvents and (
+            out["negative_declaration"]
+            or any(sc.get("evidence_type") in ("negative_declaration", "no_source")
+                   for sc in declaration_scopes)
+            or "not used" in out.get("raw_text", "").lower()
+            or "water is the only" in out.get("raw_text", "").lower()):
+        out["negative_declaration"] = True
+    else:
+        out["negative_declaration"] = False
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3. MAPPER — RS material identity resolver
+#    Ported/adapted from the proven EI injection identity-resolution architecture:
+#    descriptor stripping, identity-source pooling, canonical tokens, brand/family
+#    recognition, negative-pair protection, confidence scoring, and semantic
+#    fallback. NONE of the EI element/PDE/Q3D calculation logic is reused — only
+#    the identity-resolution framework.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Non-identity noise tokens removed from matching pools (Red Flag 2).
+_RS_NOISE = {
+    "usp", "nf", "ep", "bp", "jp", "ip", "pheur", "eur", "ph",
+    "grade", "purified", "for", "of", "the", "and", "a", "an", "c",
+    "cas", "no", "number", "lva", "dispersion", "coating", "premium",
+    "cps", "cp", "mesh", "rs", "json", "annexure", "datasheet", "data", "sheet",
+    "regulatory", "product", "operations", "gmbh", "inc", "llc", "ltd", "limited",
+    "co", "company", "residual", "solvents", "solvent", "committee",
+    "harmonization", "harmonisation", "statement", "declaration", "summary",
+    "information", "quality", "spec", "specification", "type", "pharma",
+    "pharmaceutical", "material", "supplier", "certificate", "analysis",
+    "monograph", "ih", "coa", "ligamed", "powder", "report", "final", "copy",
+    "batch", "lot", "code", "sds", "msds",
+}
+
+# Generic chemical SUFFIX tokens that must NOT drive a match on their own
+# (Red Flag 2: "citrate" alone must not bind Triethyl citrate ↔ ATBC).
+_RS_GENERIC_TOKENS = {
+    "citrate", "acid", "cellulose", "glycol", "alcohol", "acetate",
+    "stearate", "phosphate", "chloride", "sodium", "calcium", "potassium",
+    "magnesium", "dioxide", "copolymer", "ester", "water", "spheres", "sphere",
+}
+
+# Salt / hydrate / purity descriptor sets — same product-agnostic vocabulary as
+# deg_eg.py. Kept as WEAK ALIASES (extras), never as identity drivers.
+_RS_SALT_SUFFIXES = (
+    "hcl", "hbr", "sulfate", "sulphate", "phosphate", "acetate", "citrate",
+    "tartrate", "mesylate", "tosylate", "besylate", "maleate", "fumarate",
+    "hydrochloride", "hydrobromide", "2hcl", "3hcl", "dihydrochloride",
+    "trihydrochloride",
+)
+_RS_HYDRATE_SUFFIXES = (
+    "anhydrous", "monohydrate", "dihydrate", "trihydrate", "tetrahydrate",
+    "pentahydrate", "heptahydrate", "hemihydrate", "hydrate",
+)
+_RS_PURITY_DESCRIPTORS_RE = re.compile(
+    r"\b(pyrogen[\s\-]*free|endotoxin[\s\-]*controlled|endotoxin[\s\-]*free|"
+    r"sterile|apyrogenic|non[\s\-]*pyrogenic|"
+    r"free\s+from\s+endotoxins?)\b",
+    re.IGNORECASE,
+)
+_RS_DESCRIPTOR_PHRASE_RE = re.compile(
+    "|".join([
+        r"\bih\s*spec(?:ification)?\s*[a-z]?\d+\w*\b",
+        r"\bih\s*spec(?:ification)?\b",
+        r"\bspec(?:ification)?\s*[a-z]?\d+\w*\b",
+        r"\bspec(?:ification)?\b",
+        r"\bgrade\s*[a-z0-9]*\b",
+        r"\btype\s*[iv0-9]+\b",
+        r"\busp[/\-\s]*nf\b",
+        r"\bph\.?\s*eur\.?\b",
+        r"\bcertificate\s+of\s+analysis\b",
+        r"\bresidual\s+solvents?\b",
+        r"\bdeg\s*&?\s*eg\b",
+        r"\bmonograph\b",
+        r"\bproduct\s+regulatory\s+information\b",
+        r"\bquality\s+statement\b",
+    ]), re.IGNORECASE)
+
+# RS material family vocabulary. Each family maps distinctive aliases/brands to a
+# shared canonical family token. Product-agnostic chemical identities, not
+# one-off product mappings.
+_RS_FAMILY_RULES: Dict[str, Dict[str, Any]] = {
+    "sugar_sphere": {
+        "family": "sugar sphere",
+        "aliases": ["sugar sphere", "sugar spheres", "sugar pellet",
+                    "sugar pellets", "nonpareil", "nonpareils", "nonpareil seed",
+                    "nonpareil seeds", "sugar seed", "sugar seeds",
+                    "sucrose sphere", "sucrose spheres"],
+    },
+    "hypromellose": {
+        "family": "hypromellose",
+        "aliases": ["hypromellose", "hpmc", "methocel", "celsential",
+                    "hydroxypropyl methylcellulose", "hydroxypropylmethylcellulose",
+                    "hydroxy propyl methyl cellulose",
+                    "hydroxypropyl methyl cellulose",
+                    "hydroxy propyl methylcellulose"],
+    },
+    "eudragit": {
+        "family": "methacrylic acid copolymer",
+        "aliases": ["eudragit", "eudragit l30 d-55", "eudragit l 30 d-55",
+                    "l30 d-55", "l 30 d-55", "methacrylic acid copolymer",
+                    "methacrylate copolymer", "methacrylic acid ethyl acrylate copolymer",
+                    "kollicoat"],
+    },
+    "triethyl_citrate": {
+        "family": "triethyl citrate",
+        "aliases": ["triethyl citrate", "triethylcitrate", "tec"],
+    },
+    "atbc": {
+        "family": "acetyltributyl citrate",
+        "aliases": ["acetyltributyl citrate", "acetyl tributyl citrate", "atbc",
+                    "tributyl acetylcitrate", "tributyl o-acetylcitrate"],
+    },
+    "polysorbate80": {
+        "family": "polysorbate 80",
+        "aliases": ["polysorbate 80", "polysorbate80", "tween 80", "tween80",
+                    "polyoxyethylene sorbitan monooleate"],
+    },
+    "dextrose": {
+        "family": "dextrose",
+        "aliases": ["dextrose", "glucose", "anhydrous dextrose", "dextrose monohydrate",
+                    "d-glucose"],
+    },
+    "hpc": {
+        "family": "hydroxypropyl cellulose",
+        "aliases": ["hydroxypropyl cellulose", "hydroxypropylcellulose", "hpc",
+                    "klucel", "hydroxy propyl cellulose"],
+    },
+    "simethicone": {
+        "family": "simethicone",
+        "aliases": ["simethicone", "simeticone", "q7-2243", "q7 2243",
+                    "dow corning q7", "dimethicone simethicone"],
+    },
+    "macrogol": {
+        "family": "macrogol",
+        "aliases": ["macrogol", "polyethylene glycol", "peg", "carbowax"],
+    },
+    "talc": {
+        "family": "talc",
+        "aliases": ["talc", "purified talc", "talcum", "hydrous magnesium silicate",
+                    "magnesium silicate hydrate"],
+    },
+    "magnesium_stearate": {
+        "family": "magnesium stearate",
+        "aliases": ["magnesium stearate", "ligamed", "magnesium octadecanoate",
+                    "vegetable magnesium stearate"],
+    },
+    "crospovidone": {
+        "family": "crospovidone",
+        "aliases": ["crospovidone", "kollidon cl", "kollidon", "crosslinked pvp",
+                    "cross linked pvp", "crosslinked povidone", "polyplasdone"],
+    },
+    "xanthan_gum": {
+        "family": "xanthan gum",
+        "aliases": ["xanthan gum", "xanthan", "xantural", "cp kelco"],
+    },
+    "yellow_iron_oxide": {
+        "family": "iron oxide",
+        "aliases": ["yellow iron oxide", "iron oxide yellow", "ferric oxide yellow",
+                    "pigment yellow", "iron oxide (yellow)", "iron oxide",
+                    "ferric oxide", "iron(iii) oxide", "sicovit", "ferroxide",
+                    "iron oxide based high purity pigments", "iron oxide pigments"],
+    },
+    "citric_acid_anhydrous": {
+        "family": "anhydrous citric acid",
+        "aliases": ["citric acid anhydrous", "anhydrous citric acid",
+                    "citric acid (anhydrous)"],
+    },
+    "dehydrated_alcohol": {
+        "family": "ethanol",
+        "aliases": ["dehydrated alcohol", "ethanol", "ethyl alcohol",
+                    "anhydrous alcohol", "absolute alcohol", "alcohol usp"],
+    },
+    # ── PRODUCT-AGNOSTIC excipient / API families (broad vocabulary) ──────────
+    "croscarmellose": {
+        "family": "croscarmellose",
+        "aliases": ["croscarmellose sodium", "croscarmellose",
+                    "ac-di-sol", "ac di sol", "acdisol", "ac-di-sol sd-711",
+                    "ac di sol sd 711", "crosslinked sodium carboxymethylcellulose",
+                    "cross-linked cmc sodium", "crosslinked cmc sodium"],
+    },
+    "mavacamten": {"family": "mavacamten",
+        "aliases": ["mavacamten"]},
+    "mannitol": {"family": "mannitol",
+        "aliases": ["mannitol", "d-mannitol", "pearlitol", "pearlitol 50c",
+                    "pearlitol 100sd", "pearlitol 200sd", "pearlitol mannitol"]},
+    "mcc": {"family": "microcrystalline cellulose",
+        "aliases": ["microcrystalline cellulose", "mcc", "avicel",
+                    "avicel ph 101", "avicel ph 102", "avicel ph101", "avicel ph102",
+                    "cellulose microcrystalline"]},
+    "sodium_chloride": {"family": "sodium chloride",
+        "aliases": ["sodium chloride", "nacl", "saline"]},
+    "hydrochloric_acid": {"family": "hydrochloric acid",
+        "aliases": ["hydrochloric acid", "hcl", "hydrogen chloride"]},
+    "sodium_hydroxide": {"family": "sodium hydroxide",
+        "aliases": ["sodium hydroxide", "naoh", "caustic soda"]},
+    "water_family": {"family": "water",
+        "aliases": ["water for injection", "purified water", "wfi",
+                    "water usp", "water ip", "water"]},
+    "nitrogen_family": {"family": "nitrogen",
+        "aliases": ["nitrogen", "n2", "nitrogen gas"]},
+    "sofosbuvir": {"family": "sofosbuvir",
+        "aliases": ["sofosbuvir"]},
+    "velpatasvir": {"family": "velpatasvir",
+        "aliases": ["velpatasvir", "velpatasvir premix"]},
+    "colloidal_sio2": {"family": "colloidal silicon dioxide",
+        "aliases": ["colloidal silicon dioxide", "aerosil", "aerosil 200",
+                    "silica colloidal anhydrous", "silicon dioxide colloidal",
+                    "colloidal anhydrous silica"]},
+    "sodium_stearyl_fumarate": {"family": "sodium stearyl fumarate",
+        "aliases": ["sodium stearyl fumarate", "pruv"]},
+    "opadry": {"family": "opadry",
+        "aliases": ["opadry", "opadry ii", "opadry white",
+                    "opadry ii 85f580019", "opadry ii 85f580019 white"]},
+    "chlorobutanol": {"family": "chlorobutanol",
+        "aliases": ["chlorobutanol", "chlorobutanol hemihydrate", "chlorbutol"]},
+    "sodium_metabisulphite": {"family": "sodium metabisulphite",
+        "aliases": ["sodium metabisulphite", "sodium metabisulfite",
+                    "sodium disulfite", "sodium pyrosulfite"]},
+    "trilaciclib": {"family": "trilaciclib",
+        "aliases": ["trilaciclib", "trilaciclib 2hcl", "trilaciclib dihydrochloride"]},
+    "epinephrine": {"family": "epinephrine",
+        "aliases": ["epinephrine", "adrenaline", "adrenalin"]},
+    "citric_acid_broad": {"family": "citric acid",
+        "aliases": ["citric acid", "citric acid anhydrous",
+                    "citric acid monohydrate", "anhydrous citric acid"]},
+}
+
+# Negative family pairs — chemically distinct identities that share a generic
+# suffix and must NEVER match each other (Red Flag 2).
+_RS_NEGATIVE_FAMILY_PAIRS: List[Tuple[str, str]] = [
+    ("triethyl citrate", "acetyltributyl citrate"),
+    ("dextrose", "sugar sphere"),
+    ("hypromellose", "hydroxypropyl cellulose"),
+    ("polysorbate 80", "macrogol"),
+    ("talc", "magnesium stearate"),
+    ("anhydrous citric acid", "yellow iron oxide"),
+]
+
+# Build alias → family lookups
+_RS_ALIAS_TO_FAMILY: Dict[str, str] = {}
+_RS_ALIAS_TO_KEY: Dict[str, str] = {}
+for _k, _rule in _RS_FAMILY_RULES.items():
+    for _al in _rule["aliases"]:
+        _RS_ALIAS_TO_FAMILY[_al.lower()] = _rule["family"]
+        _RS_ALIAS_TO_KEY[_al.lower()] = _k
+
+
+def _rs_norm(text: str) -> str:
+    s = _s(text).lower()
+    s = s.replace("\u00ae", " ").replace("\u2122", " ").replace("&", " and ")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _rs_canonical_tokens(text: str) -> set:
+    """Identity tokens with noise removed. Generic suffix tokens are KEPT here
+    but down-weighted later; pure-noise tokens are dropped."""
+    out = set()
+    for t in _rs_norm(text).split():
+        if len(t) <= 1 or t in _RS_NOISE:
+            continue
+        out.add(t)
+    return out
+
+
+def _rs_strip_descriptor_phrases(text: str) -> str:
+    """String-level strip of specification / grade / pharmacopoeia / purity
+    phrases before identity normalization. Product-agnostic."""
+    if not text:
+        return ""
+    s = _s(text)
+    s = _RS_DESCRIPTOR_PHRASE_RE.sub(" ", s)
+    s = _RS_PURITY_DESCRIPTORS_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _rs_paren_tokens(text: str) -> set:
+    extras: set = set()
+    for m in re.finditer(r"\(([^)]+)\)", _s(text)):
+        for t in _rs_norm(m.group(1)).split():
+            if len(t) > 1 and t not in _RS_NOISE:
+                extras.add(t)
+    return extras
+
+
+def _rs_extras_from_name(text: str) -> set:
+    extras: set = set()
+    low = _s(text).lower()
+    for sfx in _RS_SALT_SUFFIXES + _RS_HYDRATE_SUFFIXES:
+        if re.search(rf"\b{re.escape(sfx)}\b", low):
+            extras.add(sfx)
+    for m in _RS_PURITY_DESCRIPTORS_RE.finditer(text):
+        extras.add(re.sub(r"\s+", "_", m.group(0).lower().strip()))
+    return extras
+
+
+def _rs_identity_norm(text: str) -> str:
+    """Fully-stripped normalized identity STRING for exact-match tests.
+    Same rules as deg_eg._identity_norm: strips paren content, descriptor
+    phrases, salt / hydrate suffixes, purity descriptors, noise, and standalone
+    digits. Product-agnostic \u2014 never touches chemistry identity words."""
+    if not text:
+        return ""
+    s = _s(text)
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = _rs_strip_descriptor_phrases(s)
+    for sfx in _RS_SALT_SUFFIXES + _RS_HYDRATE_SUFFIXES:
+        s = re.sub(rf"\b{re.escape(sfx)}\b", " ", s, flags=re.IGNORECASE)
+    tokens = []
+    for t in _rs_norm(s).split():
+        if t in _RS_NOISE or t.isdigit() or len(t) <= 1:
+            continue
+        tokens.append(t)
+    return " ".join(sorted(set(tokens)))
+
+
+def _rs_filename_derived_name(filename: str) -> str:
+    """Strip filename to a plausible material subject. Same rules as
+    deg_eg._filename_derived_name \u2014 kept isolated to avoid a cross-module dep."""
+    if not filename:
+        return ""
+    s = _s(filename)
+    s = re.sub(r"\.(pdf|json|docx?|xlsx?|png|jpe?g|tiff?)$", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"[\(\[]?\s*annexure[\s_\-]*\d+\s*[\)\]]?", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\b(RCQR|RCRR|GRN|AR|ATR|SAP)[\-_ ]?\d{2,}\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"[_\-]+", " ", s)
+    s = re.sub(r"\b\d{4}[\-/]\d{2}[\-/]\d{2}\b", " ", s)
+    s = re.sub(r"\b\d{2}[\-/]\d{2}[\-/]\d{4}\b", " ", s)
+    s = re.sub(r"\b\d{8,}\b", " ", s)
+    _docwords = (r"coa|certificate\s+of\s+analysis|specification|spec|declaration|"
+                 r"statement|sds|msds|regulatory|quality|residual\s+solvents?|"
+                 r"annexure|monograph|information|report|final|copy")
+    s = re.sub(r"\b(" + _docwords + r")\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" -\u2013:_")
+    if not s or re.fullmatch(r"[\d\s.]+", s):
+        return ""
+    return s
+
+
+def _rs_detect_family(text: str) -> Tuple[str, str]:
+    """Return (family, family_key) if any alias appears in the text, else ('','')."""
+    norm = _rs_norm(text)
+    norm_padded = f" {norm} "
+    best = ("", "")
+    best_len = 0
+    for alias, fam in _RS_ALIAS_TO_FAMILY.items():
+        a = _rs_norm(alias)
+        if not a:
+            continue
+        if f" {a} " in norm_padded:
+            if len(a) > best_len:        # prefer the most specific (longest) alias
+                best = (fam, _RS_ALIAS_TO_KEY[alias])
+                best_len = len(a)
+    return best
+
+
+def _rs_strip_descriptor_name(name: str) -> str:
+    """Recover the material subject from a '<descriptor> for <material>' phrase."""
+    return rs_strip_descriptor(name)
+
+
+def _rs_identity(text: str) -> Dict[str, Any]:
+    """Build an identity record for a component or annexure source string."""
+    raw = _s(text)
+    stripped = _rs_strip_descriptor_name(raw) or raw
+    stripped = _rs_strip_descriptor_phrases(stripped)
+    fam, fam_key = _rs_detect_family(stripped)
+    toks = _rs_canonical_tokens(stripped)
+    # Fold paren-content and salt/hydrate extras into the token pool for
+    # containment / overlap tiers.
+    toks |= _rs_paren_tokens(raw)
+    toks |= _rs_extras_from_name(raw)
+    fam_tokens = set()
+    if fam:
+        fam_tokens = _rs_canonical_tokens(fam)
+    return {
+        "raw": raw, "norm": _rs_norm(stripped),
+        "tokens": toks, "family": fam, "family_key": fam_key,
+        "family_tokens": fam_tokens,
+        "identity_norm": _rs_identity_norm(raw),
+    }
+
+
+def _rs_distinctive(tokens: set) -> set:
+    return {t for t in tokens if t not in _RS_GENERIC_TOKENS}
+
+
+def _rs_pair_blocked(fam_a: str, fam_b: str) -> bool:
+    if not fam_a or not fam_b or fam_a == fam_b:
+        return False
+    for x, y in _RS_NEGATIVE_FAMILY_PAIRS:
+        if {fam_a, fam_b} == {x, y}:
+            return True
+    return False
+
+
+def _rs_pool_identity(ann: Dict) -> Dict[str, Any]:
+    """Pool identity from material_name, candidates, filename-derived name,
+    title, supplier. Also emit per-source normalized identity strings for
+    Tier 1/2 exact-match tests."""
+    primary = _s(ann.get("material_name"))
+    candidates = [_s(c) for c in (ann.get("material_name_candidates") or []) if _s(c)]
+    filename_derived = _rs_filename_derived_name(_s(ann.get("filename")))
+    title = _s(ann.get("document_title"))
+    supplier = _s(ann.get("supplier_name"))
+
+    kinded: List[Tuple[str, str]] = []
+    if primary:
+        kinded.append(("material_name", primary))
+    for c in candidates:
+        kinded.append(("candidate", c))
+    if filename_derived:
+        kinded.append(("filename", filename_derived))
+    if title:
+        kinded.append(("title", title))
+    if supplier:
+        kinded.append(("supplier", supplier))
+
+    tokens: set = set()
+    fam, fam_key = "", ""
+    identity_norms: List[Tuple[str, str]] = []
+    for kind, s in kinded:
+        idd = _rs_identity(s)
+        tokens |= idd["tokens"]
+        tokens |= idd["family_tokens"]
+        if idd["family"] and not fam:
+            fam, fam_key = idd["family"], idd["family_key"]
+        n = idd.get("identity_norm", "")
+        if n:
+            identity_norms.append((kind, n))
+
+    return {"tokens": tokens, "family": fam, "family_key": fam_key,
+            "sources": [s for _k, s in kinded],
+            "identity_norms": identity_norms,
+            "filename_derived": filename_derived}
+
+
+def _rs_score(comp_id: Dict[str, Any], ann_id: Dict[str, Any]) -> Tuple[float, str]:
+    """Sequential-tier identity similarity in [0,1] with a reason. Never
+    short-circuits at 0 for a missing family — token-based tiers always run so
+    any molecule is scorable without pre-registration.
+
+    Tier 1 (0.99): exact normalized match to annexure material_name
+    Tier 2 (0.99): exact normalized match to any candidate
+    Tier 3 (0.97): recognised family alias match
+    Tier 4 (0.90): distinctive-token containment (either direction)
+    Tier 5 (0.50–0.85): Jaccard + distinctive overlap fallback
+    Tier 6 (0.95): exact normalized match to filename-derived name
+
+    Negative family pairs are always blocked (0.0).
+    """
+    cfam, afam = comp_id.get("family", ""), ann_id.get("family", "")
+    if _rs_pair_blocked(cfam, afam):
+        return 0.0, f"blocked negative pair {cfam} vs {afam}"
+
+    c_norm = comp_id.get("identity_norm", "")
+    identity_norms: List[Tuple[str, str]] = ann_id.get("identity_norms", [])
+
+    # Tier 1 & 2: exact normalized match against material_name or any candidate.
+    if c_norm:
+        for kind, a_norm in identity_norms:
+            if a_norm and c_norm == a_norm and kind in ("material_name", "candidate"):
+                return 0.99, f"exact normalized match to {kind}"
+        # Tier 6: filename-derived name exact
+        for kind, a_norm in identity_norms:
+            if kind == "filename" and a_norm and c_norm == a_norm:
+                return 0.95, "exact match to filename-derived name"
+
+    # Tier 3: recognised family alias match
+    if cfam and afam and cfam == afam:
+        return 0.97, f"family match: {cfam}"
+
+    # Partial family match retained — one family name contained in the other AND
+    # at least one shared non-generic token. Handles Yellow Iron Oxide ↔ Iron
+    # Oxide, Anhydrous Citric Acid ↔ Citric Acid, Purified Talc ↔ Talc.
+    if cfam and afam and cfam != afam:
+        cfam_toks = set(cfam.split())
+        afam_toks = set(afam.split())
+        if cfam_toks <= afam_toks or afam_toks <= cfam_toks:
+            shared_distinct = (_rs_distinctive(cfam_toks)
+                               & _rs_distinctive(afam_toks))
+            if shared_distinct:
+                return 0.90, f"partial family match: {cfam} ~ {afam}"
+
+    ctoks = comp_id.get("tokens", set()) | comp_id.get("family_tokens", set())
+    atoks = ann_id.get("tokens", set())
+    if not ctoks or not atoks:
+        return 0.0, "no tokens"
+
+    inter = ctoks & atoks
+    union = ctoks | atoks
+    jaccard = len(inter) / len(union) if union else 0.0
+
+    dist_c = _rs_distinctive(ctoks)
+    dist_a = _rs_distinctive(atoks)
+    dist_inter = dist_c & dist_a
+    dist_union = dist_c | dist_a
+    dist_overlap = len(dist_inter) / len(dist_union) if dist_union else 0.0
+
+    # Tier 4: distinctive-token containment
+    if dist_c and dist_a and dist_inter:
+        smaller, larger = ((dist_c, dist_a) if len(dist_c) <= len(dist_a)
+                           else (dist_a, dist_c))
+        if smaller and smaller <= larger:
+            return 0.90, f"distinctive token containment {sorted(smaller)}"
+
+    contain = 0.0
+    if dist_c and dist_a:
+        smaller, larger = ((dist_c, dist_a) if len(dist_c) <= len(dist_a)
+                           else (dist_a, dist_c))
+        if smaller:
+            contain = len(smaller & larger) / len(smaller)
+
+    if not dist_inter:
+        return round(0.12 * jaccard, 4), "generic-only overlap"
+
+    # Tier 5: Jaccard + distinctive overlap fallback (0.50–0.85 typical)
+    score = 0.30 * jaccard + 0.40 * dist_overlap + 0.30 * contain
+    return round(min(0.85, max(0.0, score)), 4), \
+        f"distinctive overlap {sorted(dist_inter)}"
+
+
+def map_components_to_annexures(components: List[str],
+                                annexures: List[Dict]) -> Dict[str, Dict]:
+    """
+    Resolve each Excel component to an RS annexure using the ported identity
+    resolver: descriptor stripping, identity pooling, family/brand recognition,
+    distinctive-token scoring, negative-pair protection, confidence + needs-
+    confirmation. Product-agnostic; no one-off product mappings.
+    """
+    ann_records = []
+    for ann in annexures:
+        if isinstance(ann, dict) and not ann.get("_error"):
+            ann_records.append((ann, _rs_pool_identity(ann)))
+
+    result: Dict[str, Dict] = {}
+    for comp in components:
+        comp_id = _rs_identity(comp)
+        best = None
+        best_score = 0.0
+        best_reason = ""
+        runner = 0.0
+        for ann, ann_id in ann_records:
+            score, reason = _rs_score(comp_id, ann_id)
+            if score > best_score:
+                runner = best_score
+                best_score, best, best_reason = score, ann, reason
+            elif score > runner:
+                runner = score
+
+        if best is not None and best_score >= 0.85:
+            confidence = round(best_score, 2)
+            result[comp] = {
+                "matched_annexure": best.get("annexure_number"),
+                "matched_material": best.get("material_name", ""),
+                "confidence": confidence,
+                "match_reason": best_reason,
+                "evidence_fields": ["material_name", "material_name_candidates",
+                                    "document_title", "supplier_name", "filename"],
+                "needs_confirmation": False,
+                "validation_flags": [],
+                "_annexure": best,
+            }
+        elif best is not None and best_score >= 0.60:
+            confidence = round(best_score, 2)
+            result[comp] = {
+                "matched_annexure": best.get("annexure_number"),
+                "matched_material": best.get("material_name", ""),
+                "confidence": confidence,
+                "match_reason": best_reason,
+                "evidence_fields": ["material_name", "material_name_candidates",
+                                    "document_title", "supplier_name", "filename"],
+                "needs_confirmation": False,
+                "validation_flags": [],
+                "_annexure": best,
+            }
+        else:
+            result[comp] = {
+                "matched_annexure": None, "matched_material": "",
+                "confidence": 0.0,
+                "match_reason": (f"no confident identity match (best {best_score:.2f})"
+                                 if best is not None else "no candidates"),
+                "evidence_fields": [], "needs_confirmation": True,
+                "validation_flags": ["unresolved"], "_annexure": None,
+            }
+    return result
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3b. CALCULATION IDENTITY AGGREGATION (Red Flag 3)
+#     Composition stays stage-wise for Section 4; Section 5 calculation collapses
+#     repeated / synonymous material rows into ONE calculation identity each.
+# ════════════════════════════════════════════════════════════════════════════
+def aggregate_calculation_identities(parsed: Dict) -> Dict:
+    """
+    Collapse repeated/synonymous component rows into one calculation identity,
+    summing quantity_per_unit and amount_in_maximum_dose. Uses the same family
+    recognition as the mapper (with negative-pair protection) so e.g. HPC/Klucel
+    variants merge but Triethyl citrate never merges with ATBC. q.s. rows are
+    NOT aggregated (kept separate, calculation-exempt). Returns a parsed-like
+    dict whose 'rows' are the aggregated identities, plus an audit trail.
+    """
+    rows = parsed.get("rows", []) or []
+    no_of_doses = parsed.get("no_of_doses")
+
+    buckets: List[Dict] = []          # each: {family, key, ident, members[]}
+    qs_rows: List[Dict] = []
+
+    def bucket_for(name: str):
+        ident = _rs_identity(name)
+        fam = ident.get("family", "")
+        dist = _rs_distinctive(ident.get("tokens", set()))
+        for b in buckets:
+            bfam = b["ident"].get("family", "")
+            # Block chemically distinct families that share weak generic tokens
+            if _rs_pair_blocked(fam, bfam):
+                continue
+            # Strong merge: identical recognised family
+            if fam and bfam and fam == bfam:
+                return b
+            # Else merge only on distinctive (non-generic) token equality
+            if not fam and not bfam:
+                bdist = _rs_distinctive(b["ident"].get("tokens", set()))
+                if dist and bdist and dist == bdist:
+                    return b
+        return None
+
+    for r in rows:
+        if r.get("_is_qs"):
+            qs_rows.append(r)
+            continue
+        name = r.get("component", "")
+        b = bucket_for(name)
+        if b is None:
+            b = {"ident": _rs_identity(name), "members": []}
+            buckets.append(b)
+        b["members"].append(r)
+
+    agg_rows: List[Dict] = []
+    aggregation_warnings: List[str] = []
+    for b in buckets:
+        members = b["members"]
+        qty_sum = 0.0
+        had_qty = False
+        amt_sum = 0.0
+        had_amt = False
+        stages, names, src = [], [], []
+        for m in members:
+            q = m.get("quantity")
+            if isinstance(q, (int, float)):
+                qty_sum += q; had_qty = True
+            a = m.get("amount_in_maximum_dose_mg")
+            if isinstance(a, (int, float)):
+                amt_sum += a; had_amt = True
+            names.append(m.get("component", ""))
+            st = m.get("stage") or (m.get("columns", {}) or {}).get("Stage")
+            if st:
+                stages.append(_s(st))
+            src.append(m.get("component", ""))
+
+        # Recompute amount from summed qty × doses when possible (authoritative)
+        amount = None
+        basis = members[0].get("amount_basis", "none")
+        if had_qty and no_of_doses:
+            amount = round(qty_sum * no_of_doses, 6)
+            basis = "aggregated_quantity_times_doses"
+        elif had_amt:
+            amount = round(amt_sum, 6)
+            basis = "aggregated_amount_sum"
+
+        primary = members[0].get("component", "")
+        # Prefer the recognised family label as the canonical display name
+        canon_name = b["ident"].get("family") or primary
+        canon_name = canon_name if canon_name else primary
+        if len(members) > 1:
+            aggregation_warnings.append(
+                f"Aggregated {len(members)} rows into '{canon_name}' "
+                f"(stages: {', '.join(stages) or 'n/a'}).")
+        agg_rows.append({
+            "component": canon_name if len(members) > 1 else primary,
+            "quantity": round(qty_sum, 6) if had_qty else None,
+            "amount_in_maximum_dose_mg": amount,
+            "amount_basis": basis,
+            "_is_qs": False,
+            "solvents": members[0].get("solvents", {}) or {},
+            "columns": {},
+            "_aggregation": {
+                "source_rows": len(members),
+                "stages": stages,
+                "original_names": names,
+                "aggregation_reason": (b["ident"].get("family") and "family identity")
+                                      or "distinctive-token identity",
+            },
+        })
+
+    # q.s. rows preserved as separate calculation-exempt rows
+    for q in qs_rows:
+        agg_rows.append({
+            "component": q.get("component", ""),
+            "quantity": q.get("quantity"),
+            "amount_in_maximum_dose_mg": None,
+            "amount_basis": "qs",
+            "_is_qs": True,
+            "solvents": {}, "columns": {},
+            "_aggregation": {"source_rows": 1, "stages": [], "original_names":
+                             [q.get("component", "")], "aggregation_reason": "q.s. row"},
+        })
+
+    out = dict(parsed)
+    out["rows"] = agg_rows
+    out["aggregation_warnings"] = aggregation_warnings
+    out["needs_dose_basis"] = any(
+        (not r["_is_qs"]) and r["amount_in_maximum_dose_mg"] is None for r in agg_rows)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4. CALCULATOR — exposure = amount_mg × limit_ppm / 1e6
+# ════════════════════════════════════════════════════════════════════════════
+def _rs_display_name(name: str) -> str:
+    """Readable display key for a solvent. Canonical names are used directly;
+    non-USP names keep short all-caps acronyms (CPME, TFA, MTBE) as-is and
+    title-case longer free text (RF2)."""
+    name = _s(name).strip()
+    if not name:
+        return ""
+    if name.isupper() and len(name) <= 6:
+        return name
+    return name.title() if (name.islower() or " " in name) else name
+
+
+def _rs_solvent_disp(sv: Dict) -> Optional[str]:
+    """Display key for a solvent evidence entry, or None if it should not form a
+    column. USP <467> solvents use the canonical name; a NON-USP solvent forms a
+    column ONLY when it carries a numeric ppm (RF2)."""
+    name = _s(sv.get("solvent_name"))
+    if not name or is_generic_solvent_category(name):
+        return None
+    canon = sv.get("canonical") or RSM.resolve_solvent(name)
+    if canon:
+        return canon
+    if sv.get("converted_ppm") is not None:
+        return _rs_display_name(name)
+    return None
+
+
+def _annexure_solvent_universe(mapping: Dict[str, Dict]) -> List[str]:
+    """Collect the distinct solvent display names across mapped annexures. USP
+    <467> solvents use their canonical name; non-USP solvents that carry a real
+    numeric ppm are included too (RF2). Generic categories are excluded."""
+    seen: List[str] = []
+    for m in mapping.values():
+        ann = m.get("_annexure")
+        if not ann:
+            continue
+        for sv in (ann.get("solvents") or []):
+            disp = _rs_solvent_disp(sv)
+            if disp and disp not in seen:
+                seen.append(disp)
+    return seen
+
+
+def calculate_rs_exposures(parsed: Dict, mapping: Dict[str, Dict],
+                           user_limits: Dict[str, Dict[str, float]] = None) -> Dict:
+    """
+    Compute per-component daily exposure per solvent.
+
+    Two solvent-source paths:
+      A) Excel solvent matrix: parsed['solvents_display'] is non-empty → use the
+         sheet limits/exposures and validate against the formula.
+      B) Annexure-driven: parsed['solvents_display'] is empty → derive the solvent
+         universe and per-component limits from the matched annexures'
+         solvents[] (converted_ppm). This makes unit-composition / MDD-only
+         Excels (which have no solvent columns) produce real exposure tables.
+
+    Daily Exposure (mg/day) = Amount in Maximum Dose (mg/day) × Limit (ppm) / 1e6.
+    False zeros are never invented; negative declarations contribute nothing but
+    are recorded; ambiguous evidence is flagged unresolved.
+    """
+    user_limits = user_limits or {}
+    excel_solvents = parsed.get("solvents_display", []) or []
+    solvent_canon = parsed.get("solvent_canon", {})
+    consistency_flags: List[str] = []
+
+    annexure_driven = len(excel_solvents) == 0
+    if annexure_driven:
+        solvents = _annexure_solvent_universe(mapping)
+    else:
+        solvents = excel_solvents
+
+    rows_out: List[Dict] = []
+    per_solvent_total: Dict[str, float] = {s: 0.0 for s in solvents}
+    evidence_unresolved: List[str] = []
+
+    def annexure_limit(comp: str, solvent_disp: str) -> Tuple[Optional[float], str, Dict]:
+        """Pull a usable ppm limit for this component/solvent from its annexure."""
+        m = mapping.get(comp, {})
+        ann = m.get("_annexure")
+        if not ann:
+            return None, "missing", {}
+        for sv in (ann.get("solvents") or []):
+            disp = _rs_solvent_disp(sv)
+            if disp is None or disp != solvent_disp:
+                continue
+            etype = sv.get("evidence_type")
+            ppm = sv.get("converted_ppm")
+            if etype in ("numerical_limit", "percentage_limit", "nmt",
+                         "controlled_by_spec", "coa_statement") and ppm is not None:
+                return float(ppm), "annexure", sv
+            if ppm is not None:          # non-USP / other evidence carrying a ppm
+                return float(ppm), "annexure", sv
+            if etype in ("negative_declaration", "no_source"):
+                return 0.0, "negative_declaration", sv
+            if etype == "ambiguous":
+                return None, "ambiguous", sv
+        # No explicit per-solvent evidence. If the annexure carries an overall
+        # negative declaration (e.g. "Class 1/2/3 residual solvents are not used"),
+        # treat this solvent as a CONFIRMED no-contribution (0/0), not missing.
+        if ann.get("negative_declaration"):
+            return 0.0, "negative_declaration", {"evidence_type": "negative_declaration",
+                                                 "raw_text": _s(ann.get("raw_text"))}
+        return None, "missing", {}
+
+    def excel_limit(disp: str, comp: str, sheet_limit: Optional[float]) -> Tuple[Optional[float], str]:
+        # Ingredient-row CONTENT ppm is a vendor/measured value — the Excel cell or
+        # a user override only. It must NEVER fall back to the USP <467> master
+        # regulatory limit (that limit belongs solely in the final comparison row,
+        # built from usp_limits below). Falling back to the master here filled
+        # ingredient cells with the regulatory limit (e.g. Methanol 3000 instead of
+        # the vendor content 29) and invented exposures. No vendor value → NA.
+        if sheet_limit is not None and sheet_limit > 0:
+            return sheet_limit, "excel"
+        ul = user_limits.get(comp, {}).get(disp)
+        if ul is not None and ul > 0:
+            return ul, "user"
+        return None, "missing"
+
+    for cr in parsed.get("rows", []):
+        if cr.get("_is_qs"):
+            # RF5/RF9: q.s. rows are VISIBLE but not calculable. Emit them with
+            # not_applicable solvent cells (rendered 'NA'), the raw q.s. quantity
+            # text, and no exposure. Excluded from totals and solid DP mass (the
+            # None amount is filtered out of the sums below).
+            qs_text = (_s(cr.get("quantity_raw")) or _s(cr.get("quantity"))
+                       or "q.s.")
+            rows_out.append({
+                "component": cr["component"],
+                "quantity": qs_text,
+                "amount_max_dose": None,
+                "amount_basis": cr.get("amount_basis", "q.s."),
+                "_is_qs": True,
+                "solvents": {disp: {
+                    "limit": None, "limit_source": "not_applicable",
+                    "daily_exposure": None, "exposure_source": "not_applicable",
+                    "evidence_type": "", "raw_text": "", "confidence": None,
+                    "page": None, "cell_status": "not_applicable"}
+                    for disp in solvents},
+            })
+            continue
+        amount = cr.get("amount_in_maximum_dose_mg")
+        comp = cr["component"]
+        # RS Bug 4: a component whose annexure WAS matched but is silent on a
+        # particular solvent renders "NA" (not applicable), not a blank. Only a
+        # component with no matched annexure at all leaves the cell blank.
+        has_annexure = bool(mapping.get(comp, {}).get("_annexure"))
+        row_solvents: Dict[str, Dict] = {}
+
+        for disp in solvents:
+            if annexure_driven:
+                limit_ppm, limit_src, sv_ev = annexure_limit(comp, disp)
+                sheet_de = None
+                raw_text = _s(sv_ev.get("raw_text")) if sv_ev else ""
+                etype = _s(sv_ev.get("evidence_type")) if sv_ev else ""
+                conf = sv_ev.get("confidence") if sv_ev else None
+                page = sv_ev.get("page") if sv_ev else None
+                if limit_src == "ambiguous":
+                    evidence_unresolved.append(f"{comp}/{disp}")
+            else:
+                sv = (cr.get("solvents", {}) or {}).get(disp, {}) or {}
+                sheet_limit = sv.get("limit")
+                sheet_de = sv.get("daily_exposure")
+                limit_ppm, limit_src = excel_limit(disp, comp, sheet_limit)
+                raw_text = ""; etype = ""; conf = None; page = None
+
+            computed_de = None
+            if amount is not None and limit_ppm is not None:
+                computed_de = round(amount * limit_ppm / 1_000_000.0, 6)
+
+            if sheet_de is not None:
+                daily_exp = sheet_de
+                de_src = "excel"
+                if computed_de is not None and sheet_de > 0:
+                    if abs(computed_de - sheet_de) / max(sheet_de, 1e-9) > 0.05:
+                        consistency_flags.append(
+                            f"{comp}/{disp}: Excel exposure {sheet_de} vs computed "
+                            f"{computed_de} differ >5%")
+            elif computed_de is not None:
+                daily_exp = computed_de
+                de_src = "computed"
+            elif limit_src == "negative_declaration":
+                daily_exp = 0.0
+                de_src = "negative_declaration"
+            else:
+                daily_exp = None
+                de_src = "missing"
+
+            if daily_exp is not None:
+                per_solvent_total[disp] += daily_exp
+
+            # Cell status drives rendering (Red Flag 4):
+            #   value            → real number present
+            #   confirmed_zero   → negative declaration / confirmed no contribution
+            #   not_applicable   → annexure matched but silent on this solvent → NA
+            #   unresolved       → no matched annexure (evidence genuinely missing)
+            if de_src == "negative_declaration" or (daily_exp == 0.0
+                                                    and limit_src == "negative_declaration"):
+                cell_status = "confirmed_zero"
+            elif daily_exp is not None:
+                cell_status = "value"
+            elif limit_src == "missing" and (
+                    (annexure_driven and has_annexure) or not annexure_driven):
+                # No vendor evidence for THIS solvent → NA. Covers a matched
+                # annexure that is silent on the solvent (annexure-driven, RS Bug 4)
+                # AND an empty cell in an Excel solvent matrix (which must render NA
+                # rather than borrow the USP master limit). Ambiguous evidence and a
+                # genuinely unmatched component still fall through to unresolved.
+                cell_status = "not_applicable"
+            else:
+                cell_status = "unresolved"
+
+            row_solvents[disp] = {
+                "limit": limit_ppm,
+                "limit_source": limit_src,
+                "daily_exposure": daily_exp,
+                "exposure_source": de_src,
+                "evidence_type": etype,
+                "raw_text": raw_text,
+                "confidence": conf,
+                "page": page,
+                "cell_status": cell_status,
+            }
+        rows_out.append({
+            "component": comp,
+            "quantity": cr.get("quantity"),
+            "amount_max_dose": amount,
+            "amount_basis": cr.get("amount_basis"),
+            "solvents": row_solvents,
+        })
+
+    # Drug Product totals. For a detailed/Excel-authoritative sheet, PREFER the
+    # Excel's own 'Drug Product' row and 'Total Daily Exposure' footer verbatim
+    # (Fix 3: Excel is authoritative — do not recompute/override). Fall back to
+    # summed values only when the Excel does not carry those footers.
+    dp_row = parsed.get("drug_product_row", {}) or {}
+    footer_total = parsed.get("footer_total", {}) or {}
+    dp_quantity = None
+    dp_amount = None
+    q_vals = [r.get("quantity") for r in rows_out if isinstance(r.get("quantity"), (int, float))]
+    a_vals = [r.get("amount_max_dose") for r in rows_out
+              if isinstance(r.get("amount_max_dose"), (int, float))]
+    if isinstance(dp_row.get("quantity"), (int, float)):
+        dp_quantity = dp_row["quantity"]
+    elif q_vals:
+        dp_quantity = round(sum(q_vals), 6)
+    if isinstance(dp_row.get("amount_max_dose"), (int, float)):
+        dp_amount = dp_row["amount_max_dose"]
+    elif isinstance(parsed.get("drug_product_mass_mg"), (int, float)) and parsed.get("drug_product_mass_mg"):
+        # RF1/RF12: the single-strength parser's Drug Product mass is authoritative
+        # and drives the Total-row equivalent-ppm denominator. For a LIQUID it is
+        # mL/day × density × 1000 (NOT the sum of dissolved solids — that sum, e.g.
+        # 114.8 mg, gives equivalent-ppm ~70× too high); for a SOLID it equals the
+        # sum of the non-q.s. component amounts (unchanged behaviour).
+        dp_amount = round(float(parsed["drug_product_mass_mg"]), 6)
+    elif a_vals:
+        dp_amount = round(sum(a_vals), 6)
+
+    # Excel-authoritative per-solvent totals override recomputed sums when the
+    # sheet provides a 'Total Daily Exposure' footer with a numeric exposure.
+    excel_authoritative = bool(parsed.get("solvents_display")) and (
+        bool(footer_total) or parsed.get("has_calculated_values"))
+    if excel_authoritative and footer_total:
+        for disp in solvents:
+            fv = footer_total.get(disp, {}) or {}
+            de = fv.get("daily_exposure")
+            if isinstance(de, (int, float)):
+                per_solvent_total[disp] = de
+
+    usp_limits: Dict[str, Dict] = {}
+    solvent_compliance: Dict[str, Dict] = {}
+    per_solvent_equiv_ppm: Dict[str, Optional[float]] = {}
+    footer_limit = parsed.get("footer_limit", {}) or {}
+    for disp in solvents:
+        canon = solvent_canon.get(disp) or RSM.resolve_solvent(disp)
+        mlim = RSM.get_limit_ppm(canon) if canon else None
+        mpde = RSM.get_pde_mg_day(canon) if canon else None
+        # Prefer the Excel's USP <467> limit footer when present (authoritative).
+        fl = footer_limit.get(disp, {}) or {}
+        if isinstance(fl.get("limit"), (int, float)):
+            mlim = fl.get("limit")
+        usp_limits[disp] = {"limit": mlim, "pde": mpde, "canonical": canon}
+        total = round(per_solvent_total[disp], 6)
+        # Total equivalent ppm: prefer the Excel footer's ppm if present, else
+        # compute total_exposure_mg × 1e6 / DP amount.
+        equiv_ppm = None
+        fv = footer_total.get(disp, {}) or {}
+        if isinstance(fv.get("limit"), (int, float)):
+            equiv_ppm = fv.get("limit")
+        elif dp_amount and dp_amount > 0:
+            equiv_ppm = round(total * 1_000_000.0 / dp_amount, 6)
+        per_solvent_equiv_ppm[disp] = equiv_ppm
+        compliant = None
+        if mpde is not None:
+            compliant = total <= mpde
+        solvent_compliance[disp] = {
+            "total_exposure_mg": total, "pde_mg_day": mpde,
+            "limit_ppm": mlim, "equivalent_ppm": equiv_ppm, "compliant": compliant,
+        }
+
+    return {
+        "rows": rows_out,
+        "solvents": solvents,
+        "solvent_source": "annexure" if annexure_driven else "excel",
+        "per_solvent_total": {k: round(v, 6) for k, v in per_solvent_total.items()},
+        "per_solvent_equiv_ppm": per_solvent_equiv_ppm,
+        "drug_product_quantity": dp_quantity,
+        "drug_product_amount": dp_amount,
+        "usp_limits": usp_limits,
+        "solvent_compliance": solvent_compliance,
+        "consistency_flags": consistency_flags,
+        "evidence_unresolved": evidence_unresolved,
+        "drug_product_row": parsed.get("drug_product_row", {}),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5. VALIDATOR — WARNING-FIRST policy (Red Flag 10)
+#    Hard-block ONLY for: no parsed rows, non-q.s. quantitative rows with no
+#    amount basis, no calc rows, or a structurally-empty payload. Everything
+#    else (unmapped component, missing/low-confidence annexure, no usable solvent
+#    evidence, generic policy statements, q.s. unresolved, numbering mismatch,
+#    duplicates) becomes a WARNING / manual-review item — never a blocker.
+# ════════════════════════════════════════════════════════════════════════════
+def validate_rs_full(parsed: Dict, calc: Dict, mapping: Dict[str, Dict],
+                     annexures: List[Dict], payload: Dict = None) -> Dict:
+    errors: List[str] = []
+    warnings: List[str] = []
+    unmapped_components: List[str] = []
+    low_confidence_mappings: List[str] = []
+    missing_annexure_evidence: List[str] = []
+    duplicate_annexures: List[str] = []
+    annexure_numbering_mismatches: List[str] = []
+    unresolved_qs_rows: List[str] = []
+    generic_policy_statements: List[str] = []
+    manual_review_items: List[str] = []
+
+    # ── HARD BLOCKS (only these) ──────────────────────────────────────────────
+    if not parsed.get("rows"):
+        errors.append("No component/composition rows were parsed from the Excel.")
+    if parsed.get("needs_dose_basis"):
+        errors.append("One or more non-q.s. quantitative components have no "
+                      "determinable Amount in Maximum Dose (no MDD/strength/amount "
+                      "basis).")
+    if not calc.get("rows"):
+        errors.append("No calculation rows were produced.")
+    if payload is not None:
+        comp_tbl = payload.get("composition_table") or []
+        comp_rows_total = sum(len(s.get("rows", [])) for s in comp_tbl
+                              if isinstance(s, dict))
+        smt = payload.get("solvent_matrix_tables") or {}
+        if comp_rows_total == 0 and not smt:
+            errors.append("Final payload has no composition table and no solvent "
+                          "tables — nothing reportable to render.")
+
+    # ── WARNINGS / MANUAL REVIEW (never block) ────────────────────────────────
+    for ann in annexures:
+        if isinstance(ann, dict) and ann.get("_error"):
+            warnings.append(f"Annexure {ann.get('annexure_number','?')} is malformed "
+                            "and was skipped.")
+            manual_review_items.append(
+                f"Malformed annexure {ann.get('annexure_number','?')}")
+
+    for comp, m in mapping.items():
+        if m.get("matched_annexure") is None:
+            unmapped_components.append(comp)
+            warnings.append(f"Component '{comp}' has no matched annexure.")
+            manual_review_items.append(f"Unmapped component: {comp}")
+        elif m.get("needs_confirmation"):
+            low_confidence_mappings.append(comp)
+            warnings.append(f"Component '{comp}' annexure match is low-confidence.")
+            manual_review_items.append(f"Low-confidence mapping: {comp}")
+
+    # Components mapped but annexure has no usable solvent evidence and no neg-decl
+    for row in calc.get("rows", []):
+        comp = row["component"]
+        m = mapping.get(comp, {})
+        ann = m.get("_annexure")
+        neg_decl = bool(ann and ann.get("negative_declaration"))
+        scopes = bool(ann and ann.get("declaration_scopes"))
+        row_has_value = any(sv.get("daily_exposure") is not None
+                            for sv in row.get("solvents", {}).values())
+        if ann and not row_has_value and not neg_decl:
+            missing_annexure_evidence.append(comp)
+            warnings.append(f"Component '{comp}' matched an annexure with no usable "
+                            "material-specific solvent limit.")
+            manual_review_items.append(f"Missing solvent evidence: {comp}")
+        for disp, sv in row.get("solvents", {}).items():
+            if sv.get("limit_source") == "ambiguous":
+                warnings.append(f"Solvent '{disp}' for '{comp}' has ambiguous "
+                                "evidence (manual review).")
+                manual_review_items.append(f"Ambiguous solvent evidence: {comp}/{disp}")
+
+    # Generic policy statements captured but not usable as material limits
+    for ann in annexures:
+        if isinstance(ann, dict) and ann.get("declaration_scopes") \
+           and not ann.get("solvents"):
+            for sc in ann.get("declaration_scopes", []):
+                generic_policy_statements.append(
+                    f"Annexure {ann.get('annexure_number','?')}: "
+                    f"{sc.get('scope_text','')}")
+
+    # q.s. rows that remain unresolved (display-valid, calculation-exempt)
+    for r in parsed.get("rows", []):
+        if r.get("_is_qs"):
+            unresolved_qs_rows.append(r.get("component", ""))
+
+    # Duplicate / numbering issues from the payload dedup pass
+    if payload is not None:
+        for w in payload.get("_dup_warnings", []):
+            duplicate_annexures.append(w)
+            warnings.append(w)
+        for w in payload.get("_numbering_warnings", []):
+            annexure_numbering_mismatches.append(w)
+            warnings.append(w)
+
+    for f in calc.get("consistency_flags", []):
+        warnings.append(f)
+
+    if parsed.get("aggregation_warnings"):
+        for w in parsed["aggregation_warnings"]:
+            warnings.append(w)
+
+    # Missing equivalent ppm
+    if calc.get("drug_product_amount") in (None, 0):
+        warnings.append("Drug Product total amount is unavailable; total equivalent "
+                        "ppm could not be computed.")
+        manual_review_items.append("Missing drug-product amount for equivalent ppm")
+
+    # ── conclusion status ─────────────────────────────────────────────────────
+    if errors:
+        conclusion_status = "blocked"
+    elif (unmapped_components or low_confidence_mappings or missing_annexure_evidence
+          or unresolved_qs_rows or manual_review_items or warnings):
+        conclusion_status = "incomplete_manual_review"
+    else:
+        # All resolved → compliance can be asserted iff all exposures below limits
+        comps = [c.get("compliant") for c in calc.get("solvent_compliance", {}).values()
+                 if c.get("compliant") is not None]
+        conclusion_status = ("complete_compliant"
+                             if comps and all(comps) else "generated_with_warnings")
+
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "unmapped_components": unmapped_components,
+        "low_confidence_mappings": low_confidence_mappings,
+        "missing_annexure_evidence": missing_annexure_evidence,
+        "duplicate_annexures": duplicate_annexures,
+        "annexure_numbering_mismatches": annexure_numbering_mismatches,
+        "unresolved_qs_rows": unresolved_qs_rows,
+        "generic_policy_statements_not_used": generic_policy_statements,
+        "manual_review_items": manual_review_items,
+        "conclusion_status": conclusion_status,
+    }
+
+
+def validate_rs(parsed: Dict, calc: Dict, mapping: Dict[str, Dict],
+                annexures: List[Dict], payload: Dict = None) -> Tuple[List[str], List[str]]:
+    """Backward-compatible wrapper returning (errors, warnings)."""
+    v = validate_rs_full(parsed, calc, mapping, annexures, payload)
+    return v["errors"], v["warnings"]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6. PAYLOAD BUILDER — clean RS payload for generate_residual_solvent.js
+# ════════════════════════════════════════════════════════════════════════════
+def _chunk(lst: List[Any], n: int) -> List[List[Any]]:
+    return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+
+def build_rs_payload(header: Dict, parsed: Dict, calc: Dict,
+                     mapping: Dict[str, Dict], annexures: List[Dict],
+                     text_sections: Dict, group_size: int = 3,
+                     validation: Dict = None,
+                     preserve_uploaded_annexure_numbers: bool = False,
+                     framework: str = DEFAULT_RS_FRAMEWORK) -> Dict:
+    """
+    Assemble the RS renderer payload (warning-first). Solvents are grouped to fit
+    A4. NO EI keys are emitted. Implements: reconciled supplier-table numbering,
+    deduplicated annexure list, confirmed-zero cell rendering, total-row
+    equivalent ppm, complete Drug Product row, and a risk summary table.
+    """
+    solvents = calc.get("solvents") or parsed.get("solvents_display", [])
+    rows = calc.get("rows", [])
+    usp_limits = calc.get("usp_limits", {})
+    per_total = calc.get("per_solvent_total", {})
+    per_equiv = calc.get("per_solvent_equiv_ppm", {})
+    dp_quantity = calc.get("drug_product_quantity")
+    dp_amount = calc.get("drug_product_amount")
+
+    unresolved_display = ""
+
+    def _na(v: Any) -> str:
+        """Format a value, rendering None as 'NA' — used for the USP <467>
+        comparison of a non-USP solvent (RF2)."""
+        return "NA" if v is None else _fmt(v)
+
+    def cell_pair(sv: Dict) -> Dict:
+        """Render a solvent cell honouring the four-state cell_status (RF5):
+          value          → real numeric limit + exposure
+          confirmed_zero → negative declaration: Limit 'NA', Exposure '0.000'
+          not_applicable → q.s. row (variable amount): Limit 'NA', Exposure 'NA'
+          unresolved     → no evidence: both blank (warning lives in the UI)
+        Matches the approved Epinephrine convention."""
+        status = sv.get("cell_status")
+        if status == "not_applicable":
+            return {"limit": "NA", "daily_exposure": "NA"}
+        if status == "confirmed_zero":
+            return {"limit": "NA", "daily_exposure": "0.000"}
+        if status == "value":
+            return {"limit": _fmt(sv.get("limit")),
+                    "daily_exposure": _fmt(sv.get("daily_exposure"))}
+        return {"limit": unresolved_display, "daily_exposure": unresolved_display}
+
+    # ── Deduplicate annexures (RF8) ───────────────────────────────────────────
+    # Key on (normalized material, normalized supplier) ONLY — the same material
+    # + supplier is one logical annexure regardless of filename/title (Trilaciclib
+    # Annexure 1 & 6). On collision, merge non-conflicting solvent evidence and
+    # keep the RICHER record (more solvents[], then higher confidence). Records
+    # with no resolved material never merge (avoids collapsing distinct unknowns).
+    def _norm_key(ann: Dict) -> Tuple[str, ...]:
+        mat = _rs_norm(_s(ann.get("material_name")))
+        sup = _rs_norm(_s(ann.get("supplier_name")))
+        if not mat:
+            return ("~unresolved",
+                    _rs_norm(_s(ann.get("document_title")) or _s(ann.get("filename"))),
+                    str(ann.get("annexure_number")))
+        return (mat, sup)
+
+    valid_anns = [a for a in annexures if isinstance(a, dict) and not a.get("_error")]
+    deduped: List[Dict] = []
+    key_to_idx: Dict[Tuple[str, ...], int] = {}
+    dup_warnings: List[str] = []
+    for ann in valid_anns:
+        k = _norm_key(ann)
+        if k in key_to_idx:
+            idx = key_to_idx[k]
+            kept = deduped[idx]
+            challenger = dict(ann)
+            merged_solvents = _dedup_rs_solvents(
+                (kept.get("solvents") or []) + (challenger.get("solvents") or []),
+                framework)
+            winner = dict(_pick_richer_annexure(kept, challenger))
+            winner["solvents"] = merged_solvents
+            # negative declaration only survives if the winner has no numeric limit
+            if any(s.get("converted_ppm") is not None for s in merged_solvents):
+                winner["negative_declaration"] = False
+            merged_from = list(kept.get("_merged_from", []))
+            for num in (kept.get("annexure_number"), challenger.get("annexure_number")):
+                if (num is not None and num != winner.get("annexure_number")
+                        and num not in merged_from):
+                    merged_from.append(num)
+            if merged_from:
+                winner["_merged_from"] = merged_from
+            deduped[idx] = winner
+            dup_warnings.append(
+                f"Duplicate annexure for material '{_s(ann.get('material_name'))}' "
+                f"/ supplier '{_s(ann.get('supplier_name'))}' "
+                f"(Annexure {ann.get('annexure_number','?')}) merged into the "
+                "richer record; solvent evidence combined.")
+            continue
+        key_to_idx[k] = len(deduped)
+        deduped.append(dict(ann))
+
+    # ── Display annexure numbering (Red Flag 1) ───────────────────────────────
+    # Assign sequential display numbers based on deduped order, unless the caller
+    # explicitly preserves uploaded numbers.
+    numbering_warnings: List[str] = []
+    uploaded_nums = [a.get("annexure_number") for a in deduped]
+    if uploaded_nums != list(range(1, len(deduped) + 1)):
+        numbering_warnings.append(
+            "Uploaded annexure numbers are non-sequential/duplicated; display "
+            "numbers were reconciled sequentially.")
+    orig_to_display: Dict[Any, int] = {}
+    for i, ann in enumerate(deduped, start=1):
+        disp_no = (ann.get("annexure_number")
+                   if preserve_uploaded_annexure_numbers else i)
+        orig_to_display[ann.get("annexure_number")] = disp_no
+        ann["_display_number"] = disp_no
+
+    def display_ref(ann: Dict) -> str:
+        n = ann.get("_display_number", ann.get("annexure_number", "?"))
+        return f"Annexure {n}"
+
+    # ── Solvent matrix tables (Red Flags 4,5,6) ───────────────────────────────
+    solvent_tables: Dict[str, Dict] = {}
+    groups = _chunk(solvents, max(1, group_size))
+    for gi, group in enumerate(groups):
+        table_rows = []
+        for r in rows:
+            if r.get("_is_qs"):
+                # RF5: q.s. row visible with 'NA' solvent cells + raw q.s. text.
+                sv = {s: cell_pair(r["solvents"].get(s, {})) for s in group}
+                table_rows.append({"component": r["component"],
+                                   "quantity": _s(r.get("quantity")) or "q.s.",
+                                   "amount_max_dose": "NA", "solvents": sv,
+                                   "is_qs": True})
+                continue
+            sv = {s: cell_pair(r["solvents"].get(s, {})) for s in group}
+            table_rows.append({
+                "component": r["component"],
+                "quantity": _fmt(r.get("quantity")),
+                "amount_max_dose": _fmt(r.get("amount_max_dose")),
+                "solvents": sv, "is_qs": False,
+            })
+        # Total Daily Exposure row: equivalent ppm + exposure mg (Red Flag 5)
+        totals = {s: {"limit_total": _fmt(per_equiv.get(s)),
+                      "exposure_total": _fmt(per_total.get(s))} for s in group}
+        # USP <467> comparison: a non-USP solvent has no master limit → 'NA' (RF2)
+        usp = {s: {"limit": _na((usp_limits.get(s) or {}).get("limit")),
+                   "pde": _na((usp_limits.get(s) or {}).get("pde"))} for s in group}
+        # Drug Product row: total qty + amount; solvent limit dash, exposure=total
+        drug_product_row = {
+            "quantity": _fmt(dp_quantity),
+            "amount_max_dose": _fmt(dp_amount),
+            "solvents": {s: {"limit": "-", "daily_exposure": _fmt(per_total.get(s))}
+                         for s in group},
+        }
+        solvent_tables[f"table_{4+gi}"] = {
+            "table_number": 4 + gi,
+            "caption": (f"Table {4+gi}: Residual Solvent risk Assessment in drug "
+                        "product and comparison against the control levels"),
+            "solvents": group,
+            "rows": table_rows,
+            "drug_product_row": drug_product_row,
+            "totals": totals,
+            "usp_limits": usp,
+        }
+
+    # ── Supplier declaration table from CALCULATION components (Red Flag 1) ────
+    # RF9: q.s. status affects ONLY the solvent matrix (Tables 4-6), not this
+    # table — every material with a matched annexure appears here, q.s. included.
+    supplier_decls = []
+    s_no = 0
+    for comp in [r["component"] for r in rows]:
+        m = mapping.get(comp, {})
+        ann = m.get("_annexure")
+        s_no += 1
+        if ann and ann.get("annexure_number") in orig_to_display:
+            ref = f"Annexure {orig_to_display[ann.get('annexure_number')]}"
+            supplier = _s(ann.get("supplier_name")) or "(vendor not stated)"
+        elif ann:
+            ref = display_ref(ann)
+            supplier = _s(ann.get("supplier_name")) or "(vendor not stated)"
+        else:
+            # Unmapped: no internal "manual review" language in the rendered doc.
+            ref = "-"
+            supplier = "-"
+        supplier_decls.append({
+            "s_no": s_no, "ingredient": comp,
+            "supplier": supplier, "annexure": ref,
+        })
+
+    # ── Deduplicated annexure list, 3 columns (Red Flag 2) ────────────────────
+    annexure_list = []
+    for ann in deduped:
+        annexure_list.append({
+            "annexure": display_ref(ann),
+            "material": _s(ann.get("material_name")) or "(material not stated)",
+            "supplier": _s(ann.get("supplier_name")) or "(vendor not stated)",
+            "_display_number": ann.get("_display_number"),
+        })
+
+    # ── Risk summary table (Table 7): always definitive, negligible-risk rows.
+    # Internal validation state must never leak into the rendered document.
+    v = validation or {}
+    risk_summary_table = {
+        "title": "Residual Solvent Assessment and Controls for Drug Product",
+        "columns": ["Potential Risks", "Action / Mitigation"],
+        "rows": [
+            {"risk": "Residual solvents from Drug Substance",
+             "action": "No action required, negligible risk"},
+            {"risk": "Residual solvents from Excipients",
+             "action": "No action required, negligible risk"},
+            {"risk": "Residual solvents from Pharmaceutical aids / process solvents",
+             "action": "No action required, negligible risk"},
+        ],
+    }
+
+    conclusion_status = v.get("conclusion_status", "generated_with_warnings")
+    all_warnings = list(v.get("warnings", [])) + dup_warnings + numbering_warnings
+
+    return {
+        "rs_meta": {
+            "title": header.get("title", ""),
+            "document_no": header.get("document_no", ""),
+            "product_name": header.get("product_name", ""),
+            "dosage_form": header.get("dosage_form", ""),
+            "strength": header.get("strength", ""),
+            "strength_note": header.get("strength_note", ""),
+            "department": header.get("department", "FR&D"),
+            "market": header.get("market", ""),
+            "version": header.get("version", "1.0, CURRENT"),
+            "protocol": header.get("protocol", "NA"),
+            "sop_format_number": header.get("sop_format_number", ""),
+        },
+        "product_details": {
+            "product_name": header.get("product_name", ""),
+            "market": header.get("market", ""),
+            "dosage_form": header.get("dosage_form", ""),
+            "strengths": header.get("strength", ""),
+            "maximum_daily_dose": header.get("maximum_daily_dose", ""),
+        },
+        "composition_table": parsed.get("_display_sections", []),
+        "comp_columns": parsed.get("_display_columns", []),
+        "comp_meta": {"caption": "Table 2: Unit Composition"},
+        "supplier_declaration_table": supplier_decls,
+        "solvent_matrix_tables": solvent_tables,
+        "solvent_totals": per_total,
+        "per_solvent_equiv_ppm": per_equiv,
+        "drug_product_quantity": dp_quantity,
+        "drug_product_amount": dp_amount,
+        "solvent_limit_master": {s: (usp_limits.get(s) or {}) for s in solvents},
+        "annexure_list": annexure_list,
+        "annexure_list_deduplicated": annexure_list,
+        "risk_summary_table": risk_summary_table,
+        "text_sections": text_sections,
+        "references": text_sections.get("reference", ""),
+        "revision_history": header.get("revision_history", []),
+        "signatures": header.get("signatures", []),
+        # ALL internal validation signals live ONLY under a "_" prefixed key.
+        # The renderer must not read anything prefixed with "_". This keeps
+        # manual-review / unmapped / conclusion-status data out of the document.
+        "_verification_audit": {
+            "conclusion_status": conclusion_status,
+            "validation_warnings": all_warnings,
+            "manual_review_items": v.get("manual_review_items", []),
+            "unmapped_components": v.get("unmapped_components", []),
+            "low_confidence_mappings": v.get("low_confidence_mappings", []),
+            "missing_annexure_evidence": v.get("missing_annexure_evidence", []),
+            "duplicate_annexures": dup_warnings,
+            "annexure_numbering_mismatches": numbering_warnings,
+            "generic_policy_statements_not_used":
+                v.get("generic_policy_statements_not_used", []),
+            "mode": parsed.get("mode"),
+            "no_of_doses": parsed.get("no_of_doses"),
+            "mapping": {k: {kk: vv for kk, vv in v2.items() if kk != "_annexure"}
+                        for k, v2 in mapping.items()},
+        },
+        # validator-only channels (also "_" prefixed → renderer ignores them)
+        "_dup_warnings": dup_warnings,
+        "_numbering_warnings": numbering_warnings,
+    }
+
+
+def _fmt(v: Any) -> str:
+    if v is None or v == "":
+        return ""
+    if isinstance(v, (int, float)):
+        # trim trailing zeros but keep precision
+        s = f"{v:.6f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    return _s(v)
