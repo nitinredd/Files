@@ -3956,3 +3956,411 @@ def _fmt(v: Any) -> str:
         s = f"{v:.6f}".rstrip("0").rstrip(".")
         return s if s else "0"
     return _s(v)
+
+###############
+#!/usr/bin/env python3
+"""
+Residual Solvent Annexure PDF → JSON Converter
+Dr. Reddy's IPDO | USP <467> / ICH Q3C
+
+Standalone Streamlit tool. Upload one or more vendor residual-solvent annexure
+PDFs (supplier declarations, COAs, specifications, regulatory statements, SDS).
+Claude Vision reads every page, extracts the MATERIAL identity and SOLVENT
+declarations / limits, and outputs one JSON per PDF. All JSONs are zipped for
+download and plug directly into the Residual Solvent workflow in app.py.
+
+COMPLETELY SEPARATE from the EI annexure converter (annexure_converter.py):
+this tool extracts SOLVENTS and solvent limits, never elemental impurities
+(Pb/As/Cd/…). It shares no EI element registry or EI prompts.
+
+Schema guarantee: every converted annexure is a consistent top-level OBJECT,
+never a bare list. If the model returns a list, it is wrapped under
+extracted_items with schema_repaired=true. Extraction failures return a
+structured error object; nothing crashes the run.
+"""
+import os, json, base64, logging, time, zipfile, re
+from io import BytesIO
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import streamlit as st
+import fitz                         # PyMuPDF
+from anthropic import AnthropicVertex
+
+# Shared RS logic (evidence typing, ppm conversion, schema-safe normalisation,
+# material-name extraction). This is the SAME logic used at ingestion time in
+# app.py, so the converter output and the report ingester stay perfectly aligned.
+import residual_solvent as RS
+import residual_solvent_master as RSM
+
+# ── Vertex AI — identical config to app.py ────────────────────────────────────
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "datascience-254609-genai.json"
+GCP_PROJECT = "prj-thematic-analysis-dev"
+GCP_REGION  = "us-east5"
+MODEL       = "claude-opus-4-6-20250514"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    client = AnthropicVertex(project_id=GCP_PROJECT, region=GCP_REGION)
+except Exception as _e:          # allow import without credentials (e.g. tests)
+    client = None
+    logger.warning(f"AnthropicVertex not initialised: {_e}")
+
+
+# ── Claude helpers ────────────────────────────────────────────────────────────
+def call_claude(messages: List[Dict], max_tokens: int = 8192) -> str:
+    if client is None:
+        return ""
+    for attempt in range(3):
+        try:
+            r = client.messages.create(
+                model=MODEL, max_tokens=max_tokens, messages=messages
+            )
+            return "".join(b.text for b in r.content if hasattr(b, "text"))
+        except Exception as e:
+            logger.warning(f"Claude attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    return ""
+
+
+def claude_vision(image_bytes: bytes, prompt: str) -> str:
+    if not image_bytes:
+        return ""
+    b64 = base64.standard_b64encode(image_bytes).decode()
+    return call_claude([{
+        "role": "user",
+        "content": [
+            {"type": "image",
+             "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+            {"type": "text", "text": prompt},
+        ],
+    }])
+
+
+def _s(v: Any, default: str = "") -> str:
+    return str(v).strip() if v is not None else default
+
+
+# ── PDF rasterization ─────────────────────────────────────────────────────────
+def rasterize_pdf(pdf_bytes: bytes, dpi: int = 250) -> List[bytes]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pages: List[bytes] = []
+    for page in doc:
+        pix = page.get_pixmap(matrix=mat, alpha=False, colorspace=fitz.csRGB)
+        pages.append(pix.tobytes("png"))
+    doc.close()
+    return pages
+
+
+# ── Per-page solvent prompt ───────────────────────────────────────────────────
+def make_rs_page_prompt(page_number: int, total_pages: int) -> str:
+    return (
+        f"This is page {page_number} of {total_pages} of a residual-solvent "
+        "annexure. Extract ANY residual-solvent statements or limits on THIS page. "
+        "Solvent statements may be numeric (NMT X ppm, X ppm, X%), BDL/ND, or "
+        "textual (e.g. 'solvents listed in USP <467> are not used', 'water is the "
+        "only solvent used', 'no source for residual solvents', 'testing not "
+        "required because solvent is not used', 'ethyl alcohol may be present up to "
+        "0.5% maximum', 'controlled by vendor specification').\n\n"
+        "TABULAR ROWS: when a test row is labelled by a peak/impurity id with the "
+        "chemical in parentheses ('Impurity B (Acetone)', 'Impurity A "
+        "(Chloroform)', 'RS-3 (Toluene)'), the solvent_name is the parenthesized "
+        "chemical: 'Impurity B (Acetone)' → solvent_name='Acetone'.\n\n"
+        "BOTH A RESULT AND A SPEC LIMIT (critical — never drop the spec): when a "
+        "row shows a measured result AND its specification/limit for the SAME "
+        "solvent (a 'Result | Specification' table, a range '159 - 5000', "
+        "'24 to 60', '159 (NMT 5000)', or 'result 29 ppm, spec NMT 3000 ppm'), you "
+        "MUST capture BOTH: set raw_value to the SPEC LIMIT (larger/NMT value) and "
+        "put the COMPLETE text VERBATIM in raw_text (both the result and the spec, "
+        "e.g. '159 - 5000 ppm'), evidence_type='nmt'. Never return only one number "
+        "and discard the other. If ONLY a result is given, report just that value "
+        "(evidence_type='coa_statement'); do not invent a spec.\n\n"
+        "ALSO capture material IDENTITY if THIS page shows it (RF6: a CoA header "
+        "or material block often sits on page 2+). material_name is the SUBSTANCE "
+        "the document is about (e.g. 'Sodium chloride low in endotoxins EMPROVE'), "
+        "never a document title/descriptor. supplier_name is the manufacturer. "
+        "Leave these empty if this page does not show them.\n\n"
+        "Return ONLY valid JSON (an OBJECT, never a bare array):\n"
+        "{\n"
+        '  "material_name": "", "material_name_candidates": [], "supplier_name": "",\n'
+        '  "solvents": [\n'
+        '    {"solvent_name":"", "raw_text":"", "raw_value":"", "raw_unit":"ppm|%|none",\n'
+        '     "evidence_type":"numerical_limit|percentage_limit|nmt|negative_declaration|'
+        'no_source|controlled_by_spec|coa_statement|ambiguous",\n'
+        f'     "page":{page_number}, "confidence":0.0}}\n'
+        "  ],\n"
+        '  "negative_declaration": false,\n'
+        '  "page_text_excerpt": ""\n'
+        "}"
+    )
+
+
+def _merge_rs_pages(meta_obj: Any, page_objs: List[Dict]) -> Dict:
+    """Deterministically merge the page-1 metadata object with the per-page sweep
+    results (RF6). Pure/testable — no vision calls. It:
+      • concatenates solvent evidence across ALL pages (dedup by name + raw_text),
+      • backfills material_name / supplier_name from the FIRST page that carries a
+        real one when page 1 was silent (CoA header on page 2+),
+      • unions material_name_candidates,
+      • concatenates page text across pages into raw_text,
+      • ORs negative_declaration across pages.
+    The final NMT/compendial/spec-over-batch dedup happens later in
+    residual_solvent.process_rs_annexure (single source of truth)."""
+    merged: Dict = dict(meta_obj) if isinstance(meta_obj, dict) else {}
+    pages = [p for p in ([meta_obj] + list(page_objs)) if isinstance(p, dict)]
+
+    # Identity: keep a page-1 value; else first later page that has a real one.
+    for fld in ("material_name", "supplier_name"):
+        if not _s(merged.get(fld)):
+            for p in pages:
+                if _s(p.get(fld)):
+                    merged[fld] = _s(p.get(fld))
+                    break
+
+    # material_name_candidates: order-preserving union across pages.
+    cand: List[str] = []
+    for p in pages:
+        cs = p.get("material_name_candidates")
+        if isinstance(cs, list):
+            for c in cs:
+                if _s(c) and _s(c) not in cand:
+                    cand.append(_s(c))
+    if cand:
+        merged["material_name_candidates"] = cand
+
+    # Solvents: page-1 base + every sweep page, dedup by (name, raw_text head).
+    base = merged.get("solvents") if isinstance(merged.get("solvents"), list) else []
+    extra: List[Dict] = []
+    for p in page_objs:
+        if isinstance(p, dict):
+            for sv in (p.get("solvents") or []):
+                if isinstance(sv, dict) and _s(sv.get("solvent_name")):
+                    extra.append(sv)
+    seen = set()
+    all_solvents: List[Dict] = []
+    for sv in list(base) + extra:
+        if not isinstance(sv, dict):
+            continue
+        key = (_s(sv.get("solvent_name")).lower(), _s(sv.get("raw_text")).lower()[:40])
+        if key in seen:
+            continue
+        seen.add(key)
+        all_solvents.append(sv)
+    merged["solvents"] = all_solvents
+
+    # raw_text: page-1 raw_text + each page's excerpt, concatenated (RF6).
+    chunks: List[str] = []
+    if _s(merged.get("raw_text")):
+        chunks.append(_s(merged.get("raw_text")))
+    for p in pages:
+        exc = _s(p.get("page_text_excerpt"))
+        if exc and exc not in chunks:
+            chunks.append(exc)
+    if chunks:
+        merged["raw_text"] = "\n".join(chunks)
+
+    # negative_declaration: OR across pages.
+    if any(bool(p.get("negative_declaration")) for p in pages):
+        merged["negative_declaration"] = True
+
+    return merged
+
+
+# ── Convert one PDF → RS annexure JSON ────────────────────────────────────────
+def convert_rs_pdf_to_json(pdf_bytes: bytes, filename: str, index: int,
+                           progress_callback=None, framework: str = None) -> Dict:
+    """
+    Convert one residual-solvent annexure PDF to a structured JSON object.
+
+    Steps:
+      1. Rasterize all pages
+      2. Extract material identity + solvent evidence from page 1 (RS meta prompt)
+      3. Sweep remaining pages for additional solvent statements
+      4. Merge + normalise via residual_solvent.process_rs_annexure (consistent
+         object schema, ppm conversion, evidence typing, material-not-descriptor)
+
+    Always returns a consistent top-level OBJECT. Never raises.
+    """
+    def _progress(msg: str, pct: float = 0.0):
+        if progress_callback:
+            progress_callback(msg, pct)
+        logger.info(f"[{filename}] {msg}")
+
+    # Structured error object on rasterization failure (never crash the run)
+    _progress("Rasterizing PDF pages…", 0.05)
+    try:
+        page_images = rasterize_pdf(pdf_bytes, dpi=250)
+    except Exception as e:
+        err = RS.process_rs_annexure(
+            {"_error": True, "extraction_notes": f"PDF rasterization failed: {e}"},
+            index)
+        err["filename"] = filename
+        return err
+
+    if not page_images:
+        err = RS.process_rs_annexure(
+            {"_error": True, "extraction_notes": "PDF had no readable pages."}, index)
+        err["filename"] = filename
+        return err
+
+    n_pages = len(page_images)
+    _progress(f"PDF has {n_pages} page(s). Extracting material + solvents…", 0.12)
+
+    # Step 2: page-1 metadata + solvents using the shared RS annexure prompt
+    meta_raw = claude_vision(page_images[0], RS.rs_annexure_prompt())
+    meta_obj = RS.rs_safe_json(meta_raw, want="dict")      # shape-safe (list → wrapped)
+
+    # Step 3: sweep remaining pages for additional solvent statements AND for a
+    # material/supplier identity that may live on page 2+ (RF6).
+    page_objs: List[Dict] = []
+    for pi in range(1, n_pages):
+        pct = 0.12 + 0.70 * (pi / max(1, n_pages))
+        _progress(f"Reading page {pi + 1}/{n_pages}…", pct)
+        page_raw = claude_vision(page_images[pi], make_rs_page_prompt(pi + 1, n_pages))
+        page_obj = RS.rs_safe_json(page_raw, want="dict")
+        if isinstance(page_obj, dict):
+            page_objs.append(page_obj)
+
+    # Merge page-1 metadata with every sweep page (solvents + identity + text).
+    merged = _merge_rs_pages(meta_obj, page_objs)
+
+    _progress("Normalising material + solvent evidence…", 0.88)
+
+    # Step 4: normalise through the SAME ingestion logic used by the report.
+    # Honour the project's assessment framework for multi-compendial dedup (RS
+    # Bug 1); default to USP <467> when the caller does not supply one.
+    if framework is None:
+        framework = getattr(RS, "DEFAULT_RS_FRAMEWORK", "USP <467>")
+    result = RS.process_rs_annexure(merged, index, framework)
+    result["filename"] = filename
+
+    # Build a short human-readable extraction note
+    notes = []
+    if result.get("schema_repaired"):
+        notes.append("schema repaired (list root wrapped)")
+    if result.get("negative_declaration"):
+        notes.append("negative declaration (no USP <467> solvents / water only)")
+    n_num = sum(1 for s in result.get("solvents", [])
+                if s.get("converted_ppm") is not None)
+    notes.append(f"{len(result.get('solvents', []))} solvent statement(s), "
+                 f"{n_num} with numeric ppm")
+    result.setdefault("extraction_notes", "; ".join(notes))
+
+    _progress("Done.", 1.0)
+    return result
+
+
+# ── Packaging ─────────────────────────────────────────────────────────────────
+def build_zip(results: List[Dict]) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        manifest = []
+        for r in results:
+            num = r.get("annexure_number", "?")
+            base = re.sub(r"[^A-Za-z0-9_\-]", "_",
+                          _s(r.get("material_name")) or f"annexure_{num}")[:50]
+            fname = f"RS_annexure_{num}_{base}.json"
+            zf.writestr(fname, json.dumps(r, indent=2, ensure_ascii=False))
+            manifest.append({
+                "annexure_number": num,
+                "filename": fname,
+                "source_pdf": r.get("filename", ""),
+                "material_name": r.get("material_name", ""),
+                "supplier_name": r.get("supplier_name", ""),
+                "negative_declaration": r.get("negative_declaration", False),
+                "n_solvents": len(r.get("solvents", [])),
+                "error": r.get("_error", False),
+            })
+        zf.writestr("_manifest.json", json.dumps(manifest, indent=2))
+    return buf.getvalue()
+
+
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config(page_title="RS Annexure Converter", layout="wide")
+    st.title("🧴 Residual Solvent Annexure PDF → JSON Converter")
+    st.caption("USP <467> / ICH Q3C | Dr. Reddy's IPDO | Separate from the EI "
+               "annexure converter — extracts SOLVENTS, not elemental impurities.")
+    st.markdown("Upload vendor residual-solvent annexures (declarations, COAs, "
+                "specifications, statements). Each PDF becomes one JSON that plugs "
+                "into the Residual Solvent workflow.")
+    st.markdown("---")
+
+    uploaded = st.file_uploader("Upload annexure PDF(s)", type=["pdf"],
+                                accept_multiple_files=True)
+    if not uploaded:
+        st.info("📁 Upload one or more residual-solvent annexure PDFs to begin.")
+        with st.expander("ℹ️ What this extracts"):
+            st.markdown(
+                "- **Material identity** (the subject, not the document title)\n"
+                "- **Supplier name**, document title, annexure type\n"
+                "- **Solvent statements**: numeric (NMT X ppm, X ppm, X%), BDL/ND, "
+                "or textual negative declarations\n"
+                "- **Evidence type** per solvent + **converted ppm** (0.5% → 5000 ppm)\n"
+                "- Source page, raw text, confidence, calculation basis")
+        return
+
+    st.markdown(f"**{len(uploaded)} file(s) selected:**")
+    for f in uploaded:
+        st.write(f"  📄 {f.name} ({len(f.getvalue())/1024:.0f} KB)")
+    st.markdown("---")
+
+    if st.button("🚀 Convert All PDFs", type="primary"):
+        results: List[Dict] = []
+        overall = st.progress(0.0)
+        for idx, uf in enumerate(uploaded):
+            status = st.empty()
+            def cb(msg, pct, _s=status):
+                _s.info(f"📄 {uf.name}: {msg}")
+            try:
+                res = convert_rs_pdf_to_json(uf.getvalue(), uf.name, idx + 1, cb)
+            except Exception as e:
+                logger.exception("RS conversion error")
+                res = RS.process_rs_annexure(
+                    {"_error": True, "extraction_notes": f"Unexpected error: {e}"},
+                    idx + 1)
+                res["filename"] = uf.name
+            results.append(res)
+
+            # Per-file summary
+            if res.get("_error"):
+                status.error(f"❌ {uf.name}: {res.get('extraction_notes','failed')}")
+            else:
+                mat = res.get("material_name") or "(material not resolved)"
+                sols = res.get("solvents", [])
+                if res.get("negative_declaration") and not sols:
+                    status.success(f"✅ {uf.name}: {mat} — negative declaration "
+                                   "(no USP <467> solvents / water only)")
+                else:
+                    status.success(f"✅ {uf.name}: {mat} — {len(sols)} solvent "
+                                   "statement(s)")
+                with st.expander(f"🔎 {uf.name} — extracted detail"):
+                    st.json({
+                        "material_name": res.get("material_name"),
+                        "material_name_candidates": res.get("material_name_candidates"),
+                        "supplier_name": res.get("supplier_name"),
+                        "document_title": res.get("document_title"),
+                        "annexure_type": res.get("annexure_type"),
+                        "negative_declaration": res.get("negative_declaration"),
+                        "solvents": res.get("solvents"),
+                        "schema_repaired": res.get("schema_repaired", False),
+                    })
+            overall.progress((idx + 1) / len(uploaded))
+
+        st.markdown("---")
+        n_ok = sum(1 for r in results if not r.get("_error"))
+        st.success(f"Conversion complete: {n_ok}/{len(results)} succeeded.")
+        st.download_button("📥 Download all JSON (ZIP)",
+            data=build_zip(results),
+            file_name=f"RS_annexures_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip")
+
+
+if __name__ == "__main__":
+    main()
+
