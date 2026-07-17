@@ -1,1794 +1,409 @@
-BE NOC — Final Red Flags and Intended Changes
+RS footnote validator — simplify to warning-only.
 
-Deliver a single, product-agnostic BE NOC pipeline that assembles the report
-from whatever supporting files the scientist uploads. Zero calculations.
-Warning-first: block generation ONLY on true structural failure (no files at
-all, or every uploaded annexure failed extraction). Placeholder "Not provided."
-for empty sections. No "manual review" / warning language in the DOCX body.
+Bug: current validate_excel_footnotes() hard-blocks generation when markers 
+(*, #, $, @) have no matching footnote. Over-aggressive — blocked Epinephrine 
+(1.10* overage, 5.25# preservative note) despite math being correct via 
+volume-based dosing.
 
-═══════════════════════════════════════════════════════════════
-RED FLAG 1 — Remove hardcoded chemistry lookup; require D04 upload
-═══════════════════════════════════════════════════════════════
+Fix: convert hard-block to warning-only across the entire footnote validation 
+path.
 
-Symptom: Pseudoephedrine Sulfate renders as free-base (C10H15NO, MW 165.23,
-CAS 90-82-4) instead of the sulfate (C20H32O6S, MW 428.544, CAS 7460-12-0).
-Root cause: hardcoded chemistry lookup dropped the salt qualifier.
+1. residual_solvent.py validate_excel_footnotes():
+- Never raise ExcelValidationError
+- Log all unresolved markers via logger.warning
+- Always return {salt_base_detected, matched_entries}
+- Generation always proceeds
 
-Change:
-1. Delete benoc_chemistry_lookup.py (or rename to .deprecated).
-2. Remove _backfill_chemistry() and CHEM import from benoc.py.
-3. Add new annexure type "api_information" (D04 category) covering:
-- API vendor Certificate of Analysis (CoA)
-- API vendor Drug Master File (DMF) — Open Part
-- Material Safety Data Sheet (SDS / MSDS)
-- API vendor specification sheet
-- Pharmacopeial monograph reprint
-4. Extend benoc_annexure_convertor.py classifier with api_information markers:
-"certificate of analysis", "coa", "drug master file", "dmf",
-"safety data sheet", "sds", "msds", "material specification",
-"api specification", "molecular formula", "cas number", "iupac name",
-combined with molecular formula pattern (C##H##...) or CAS pattern
-(X-XX-X).
-5. Build API_INFO_EXTRACTION_PROMPT to extract per-API from D04:
-api_name (full name including salt form and pharmacopeial designation),
-iupac_name, molecular_formula, molecular_weight, cas_number,
-therapeutic_category, indications (list), manufacturer_name,
-manufacturer_address, smiles (if present), source_document_type.
-Critical rule: preserve salt forms verbatim. Never convert or infer.
-6. Update collect_by_type() to add "api_information": [] category.
-7. Add _attach_api_information() in benoc.py:
-For each api_information doc, match to composition APIs via
-_match_api_index (salt-aware). Populate empty chemistry fields
-from the doc. Set _chemistry_source = "api_information_annexure_N".
-8. Wire _attach_api_information() into build_apis() BEFORE
-_apply_api_overrides() (metadata form still wins as final override).
-9. In validate_benoc(), warn (not block) if any API lacks chemistry:
-"Section 1 Drug Information: N API(s) [names] have no chemistry
-information. Upload the API CoA/DMF/SDS/vendor specification."
-10. Update Streamlit UI required-files list to include:
-"API Information document (per API) — required for Section 1"
+2. residual_solvent.py parse_composition_footnotes():
+- Continue to return matched_entries and unmatched_markers for audit
+- Continue to classify categories (salt/base, overage, q.s., informational)
+- No behavioral change here
+
+3. app.py _run_residual_solvent_workflow():
+- Remove try/except around validate_excel_footnotes()
+- Just call it directly
+- Never display footnote validation errors in UI
+
+4. If salt/base footnote IS present and parsed correctly:
+- Auto-populate salt_factor and base_qty as before
+- Pass to parse_single_strength_unit_composition
+
+5. If footnote missing or unparseable:
+- Log warning
+- Pipeline proceeds with default salt_factor=1.0
+- User sees no UI error
+- Math is user's responsibility for salt-form APIs
+
+Rationale: pipeline should never block on missing metadata. If scientist 
+uploads salt-form API without footnote and math comes out wrong, that's a 
+user education issue, not a code failure. Warning-first everywhere.
 
 Acceptance:
-Upload Vasudha CoA for Loratadine and Malladi CoA for Pseudoephedrine
-Sulfate. Section 1.1 shows correct Loratadine chemistry + Vasudha
-manufacturer + indications. Section 1.2 shows Pseudoephedrine Sulfate
-C20H32O6S / MW 428.544 / CAS 7460-12-0 + Malladi manufacturer + indications.
+- Epinephrine (1.10*, 5.25#, no footnotes): generates without block ✓
+- Trilaciclib 2HCl (349*, footnote present): auto-detects salt_factor=1.163 ✓
+- Trilaciclib 2HCl (349*, no footnote): generates with salt_factor=1.0 
+(wrong math, but user's responsibility), logger warns ✓
+- Chlorobutanol Hemihydrate (5.25# no footnote): generates without block ✓
+- Product without any markers: generates normally ✓
+
+No footnote-related hard blocks anywhere.
+
+
+
+Two consolidated fixes: cross-workflow JSON serialization + BE NOC final red flags.
 
 ═══════════════════════════════════════════════════════════════
-RED FLAG 2 — API name parser fabricates phantom API from dose strings
+PART A — JSON SERIALIZATION FIX (ALL 4 WORKFLOWS)
 ═══════════════════════════════════════════════════════════════
 
-Symptom: Product name "Loratadine and Pseudoephedrine Sulfate ER Tablets
-5mg/120mg" produces phantom "1.3 120mg" and "8.3 120mg" sub-sections.
+Bug: RS report generation fails with 
+"Object of type set is not JSON serializable"
 
-Root cause: _parse_api_names_from_product() splits on "and" / "/" and does
-not filter out pure dose tokens.
+Root cause: identity clustering, dedup tracking, and Excel footnote parsing 
+introduce set/frozenset objects that leak into the payload written to JSON 
+via json.dump for the renderer. Common leak points:
+- residual_solvent._rs_identity() returns "core": frozenset(...)
+- annexure_identity_clustering pools identity fields containing sets
+- parse_composition_footnotes() may use seen_markers = set()
+- process_rs_annexure() dedup tracking sets
+- Same pattern likely present in EI/DEG-EG/BE NOC after clustering fix
 
-Fix in benoc.py _parse_api_names_from_product():
-After the split, add a filter that rejects any candidate matching:
-- Pure numeric + unit: r"\d+(?:.\d+)?\s(?:mg|g|ml|mcg|μg|ug|iu|%|units?)$"
-- Pure dose ratio: r"\d+(?:.\d+)?\s*/\s*\d+(?:.\d+)?" (e.g. "5mg/120mg")
-- Pure numeric: r"^\s*\d+(?:.\d+)?\s*$"
-- Standalone dosage-form words (already stripped upstream by
-_DOSAGE_QUALIFIERS regex)
+Fix — apply in three layers:
 
-Additionally strip trailing dose strings BEFORE splitting:
-Apply r"\s*\d+(?:.\d+)?\smg\s/\s*\d+(?:.\d+)?\smg\b" removal to the
-product name so "5mg/120mg" is gone before any "and" split.
+LAYER 1 (immediate unblock) — Defensive default handler at every json.dump 
+call across all 4 workflows.
+
+In app.py _generate_rs_report(), _generate_ei_report()/assemble_and_generate 
+(EI), _generate_deg_eg_report(), _generate_benoc_report(): change every 
+json.dump call to include:
+
+def _json_safe(o):
+if isinstance(o, (set, frozenset)):
+return sorted(list(o), key=str)
+if hasattr(o, "isoformat"): # datetime/date
+return o.isoformat()
+if hasattr(o, "__dict__"):
+return str(o)
+return str(o)
+
+json.dump(payload, jf, ensure_ascii=False, default=_json_safe)
+
+This is belt-and-suspenders. Guarantees generation never fails on any 
+unserializable type across any workflow.
+
+LAYER 2 (root cause fix) — Convert at the point sets enter the payload, 
+not at serialization time.
+
+In residual_solvent.py _rs_identity() and _merge_annexure_identity():
+Change frozenset(pooled_core) → sorted(list(pooled_core))
+
+In annexure_identity_clustering.py cluster_annexures_by_identity(): 
+Ensure cluster["identity"] fields are lists, not sets, before adding 
+cluster to payload._cluster_audit.
+
+In residual_solvent.py process_rs_annexure() dedup: internal sets are fine 
+for O(1) lookup; convert to list only when adding to solvents[] audit 
+metadata or _dup_warnings.
+
+In parse_composition_footnotes(): return matched_entries as list of dicts; 
+never expose the internal seen_markers set.
+
+LAYER 3 (payload boundary sanitizer) — Optional defensive walker.
+
+Add to each workflow's payload builder as final step before returning:
+
+def _sanitize_payload(obj):
+if isinstance(obj, (set, frozenset)):
+return sorted(list(obj), key=str)
+if isinstance(obj, dict):
+return {k: _sanitize_payload(v) for k, v in obj.items()}
+if isinstance(obj, list):
+return [_sanitize_payload(v) for v in obj]
+if isinstance(obj, tuple):
+return [_sanitize_payload(v) for v in obj]
+return obj
+
+payload = _sanitize_payload(payload)
+return payload
+
+Cheap insurance. Runs once per generation. Catches anything missed at Layer 2.
+
+Diagnostic (temporary) to trace remaining sets in dev:
+
+def _find_sets(obj, path="root"):
+if isinstance(obj, (set, frozenset)):
+logger.error(f"[JSON-DBG] SET at {path} → {list(obj)[:5]}")
+elif isinstance(obj, dict):
+for k, v in obj.items():
+_find_sets(v, f"{path}.{k}")
+elif isinstance(obj, list):
+for i, v in enumerate(obj):
+_find_sets(v, f"{path}[{i}]")
+
+Call once in each workflow after payload assembly. Remove after all leaks 
+are confirmed fixed at source.
 
 Acceptance:
-"Loratadine and Pseudoephedrine Sulfate ER Tablets 5mg/120mg"
-→ ["Loratadine", "Pseudoephedrine Sulfate"] (exactly 2, no phantom)
-Same test with "Metformin HCl 500mg / Sitagliptin 50mg Tablets"
-→ ["Metformin HCl", "Sitagliptin"] (2, no phantom)
+- RS Trilaciclib generation succeeds (currently failing)
+- RS Epinephrine generation succeeds
+- RS Sofosbuvir/Esomeprazole regression clean
+- EI OSD + Injection workflows succeed with clustering enabled
+- DEG/EG workflow succeeds with FDA high-risk observations
+- BE NOC workflow succeeds with D04 clusters
+- No "Object of type set is not JSON serializable" error anywhere
+- Audit fields (_cluster_audit, _verification_audit) render as lists in 
+payload JSON
+
+Preserve: identity comparison logic continues to use sets internally for 
+O(1) lookups. Only convert at payload-construction boundary.
 
 ═══════════════════════════════════════════════════════════════
-RED FLAG 3 — STP test extractor over-flattens hierarchy
+PART B — BE NOC FINAL RED FLAGS
 ═══════════════════════════════════════════════════════════════
 
-Symptom: Section 8.2 Pseudoephedrine spec shows 42 tests when the approved
-document lists 6-7. Extractor treats microbiology sub-tests, confirmation
-tests, and pathogen sub-tests as separate top-level line items.
-Example bloat:
-27. Microbiological Test
-28. Microbial Enumeration Test
-29. TYMC
-30. TAMC
-31. Pathogen Analysis
-32. Staphylococcus aureus
-33. Confirmation test: Gram staining
-... (through 42)
+Latest generation verified at 82/100. Two critical bugs and two polish 
+items remain. Ship these to reach 90+.
 
-Root cause: STP converter emits every test method row as a separate item
-with no hierarchy collapse.
+RED FLAG A (CRITICAL) — Section 13 Stability duplicates + missing files:
 
-Fix in benoc_annexure_convertor.py STP extractor:
-1. Post-process tests_covered[] to collapse child tests under a parent when
-the parent test name is a category keyword:
-Category patterns:
-- "microbiological test" / "microbial enumeration" / "microbial limits"
-→ merge all TYMC / TAMC / Pathogen / individual organism entries
-under a single "Microbiological Testing" line
-- "identification" (top-level) + "identification by IR/UV/HPLC" (child)
-→ keep parent, drop children OR merge as sub-labels
-- "confirmation test" → merge under parent test being confirmed
-- "growth in TSI Agar", "Indole test", "Catalase test", "Oxidase test",
-"Gram staining" → subordinate to nearest parent (pathogen category)
-2. When extractor encounters a pathogen category ("Salmonella",
-"E.coli", "Clostridia", "Candida albicans", "Staphylococcus aureus"),
-collapse it and all its confirmation sub-tests under
-"Pathogen Analysis".
-3. Emit maximum 15 top-level tests per STP even for comprehensive STPs.
-4. Preserve full hierarchy in an internal _tests_detail field for audit
-but the tests_covered[] list used by build_specs_from_stp() is the
-collapsed list.
+Bug: Uploaded 4 stability files (25/60 1M, 25/60 6M, 40/75 1M, 40/75 6M). 
+Rendered output shows:
+- 2 blocks both labeled "25°C/60%RH (Initial)" — same file duplicated
+- Missing 40°C/75%RH blocks entirely
+- Missing 6M timepoints entirely
 
-Acceptance:
-Pseudoephedrine STP 167410 should emit ≤12 tests: Description, Solubility,
-Identification, Assay, Sulfate, Melting Range, Loss on Drying, Residue on
-Ignition, Related Substances, Residual Solvents, Microbiological Testing,
-Elemental Impurities. Section 8.2 shows those + "As per STP No. 167410"
-in Specifications column.
+Root cause: stability dedup key uses only batch number. All 4 stability files 
+share the same batch (LRD-2-(5+120)-F-NB1-80), so 3 of 4 collapse under one 
+key.
 
-═══════════════════════════════════════════════════════════════
-RED FLAG 4 — Storage condition label contamination in stability blocks
-═══════════════════════════════════════════════════════════════
-
-Symptom: Section 13 and annexure list show all stability blocks labeled
-"25°C/60%RH" even when file is a 40°C/75%RH file. The wrong condition is
-in the storage_condition field; the true condition only appears in the
-table's column header ("Stability- 40°C/75%RH").
-
-Root cause: stability file extractor is reading storage_condition from the
-wrong location (probably the column header for the first stability column,
-which contains the initial condition, not from the top-of-document
-condition declaration).
+Fix in benoc.py collect_by_type() and _dedup logic for stability:
+Dedup key = (batch_number, storage_condition, timepoint) — all three 
+required for uniqueness. Batch alone is NOT sufficient.
 
 Fix in benoc_annexure_convertor.py stability extractor:
-1. Extract storage_condition from the top-of-document header line
-(usually "Storage Condition: 40°C/75%RH" or from the file's title
-line "F-NB1-80 4075" filename pattern).
-2. Do NOT extract storage_condition from column headers of the result
-table. Column headers contain timepoints ("Initial", "1M", "6M"),
-not storage conditions.
-3. Filter timepoint values to reject strings that look like conditions:
-- Reject if matches r"stability\s[-—]\s*\d+"
-- Reject if matches r"\d+°?[CF]\s*/\s*\d+%\sRH?"
-- Reject if starts with "Stability-" or "Stability -"
-4. If storage_condition cannot be extracted from body, infer from filename:
-"F-NB1-80 2560" → "25°C/60%RH"
-"F-NB1-80 4075" → "40°C/75%RH"
-Store as _condition_source: "filename_inferred".
-
-Fix in benoc.py build_stability_sources():
-Filter timepoints defensively before building the annexure title:
-clean_tps = [t for t in raw_tps
-if t and not t.lower().startswith("stability-")
-and not t.lower().startswith("stability -")
-and not re.match(r"\d+°?[cf]\s/\s*\d+%?", t.lower())
-and t.lower() not in ("stability", "condition", "storage")]
+1. Extract storage_condition from filename as PRIMARY source:
+- "F-NB1-80 2560" or "F-NB1-080 2560" → "25°C/60%RH"
+- "F-NB1-80 4075" or "F-NB1-080 4075" → "40°C/75%RH"
+2. Extract timepoint from filename:
+- "1M" in filename → timepoint "1M"
+- "6M" in filename → timepoint "6M"
+3. Body extraction is secondary — only if filename detection fails
+4. Never extract storage_condition from result table column headers
+5. Filter timepoints: reject any string starting with "Stability-" or matching
+condition patterns
 
 Acceptance:
-4 stability files (25/60 1M, 25/60 6M, 40/75 1M, 40/75 6M) each get correct
-storage_condition. Annexure list shows 4 distinct entries with correct
-condition labels. Section 13 blocks show correct "Storage Condition: ..."
-header per block. No "Stability- 40°C/75%RH" appearing as a timepoint.
+- 4 stability files → 4 distinct blocks in Section 13
+- Correct labels: 25°C/60%RH 1M, 25°C/60%RH 6M, 40°C/75%RH 1M, 40°C/75%RH 6M
+- Annexure list shows 4 distinct stability entries, no duplicates
 
-═══════════════════════════════════════════════════════════════
-RED FLAG 5 — Content-identical uploads silently duplicate output
-═══════════════════════════════════════════════════════════════
+RED FLAG B (CRITICAL) — Section 12 Comparative Dissolution empty:
 
-Symptom: Scientist uploaded 24 files with different filenames but 12
-files were content-identical to another (same STP, same license, same
-stability data). Pipeline correctly processed 24 → produced 24 annexure
-entries with visible duplication.
+Bug: Section 12 shows "Not provided." even when comparative dissolution 
+report PDF is uploaded. Extractor doesn't classify or extract it.
 
-Not a code bug — user input error. But surface it defensively.
+Root cause: benoc_annexure_convertor.py has no annexure_type classifier for 
+comparative_dissolution_report documents.
 
-Fix in app.py dispatch_annexures():
-After building the out list, log a warning when two different filenames
-produce identical content signatures:
+Fix in benoc_annexure_convertor.py:
 
-from collections import Counter
-signatures = Counter()
-for ann in out:
-if isinstance(ann, dict) and not ann.get("_error"):
-at = safe_str(ann.get("annexure_type"))
-ident = (safe_str(ann.get("material_name"))
-or safe_str(ann.get("license_number"))
-or safe_str(ann.get("stp_number"))
-or safe_str(ann.get("batch_number")))
-if at and ident:
-signatures[(at, ident)] += 1
-for sig, count in signatures.items():
-if count > 1:
-logger.warning(f"[BENOC] Content-identical uploads detected: "
-f"{count} files classified as {sig[0]} with "
-f"identity '{sig[1]}'. Check for duplicates.")
+1. Add new annexure_type "comparative_dissolution_report" with classifier 
+markers:
+- "comparative dissolution" (in title or first page)
+- "F2 similarity factor" or "similarity factor F2"
+- Columns matching pattern: "Reference" + "Test" + "%DR" or "%RSD"
+- "reference product" + "test product" + numeric time points
+- Media descriptors: "0.1N HCl", "phosphate buffer", "acid + buffer"
 
-Also show in Streamlit UI verification screen when duplicates detected:
-st.warning("⚠️ Detected N files with identical content. Consider
-removing duplicates before generation.")
+2. Add COMPARATIVE_DISSOLUTION_EXTRACTION_PROMPT to extract:
+{
+"annexure_type": "comparative_dissolution_report",
+"report_number": "...",
+"test_product_name": "...",
+"test_batch_number": "...",
+"reference_product_name": "...",
+"reference_batch_number": "...",
+"reference_ar_number": "...",
+"test_ar_number": "...",
+"protocol_number": "...",
+"study_dates": {"initiation": "...", "completion": "..."},
+"dissolution_conditions": {
+"apparatus": "USP Type-II Paddle",
+"rpm": "50",
+"volume_ml": "900",
+"temperature": "37 C",
+"detection": {...}
+},
+"tables": [
+{
+"caption": "Loratadine — Media: 0.1N HCl",
+"api_name": "Loratadine",
+"media": "0.1N HCl",
+"x_axis_label": "Time (minutes)",
+"data_points": [
+{"time": "10", "ref_pct_dr": "74", "ref_pct_rsd": "14.8",
+"test_pct_dr": "55", "test_pct_rsd": "12.5"},
+...
+],
+"f2_value": "84"
+},
+...
+],
+"conclusion": "..."
+}
 
-Do NOT auto-dedup. Pipeline should respect user input. User decides
-whether to re-upload with duplicates removed.
+3. Add process_dissolution_report() in benoc.py that normalizes extracted 
+data for the payload's dissolution section.
 
-═══════════════════════════════════════════════════════════════
+4. Wire into collect_by_type():
+- "comparative_dissolution_report": None (single-slot; last upload wins if 
+multiple)
 
-═══════════════════════════════════════════════════════════════
-RED FLAG 7 — Manufacturing address distinction lost
-═══════════════════════════════════════════════════════════════
+5. Wire into build_dissolution() in benoc.py:
+Priority order:
+- Main application document dissolution (existing)
+- Comparative dissolution report annexure (NEW)
+- Meta manual_dissolution (existing)
 
-Symptom: Approved document distinguishes Test Batch (IPDO, Survey
-No. 42/45/46/54) from BE Batch (FTO Unit-3, Survey no. 41/42 part).
-AI shows same address for both.
-
-Root cause: Manufacturing Location Declaration file has both addresses,
-but extractor merged them or picked one.
-
-Fix in benoc_annexure_convertor.py manufacturing_location_declaration
-extractor:
-Extract BOTH fields explicitly:
-- test_batch_address: from "Test Batch" / "TEST BATCH" section
-- be_batch_address: from "BE Batch" / "PROPOSED BE BATCH" section
-Do not default one to the other. If only one is present, mirror to the
-other with an audit note _be_address_source: "same_as_test_batch".
+6. In generate_benoc.js buildDissolutionSection: 
+Chart generation via matplotlib auto-fires when dissolution.tables[] 
+contains data_points arrays. Existing logic unchanged.
 
 Acceptance:
-Section 2 shows different addresses if the declaration file has different
-addresses. If only one address in file, both fields show same address
-(current behavior preserved).
+- Upload D08_Comparative_Dissolution_Report.pdf
+- Section 12 populated with 3 tables (Loratadine, Pseudoephedrine IR, 
+Pseudoephedrine ER)
+- F2 = 84 shown for Loratadine and Pseudoephedrine ER
+- 3 dissolution charts auto-rendered via matplotlib
+- Reference batch AT5099A and Test batch LRD-2-(5+120)-F-NB1-80 shown
 
-═══════════════════════════════════════════════════════════════
-RED FLAG 8 — Structure generation pipeline consumes D04 output
-═══════════════════════════════════════════════════════════════
+RED FLAG C (POLISH) — Section 8.1 API spec fallback:
 
-No new code needed if D04 extraction populates iupac_name, smiles,
-cas_number. Existing generate_structure() already has fallback chain:
-1. Explicit SMILES → RDKit direct render
-2. IUPAC → OPSIN → SMILES → RDKit
-3. CAS + name → PubChem → SMILES → RDKit
-4. Blank if all fail (no block, no fabrication)
+Bug: When Loratadine STP is not uploaded, Section 8.1 shows "Not provided." 
+But Loratadine D04 CoA (already uploaded) contains a spec table with 
+Description, Solubility, Melting Point, LOD, ROI, Assay.
 
-Verify:
-- Loratadine D04 with IUPAC → renders correct 2D structure
-- Pseudoephedrine Sulfate D04 with IUPAC of sulfate → renders correct
-structure (may render base with sulfate note since OPSIN struggles with
-2:1 salts; that's acceptable, do not fabricate salt structure)
+Fix in benoc.py build_drug_substance_specs():
+Priority chain for Section 8.N spec population:
+1. Drug substance STP for that API (existing)
+2. FALLBACK: physicochemical properties from api_information (D04) annexure
+Extract from D04 cluster's raw_text section labeled "Physicochemical 
+Properties" and format as spec table
+3. Otherwise: "Not provided."
 
-═══════════════════════════════════════════════════════════════
-GLOBAL RULES (unchanged, preserved)
-═══════════════════════════════════════════════════════════════
+In benoc_annexure_convertor.py api_information extractor, add 
+physicochemical_properties field:
+{
+"physicochemical_properties": [
+{"test": "Description", "specification": "White or almost white 
+crystalline powder"},
+{"test": "Solubility", "specification": "Practically insoluble in water; 
+freely soluble in methanol..."},
+...
+]
+}
 
-- Warning-first. Hard-block only on structural failure.
-- Placeholder "Not provided." in empty sections. Never render warning
-text in DOCX body.
-- Sequential Annexure 1..N numbering in build_annexure_list.
-- No calculations anywhere in BE NOC pipeline.
-- Product-agnostic. All rules based on classification patterns, not on
-specific product names.
-- Reuse existing identity resolver from residual_solvent.py; do NOT
-rebuild.
-- Multi-page annexure extraction: rasterize ALL pages, merge results.
-- Never fabricate chemistry values. If D04 not provided, section stays
-empty with warning in UI panel (not in DOCX).
+Acceptance:
+- Loratadine D04 uploaded, no Loratadine STP
+- Section 8.1 shows 6 tests extracted from D04 CoA physicochemical section
+- Loratadine STP uploaded (future case): STP takes priority, D04 fallback 
+ignored
+
+RED FLAG D (POLISH) — Strength field population:
+
+Bug: Header Strength field and Section 10 Innovator Strength column both 
+blank.
+
+Fix in benoc.py build_benoc_payload():
+Extract strength ("5 mg / 120 mg" or similar) from:
+1. Meta.strength if user entered (highest priority)
+2. Test License extracted "label_claim" or "strength" field
+3. RLD Utilization extracted "strength" field
+4. First stability file "label_claim" field
+5. Empty string if all fail
+
+Populate:
+- payload.meta.strength
+- payload.innovator.strength
+- Any other section referencing strength
+
+Acceptance:
+- With any of the above sources present, header shows "5 mg / 120 mg"
+- Section 10 Innovator table shows strength column populated
 
 ═══════════════════════════════════════════════════════════════
 IMPLEMENTATION ORDER
 ═══════════════════════════════════════════════════════════════
 
-Phase 1 (blocking correctness):
-1. RED FLAG 1 — Remove hardcoded lookup, require D04
-2. RED FLAG 2 — Fix API name parser (phantom section)
-3. RED FLAG 6 — Fix manufacturing_license and stability dedup keys
-
-Phase 2 (polish):
-4. RED FLAG 3 — STP hierarchy collapse
-5. RED FLAG 4 — Storage condition extraction fix
-6. RED FLAG 7 — Test/BE batch address distinction
-
-Phase 3 (defensive):
-7. RED FLAG 5 — Content-identical upload warning
-8. RED FLAG 8 — Verify structure pipeline consumes D04
-
-Acceptance (end-to-end):
-Upload 11 supporting files + 2 API D04 files (Loratadine CoA + Pseudoephedrine
-Sulfate CoA). Generate. Expected outcome:
-- Sections 1.1 and 1.2 fully populated with correct chemistry per API
-(Pseudoephedrine shows Sulfate values, not base)
-- No phantom "1.3 120mg" section
-- Section 2 shows Test Batch vs BE Batch addresses
-- Section 8.2 shows ≤12 clean tests (not 42)
-- Section 13 shows 4 stability blocks with correct condition labels
-- Annexure list shows 13 items (11 supporting + 2 D04) sequentially
-- Sections 5, 6, 7, 8.1, 12 correctly show "Not provided." (BMR + Loratadine
-STP + comparative dissolution genuinely absent)
-- Score target: 85+/100 against approved TSR
-
-
-CROSS-CUTTING ANNEXURE IDENTITY CLUSTERING — All 4 doc types (EI, RS, DEG/EG, BE NOC)
-
-CORE PROBLEM:
-Each material is documented across multiple annexures (CoA, declaration, DMF, SDS).
-Current mappers pick ONE annexure per material and drop the rest, losing information.
-Example: Pearlitol Mannitol — Roquette declaration has DEG/EG limits, Signet CoA has
-material code 100020207. Current pipeline captures one, not both.
-
-FIX:
-Two-phase mapping applied uniformly across all 4 doc types.
-Phase 1: Cluster all uploaded annexures by material identity (universal).
-Phase 2: Merge cluster evidence per doc type; display one row per cluster.
-
-═══════════════════════════════════════════════════════════════
-NEW MODULE — annexure_identity_clustering.py (universal, reused by all 4)
-═══════════════════════════════════════════════════════════════
-
-Location: root of app, alongside residual_solvent.py.
-
-Purpose: Group raw annexures into identity clusters using the proven identity
-resolver from residual_solvent.py. Product-agnostic. Zero doc-type logic.
-
-API:
-- cluster_annexures_by_identity(annexures: List[Dict]) -> List[Cluster]
-- Cluster shape:
-{
-"cluster_id": int,
-"canonical_name": str, # display name
-"identity": Dict, # merged identity for future matching
-"annexures": List[Dict], # all raw annexures in this cluster
-"match_reasons": List[str],
-"cluster_size": int,
-}
-
-Implementation:
-1. Build identity fingerprint for each annexure by pooling material_name,
-material_name_candidates, supplier_name, brand_name, trade_name, and
-filename-derived identity (strip annexure numbers and extensions).
-2. For each annexure, compare against existing clusters using
-residual_solvent._rs_score. If score >= IDENTITY_CLUSTER_THRESHOLD (0.75
-default; tunable), join cluster. Else start new cluster.
-3. When joining, merge identity fingerprints so cluster's representative
-identity strengthens.
-4. Preserve raw annexures in cluster["annexures"] — nothing is discarded.
-5. Reuse _rs_identity, _rs_score from residual_solvent.py. Do NOT rebuild
-identity logic.
-6. Cluster canonical_name selection priority:
-- First non-empty material_name from any CoA-type annexure
-- Else first non-empty material_name from any annexure
-- Else canonical family alias if detected
-- Else filename-derived name
-
-Utility functions:
-- _pick_primary_annexure(cluster) → primary annexure for display
-Priority: coa > vendor_spec > vendor_declaration > sds > monograph > first
-- _pick_best_material_code(cluster) → material code from CoA preferred
-Validation: matches ^(1000|2000|3000|3500)\d{4,5}$ or ^350\d{6}$
-- _pick_best_vendor(cluster) → manufacturer preferred over supplier
-- _pick_best_specification_no(cluster) → DRL spec pattern
-- _pool_raw_text(cluster) → concatenated raw_text from all annexures for
-narrative extraction
-
-═══════════════════════════════════════════════════════════════
-PER-DOC-TYPE MERGE FUNCTIONS
-═══════════════════════════════════════════════════════════════
-
-Each doc type has one merge function that extracts doc-relevant fields from
-a cluster. Add to the doc type's backend module.
-
-DEG/EG (deg_eg.py):
-def merge_deg_eg_evidence(cluster) -> Dict:
-Extract from all cluster annexures:
-- material_code (via _pick_best_material_code)
-- vendor / manufacturer_name (via _pick_best_vendor)
-- drl_specification_no (via _pick_best_specification_no)
-- deg_present: prefer Yes (batch-tested) > No (guarantee ceiling) > No (default)
-- eg_present: same priority
-- deg_specification_limit / eg_specification_limit: first non-null
-- fda_high_risk: True if any annexure sets it (or material canonical is on
-FDA high-risk list: glycerin, propylene glycol, sorbitol, mannitol,
-maltitol, HSH, PEG, polysorbate)
-- mechanism: extracted from pooled raw_text (hydrogenation by-product,
-manufacturing residue, etc.)
-- guarantee_ceiling: True if pooled raw_text contains guarantee-ceiling
-signals (see prior DEG/EG spec)
-
-Downgrade rules (preserve prior Tier 1/2/3 fixes):
-- Yes + guarantee-ceiling signals → downgrade to No, keep spec_limit
-- Yes + policy_statement source → downgrade to Unknown then No
-- Yes + no numeric limit → downgrade to Unknown then No
-
-RESIDUAL SOLVENT (residual_solvent.py):
-def merge_rs_evidence(cluster) -> Dict:
-Extract from all cluster annexures:
-- material_name, material_code, supplier, drl_spec_no
-- solvents[]: union of all solvent entries across cluster
-- Deduplicate by (canonical_solvent, compendial_priority) using existing
-dedup logic in process_rs_annexure
-- Apply NMT-over-batch-actual preference (existing rule)
-- Apply USP/NF-first compendial preference (existing rule)
-- negative_declaration: True if ANY cluster annexure has it AND
-no positive solvent entries exist (respect the "if solvents[] has any
-positive limit → false" rule from prior fix)
-- declaration_scopes: union across cluster
-
-BE NOC (benoc.py):
-def merge_benoc_evidence(cluster) -> Dict:
-Extract from all cluster annexures based on annexure_type:
-For api_information cluster:
-- iupac_name, molecular_formula, molecular_weight, cas_number,
-therapeutic_category, indications, manufacturer, manufacturer_address,
-smiles → first non-empty from cluster, prefer CoA over SDS over DMF
-For stability_file cluster: not typically clustered (each timepoint unique)
-For stp_document cluster: not typically clustered (drug substance vs FP distinct)
-For manufacturing_license cluster: cluster only if same license_number
-(different Form 25 numbers = different clusters)
-
-ELEMENTAL IMPURITY (annexure_converter.py / EI backend):
-def merge_ei_evidence(cluster) -> Dict:
-Extract from all cluster annexures:
-- material_name, material_code, supplier
-- elements[]: union across cluster, deduplicate by (symbol, source_priority)
-- Prefer measured concentration values over LOD/LOQ statements
-- Apply existing EI evidence-priority logic
-- source_type: pick most authoritative (CoA > vendor decl > MSDS)
-
-═══════════════════════════════════════════════════════════════
-CLUSTER-BASED build_annexure_list PER DOC TYPE
-═══════════════════════════════════════════════════════════════
-
-Change signature: build_annexure_list now takes clusters, not raw annexures.
-
-DEG/EG annexure list (Section 16 in DEG/EG DOCX):
-Columns: Annexure No. | Material Code | Ingredient | Vendor
-Rows: one per cluster.
-For each cluster:
-Annexure N = sequential position
-Material Code = _pick_best_material_code(cluster) or blank
-Ingredient = cluster.canonical_name
-Vendor = _pick_best_vendor(cluster) or blank
-
-RS annexure list:
-Columns: Annexure No. | Material | Supplier
-Rows: one per cluster with same primary-selection logic.
-
-BE NOC annexure list (Section 16 in BE NOC DOCX):
-Preserve existing sequential ordering rules (Test License → STPs → Licenses
-→ RLD/Narcotic → Stability). Clusters affect only STP grouping (multiple STP
-files for same drug substance cluster) and api_information grouping.
-Columns: Annexure No. | Title of Annexure | Source (audit only)
-
-EI annexure list:
-Columns: Annexure No. | Material | Supplier
-Rows: one per cluster.
-
-Rules for all:
-- Sequential numbering starts at 1, no gaps.
-- Blank cells allowed (material_code, vendor may be missing).
-- Never render "Not provided", "Manual review", "Unknown", or warning text
-in the DOCX annexure list body.
-- Empty cell = blank cell, not placeholder text.
-
-═══════════════════════════════════════════════════════════════
-BACKEND WIRING PER DOC TYPE
-═══════════════════════════════════════════════════════════════
-
-Each workflow's payload builder does:
-
-1. Call cluster_annexures_by_identity(raw_annexures) → clusters
-2. Match composition materials to clusters (not raw annexures):
-For each composition material:
-- Score against each cluster's identity
-- Pick best-matching cluster
-- Call doc-type merge_*_evidence(cluster) → merged_data
-- Populate assessment/calculation table row with merged_data
-3. Build annexure list from clusters using cluster-based build_annexure_list
-4. Store cluster mapping in payload under "_cluster_audit" (internal only,
-never rendered in DOCX)
-
-Composition-to-cluster matching:
-- Same _rs_score identity resolver, applied composition ↔ cluster.identity
-- Threshold: 0.55 (existing FUZZY_ACCEPT_THRESHOLD) for auto-map
-- Below threshold: leave material unmapped, warn in UI only
-
-Assessment table population:
-- DEG/EG Table 2: uses merged evidence per material
-- RS Section 5: uses merged solvent evidence per material
-- EI element table: uses merged element data per material
-- BE NOC Section 1 (per API): uses merged api_information data per API cluster
-
-═══════════════════════════════════════════════════════════════
-UI VERIFICATION SCREEN (Streamlit)
-═══════════════════════════════════════════════════════════════
-
-Add cluster visibility panel in each workflow's verification screen:
-
-Show a collapsible expander "Annexure Identity Clustering":
-- One row per cluster
-- Columns: Cluster ID | Canonical Name | # Files | Files
-- Files column shows filenames comma-separated
-
-Scientist can review clusters before generation. Clusters with unexpected
-groupings visible; single-file clusters visible; large clusters visible.
-
-Do not block generation on any cluster issue. Warning-first.
-
-═══════════════════════════════════════════════════════════════
-GLOBAL RULES (preserve prior fixes across all workflows)
-═══════════════════════════════════════════════════════════════
-
-- Warning-first validation. Hard-block only on: no files uploaded, or every
-annexure extraction failed.
-- Placeholder "Not provided." in empty DOCX sections. Never "Unknown",
-never "Manual review", never warning language in DOCX body.
-- Multi-page annexure extraction: rasterize ALL pages, merge results,
-concatenate raw_text across pages.
-- Preserve DEG/EG three-tier classification (Yes / No + guarantee ceiling /
-No + not applicable) with FDA-high-risk observation generation.
-- Preserve RS overage/salt-base/density/liquid-mass fixes.
-- Preserve RS vendor-content vs USP-master separation.
-- Preserve RS non-USP solvent inclusion with N/A for USP row.
-- Preserve BE NOC D04 requirement for API chemistry (no hardcoded lookup).
-- Reuse existing identity resolver architecture; no rebuilds.
-- Zero cross-document-type logic bleed.
-
-═══════════════════════════════════════════════════════════════
-ACCEPTANCE (test cases across all 4 doc types)
-═══════════════════════════════════════════════════════════════
-
-DEG/EG — Pearlitol Mannitol case:
-Upload:
-- Roquette EG/DEG declaration for Pearlitol Mannitol Powder
-- Signet CoA for Pearlitol 50C (100020207)
-Expected:
-- 1 cluster: Mannitol / Pearlitol 50C
-- Table 2 row: material_code=100020207, ingredient=Mannitol (Pearlitol 50C),
-DEG=No, EG=No, spec_limit="< 620 ppm"
-- Annexure list: 1 row for Mannitol showing 100020207 and Roquette vendor
-- Observations paragraph: hydrogenation mechanism, guarantee ceiling
-language, FDA high-risk rationale (from Roquette declaration)
-
-DEG/EG — Croscarmellose Sodium multi-doc case:
-Upload:
-- Croscarmellose Sodium CoA (100003381)
-- Croscarmellose Sodium nitrosamine declaration
-- Croscarmellose Sodium DEG/EG declaration
-Expected:
-- 1 cluster: Croscarmellose Sodium
-- Table 2 row: material_code=100003381, DEG=No, EG=No
-- Annexure list: 1 row for Croscarmellose Sodium
-- All 3 files pooled internally for evidence extraction
-
-RS — Chlorobutanol multi-doc case:
-Upload:
-- Chlorobutanol Hemihydrate CoA
-- Chlorobutanol residual solvent declaration
-Expected:
-- 1 cluster: Chlorobutanol Hemihydrate
-- Section 5 rows for Chlorobutanol use merged solvent evidence
-- Annexure list: 1 row for Chlorobutanol showing supplier
-
-RS — Trilaciclib multi-doc case:
-Upload:
-- Trilaciclib 2HCl RS declaration
-- Trilaciclib 2HCl separate TFA declaration
-Expected:
-- 1 cluster: Trilaciclib 2HCl
-- Section 5 shows all solvents including CPME 1500 ppm and TFA 3400 ppm
-(from merged evidence)
-- Annexure list: 1 row for Trilaciclib
-
-BE NOC — Loratadine API multi-doc case:
-Upload:
-- Vasudha Pharma Chem CoA for Loratadine
-- Vasudha DMF summary for Loratadine
-Expected:
-- 1 cluster: Loratadine (api_information type)
-- Section 1.1 chemistry populated from cluster merge
-- Annexure list: 1 row for Loratadine API Information
-
-BE NOC — Pseudoephedrine Sulfate salt-form case:
-Upload:
-- Malladi CoA for Pseudoephedrine Sulfate (preserving salt form)
-Expected:
-- Section 1.2 shows Pseudoephedrine Sulfate values (C20H32O6S, MW 428.544,
-CAS 7460-12-0), NOT free base
-- Annexure list: 1 row for Pseudoephedrine Sulfate
-
-EI — Excipient with multi-annexure case:
-Upload:
-- Excipient CoA (with 24 elements)
-- Same excipient elemental impurity declaration (with 15 more elements or
-updated concentrations)
-Expected:
-- 1 cluster
-- EI element table shows union of elements from both annexures
-- Annexure list: 1 row for the excipient
-
-═══════════════════════════════════════════════════════════════
-IMPLEMENTATION ORDER (single sprint)
-═══════════════════════════════════════════════════════════════
-
-Step 1: Build annexure_identity_clustering.py (universal module)
-Step 2: Wire into DEG/EG workflow first (pilot; test Pearlitol case)
-Step 3: Add merge_deg_eg_evidence() and update Table 2 population
-Step 4: Update DEG/EG build_annexure_list to cluster-based
-Step 5: Add UI verification panel showing clusters
-Step 6: Wire into RS workflow (add merge_rs_evidence)
-Step 7: Update RS Section 5 population and annexure list
-Step 8: Wire into EI workflow (add merge_ei_evidence)
-Step 9: Update EI element table population and annexure list
-Step 10: Wire into BE NOC workflow (add merge_benoc_evidence)
-Step 11: Update BE NOC Section 1 and annexure list
-Step 12: Run acceptance tests for all 4 doc types simultaneously
-
-Test all 4 doc types together after implementation, not sequentially.
-Duplication tests, single-annexure baseline tests, and multi-annexure
-cluster tests for each doc type.
-
-═══════════════════════════════════════════════════════════════
-NON-GOALS (do not do)
-═══════════════════════════════════════════════════════════════
-
-- Do NOT auto-deduplicate identical-content files. Different annexures with
-same identity but DIFFERENT information should cluster and merge.
-Identical-content files are a separate issue (warn in UI, do not silently
-drop).
-- Do NOT change the identity resolver logic itself. Only apply it in a new
-place (annexure ↔ annexure clustering) before its existing place
-(annexure ↔ composition matching).
-- Do NOT expose cluster IDs in the DOCX output. Cluster mechanics are
-internal audit; scientist sees clean annexure list.
-- Do NOT re-cluster on every rerun. Cluster once per session, store in
-session state.
-- Do NOT change existing calculation logic in EI or RS. Only the source of
-evidence (raw annexure → cluster) changes.
-
-
-Residual Solvent — Final Consolidated Red Flags
-
-Verified working baseline: Component amount calculations, USP <467> comparison
-row, cell rendering (value/confirmed_zero/not_applicable/unresolved), non-USP
-solvent inclusion, compendial priority, NMT-over-batch-actual dedup, canonical
-alias normalization, multi-page annexure extraction, salt/base multiplier
-formula (when correct salt_factor supplied), overage handling (when correctly
-detected), core RS master coverage for Class 1/2/3 ICH Q3C solvents.
-
-Four red flags remaining. Fix product-agnostic. Do not regress working paths.
-Preserve all prior fixes.
-
-═══════════════════════════════════════════════════════════════
-RED FLAG 1 — Mandatory Excel marker footnote parsing
-═══════════════════════════════════════════════════════════════
-
-Bug: Excel quantity cells with markers (*, #, $, @, etc.) require footnote 
-text to parse correctly. Two failure modes:
-
-Case A (Trilaciclib): "349*" for salt-form API. Excel has no footnote. User 
-asked for salt_factor, guessed 1.4 (wrong). Correct value from footnote 
-would be 1.163. All Amount in Max Dose values off by 1.203x.
-
-Case B (Epinephrine): "1.10*" for 10% overage on API. Excel has no footnote. 
-Volume-based dosing (mg/mL) naturally captured overage in this case — math 
-worked coincidentally. But same class of missing-context bug.
-
-Case C (q.s. markers): "@" on Water for Injection, "Qs to adjust pH" on HCl. 
-Standard q.s. notation — needs recognition to render "NA" cells correctly.
-
-Architectural fix: Make Excel footnotes mandatory when markers present. Parse 
-footnote content to classify purpose. Route to appropriate handler.
-
-Fix in residual_solvent.py:
-
-1. Add parse_composition_footnotes(excel_bytes):
-Scan all cells across all sheets for marker-marked quantity cells.
-Supported markers: *, **, ***, #, ##, $, @, †, ‡, § (all footnote symbols).
-Record: ingredient_name, quantity_value, marker_symbol, sheet, row.
-
-Scan all cells for footnote text starting with matching marker.
-Classify footnote purpose into 4 categories:
-
-Category A — Salt/base equivalence:
-Patterns:
-- "X mg of [salt] is equivalent to Y mg [base]"
-- "X mg of [salt] contains Y mg [base]"
-- "X mg of [salt] equals Y mg [base]"
-- "* Corresponding to Y mg [base]"
-- "* Expressed as [base name]"
-Extracted values: salt_qty (X), base_qty (Y), salt_name, base_name
-Compute: salt_factor = salt_qty / base_qty
-
-Category B — Overage:
-Patterns:
-- "X% overage of API"
-- "includes overage of X%"
-- "Y mg per mL includes X% overage"
-- "manufacturing overage of X%"
-Extracted values: overage_pct (X)
-Compute: effective_qty = declared_qty / (1 + overage_pct/100)
-
-Category C — q.s. notation:
-Patterns:
-- "Qs to adjust pH to X"
-- "Qs to X mL"
-- "Qs to make X mL"
-- "q.s.", "q. s.", "Q.s"
-- "quantity sufficient"
-Set: is_qs flag on the row
-
-Category D — Informational:
-Any other footnote text (preservative note, adjustment note, etc.)
-Log for audit; no math effect
-
-Return: matched_entries with classification per marker, unmatched_markers 
-for validation errors.
-
-2. Add validate_excel_footnotes(excel_bytes):
-Wraps parse_composition_footnotes. Raise ExcelValidationError if:
-- Marker present on quantity cell but no matching footnote text
-- Category A footnote present but cannot extract salt_qty AND base_qty
-- Category B footnote present but cannot extract overage percentage
-
-Provide clear error message with:
-- Which ingredients have unmatched markers
-- Required footnote format examples for each category
-- Reference to approved TSR footnote convention
-
-3. In app.py _run_residual_solvent_workflow:
-BEFORE classify_rs_excel, call validate_excel_footnotes.
-Block workflow on validation errors with UI error message.
-
-On validation pass:
-- Category A entries → set salt_factor, base_qty per ingredient
-- Category B entries → set overage_pct per ingredient
-- Category C entries → flag is_qs on row (renders "NA")
-- Pass to parse_single_strength_unit_composition (never ask user)
-
-4. UI simplification:
-Remove salt_factor field from Advanced section.
-Remove overage_pct field from Advanced section.
-
-Keep only:
-- Maximum Daily Dose input (single field)
-* If unit basis = "mg/vial" or "mg/tablet" or "mg/capsule": ask in mg/day
-* If unit basis = "mg/mL": ask in mL/day
-* If unit basis = "mg/sachet": ask in sachets/day
-- Density input (only shown for mg/mL unit basis — optional override, see 
-Red Flag 2)
-
-Show detected marker classifications in info panel (informational, not a 
-confirmation gate):
-"Auto-detected markers:
-* on 'Trilaciclib 2HCl' (349 mg/vial) → Salt/base equivalence
-Salt: 349 mg dihydrochloride ≡ Base: 300 mg (factor 1.163)
-# on 'Chlorobutanol' (5.25 mg/mL) → Informational note
-@ on 'Water for Injection' → q.s. marker (NA cells)"
-
-5. Product-agnostic marker vocabulary:
-Support salt suffixes: HCl, 2HCl, 3HCl, HBr, hydrochloride, dihydrochloride,
-trihydrochloride, sulfate, hemisulfate, bisulfate, mesylate, methanesulfonate,
-tosylate, besylate, phosphate, tartrate, hemitartrate, acetate, citrate,
-maleate, fumarate, sodium, potassium, calcium, magnesium, bromide, iodide,
-nitrate, xinafoate, camsylate, napsylate.
-
-Acceptance:
-
-Trilaciclib (weight-based, salt-form):
-Excel: 349* AND footnote "* 349 mg of Trilaciclib Dihydrochloride is 
-equivalent to 300 mg Trilaciclib base"
-Auto-detected: Category A, salt_factor=1.163, base_qty=300
-User inputs: MDD = 432 mg/day (base) — only field
-Multiplier: 432/300 = 1.44
-Amounts: Trilaciclib 502.56 mg, Mannitol 432 mg, Citric acid 108.86 mg,
-Drug Product 1043.42 mg ✓
-
-Epinephrine (volume-based, overage):
-Excel: 1.10* AND footnote "* 1.10 mg per mL includes 10% overage"
-Auto-detected: Category B, overage_pct=10
-User inputs: MDD = 8 mL/day (density auto-estimated, see Red Flag 2)
-Multiplier: 8 (mL directly)
-Amounts: Epinephrine 8.8 mg, NaCl 60 mg, Chlorobutanol 42 mg,
-Sodium Metabisulfite 4 mg ✓
-
-Metformin HCl (weight-based, salt-form):
-Excel: "500*" + footnote "500 mg = 400 mg base"
-Auto-detected: Category A
-MDD input: 2000 mg
-Multiplier: 2000/400 = 5
-Metformin amount: 500 × 5 = 2500 mg ✓
-
-Excel with no markers at all:
-No validation error triggered
-Standard workflow with MDD input only
-
-Rejection cases:
-- Excel with "349*" but no footnote → ExcelValidationError with fix message
-- Excel with unrecognized Category A pattern → error requesting clarification
-- Excel with malformed q.s. text ("Qsto") → error requesting standard notation
-
-═══════════════════════════════════════════════════════════════
-RED FLAG 2 — Density: auto-estimate + optional user override
-═══════════════════════════════════════════════════════════════
-
-Bug: Epinephrine drug product mass = 8000 mg (density 1.0 default). Approved 
-TSR = 8800 mg (density 1.1 from formulation specification). Hardcoded default 
-per dosage form is not product-agnostic. Different formulations need different 
-densities.
-
-Architectural principle: Auto-estimate density from composition. Present the 
-estimated value as an optional override field. Pipeline uses the estimate 
-without requiring user confirmation. Scientist can update if their 
-formulation spec differs.
-
-Fix in residual_solvent.py and app.py:
-
-For single_strength_unit_composition mode with unit basis = "mg/mL":
-
-1. Add estimate_density_from_composition(components):
-"""
-Approximate drug product density from composition data.
-Universal formula:
-density_estimate = 1.000 + (solids_g_per_mL × 0.65)
-
-Where solids_g_per_mL = sum of quantity/mL for non-q.s. components.
-
-Adjustments:
-- Alcohol content >15% by weight → subtract 0.05
-- Sugar content >30% by weight → use 0.75 factor
-- Emulsion classification (lipid+aqueous) → cap at 1.02
-- Very dense IV solutions (>50% solids) → cap at 1.35
-"""
-
-2. UI for liquid formulations:
-Compute auto-estimated density from composition.
-Show density field as OPTIONAL with estimate pre-filled:
-
-Drug product density (g/mL): [1.009] (optional — update if needed)
-────────────────────────────────────────
-Auto-estimated from composition (1.435% dissolved solids)
-
-Typical ranges (for reference):
-- Aqueous injection: 1.00-1.15
-- Aqueous suspension: 1.05-1.15
-- Oral syrup (sugar): 1.15-1.35
-- Emulsion: 0.98-1.02
-
-Update this value if your formulation specification differs.
-
-3. Behavior:
-- Auto-estimate always calculated and pre-populated
-- User can leave as-is → pipeline uses auto-estimated value
-- User can update value → pipeline uses user-provided value
-- NEVER blocks generation
-- NEVER requires confirmation click
-- Pipeline proceeds using whatever value is in the field
-
-4. Log source in payload for audit:
-"density_used": [value used],
-"density_source": "auto_estimated" | "user_updated",
-"density_auto_estimate": [computed value]
-
-5. Drug product mass calculation (universal formula):
-drug_product_mass_mg = mL_per_day × density_value × 1000
-
-Acceptance:
-
-Epinephrine (aqueous injection, no user update):
-- Composition: 14.35 mg dissolved solids per mL
-- Auto-estimated density: 1.009 g/mL (pre-populated in UI)
-- Scientist proceeds without updating field
-- Drug Product mass: 8 × 1.009 × 1000 = 8072 mg
-- Log: density_source = "auto_estimated", value = 1.009
-- Note: Does not match approved 8800 (which uses 1.1) — scientist must 
-update if they want to match approved TSR
-
-Epinephrine (aqueous injection, with user update to 1.1):
-- Auto-estimated: 1.009 (pre-populated)
-- Scientist updates to 1.1 (from formulation spec)
-- Drug Product mass: 8 × 1.1 × 1000 = 8800 mg ✓ matches approved
-- Log: density_source = "user_updated", value = 1.1
-
-Trilaciclib (solid dosage — mg/vial):
-- Density field not shown at all
-- Drug product mass = sum of solid component amounts
-- No density estimation performed
-
-Emulsion product (hypothetical propofol):
-- Auto-estimated: 1.00 (emulsion cap applied)
-- Scientist can update to measured value 0.98 or accept as-is
-- Both paths proceed without blocking
-
-Oral syrup (hypothetical sugar-based):
-- Auto-estimated: 1.30 (sugar factor applied)
-- Scientist can update to measured spec value or accept
-- Both paths proceed without blocking
-
-═══════════════════════════════════════════════════════════════
-RED FLAG 3 — Extractor pattern expansion for non-standard tables
-═══════════════════════════════════════════════════════════════
-
-Bug: Epinephrine Benzene NMT 2 ppm is explicitly present in Gland DMF page 8 
-in a single-solvent quality-check box format. Current extractor recognizes 
-only multi-solvent tables and misses this pattern. Benzene shows NA in the 
-report despite being in the source.
-
-Fix in residual_solvent_annexure_converter.py:
-
-Add extraction patterns for these vendor DMF/CoA structures:
-
-1. Single-solvent quality-check box:
-Format:
-| Batch Number | [Solvent] Limit | Results | LOD | LOQ |
-| E105A0001 | Not more than 2 ppm| Not detected | 0.1 ppm| 0.3 ppm|
-
-Pattern detection:
-- Column contains batch identifier(s)
-- Column labeled "[Solvent name] Limit" or contains "Limit" adjacent to 
-solvent header
-- Adjacent columns: Results, LOD, LOQ (any combination)
-
-Extract: solvent_name, ppm_value from "Not more than X ppm" or "NMT X ppm"
-
-2. Discussion-embedded numeric limits:
-Prose sections in DMF Section 3.2.S.3.2 or similar. Sentences like:
-"benzene is controlled at NMT 2 ppm in raw material specifications"
-"Class 2 solvent methanol is limited to 3000 ppm in the API"
-
-Pattern: solvent name + control language ("controlled at", "limited to", 
-"specified as", "kept below") + numeric ppm value
-
-3. Process validation batch tables:
-Multi-batch table with solvent rows and batch columns plus specification 
-limit column:
-| Residual solvent | Batch1 | Batch2 | Batch3 | Specification limit |
-| Methanol | 237 ppm| 463 ppm| 463 ppm| Not more than 3000 ppm |
-| Acetone | BDL | BDL | BDL | Not more than 5000 ppm |
-
-Extract from Specification limit column primarily.
-Batch actuals stored in audit trail; NMT spec used per priority rule.
-
-4. Multi-page DMF Section documents:
-DMF Section 3.2.S.3.2 "Discussion of Residual Solvents"
-May span multiple pages with different structural elements per page
-Multi-page merge required (existing multi-page fix already handles this)
-
-5. Mixed spec-and-batch CoA:
-Page 1: spec limits table with declared values
-Page 2+: batch analysis with measured values
-Merge across pages; apply NMT-spec preference over batch actuals
-
-For each pattern, extract:
-- Solvent name (normalized via alias map)
-- Numeric ppm value with unit conversion if needed
-- Evidence type (nmt_spec, batch_actual, discussion_embedded)
-- Source page and section for audit trail
-- Confidence score
-
-Apply existing dedup priority: NMT spec > batch actual > BDL-with-spec-fallback.
-
-Acceptance:
-- Epinephrine Gland DMF page 8 → Benzene 2 ppm captured (evidence_type=nmt_spec)
-- Downstream: Epinephrine Benzene daily exposure = 8.8 × 2 / 1e6 = 0.0000176 mg
-- Cell renders 0.00002 (matching approved TSR)
-- Multi-solvent tables continue to extract correctly (no regression)
-- Prose discussion pages captured with numeric limits
-
-═══════════════════════════════════════════════════════════════
-RED FLAG 4 — RS Master File Expansion (Detailed)
-═══════════════════════════════════════════════════════════════
-
-Bug: RS master file (residual_solvent_master.py) is missing solvents needed 
-for real vendor annexures. Trilaciclib CPME and TFA showed NA in earlier 
-tests. Deployment gap or alias mismatch. Need comprehensive expansion.
-
-Fix: Update residual_solvent_master.py with complete Class 1/2/3 + vendor 
-specialty coverage. Version-bump the file. Externalize to config if possible.
-
-═══════ CURRENT MASTER STATE (baseline coverage) ═══════
-
-Class 1 (avoid):
-Benzene 2/None, Carbon tetrachloride 4/None, 1,2-Dichloroethane 5/None,
-1,1-Dichloroethene 8/None, 1,1,1-Trichloroethane 1500/None
-
-Class 2 (limit):
-Acetonitrile 410/4.1, Chlorobenzene 360/3.6, Chloroform 60/0.6,
-Cyclohexane 3880/38.8, Cyclopentyl methyl ether 1500/15.0 [R8],
-1,2-Dichloroethene 1870/18.7, Dichloromethane 600/6.0,
-1,2-Dimethoxyethane 100/1.0, N,N-Dimethylacetamide 1090/10.9,
-N,N-Dimethylformamide 880/8.8, 1,4-Dioxane 380/3.8,
-2-Ethoxyethanol 160/1.6, Ethylene glycol 620/6.2, Formamide 220/2.2,
-Hexane 290/2.9, Methanol 3000/30, 2-Methoxyethanol 50/0.5,
-Methylbutyl ketone 50/0.5, Methylcyclohexane 1180/11.8,
-N-Methylpyrrolidone 530/5.3, Nitromethane 50/0.5, Pyridine 200/2.0,
-Sulfolane 160/1.6, tert-Butyl alcohol 3500/35.0 [R8],
-Tetrahydrofuran 720/7.2, Tetralin 100/1.0, Toluene 890/8.9,
-Trichloroethene 80/0.8, Xylene 2170/21.7
-
-Class 3 (low toxicity, default 5000/50):
-Acetic acid, Acetone, Anisole, 1-Butanol, 2-Butanol, Butyl acetate,
-tert-Butyl methyl ether, Cumene [R5] 700/7.0, Dimethyl sulfoxide, Ethanol,
-Ethyl acetate, Ethyl ether, Ethyl formate, Formic acid, Heptane,
-Isobutyl acetate, Isopropyl acetate, Isopropyl alcohol, Methyl acetate,
-3-Methyl-1-butanol, Methylethyl ketone, Methylisobutyl ketone 4500/45,
-2-Methyl-1-propanol, 2-Methyltetrahydrofuran 5000/50 [R8],
-Pentane, 1-Pentanol, 1-Propanol, Propyl acetate, Triethylamine 6250/62.5
-
-Vendor specialty (class=None, non-ICH):
-Trifluoroacetic acid 3400/3.4 (vendor spec, common CDK4/6 API by-product)
-Trifluoroethanol (no compendial limit)
-Hexafluoroisopropanol (no compendial limit)
-Trifluorotoluene (no compendial limit)
-Diglyme, Dimethyl carbonate, 1,3-Dioxolane, Ethylene oxide (no limits)
-
-═══════ EXPANSION REQUIRED — Additions with rationale ═══════
-
-Category X — Common API synthesis by-products missing:
-Add these based on real vendor DMF patterns observed in DRL portfolio:
-
-2-Methylimidazole:
-class=None (vendor spec), typical vendor limit 6.7-100 ppm
-Common in imidazole-based drug intermediates
-
-Diisopropyl ether:
-class="3", limit=5000 ppm, pde=50.0 mg/day
-Common alternative to diethyl ether
-
-Ensure MIBK aliases include: MIBK, methyl amyl ketone, isopropylacetone
-
-Hexafluoro-2-butanone:
-class=None, vendor spec limit
-Common in fluorinated pharmaceutical intermediates
-
-Category Y — R9 draft additions (verify at rollout):
-ICH Q3C R9 minor revision — verify:
-- No new solvents in R9 (analytical procedures update only)
-- MTBE PDE unchanged (5000 ppm / 50 mg/day)
-- Formaldehyde not added (mentioned in draft only)
-Note in master: MASTER_VERSION should reflect R9 verification date.
-
-Category Z — Common vendor specialty solvents:
-These appear in real DMFs from Indian and Chinese vendors:
-
-Diglyme: class=None (vendor spec)
-Triglyme: class=None (vendor spec)
-Trifluoroacetic anhydride: class=None
-Methyl formate: class="3", 5000/50
-Diethyl carbonate: class=None (vendor spec)
-Propylene carbonate: class=None or class="3", depending on interpretation
-
-═══════ ALIAS EXPANSION ═══════
-
-Current alias handling may miss variants. Add explicit aliases for:
-
-Cyclopentyl methyl ether:
-aliases = ["Cyclopentyl methyl ether", "Cyclopentylmethylether",
-"Cyclopentyl-methyl ether", "CPME", "cpme"]
-
-Trifluoroacetic acid:
-aliases = ["Trifluoroacetic acid", "TFA", "tfa", "TFAA",
-"Trifluoroacetic Acid", "Perfluoroacetic acid",
-"Trifluoro acetic acid"]
-
-2-Methyltetrahydrofuran:
-aliases = ["2-Methyltetrahydrofuran", "2-methyl tetrahydrofuran",
-"Me-THF", "MeTHF", "2-Me-THF", "Methyl-THF",
-"Methyltetrahydrofuran", "2-Methyl-THF", "2-Methyloxolane"]
-
-Every solvent entry should have aliases including:
-- Full name variants (with/without hyphens, with/without spaces)
-- Common abbreviations (CPME, TFA, DMSO, MEK, MIBK, MTBE, etc.)
-- Chemical formula shorthand where applicable
-- Compendial name variants
-- Common industry names
-
-═══════ ALIAS RESOLUTION ═══════
-
-Ensure RSM.resolve_solvent() does case-insensitive fuzzy matching.
-Reject exact-match-only lookups that fail on:
-- "Cyclopentylmethylether" (one word vs three)
-- "Methyl tert-butyl ether" vs "tert-Butyl methyl ether"
-- "MTBE" vs "MTBE " (trailing space)
-- "CH2Cl2" vs "Dichloromethane"
-
-Test coverage:
-RSM.resolve_solvent("CPME") → "Cyclopentyl methyl ether"
-RSM.resolve_solvent("cpme") → "Cyclopentyl methyl ether"
-RSM.resolve_solvent("Cyclopentylmethylether") → "Cyclopentyl methyl ether"
-RSM.resolve_solvent("TFA") → "Trifluoroacetic acid"
-RSM.resolve_solvent("Me-THF") → "2-Methyltetrahydrofuran"
-RSM.resolve_solvent("MeTHF") → "2-Methyltetrahydrofuran"
-RSM.resolve_solvent("MEK") → "Methylethyl ketone"
-RSM.resolve_solvent("Nonexistent") → None
-
-═══════ CONFIG EXTERNALIZATION ═══════
-
-Move master data to versioned JSON/YAML config file:
-residual_solvent_master.json
-
-Include at top:
-{
-"master_version": "v2.1 (ICH Q3C R8 verified 2026-07-16)",
-"master_effective_date": "2026-07-16",
-"master_next_review_date": "2027-01-16",
-"reviewed_by": "[QA scientist initials + date]",
-"source_documents": [
-"ICH Q3C(R8) April 2021 Step 4",
-"USP <467> current edition",
-"Vendor DMF observations"
-],
-"solvents": {
-"Benzene": {
-"class": "1",
-"limit_ppm": 2,
-"pde_mg_day": null,
-"aliases": ["benzene", "benzol"],
-"source": "ICH Q3C R6"
-},
-...
-}
-}
-
-Benefits:
-- No code deployment for regulatory updates
-- Version-controlled per scientist review
-- Audit trail per solvent entry
-- Can add solvents at runtime
-- Version-bump alert in app UI when new master file detected
-
-Loading logic in residual_solvent_master.py:
-- Try to load residual_solvent_master.json first
-- Fall back to hardcoded dict if JSON not found (for legacy support)
-- Log master version at startup for audit
-
-═══════ ACCEPTANCE FOR MASTER EXPANSION ═══════
-
-Trilaciclib workflow:
-- CPME solvent: Limit 1500 ppm, PDE 15 mg/day (not NA)
-- TFA solvent: Limit 3400 ppm, PDE 3.4 mg/day (not NA)
-- Both correctly extracted from annexure via canonical resolution
-
-Any product with these solvents:
-- Sulfolane: 160 ppm, PDE 1.6 mg/day
-- Dimethylacetamide: 1090 ppm, PDE 10.9 mg/day
-- Dimethylformamide: 880 ppm, PDE 8.8 mg/day
-- Any Class 3 solvent listed above
-
-Alias resolution:
-- All common abbreviations (CPME, TFA, DCM, IPA, MTBE, DMSO, MEK, MIBK, THF,
-ACN, NMP, DMA, DMF, DME, Me-THF, EtOAc, EtOH) resolve correctly
-- Chemical formula variants (CH2Cl2, HCl, NaOH) resolve where appropriate
-- Case-insensitive matching works
-- Spacing/hyphen variants normalized
-
-Config file:
-- residual_solvent_master.json created and populated
-- MASTER_VERSION reflects verification date
-- Fallback to hardcoded dict works if JSON missing
-
-═══════════════════════════════════════════════════════════════
-GLOBAL RULES (preserve all prior fixes)
-═══════════════════════════════════════════════════════════════
-
-- Warning-first validation. Hard-block only on structural failures.
-- Placeholder "Not provided." in empty DOCX sections. Never render warning 
-language in DOCX body.
-- Vendor content vs USP master separation: ingredient rows use vendor 
-extracted content; USP master only in comparison row.
-- Multi-page annexure extraction: process all pages.
-- Compendial priority: USP/NF > EP > JP > ASMF for spec limits.
-- NMT priority over batch actual for exposure calculation.
-- Non-USP solvent inclusion with N/A for USP column.
-- BDL handling: use associated spec limit for worst-case exposure.
-- Cell rendering: value/confirmed_zero/not_applicable/unresolved four-state.
-- q.s. rows render "NA" across solvent columns; excluded from mass sum.
-- Zero cross-document-type logic bleed (RS isolated from EI/DEG-EG/BE NOC).
-- No user confirmation gates. Auto-derived values proceed automatically. 
-User can update via optional fields but is never blocked or prompted 
-to confirm.
-
-═══════════════════════════════════════════════════════════════
-IMPLEMENTATION ORDER (single sprint)
-═══════════════════════════════════════════════════════════════
-
-Phase 1 (blocking correctness):
-1. RED FLAG 1 — Excel marker footnote parser + validation + UI simplification
-2. RED FLAG 2 — Density auto-estimate + optional override
-3. RED FLAG 4 — Master expansion + alias fixes + config externalization
-
-Phase 2 (data completeness):
-4. RED FLAG 3 — Non-standard extractor pattern expansion
-
-All phases can be parallelized. Test all three test cases after Phase 1 
-completion.
-
-═══════════════════════════════════════════════════════════════
-ACCEPTANCE MATRIX
-═══════════════════════════════════════════════════════════════
-
-Trilaciclib (weight-based, salt-form):
-- Excel with mandatory footnote → Category A parsed → salt_factor 1.163
-- User MDD input: 432 mg base only
-- Amounts: 502.56 / 432 / 108.86 / 1043.42 mg ✓
-- CPME shows 1500/15 ✓
-- TFA shows 3400/3.4 ✓
-- All values match approved TSR
-
-Epinephrine (volume-based, overage):
-- Excel with mandatory footnote → Category B parsed → overage 10%
-- User MDD input: 8 mL/day
-- Density: auto-estimated 1.009 (pre-populated, optional override)
-* If user leaves as-is: DP mass 8072 mg (differs from approved)
-* If user updates to 1.1: DP mass 8800 mg (matches approved)
-- Amounts: 8.8 / 60 / 42 / 4 mg ✓
-- Benzene 2 ppm captured from Gland DMF page 8 quality-check box
-- Benzene daily exposure 0.00002 mg ✓
-- Report generates without blocking regardless of density choice
-
-Sofosbuvir (weight-based tablet):
-- Excel: no markers required
-- MDD: 400 mg (one tablet/day)
-- Amounts all match approved (already working)
-- Pipeline uses Chanyoo declared spec limits (correct given uploaded docs)
-- UI warns if user should upload batch analysis for tighter values
-
-Esomeprazole (regression baseline):
-- All existing behavior preserved
-- No changes to output
-
-═══════════════════════════════════════════════════════════════
-NON-GOALS (do NOT do)
-═══════════════════════════════════════════════════════════════
-
-- Do NOT ask user for salt_factor as UI field (must come from Excel footnote)
-- Do NOT ask user for overage_pct as UI field (must come from Excel footnote)
-- Do NOT calculate salt_factor from molecular weight as fallback
-- Do NOT auto-substitute vendor content values with USP master
-- Do NOT block Sofosbuvir generation when Chanyoo values match USP
-- Do NOT require user to click "confirm" on auto-estimated density value
-- Do NOT block generation if user leaves density field with estimated value
-- Do NOT change working extraction paths (Trilaciclib DCM/Toluene/Methanol/
-ACN/Sulfolane/CPME/IPA/Acetic acid/TFA, Epinephrine except Benzene,
-Sofosbuvir Opadry/MCC/Croscarmellose/AEROSIL/PRUV — all continue)
-- Do NOT modify RSM master alias resolution to be less strict where 
-currently strict — only add explicit aliases, don't broaden fuzzy 
-matching beyond documented patterns
-- Do NOT delete legacy hardcoded dict fallback in residual_solvent_master.py 
-during config migration
-
-DocGen UI — Complete Rebuild for Low-Touch Delivery
-
-Rebuild app.py Streamlit UI to be picture-perfect clean. Remove all backend 
-visibility from user-facing flow. Preserve ALL backend logic in place (no 
-changes to residual_solvent.py, deg_eg.py, benoc.py, annexure_converter.py, 
-or the JS renderers). Only the presentation layer changes.
-
-═══════════════════════════════════════════════════════════════
-GLOBAL RULES
-═══════════════════════════════════════════════════════════════
-
-1. App title: "DocGen" — that's the only header text visible. Remove:
-- "🧪 TSR Elemental Impurities Report Generator"
-- "ICH Q3D (R2) | Dr. Reddy's IPDO | Claude Opus 4.6..."
-- All emoji-decorated section titles ("🔬", "📋 Report Header", etc.)
-- All descriptive captions and instructional text under headers
-- All "background description" fields (auto-generated behind the scenes)
-- All "reference PDF" mentions
-- All markdown tips at bottom of pages
-
-2. Document type dropdown: 4 options ONLY, no "coming soon" items:
-- Elemental Impurity Assessment
-- Residual Solvent Risk Assessment
-- DEG & EG Risk Assessment
-- BE NOC Application
-Remove Nitrosamine, Extractables & Leachables, Impurity Qualification, etc.
-
-3. Report header metadata: NOT shown in UI. Auto-generate empty. If scientist 
-wants to fill it manually in the DOCX after generation, they can. Do not 
-collect Document No, Version, Department, Market, Protocol, SOP Format 
-Number, Signatures, Declarant details, or Signatures blocks from user.
-
-4. Advanced options and expanders: REMOVE. No "Advanced settings", no "Fill 
-data gaps (optional)", no "Declarant details", no "Electronic signatures".
-
-5. Auto-detection: everything computed silently.
-- Route of administration → derived from dosage form (dropdown or free text)
-- Strength → extracted from Excel
-- Number of doses → extracted from Excel or auto-derived
-- Density → auto-estimated from composition (optional override field only)
-- Chemistry structure generation → automatic when D04 provided
-- Dissolution charts → automatic when data available
-- Narcotic declaration → auto-triggered from NDPS controlled substances list
-
-6. No confirmations, no verification screens. Once files are uploaded and 
-processed:
-- Show progress bar with percentage during processing
-- Show spinner during generation
-- Deliver downloadable DOCX
-That's it. Never surface annexure classification tables, excel classification 
-details, mapping details, cluster audits, warning panels, "data quality 
-alerts", or backend state to the user.
-
-7. All backend warnings/errors: send to logger only. Never display in UI 
-unless it's a hard-block validation error requiring user action.
-
-8. Progress bar: use st.progress() during upload/analysis with percentage 
-display. Spinner during document rendering.
-
-═══════════════════════════════════════════════════════════════
-DOC TYPE 1 — ELEMENTAL IMPURITY ASSESSMENT (EI)
-═══════════════════════════════════════════════════════════════
-
-Preserve existing EI workflow logic. Only change UI presentation.
-
-Show fields (in this order):
-1. Product Name (text input) — required
-2. Dosage Form (text input) — required; used for auto-route inference
-3. Dosage Category (dropdown) — required — "OSD (Oral Solid Dosage)" or 
-"Injection / Parenteral" — this selects between EI OSD and EI Injection 
-workflows
-4. MDD in mg/day (number input) — required
-5. Number of unit doses per day (number input) — required, default 1
-6. Files (single upload widget) — accept: PDF, DOCX, JSON, XLSX, XLS, PNG, JPG
-Multiple files at once. All go through Combined router:
-- Excel files → composition
-- PDFs/DOCX → annexure converter (routed to EI)
-- JSON → normalized as EI annexure
-- Images → fishbone diagram if user provides one
-
-Remove entirely:
-- Report Header section (all fields)
-- Background description field
-- Route of Administration dropdown (auto-derived)
-- Strength field (extracted from Excel)
-- Separate Composition Excel and Annexure and Fishbone widgets — merge into 
-ONE "Files" widget
-
-Behavior:
-- User uploads all files at once
-- Show progress bar as annexures are processed
-- Show spinner during generation
-- Deliver DOCX
-
-Preserve EI backend routing:
-- If Dosage Category = "OSD (Oral Solid Dosage)" → route to standard EI workflow
-- If Dosage Category = "Injection / Parenteral" → route to injection workflow
-- Backend logic in _run_injection_workflow() unchanged
-
-═══════════════════════════════════════════════════════════════
-DOC TYPE 2 — RESIDUAL SOLVENT RISK ASSESSMENT
-═══════════════════════════════════════════════════════════════
-
-Show fields (in this order):
-1. Product Name (text input) — required
-2. Dosage Form (text input) — required
-3. Files (single upload widget) — accept: PDF, DOCX, JSON, XLSX, XLS
-Multiple files at once. Router:
-- Excel files → RS composition
-- PDFs/DOCX/JSON → RS annexure converter
-
-Remove entirely:
-- Document No field
-- Market field
-- Assessment Framework dropdown (default to USP <467> silently)
-- Separate Composition Excel and Solvent Declaration Annexures widgets — 
-merge into ONE "Files" widget
-- "Analyze Excel" button (auto-trigger on upload)
-- Verification screen entirely
-
-Behavior:
-- User uploads all files at once
-- Show progress bar during annexure processing
-- Auto-analyze Excel silently
-- If MDD or density required, show ONE minimal prompt with:
-- MDD (mg/day or mL/day depending on unit basis)
-- Density (g/mL) — auto-estimated from composition, optional override
-- No confirmation click — as soon as MDD is entered, proceed
-- Show spinner during generation
-- Deliver DOCX
-
-Preserve RS backend logic entirely — no changes to residual_solvent.py, 
-residual_solvent_annexure_converter.py, or generate_residual_solvent.js.
-
-═══════════════════════════════════════════════════════════════
-DOC TYPE 3 — DEG & EG RISK ASSESSMENT
-═══════════════════════════════════════════════════════════════
-
-Show fields (in this order):
-1. Product Name (text input) — required
-2. Files (single upload widget) — accept: PDF, DOCX, JSON, XLSX, XLS
-Multiple files at once. Router:
-- Excel files → composition
-- PDFs/DOCX/JSON → DEG/EG annexure converter
-
-Remove entirely:
-- Document No field
-- Strength field
-- Version field
-- Department field
-- Market field
-- Approved Date field
-- Protocol field
-- SOP Format Number field
-- Document Title field
-- "Dosage Form / Route" dropdown
-- All description text at top of workflow
-
-Behavior:
-- User uploads all files at once
-- Show progress bar during annexure processing
-- No MDD prompt (DEG/EG doesn't need calculations)
-- Show spinner during generation
-- Deliver DOCX
-
-Preserve DEG/EG backend logic entirely — no changes to deg_eg.py, 
-deg_eg_annexure_converter.py, or generate_deg_eg.js.
-
-═══════════════════════════════════════════════════════════════
-DOC TYPE 4 — BE NOC APPLICATION
-═══════════════════════════════════════════════════════════════
-
-Show fields (in this order):
-1. Product Name (text input) — required
-2. Files (single upload widget) — accept: PDF, DOCX, JSON
-Multiple files at once. Router:
-- Everything → BE NOC annexure converter (auto-classifies)
-
-Remove entirely:
-- Document No field
-- Market field
-- Protocol field
-- Version field
-- Strength field
-- Department field
-- SOP Format Number field
-- Dosage Form field
-- Document Title field
-- "Declarant details" expander
-- "Electronic signatures" expander
-- "Fill data gaps (optional)" expander
-- Optional composition/equipment/dissolution Excel uploads
-- "Generate molecular structures" checkbox (auto-enabled)
-- "Generate dissolution charts" checkbox (auto-enabled)
-- "Pre-converted annexure JSON" separate upload widget
-- "Process Annexures" button
-- Verification screen entirely
-- Any warnings expander
-
-Behavior:
-- User uploads all supporting files at once (single widget)
-- Show progress bar during annexure processing
-- Molecular structures auto-generate when D04 annexures provided
-- Dissolution charts auto-generate when dissolution data available
-- If structures/charts unavailable, leave blank in output
-- Show spinner during generation
-- Deliver DOCX
-
-Preserve BE NOC backend logic entirely — no changes to benoc.py, 
-benoc_annexure_convertor.py, or generate_benoc.js.
-
-═══════════════════════════════════════════════════════════════
-UI IMPLEMENTATION SPECIFICATION
-═══════════════════════════════════════════════════════════════
-
-main() function structure:
-
-def main() -> None:
-st.set_page_config(
-page_title="DocGen", 
-layout="centered",
-initial_sidebar_state="collapsed",
-)
-
-# Only visible header
-st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'>"
-"DocGen</h1>", unsafe_allow_html=True)
-
-# Document type selection (no captions, no descriptions)
-doc_type = st.selectbox(
-"Document Type",
-[
-"Elemental Impurity Assessment",
-"Residual Solvent Risk Assessment",
-"DEG & EG Risk Assessment",
-"BE NOC Application",
-],
-key="doc_type",
-label_visibility="collapsed",
-)
-
-st.markdown("---")
-
-# Route to workflow
-if doc_type == "Elemental Impurity Assessment":
-_run_clean_ei_workflow()
-elif doc_type == "Residual Solvent Risk Assessment":
-_run_clean_rs_workflow()
-elif doc_type == "DEG & EG Risk Assessment":
-_run_clean_deg_eg_workflow()
-elif doc_type == "BE NOC Application":
-_run_clean_benoc_workflow()
-
-Each clean workflow function:
-
-def _run_clean_ei_workflow() -> None:
-"""Clean EI UI — minimal fields, single upload, auto-processing."""
-col1, col2 = st.columns(2)
-with col1:
-product_name = st.text_input("Product Name", key="ei_product")
-dosage_category = st.selectbox(
-"Dosage Category",
-["OSD (Oral Solid Dosage)", "Injection / Parenteral"],
-key="ei_dosage_cat"
-)
-with col2:
-dosage_form = st.text_input("Dosage Form", key="ei_dosage_form")
-mdd = st.number_input(
-"MDD (mg/day)", min_value=0.001, value=100.0, step=1.0,
-key="ei_mdd"
-)
-doses_per_day = st.number_input(
-"Number of unit doses per day", min_value=1, value=1,
-key="ei_doses"
-)
-
-st.markdown("###")
-files = st.file_uploader(
-"Upload files (Excel + Annexures)",
-accept_multiple_files=True,
-type=["pdf", "docx", "json", "xlsx", "xls", "png", "jpg", "jpeg"],
-key="ei_files",
-)
-
-can_generate = bool(product_name and dosage_form and mdd > 0 and files)
-
-if st.button("Generate Report", type="primary", disabled=not can_generate,
-use_container_width=True):
-_process_ei_files(product_name, dosage_form, dosage_category, 
-mdd, doses_per_day, files)
-
-Progress bar pattern (used across all workflows):
-
-def _process_files_with_progress(files: List, doc_type: str, meta: Dict) -> Any:
-"""Process files with visible progress bar. All backend logic silent."""
-progress_bar = st.progress(0, text="Analyzing files...")
-
-n_files = len(files)
-processed_annexures = []
-
-for i, f in enumerate(files):
-# Update progress
-pct = int((i / n_files) * 90)
-progress_bar.progress(
-pct, 
-text=f"Processing file {i+1} of {n_files}: {f.name} ({pct}%)"
-)
-
-# Call backend processing (silent, all logs to logger)
-try:
-result = dispatch_annexures(doc_type, [f])
-if result:
-processed_annexures.extend(result)
-except Exception:
-logger.exception(f"Processing failed for {f.name}")
-
-progress_bar.progress(95, text="Building payload...")
-
-# Build payload and generate (silent)
-with st.spinner("Generating document..."):
-try:
-payload = _build_payload(doc_type, meta, processed_annexures)
-docx_bytes = _render_document(doc_type, payload)
-except Exception as e:
-logger.exception("Document generation failed")
-st.error("Document generation failed. Please try again.")
-return None
-
-progress_bar.progress(100, text="Complete")
-
-return docx_bytes
-
-Delivery pattern:
-
-if docx_bytes:
-filename = f"{doc_type.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-st.download_button(
-"📥 Download Report",
-data=docx_bytes,
-file_name=filename,
-mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-use_container_width=True,
-)
-
-═══════════════════════════════════════════════════════════════
-BACKEND METADATA AUTO-GENERATION
-═══════════════════════════════════════════════════════════════
-
-When user only provides Product Name + Dosage Form (etc.), auto-generate 
-the empty metadata fields in the DOCX header:
-
-def _auto_meta(product_name: str, dosage_form: str, doc_type: str) -> Dict:
-"""Auto-populate empty metadata that user didn't provide."""
-now = datetime.now()
-
-doc_no = f"TSR-{doc_type[:6].replace(' ', '_')}-{now.strftime('%Y%m%d')}"
-
-return {
-"product_name": product_name,
-"dosage_form": dosage_form,
-"document_no": doc_no, # auto-generated
-"strength": "", # from Excel, blank if unavailable
-"version": "1.0", # default
-"department": "FR&D", # default
-"market": "", # blank
-"protocol": "", # blank
-"sop_format_number": "", # blank
-"title": "", # auto-generated from doc_type
-"route": _infer_route(dosage_form), # auto-inferred
-}
-
-def _infer_route(dosage_form: str) -> str:
-"""Product-agnostic route inference from dosage form text."""
-dl = dosage_form.lower()
-if any(k in dl for k in ["injection", "parenteral", "iv", "im", "vial", "ampoule"]):
-return "parenteral"
-if any(k in dl for k in ["tablet", "capsule", "sachet", "granule", "powder"]):
-return "oral"
-if any(k in dl for k in ["cream", "ointment", "gel", "lotion", "patch"]):
-return "topical"
-if any(k in dl for k in ["drop", "solution", "suspension"]) and \
-any(k in dl for k in ["oral", "syrup"]):
-return "oral"
-return "oral" # default
-
-═══════════════════════════════════════════════════════════════
-FILE ROUTING (behind the scenes)
-═══════════════════════════════════════════════════════════════
-
-Single upload widget routes files by type:
-
-def _route_files(files: List, doc_type: str) -> Tuple[Optional[bytes], List, Optional[bytes]]:
-"""Route uploaded files to appropriate handlers.
-Returns (excel_bytes, annexure_files, fishbone_bytes)."""
-excel_bytes = None
-fishbone_bytes = None
-annexure_files = []
-
-for f in files:
-name = f.name.lower()
-if name.endswith((".xlsx", ".xls")):
-if excel_bytes is None: # first Excel wins
-excel_bytes = f.getvalue()
-elif name.endswith((".png", ".jpg", ".jpeg")):
-if fishbone_bytes is None:
-fishbone_bytes = f.getvalue()
-elif name.endswith((".pdf", ".docx", ".doc", ".json")):
-annexure_files.append(f)
-
-return excel_bytes, annexure_files, fishbone_bytes
-
-═══════════════════════════════════════════════════════════════
-DENSITY AUTO-ESTIMATION UI (RS INJECTION ONLY)
-═══════════════════════════════════════════════════════════════
-
-For RS injection workflow, after Excel analysis, if unit basis = "mg/mL":
-
-def _rs_density_ui(auto_estimated: float, dosage_form: str) -> float:
-"""Optional density field with auto-estimated default.
-User can override but not required. Never blocks generation."""
-density = st.number_input(
-f"Density (g/mL) — auto-estimated: {auto_estimated:.3f}",
-min_value=0.5,
-max_value=2.0,
-value=auto_estimated,
-step=0.001,
-format="%.3f",
-key="rs_density",
-help="Update only if your formulation specification differs. "
-"Otherwise leave as-is."
-)
-return density
+Priority 1 (unblocks RS + defensive across all 4):
+1. PART A Layer 1 — defensive json.dump default handler in all 4 workflow 
+generate functions
+
+Priority 2 (root cause + polish):
+2. PART A Layer 2 — convert sets to lists at payload construction boundary
+3. PART A Layer 3 — payload sanitizer walker (optional insurance)
+
+Priority 3 (BE NOC quality lift 82 → 90+):
+4. RED FLAG A — stability dedup key includes (batch, condition, timepoint)
+5. RED FLAG B — comparative_dissolution_report annexure type + extraction
+6. RED FLAG C — Section 8.N spec fallback from D04 physicochemical
+7. RED FLAG D — Strength field population chain
 
 ═══════════════════════════════════════════════════════════════
 NON-GOALS
 ═══════════════════════════════════════════════════════════════
 
-Do NOT:
-- Show any annexure classification tables in UI
-- Show any mapping details in UI 
-- Show any warnings expanders in UI
-- Show any "Verification" screens
-- Show any "Data Quality Alerts"
-- Show any cluster audit information
-- Show any progress bars beyond a single unified one per workflow
-- Show any backend log messages in UI
-- Ask for user confirmation on any auto-detected value
-- Add ANY captions or descriptions under headers
-- Add ANY emoji-decorated section headers except the app title area
-- Add ANY tooltips explaining backend logic
-- Show "coming soon" placeholder document types
-- Retain the current RS UI's "Analyze Excel" separate button
-- Retain the current BE NOC UI's checkboxes for structure/chart generation
+- Do NOT change identity comparison logic to avoid using sets internally 
+(they're needed for O(1) lookup performance)
+- Do NOT auto-populate any field with fabricated values when source is 
+absent — placeholder "Not provided." is correct behavior
+- Do NOT change working extraction paths (Loratadine chemistry, 
+Pseudoephedrine Sulfate salt-form preservation, composition, equipment, 
+process, process flow, Pseudoephedrine STP spec, innovator details, 
+RLD utilization, narcotic declaration — all continue)
+- Do NOT hard-block generation on any of these red flags. All fixes are 
+additive quality improvements; warning-first architecture preserved
 
 ═══════════════════════════════════════════════════════════════
-BACKEND PRESERVATION
+ACCEPTANCE (end-to-end)
 ═══════════════════════════════════════════════════════════════
 
-Do NOT modify:
-- residual_solvent.py (all logic preserved)
-- residual_solvent_master.py (master data preserved)
-- residual_solvent_annexure_converter.py (extraction preserved)
-- deg_eg.py (all logic preserved)
-- deg_eg_annexure_converter.py (extraction preserved)
-- benoc.py (all logic preserved)
-- benoc_annexure_convertor.py (extraction preserved)
-- annexure_converter.py (EI extraction preserved)
-- injection_support.py (injection EI preserved)
-- Any generate_*.js renderer
+RS Trilaciclib: generation succeeds (no JSON error), Amount in Max Dose 
+values match approved TSR (0.503/0.432/0.109/1.043 g).
 
-All UI-collected data must be routed to the same backend functions the 
-current app.py uses (build_payload, calculate_ei_tables, build_rs_payload, 
-build_deg_eg_payload, build_benoc_payload, assemble_and_generate, etc.).
+RS Epinephrine: generation succeeds, no footnote hard-block, Amount values 
+match approved with density override.
 
-Session state management should mirror current pattern but with UI-visible 
-state removed. Preserve session state keys used by backend workflows.
+RS Esomeprazole / Sofosbuvir: no regression.
 
-═══════════════════════════════════════════════════════════════
-ACCEPTANCE
-═══════════════════════════════════════════════════════════════
+EI OSD / Injection: no regression, no JSON error.
 
-User experience for each doc type:
+DEG/EG Mavacamten: no regression, FDA high-risk observations working, no 
+JSON error.
 
-EI (OSD):
-1. Sees "DocGen" title
-2. Selects "Elemental Impurity Assessment"
-3. Enters: Product Name, Dosage Form, Dosage Category=OSD, MDD, doses/day
-4. Uploads Excel + annexure PDFs in single widget
-5. Clicks "Generate Report"
-6. Sees progress bar (0-100%)
-7. Sees spinner "Generating document..."
-8. Sees "Download Report" button
-9. Downloads DOCX with auto-generated metadata + full EI content
+BE NOC Loratadine + Pseudoephedrine Sulfate ER 5/120mg:
+- No JSON error
+- Section 1.1 Loratadine chemistry + indications + manufacturer ✓
+- Section 1.2 Pseudoephedrine Sulfate (salt form preserved) ✓
+- Section 4 composition with 4 stages ✓
+- Section 5 equipment (14 items) ✓
+- Section 6 process (7 narratives) ✓
+- Section 7 flow (15 steps) ✓
+- Section 8.1 Loratadine spec from D04 CoA physicochemical fallback ✓
+- Section 8.2 Pseudoephedrine spec from STP 167410 ✓
+- Section 10 Innovator with strength "5 mg / 120 mg" ✓
+- Section 11 Finished Product spec ✓
+- Section 12 Comparative Dissolution with 3 tables + F2=84 + 3 charts ✓
+- Section 13 Stability with 4 distinct blocks (25/60 1M, 25/60 6M, 
+40/75 1M, 40/75 6M) ✓
+- Section 14 RLD Utilization 60 tablets ✓
+- Section 15 Narcotic Declaration ✓
+- Section 16 Annexure List sequential, no duplicates ✓
+- Header Strength "5 mg / 120 mg" ✓
+- Score target: 90+/100 against approved TSR
 
-EI (Injection):
-Same as OSD but Dosage Category=Injection routes to injection workflow.
-
-RS:
-1. Sees "DocGen"
-2. Selects "Residual Solvent Risk Assessment"
-3. Enters Product Name, Dosage Form
-4. Uploads Excel + annexures single widget
-5. Clicks "Generate Report"
-6. Sees progress bar
-7. If MDD/density needed: single minimal prompt (density pre-populated)
-8. Sees spinner
-9. Downloads DOCX
-
-DEG/EG:
-1. Sees "DocGen"
-2. Selects "DEG & EG Risk Assessment"
-3. Enters Product Name only
-4. Uploads Excel + annexures single widget
-5. Clicks "Generate Report"
-6. Sees progress bar → spinner
-7. Downloads DOCX
-
-BE NOC:
-1. Sees "DocGen"
-2. Selects "BE NOC Application"
-3. Enters Product Name only
-4. Uploads supporting docs (single widget)
-5. Clicks "Generate Report"
-6. Sees progress bar → spinner
-7. Downloads DOCX with structures + charts auto-generated if data available
-
-No verification screens. No confirmations. No warnings visible. 
-Zero backend info surfaced to user.
-
-PRECEDENCE NOTE: This UI rebuild takes final precedence over any UI-related 
-guidance in the BE NOC, RS, DEG/EG, or clustering prompts. Where prior 
-prompts mention "verification screen", "warning panel", "cluster audit 
-expander", or similar UI surfaces, those must be silently dropped or 
-routed to logger only. Only the app.py Streamlit UI is affected — all 
-backend logic (validation, clustering, warnings collection) is preserved 
-as specified in the other prompts. Backend still generates warnings and 
-audit data; the UI just doesn't display them.
+PRECEDENCE NOTE: Apply Prompt 1 (JSON serialization) FIRST as it unblocks 
+all generation. Then Prompt 2 (footnote validator warning-only). Then 
+Prompt 1's BE NOC red flags. Prompts do not conflict; this order minimizes 
+regression risk during dev testing.
 
