@@ -1,493 +1,379 @@
 ═══════════════════════════════════════════════════════════════════════════════
-DocGen — PRODUCTION HARDENING MEGA PROMPT (all 4 doc types: EI, RS, DEG/EG, BE NOC)
-Target: API-ready backend. Remove Streamlit. Fix all outstanding production bugs.
-GOLDEN RULE: DO NOT BREAK ANY WORKING PATH. Every fix is additive or surgical.
-Regression-test all 4 doc types after every phase.
+DocGen — PRODUCTION CRITICAL FIXES (EI + RS focus; some apply to all 4 doc types)
+Going to production. No toys. Do not break any verified-correct output.
+Regression-test all known-good products after every phase.
 ═══════════════════════════════════════════════════════════════════════════════
 
-PART 0 — ARCHITECTURE: REMOVE STREAMLIT, EXPOSE CLEAN BACKEND API
+PART 1 — DAILY EXPOSURE CALCULATION IS WRONG FOR ALL CASES (HIGHEST PRIORITY)
 ═══════════════════════════════════════════════════════════════
 
-The API team will build REST endpoints on this backend. Streamlit UI must be 
-fully decoupled.
+BUG: Across every EI and RS product, per-element/per-solvent Daily Exposure 
+values AND their column-sum Totals are wrong. This is the single most 
+important production blocker.
 
-1. Strip ALL Streamlit from business logic:
-   - Remove `import streamlit as st` from every backend module 
-     (residual_solvent.py, deg_eg.py, benoc.py, annexure_converter.py, 
-     ei backend, injection_support.py, annexure_identity_clustering.py).
-   - No st.progress, st.error, st.warning, st.session_state, st.file_uploader 
-     anywhere in backend.
-   - app.py Streamlit becomes a THIN optional demo client only; not required.
+Canonical formulas — implement exactly, no shortcuts:
 
-2. Expose pure Python functions the API layer calls directly. Each doc type 
-   exposes:
-   
-   convert_annexures(files: List[bytes], filenames: List[str], doc_type: str) 
-       -> {"annexures": [...], "errors": [...], "warnings": [...]}
-   
-   build_payload(doc_type: str, meta: dict, annexures: list, 
-                 excel_bytes: Optional[bytes]) 
-       -> {"payload": {...}, "validation": {...}, "checklist": {...}}
-   
-   generate_document(doc_type: str, payload: dict) 
-       -> {"docx_bytes": bytes, "filename": str}
-   
-   All three are pure functions: inputs in, dict/bytes out. No global state, 
-   no UI, no session.
+EI Daily Exposure (per element, per component):
+   amount_in_max_dose_g = qty_per_unit_mg × doses_per_day × 0.001
+   daily_exposure_ug   = amount_in_max_dose_g × concentration_ug_per_g
+   (concentration_ug_per_g == ppm, already normalized at extraction)
 
-3. Progress reporting via optional callback param, not st.progress:
-   def convert_annexures(..., progress_cb: Optional[Callable[[float,str],None]]=None)
-   API layer supplies its own callback (websocket/SSE). Default None = silent.
+EI Total (per element, down the column):
+   total_daily_exposure_ug = Σ daily_exposure_ug over all non-qs components
+   (exclude q.s. rows; include every quantitative component once)
 
-4. All logging via Python `logging` only. No user-facing st.* calls. 
-   API layer decides what to surface.
+RS Daily Exposure (per solvent, per component):
+   amount_in_max_dose_mg = qty_per_unit × multiplier
+   daily_exposure_mg     = amount_in_max_dose_mg × solvent_ppm ÷ 1,000,000
 
-5. Credentials: read GOOGLE_APPLICATION_CREDENTIALS and GCP_PROJECT from env 
-   vars, not hardcoded paths. Fail fast with clear error if unset.
+RS Total Daily Exposure (per solvent):
+   total_mg  = Σ daily_exposure_mg over all contributing components
+   equiv_ppm = total_mg × 1,000,000 ÷ drug_product_mass_mg
 
-Acceptance: backend importable and callable with zero Streamlit dependency. 
-`pip uninstall streamlit` must not break any backend module import.
+Root-cause checklist (verify each — the bug is likely one or more of these):
+1. Unit mismatch: mg vs g mixup in amount_in_max_dose (×0.001 applied twice, 
+   or not at all). Log intermediate amount_in_max_dose for one row and 
+   hand-verify.
+2. doses_per_day not applied, or applied twice.
+3. concentration used in wrong unit (ppb value treated as ppm, or vice versa) 
+   — must already be normalized to µg/g before this step.
+4. Total row summing the wrong axis (summing across elements instead of down 
+   components), or including q.s. rows, or double-counting multi-strength 
+   columns.
+5. Multi-strength: summing BOTH strength columns instead of the single 
+   selected strength (see Part 2/3).
 
-═══════════════════════════════════════════════════════════════
-PART 1 — CLAUDE API ROBUSTNESS (all doc types, all converters)
-═══════════════════════════════════════════════════════════════
+Add a deterministic self-test in code (runs on every generation, logs only):
+   Recompute one element's total from raw component values and compare to the 
+   emitted total. If |diff| > 0.1%, log ERROR with both values. This catches 
+   regressions permanently.
 
-BUG: Rate-limit / API-down / transient errors surface as cryptic failures or 
-silent empty extractions.
-
-Fix in call_claude() and claude_vision() (every converter uses these):
-
-1. Distinguish error classes:
-   - 429 rate limit / 529 overloaded → retryable
-   - 401/403 auth → non-retryable, clear message
-   - 500/503 server → retryable
-   - timeout → retryable
-   - empty/malformed response → retryable once
-
-2. Retry with exponential backoff + jitter:
-   for attempt in range(4):
-       try: return client.messages.create(...)
-       except RateLimit/Overloaded/ServerError/Timeout:
-           if attempt < 3: sleep((2**attempt) * (0.5 + random()*0.5)); continue
-       except Auth: raise ClaudeAuthError("Claude authentication failed...")
-   raise ClaudeUnavailableError(
-       "Claude API is currently unavailable (rate limit or service issue). "
-       "Please try again in a few moments.")
-
-3. Define exception classes: ClaudeUnavailableError, ClaudeAuthError, 
-   ClaudeExtractionError. API layer maps these to HTTP 503 / 401 / 422 with 
-   the message: "Claude error, please try again."
-
-4. NEVER return empty string silently on API failure that then flows into 
-   extraction as "no data". A failed Claude call must RAISE, not return "".
-
-5. Per-annexure isolation (bulk): a Claude failure on one annexure must not 
-   kill the batch — catch, mark that annexure _error=True with the Claude 
-   error message, continue to next. Batch returns partial results + error list.
-
-Acceptance: rate-limit during bulk run → affected annexures flagged with 
-"Claude error, please try again", others succeed, no crash, no silent zeros.
+Acceptance (hand-verifiable):
+   Take any product, pick one element, manually compute 
+   Σ(qty_mg × doses × 0.001 × ppm) across components → must equal the 
+   Total cell shown. Every element, every product.
 
 ═══════════════════════════════════════════════════════════════
-PART 2 — BULK ANNEXURE PROCESSING (all 4 doc types)
+PART 2 — MULTI-STRENGTH / MULTI-COLUMN COMPOSITION (EI + RS)
 ═══════════════════════════════════════════════════════════════
 
-BUG: Bulk processing breaks with JSON errors and other failures across all 
-4 doc types.
+BUG: Vasopressin (EI), Carboprost (EI), Chlorpromazine (RS) all have MULTIPLE 
+quantity columns in the Excel and produce wrong values. The parser mishandles 
+multi-column composition.
 
-Fix in every annexure converter (annexure_converter.py [EI], 
-residual_solvent_annexure_converter.py [RS], deg_eg_annexure_converter.py 
-[DEG/EG], benoc_annexure_convertor.py [BE NOC]):
+Multi-strength = one Excel with several quantity columns:
+   Carboprost:   "Quantity per mL" | "Quantity per 1mL"   (pre-filled syringe)
+   Chlorpromazine: "Qty./1mL" | "Qty./2mL"                 (25mg/mL & 50mg/2mL)
+   Vasopressin:  "Quantity/mL" | "Quantity/Vial (100 mL)"  (unit-dosed)
+   Generic OSD:  "10 mg" | "20 mg" | "40 mg" columns
 
-1. safe_json_parse hardening (shared utility, use everywhere):
-   - Strip markdown fences ```json ... ```
-   - Locate first { to last } (dict) or first [ to last ] (array)
-   - Handle trailing commas, single quotes, unescaped newlines in strings
-   - Bare array when dict expected → wrap {"elements":[...]} or 
-     {"extracted_items":[...]}
-   - Never raise; return shape-matched default on total failure
-   - Log the raw response (first 500 + last 500 chars) on parse failure
+Fix in composition parser (EI and RS share this logic):
 
-2. Per-file isolation loop:
-   results, errors = [], []
-   for i, (fbytes, fname) in enumerate(zip(files, filenames)):
-       reset_all_local_state()
-       tmp = unique_temp_path(i)  # UUID or index, never shared
-       try:
-           r = convert_single(fbytes, fname, index=i+1)
-           results.append(r)
-       except ClaudeUnavailableError as e:
-           results.append(error_record(fname, i+1, str(e)))
-           errors.append({"file": fname, "error": str(e), "retryable": True})
-       except Exception as e:
-           logger.exception(f"Annexure {fname} failed")
-           results.append(error_record(fname, i+1, str(e)))
-           errors.append({"file": fname, "error": str(e), "retryable": False})
-   return {"annexures": results, "errors": errors}
+1. Detect ALL quantity columns, not just the first. A quantity column = header 
+   matching any of (case-insensitive, fuzzy):
+   "qty", "quantity", "amount", "mg/", "/ml", "/mL", "/vial", "/tab", 
+   "/capsule", "/unit", "per ml", "per vial", "per unit", "per 1ml", 
+   "per 2ml", strength patterns like "^\d+\s*mg$".
+   Store each as a strength option with its label and per-component values.
 
-3. JSON serialization of payload — defensive default handler at EVERY 
-   json.dump / json.dumps across all 4 doc types:
-   def _json_safe(o):
-       if isinstance(o,(set,frozenset)): return sorted(list(o), key=str)
-       if hasattr(o,"isoformat"): return o.isoformat()
-       return str(o)
-   json.dump(payload, f, ensure_ascii=False, default=_json_safe)
+2. SELECT exactly ONE strength column for the assessment (never sum multiple):
+   Selection rule (see Part 3 for the derivation):
+     selected_strength = MDD_value ÷ doses_per_day   (implied strength)
+     Match to the nearest strength column by API quantity.
+     If no column matches within tolerance → warn, fall back to the column 
+     whose API qty × doses gives the highest drug-product mass (true 
+     worst-case), and log which column was chosen and why.
 
-4. Root-cause set leaks (convert at source, not just serialization):
-   - residual_solvent._rs_identity: frozenset(core) → sorted(list(core))
-   - annexure_identity_clustering: cluster["identity"] fields as lists
-   - any dedup seen-set that lands in audit → convert to list before payload
+3. Once one column is selected, every downstream calc uses ONLY that column's 
+   per-component quantities. The other columns are ignored for math (retained 
+   in Table 1 display for reference).
 
-5. Unicode normalization on filenames and raw responses (bulk-safe):
-   name = name.encode("utf-8","ignore").decode("utf-8")
-   Handles ®, ™, µ, Ph.Eur. etc. that break JSON in bulk.
+4. Table 1 (composition) may DISPLAY all strength columns (as approved docs 
+   do). But Table 3/4 (EI) and Section 5 (RS) use only the selected strength.
 
-6. Rate-limit backoff at batch level: if 3 consecutive annexures hit 
-   rate limit, pause 5s before continuing (avoid hammering).
+Chlorpromazine RS worked example (MDD 2400 mg, mdd_unit mg):
+   API concentration = 25 mg/mL (same in both 1mL and 2mL columns → 
+   25mg/1mL and 50mg/2mL are the SAME concentration).
+   daily_volume = MDD ÷ concentration = 2400 ÷ 25 = 96 mL/day
+   Select either column (same concentration); per-mL basis:
+     Chlorpromazine: 25 mg/mL × 96 = 2400 mg ✓
+     Ascorbic acid:  2 × 96 = 192 mg
+     Na Metabisulfite: 1 × 96 = 96 mg
+     Na sulfite: 1 × 96 = 96 mg
+     Na chloride: 6 × 96 = 576 mg
+     Water/Nitrogen: q.s. → NA
 
-Acceptance: upload 15+ mixed annexures per doc type → no JSON crash, no 
-"set not serializable", partial success on any single-file failure, clean 
-error list returned.
-
-═══════════════════════════════════════════════════════════════
-PART 3 — ANNEXURE MAPPING RESILIENCE (all 4 doc types)
-═══════════════════════════════════════════════════════════════
-
-BUG: Mapping not sustainable. Kollidon still not matching Crospovidone. 
-Mapping can fail entirely and break the whole document.
-
-3A — Mapping must NEVER fail the whole document:
-   Wrap all mapping in try/except. If mapping raises, log it, mark ALL 
-   materials as unmapped, proceed with generation (empty/"Not provided" for 
-   unmapped sections). A mapping bug can NEVER block document generation.
-
-3B — Expand excipient alias config (JSON overlay, all doc types share it):
-   New file: excipient_aliases.json (extensible, no code change to update)
-   crospovidone: [kollidon cl, kollidon cl-f, kollidon cl-sf, polyplasdone]
-   povidone: [kollidon 17 pf, kollidon 30, kollidon 90 f, plasdone]
-   glyceryl monostearate: [myverol 18-06, myverol 18-06 p k, imwitor 900, geleol]
-   polysorbate 80: [tween 80, montanox 80, super refined polysorbate 80]
-   simethicone: [q7-2243, dow corning q7-2243, liveo q7-2243, antifoam]
-   xanthan gum: [xantural, xantural 11k, keltrol]
-   microcrystalline cellulose: [avicel, avicel ph, vivapur, emcocel, prosolv]
-   dextrose: [d(+)-glucose anhydrous, glucose anhydrous, anhydrous dextrose c]
-   hypromellose: [methocel, hpmc, methocel e5]
-   hydroxypropyl cellulose: [klucel, nisso hpc]
-   yellow iron oxide: [sicovit yellow, ferroxide yellow]
-   croscarmellose sodium: [ac-di-sol, ac-di-sol sd-711]
-   mannitol: [pearlitol, pearlitol 50c, pearlitol mannitol powder]
-   sodium stearyl fumarate: [pruv]
-   opadry: [opadry ii, opadry white, opadry ii 85f580019]
-   eudragit: [methacrylic acid copolymer, eudragit l30 d-55]
-   Load once at startup; log alias count. Reused by EI, RS, DEG/EG, BE NOC.
-
-3C — Verify identity resolver uses aliases for ALL 4 doc types:
-   The resolver (_rs_identity / _rs_score in residual_solvent.py) must consult 
-   excipient_aliases.json. Confirm each doc type's mapping calls the shared 
-   resolver, not a private copy. Kollidon CL ↔ Crospovidone must resolve to 
-   0.90+ score in EI, RS, DEG/EG all three.
-
-3D — Test matrix (must pass all):
-   EI:     Kollidon CL → Crospovidone; MYVEROL 18-06 → Glyceryl monostearate
-   RS:     Chlorobutanol CoA + declaration cluster; TFA declaration
-   DEG/EG: Pearlitol 50C ↔ Mannitol; Ac-Di-Sol ↔ Croscarmellose
-   BE NOC: Vasudha CoA ↔ Loratadine; Malladi CoA ↔ Pseudoephedrine Sulfate
-
-Acceptance: no excipient with an alias in config shows "no annexure match". 
-Mapping exception never blocks generation.
-
-═══════════════════════════════════════════════════════════════
-PART 4 — EXCEL INGREDIENT NAMES DRIVE ANNEXURE LIST (EI, RS, DEG/EG — NOT BE NOC)
-═══════════════════════════════════════════════════════════════
-
-BUG: Annexure list in the DOCX should use the clean Excel-typed ingredient 
-names (as already done for EI), applied to RS and DEG/EG too. BE NOC excluded 
-(no composition Excel there).
-
-Fix in RS and DEG/EG payload builders (mirror EI behavior):
-
-1. The DISPLAY name for each annexure in Table 2 / List of Annexures / 
-   assessment table row labels = the COMPOSITION ingredient name it matched to 
-   (scientist-typed in Excel — clean, authoritative).
-
-2. Backend matching still uses all messy annexure text (title, candidates, 
-   filename) — NO CHANGE to matching.
-
-3. Fallback chain for display when NO composition match (extra annexure or 
-   unmatched):
-   a. cleaned annexure material_name (strip vendor grade / purity / compendia)
-   b. filename-derived (strip "Annexure N", extension, SAP codes, dates)
-   c. "Material [N]"
-   NEVER invent a name; NEVER show the full messy title in the document.
-
-4. BE NOC: keep existing behavior (no composition Excel; uses annexure 
-   classification titles). Do NOT apply Excel-name logic to BE NOC.
+Carboprost EI worked example (MDD 7.25 mg, salt/base footnote present):
+   "# 332 mcg Carboprost tromethamine ≡ 250 mcg carboprost" → salt/base.
+   Two columns "Quantity per mL" and "Quantity per 1mL" appear identical 
+   (same values) — treat as ONE strength (250 mcg/mL). If truly duplicate 
+   columns, dedup them; don't double-count.
+   Salt handling: strength label is base (250 mcg) but formulation weight is 
+   salt (332 mcg). Multiplier from MDD ÷ base; component amount uses salt 
+   weight (same salt/base rule as Trilaciclib).
 
 Acceptance:
-   RS Trilaciclib: annexure list shows "Trilaciclib 2HCl", "Mannitol", 
-     "Citric acid monohydrate" (composition names), not vendor titles.
-   DEG/EG Esomeprazole: shows "Polysorbate 80", "Mannitol (Pearlitol 50C)" 
-     (composition names).
-   EI: unchanged (already correct).
-   BE NOC: unchanged.
+   Carboprost EI, Chlorpromazine RS, Vasopressin EI all parse the multi-column 
+   Excel, select ONE strength, and produce correct daily exposures.
 
 ═══════════════════════════════════════════════════════════════
-PART 5 — VERIFICATION CHECKLIST LAYER (all 4 doc types)
+PART 3 — MDD UNIT + STRENGTH-COLUMN DERIVATION (EI + RS) — user's Q1 & Q2
 ═══════════════════════════════════════════════════════════════
 
-BUG: No standardized post-mapping checklist. Must show, per material, whether 
-an annexure was mapped (Yes/No). If No, PROCEED with generation but leave that 
-field/section empty — never assume or fabricate (BE NOC "Not provided" model).
+Q1 answer (implement): MDD unit and doses/day are DIFFERENT concepts. 
+mdd_unit ∈ {mg, units, IU, mcg, mL} describes the drug amount; doses_per_day 
+is a COUNT. When mdd_unit == "units" (or continuous infusion), user enters 
+MDD in units and leaves doses_per_day = 1. System derives the multiplier / 
+daily volume from MDD ÷ API concentration. Never make the user reconcile 
+units vs doses.
 
-Fix — add build_mapping_checklist() to each doc type backend, returned in the 
-build_payload() result (API layer surfaces it; never rendered in DOCX):
+Q2 answer (implement): The strength column is DERIVED, never forced to max.
+   implied_strength = MDD_value ÷ doses_per_day
+   Select the composition column whose API strength == implied_strength 
+   (nearest match). 
+   Example: MDD 120 mg, doses 12 → implied 10 mg → use the 10 mg column 
+   (NOT the 40 mg max). Forcing max strength would compute 480 mg/day and 
+   contradict the stated MDD of 120 — that is a bug.
+   If implied_strength matches NO column within tolerance → warn user 
+   ("MDD ÷ doses = X mg does not match any composition strength"), proceed 
+   using nearest column, log the choice.
+   Regulatory note (do not hardcode, just don't block): the low-strength / 
+   high-count scenario can legitimately be the worst case because EI exposure 
+   scales with total drug-product MASS/day, not API strength.
 
-checklist = {
-  "doc_type": "...",
-  "total_materials": N,
-  "mapped": M,
-  "unmapped": K,
+REMOVE any "always use maximum strength" logic in both EI and RS. Replace 
+with MDD÷doses derivation.
+
+MDD unit → derivation table (EI injection + RS both):
+   mdd_unit == "mL":    daily_volume_mL = mdd_value (direct)
+   mdd_unit == "mg":    daily_volume_mL = mdd_value ÷ api_conc_mg_per_mL
+   mdd_unit == "units": daily_volume_mL = mdd_value ÷ api_units_per_mL
+   mdd_unit == "mcg":   convert to mg first, then as mg
+   mdd_unit == "IU":    treat as units with product-specific potency
+   For solid OSD (mg/tab): multiplier = doses_per_day; strength via MDD÷doses.
+
+Acceptance:
+   MDD 120 + doses 12 → 10 mg column selected. 
+   Vasopressin MDD 144 units, doses 1 → daily volume = 144 ÷ conc. 
+   Chlorpromazine MDD 2400 mg → daily volume = 2400 ÷ 25 = 96 mL.
+
+═══════════════════════════════════════════════════════════════
+PART 4 — RS INPUT CONTRACT UNIFIED WITH EI (API-team clarity)
+═══════════════════════════════════════════════════════════════
+
+BUG: RS required-field set changes AFTER Excel processing (liquid needs 
+volume+density, strength needs MDD). API team cannot define a stable schema.
+
+Fix: RS uses the SAME fixed upfront contract as EI. Ask everything before 
+processing; backend uses only the relevant fields per detected Excel mode.
+
+Fixed contract (identical for EI and RS):
+{
+  "dosage_category": "...",        // required
+  "mdd_value": 0.0,                // required
+  "mdd_unit": "mg",                // required: mg|units|IU|mcg|mL
+  "doses_per_day": 1,              // required, default 1
+  "salt_factor": null,             // optional — auto-detected from Excel * footnote
+  "density_g_per_ml": null         // optional — auto-estimated if absent
+}
+
+DEG/EG and BE NOC keep {product_name} only (no dosing). Do NOT add dosing 
+fields to them.
+
+Rules:
+- salt_factor: priority = Excel footnote auto-detect → user field override → 
+  1.0 with warning. Never required. Never hard-block.
+- density: priority = user field → auto-estimate from composition → 1.0. 
+  Never block, never confirmation-gate.
+- The input contract is FIXED and known before Excel processing; the Excel 
+  classification only decides which supplied fields the math uses. Never make 
+  required fields depend on a processing step the API must call first.
+
+Acceptance: one stable request schema for RS, identical shape to EI. Dev no 
+longer confused by variable fields.
+
+═══════════════════════════════════════════════════════════════
+PART 5 — ANNEXURE NAME FALLBACK: NEVER "residual solvent" / GENERIC (ALL 4 TYPES)
+═══════════════════════════════════════════════════════════════
+
+BUG: RS annexure converter emits generic titles like "residual solvent" 
+(the document TYPE, not the material) into the annexure list when it can't 
+find a real material name. Applies across doc types — must be fixed everywhere.
+
+Fix — annexure DISPLAY name resolution (payload/renderer layer), priority:
+1. The COMPOSITION ingredient name it matched to (EI/RS/DEG-EG — clean, 
+   scientist-typed).
+2. Cleaned annexure material_name (strip vendor grade/purity/compendia noise).
+3. Filename-derived name: strip "Annexure N", extension, SAP codes, dates, 
+   and DOCUMENT-TYPE words ("residual solvent", "elemental impurity", 
+   "DEG", "EG", "risk assessment", "declaration", "certificate of analysis", 
+   "specification", "statement", "CoA").
+4. "Material [N]".
+
+NEVER emit a document-type/descriptor word as a material name. Add a reject 
+list of descriptor tokens; if the resolved name IS only a descriptor, fall 
+through to the next priority.
+
+Backend MATCHING still uses all messy text (title, candidates, filename) — 
+no change to matching. Only DISPLAY is cleaned.
+
+BE NOC: uses annexure-type classification titles (no composition Excel) — 
+keep existing, but still apply the "never show a bare descriptor" rule and 
+filename fallback.
+
+Acceptance:
+   RS Chlorpromazine annexures show ingredient names (or vendor material), 
+   never "residual solvent". DEG/EG never shows "DEG/EG declaration" as a 
+   material. EI never shows "elemental impurity". Filename fallback strips 
+   descriptor words.
+
+═══════════════════════════════════════════════════════════════
+PART 6 — "SHOW RESULT + REASON + PROCEED ANYWAY" WORKFLOW (EI, RS, DEG/EG ONLY)
+═══════════════════════════════════════════════════════════════
+
+BUG: When annexure mapping fails to find a match for an ingredient, the 
+system should surface it (result + reason) and PROCEED ANYWAY — never block, 
+never fabricate. Applies to EI, RS, DEG/EG (they have Excel + mapping). 
+NOT BE NOC (no composition Excel / mapping in that sense).
+
+Fix — build_payload() returns a mapping_checklist (data for API/UI, never in 
+DOCX):
+{
   "items": [
-    {"ingredient": "Crospovidone", "mapped": true,  
-     "matched_annexure": "Annexure 12 (Kollidon CL)", "confidence": 0.91},
-    {"ingredient": "Glyceryl monostearate", "mapped": false, 
-     "matched_annexure": null, "reason": "no annexure uploaded"},
-    ...
+    {"ingredient": "X", "mapped": true,  "matched_annexure": "Annexure 5 (...)", 
+     "confidence": 0.91, "reason": ""},
+    {"ingredient": "Y", "mapped": false, "matched_annexure": null, 
+     "confidence": 0.0, "reason": "No annexure uploaded for this ingredient"},
+    {"ingredient": "Z", "mapped": false, "matched_annexure": null, 
+     "reason": "Best match below threshold (0.42) — Kollidon CL vs Crospovidone"}
   ],
-  "sections_incomplete": ["Section X will show 'Not provided' for ..."],
-  "can_generate": true   # ALWAYS true unless zero files / all extractions failed
+  "mapped": M, "unmapped": K, "can_generate": true
 }
 
 Rules:
-1. can_generate is true even with unmapped materials (warning-first, BE NOC 
-   model across ALL doc types now).
-2. Unmapped material → its assessment row / spec / evidence stays empty or 
-   "Not provided." NEVER fabricate values, NEVER assume worst-case unless the 
-   doc-type math legitimately requires a documented default (and that default 
-   is logged).
-3. Hard-block ONLY when: no files uploaded, OR every annexure failed 
-   extraction, OR composition Excel produced zero rows (EI/RS/DEG-EG).
-4. Checklist is data returned to API — API/UI shows it so user can upload 
-   missing annexures and regenerate. Never written into DOCX body.
+- can_generate ALWAYS true unless: no files, or all extractions failed, or 
+  zero composition rows.
+- Unmapped ingredient → its EI element row / RS solvent row / DEG-EG evidence 
+  stays empty or "Not provided.". NEVER fabricate, NEVER assume worst-case 
+  values (except a doc-legitimate documented default that is logged).
+- API/UI shows the checklist with reasons and a "Proceed Anyway" action. User 
+  can upload the missing annexure and regenerate, or proceed with gaps.
+- Checklist NEVER rendered in the DOCX body.
+- BE NOC: not applicable (no ingredient↔annexure mapping). BE NOC keeps its 
+  own "Not provided." section behavior.
 
-Acceptance: every doc type returns a per-material mapped Yes/No checklist; 
-generation proceeds regardless; unmapped fields render empty (not fabricated).
-
-═══════════════════════════════════════════════════════════════
-PART 6 — DEG/EG CONVERTER: PER-GLYCOL INDEPENDENCE (CRITICAL, PRODUCTION BLOCKER)
-═══════════════════════════════════════════════════════════════
-
-BUG (unresolved for days): Polysorbate 80 shows DEG=Yes + EG=Yes when only 
-EG is tested. Croda CoA tests ONLY Ethylene Glycol (USP <469>), NOT DEG. 
-Confirmed the fault is in the ANNEXURE CONVERTER (vision extraction), which 
-infers DEG from the "USP <469>" chapter reference because <469> covers both 
-glycols by title.
-
-Fix — TWO layers, both required:
-
-6A — Converter prompt (deg_eg_annexure_converter.py), add PER-GLYCOL 
-INDEPENDENCE block, highest priority instruction:
-
-"DEG and EG are SEPARATE compounds. Evaluate each INDEPENDENTLY. NEVER copy 
-one glycol's evidence to the other. A CoA testing ONLY Ethylene Glycol 
-(e.g. 'Ethylene Glycol NMT 620 ppm PASS' or 'ETHYLENE GLYCOL (USP/NF 469) 
-620 PPM MAX') is EG=Yes but DEG=Unknown. The mention of 'USP <469>' or 
-'USP/NF 469' (whose chapter title names both glycols) does NOT authorize a 
-DEG value when no explicit Diethylene Glycol numeric line is printed. Only an 
-explicit 'Diethylene Glycol' line with its own numeric limit makes DEG=Yes.
-
-Case A — only EG printed:
-  deg_present=Unknown, deg_source=not_mentioned, deg_specification_limit=null
-  eg_present=Yes, eg_source=vendor_coa, eg_specification_limit='NMT 620 ppm'
-Case B — only DEG printed: mirror image.
-Case C — both printed: both Yes with their OWN limits.
-Case D — 'USP <469> compliant' with no per-glycol number: both Unknown.
-NEVER emit the same numeric limit for both glycols from a single-glycol line."
-
-6B — Post-processing guard in process_deg_eg_annexure (deterministic 
-backstop, product-agnostic):
-
-For each glycol independently, if present=="Yes":
-  Check raw_text contains that glycol's OWN name near a numeric ppm/PASS 
-  (word-boundary match: "diethylene glycol"/"deg" vs 
-   "(?<!di)(?<!tri)ethylene glycol"/"eg").
-  If the specific glycol name + numeric evidence is NOT found in raw_text 
-  (only the OTHER glycol's is), downgrade:
-    present="Unknown", specification_limit=null, source="not_mentioned"
-  Log: "Downgraded {glycol} to Unknown for {material}: no explicit 
-       {glycol} evidence; USP<469> reference alone insufficient."
-
-6C — Downstream build_assessment (deg_eg.py) — already correct per prior 
-review (per-glycol render). Verify it consumes the corrected per-glycol 
-fields and renders DEG row and EG row from their OWN limits (never shared).
-
-Acceptance:
-  Polysorbate 80 (Croda CoA): Table 2 DEG=No, EG=Yes, spec="EG: NMT 620 ppm".
-  Table 3: DEG row NA/NA/NA; EG row NA/620/620.
-  Observations mention ONLY Ethylene Glycol as confirmed present.
-  Mavacamten Mannitol (guarantee ceiling both): DEG=No/<1000, EG=No/<620, 
-  both from their own declaration lines.
-  Regression: Esomeprazole other excipients No/No/Not applicable.
+Acceptance: EI/RS/DEG-EG each return a per-ingredient mapped Yes/No + reason; 
+generation proceeds regardless; unmapped fields empty; BE NOC untouched.
 
 ═══════════════════════════════════════════════════════════════
-PART 7 — BE NOC: NEVER FABRICATE D04 CHEMISTRY
+PART 7 — PAGE NUMBERS EMPTY (all doc types where annexure page refs used)
 ═══════════════════════════════════════════════════════════════
 
-BUG: When D04 (API Information / CoA / DMF / SDS) is missing, BE NOC builds 
-Section 1 chemistry from extracted/inferred info instead of leaving it empty.
+BUG: page-number list comes back empty. Exact per-solvent/element source page 
+is hard, but empty list is unacceptable for production.
 
-Fix in benoc.py build_apis() and _attach_api_information():
-1. Chemistry (IUPAC, molecular_formula, molecular_weight, cas_number, 
-   therapeutic_category, indications, manufacturer) may ONLY come from:
-   a. Uploaded api_information (D04) annexure, OR
-   b. User-provided metadata override.
-2. If neither present: leave ALL chemistry fields empty. Section 1.x shows 
-   "Not provided." Do NOT infer from product name, do NOT compute, do NOT 
-   fabricate salt/base values, do NOT generate a structure from a guessed 
-   IUPAC.
-3. Molecular structure image: generate ONLY when a real IUPAC/SMILES/CAS 
-   exists from D04 or metadata. Missing → no structure block (no black box, 
-   no placeholder chemistry).
-4. Checklist (Part 5) flags each API without D04 as unmapped so user knows 
-   to upload it.
+Fix:
+1. Record the source page index during multi-page extraction (the page a 
+   value/table was found on). Attach page number to each extracted 
+   element/solvent record at extraction time.
+2. Roll up to per-annexure page ranges: {"annexure_pages": "1-3"} minimum.
+3. If per-field page cannot be determined, fall back to the annexure's total 
+   page span (e.g., "pp. 1–6") rather than an empty list.
+4. Never emit an empty page list — always at least the annexure page span.
 
-Acceptance: BE NOC with NO D04 → Section 1 chemistry empty ("Not provided"), 
-no fabricated formula/MW/CAS, no invented structure. With D04 → populated 
-correctly (Pseudoephedrine Sulfate salt form preserved).
+Acceptance: every annexure carries a non-empty page reference (specific page 
+if known, else full span).
 
 ═══════════════════════════════════════════════════════════════
-PART 8 — PER-DOC-TYPE CORRECTNESS (verify math, mapping, results)
+PART 8 — FONT SIZE INVERSION (all renderers)
 ═══════════════════════════════════════════════════════════════
 
-8A — ELEMENTAL IMPURITY (from EI bug list — all must be in production):
-   - Route-aware Option 1 concentrations + PDE (oral/parenteral/inhalation). 
-     Parenteral was 10× overstated (Vasopressin Cd/Hg/Co/V/Ni).
-   - Option 2b when drug-product daily mass > 10 g (Vasopressin 731 g/day).
-   - Drug-product mass = fill_volume × density × doses (injections), not 
-     sum-of-solids.
-   - "<30% Perm Conc" / "meets Option 1" qualitative → concentration = 0 
-     (DRL convention). REMOVE the 30%×Option1 computation.
-   - ND / BLD / BLQ / Below LOD → 0. No LOD/LOQ substitution.
-   - Excel parser: recognize Quantity/mL, Quantity/Vial, USP units 
-     ("units","IU"), multi-strength "/", mixed mg vs g, decorative 
-     title-banner + notes rows.
-   - UI/metadata MDD & doses override Excel-derived; never silent 0/1.
-   - Both strengths in one report (worst-case concentration).
-   - ppb→ppm normalization; Peter Greven measured-column (not RL) retained.
-   - Material Code column in Table 1 retained.
-   - Fishbone Figure 1: NO black box → empty placeholder or bare caption only.
+BUG: Section HEADINGS render SMALL and body CONTENT renders LARGE — inverted, 
+looks broken.
 
-8B — RESIDUAL SOLVENT (from RS final red flags — all in production):
-   - Salt/base + overage from Excel marker footnote (Trilaciclib 349* → 
-     factor 1.163 from footnote; Epinephrine overage). Warning-only if 
-     footnote missing (never hard-block); default factor 1.0 with warning.
-   - Density: auto-estimate from composition, optional user override, never 
-     block, no confirmation gate.
-   - RS master: 71-entry residual_solvent_master.json overlay loaded (TFA 
-     3400/3.4, CPME 1500/15, all Class 2/3 present). Verify TFA/CPME not NA.
-   - Non-USP solvents (canonical=None with numeric) included; USP row "N/A".
-   - Vendor content vs USP master separation: ingredient rows use vendor 
-     extracted content ONLY; USP master only in comparison row (no fallback).
-   - NMT spec over batch-actual; USP/NF > EP > JP compendial priority.
-   - q.s. rows render "NA"; excluded from mass sum.
-   - Multi-page extraction; single-solvent quality-box pattern (Epinephrine 
-     Benzene page 8).
+Fix in generate_*.js (all 4 renderers):
+- Headings > body. Enforce a size hierarchy:
+   Doc title:      ~26–28 half-points equivalent (largest)
+   Section heading:~22–24, bold
+   Sub-heading:    ~20, bold
+   Body text:      ~20–22 (SMALLER than or equal to headings, never larger)
+   Table cell:     ~18–20
+- Audit every run.* / heading builder for swapped size constants. The bug is 
+  almost certainly a size constant applied to the wrong element (heading using 
+  the body size and vice versa).
 
-8C — DEG/EG: Part 6 (per-glycol) is the blocker. Plus:
-   - Three-tier (confirmed / guarantee-ceiling / not-present) per glycol.
-   - FDA high-risk triggers assessment, NOT presence.
-   - Observations paragraph explains mechanism only from raw_text (no 
-     hallucination).
-
-8D — BE NOC (from BE NOC red flags):
-   - Part 7 (no D04 fabrication) is the blocker.
-   - API name parser: strip dose strings BEFORE split, catch BOTH "5mg/120mg" 
-     AND concatenated "5mg120mg" (no slash). No phantom API section. 
-     Loratadine 1.1 must appear.
-   - Stability: dedup key (batch, storage_condition, timepoint); timepoint 
-     column labels must match the data shown (6M block shows 6M data, not 1M).
-   - Manufacturing address: extract Test Batch and BE Batch separately from 
-     labeled sections; do not mirror one into both.
-   - STP spec: collapse hierarchy (microbiology/pathogen sub-tests under 
-     parent); no duplicate concepts (Melting Range + Melting Point, 
-     Elemental Impurity ICP-OES + Elemental Impurities). Cap ~12 top tests.
-   - Comparative dissolution: classify + extract when uploaded; charts 
-     auto-generate; F2 rendered as-provided (do not recompute/correct source).
+Acceptance: in all 4 doc types, headings are visibly larger/bolder than body; 
+no funny inversion.
 
 ═══════════════════════════════════════════════════════════════
-PART 9 — DISPLAY / DOCX HYGIENE (all doc types)
+PART 9 — SALT/BASE & OVERAGE FOOTNOTE (EI + RS) — reconfirm for these products
 ═══════════════════════════════════════════════════════════════
 
-1. No black boxes anywhere (EI fishbone). Empty placeholder or caption only.
-2. No "…" ellipsis truncation in any table cell; show full clean name.
-3. No internal warning language in DOCX body ("manual review", "Unknown", 
-   "no annexure match", cluster IDs). Those go to checklist/logs only.
-4. Empty section → "Not provided." (BE NOC model), never fabricated content.
-5. Material Code / Compendial Status columns from Excel where available; 
-   blank if absent (not fabricated).
+Carboprost "# 332 mcg tromethamine ≡ 250 mcg carboprost" → salt/base:
+   base_qty=250mcg, salt_qty=332mcg, salt_factor=1.328.
+   Multiplier uses BASE; component amount uses SALT weight.
+Chlorpromazine HCl: MDD and strength both salt-basis → NO salt conversion; 
+   "#" on vendor is informational (Category D). Warning-only footnote check 
+   passes. Do not ask for salt_factor.
+Rule (already built, verify wired for EI too, not just RS): parse Excel marker 
+footnotes, classify salt/base vs overage vs q.s. vs informational, auto-set 
+salt_factor/overage; warning-only if missing; default 1.0. Applies to EI AND 
+RS.
 
 ═══════════════════════════════════════════════════════════════
 GLOBAL NON-NEGOTIABLES (DO NOT BREAK)
 ═══════════════════════════════════════════════════════════════
 
-- DO NOT change any verified-correct math: EI per-element exposure 
-  (mg/dose×ppm÷1000), RS multiplier/exposure, RS Trilaciclib amounts 
-  (0.503/0.432/0.109/1.043 g), Epinephrine amounts, DEG/EG per-glycol render.
-- DO NOT regress working products: EI Diazoxide Choline, EI Medroxyprogesterone, 
-  RS Esomeprazole/Trilaciclib/Epinephrine/Sofosbuvir, DEG/EG Mavacamten, 
-  BE NOC Loratadine+Pseudoephedrine.
-- DO NOT change the identity resolver algorithm; only add aliases via config.
-- DO NOT couple DEG and EG.
-- DO NOT fabricate any value when source absent (chemistry, elements, 
-  solvents, specs). Empty/"Not provided" instead.
+- DO NOT alter any verified-correct math (RS Trilaciclib 
+  0.503/0.432/0.109/1.043 g; Epinephrine amounts; EI per-element formula once 
+  Part 1 is fixed).
+- DO NOT regress known-good: EI Diazoxide, EI Medroxyprogesterone, RS 
+  Esomeprazole/Trilaciclib/Epinephrine/Sofosbuvir, DEG/EG Mavacamten, BE NOC 
+  Loratadine+Pseudoephedrine.
+- DO NOT force max strength anywhere; strength = MDD ÷ doses.
+- DO NOT sum multiple strength columns; select ONE.
+- DO NOT fabricate values for unmapped ingredients; empty / "Not provided.".
+- DO NOT emit document-type words as material names; filename fallback strips 
+  them.
 - DO NOT hard-block except: no files / all extractions failed / zero 
   composition rows.
-- DO NOT use LOD/LOQ substitution for ND (ND=0).
-- DO NOT let mapping failure block generation.
-- DO NOT reintroduce Streamlit into backend.
-- PRESERVE warning-first everywhere; checklist is data, not a blocker.
+- DO NOT add dosing fields to DEG/EG or BE NOC.
+- DO NOT apply the mapping-checklist "proceed anyway" to BE NOC.
+- Warning-first everywhere; checklist is data, not a blocker.
 
 ═══════════════════════════════════════════════════════════════
-IMPLEMENTATION ORDER (regression-test after EACH phase, all 4 doc types)
+IMPLEMENTATION ORDER (regression-test all 4 types after each)
 ═══════════════════════════════════════════════════════════════
 
-Phase 1 — Stability & safety (no behavior change to correct outputs):
-   Part 0 (de-Streamlit backend), Part 1 (Claude retry/errors), 
-   Part 2 (bulk isolation + JSON/set fixes).
-   → Regression: all 4 known-good products must still generate identically.
+Phase 1 (correctness blockers):
+  Part 1 (daily exposure formula + self-test) 
+  Part 2 (multi-strength single-column selection)
+  Part 3 (MDD unit + strength derivation, remove max-strength)
 
-Phase 2 — Production blockers:
-   Part 6 (DEG/EG per-glycol converter fix), Part 7 (BE NOC no-D04-fabrication),
-   Part 3 (mapping resilience + Kollidon alias), Part 8A EI route/Option2b/
-   perm-conc-zero.
+Phase 2 (contract + resilience):
+  Part 4 (RS unified contract)
+  Part 5 (annexure name fallback, no descriptors)
+  Part 6 (mapping checklist + proceed-anyway, EI/RS/DEG-EG)
 
-Phase 3 — Consistency & UX-data:
-   Part 4 (Excel names → annexure list for RS/DEG-EG), Part 5 (checklist), 
-   Part 8B/8C/8D remaining, Part 9 (display hygiene).
+Phase 3 (polish):
+  Part 7 (page numbers non-empty)
+  Part 8 (font size inversion)
+  Part 9 (salt/base footnote wired for EI too)
 
 ═══════════════════════════════════════════════════════════════
-ACCEPTANCE — FULL REGRESSION MATRIX (all must pass)
+ACCEPTANCE MATRIX (must all pass, hand-verified for exposures)
 ═══════════════════════════════════════════════════════════════
 
-EI Diazoxide Choline (oral):    math unchanged, all <30%, no regression.
-EI Medroxyprogesterone (SC):    now parenteral concentrations, still compliant.
-EI Vasopressin (parenteral):    Option 2b, "<30%"→0, both strengths, 
-                                compliant conclusion, decorative Excel parses.
-EI Esomeprazole (oral sachet):  Dextrose "<30%"→0, Kollidon CL↔Crospovidone.
-RS Trilaciclib:                 amounts 0.503/0.432/0.109/1.043; TFA 3400/3.4, 
-                                CPME 1500/15 (not NA); no JSON set error.
-RS Epinephrine:                 no footnote hard-block; Benzene 2ppm captured.
-RS Sofosbuvir/Esomeprazole:     no regression.
-DEG/EG Esomeprazole:            Polysorbate 80 DEG=No / EG=Yes/620 (THE FIX).
-DEG/EG Mavacamten:              Mannitol No/No with both guarantee ceilings.
-BE NOC (with D04):              Pseudoephedrine Sulfate salt preserved.
-BE NOC (no D04):                Section 1 "Not provided", zero fabrication.
-BE NOC:                         no phantom API, Loratadine 1.1 present, 
-                                stability timepoints correct, addresses distinct.
-Bulk (each doc type, 15+ files): no crash, partial-success on failures, 
-                                checklist returned, mapping never blocks.
-Claude rate limit (injected):   "Claude error, please try again", no crash, 
-                                other files succeed.
-
-Ship only when the entire matrix passes. Nothing above may break anything 
-already working.
+EI Carboprost (250 mcg/mL PFS, MDD 7.25 mg, salt/base 332≡250 mcg):
+  multi-column parsed → single strength; salt/base applied; daily exposures 
+  hand-verify against Σ(qty×doses×0.001×ppm); Totals correct.
+EI Vasopressin (multi-column, units): daily volume derived, exposures correct.
+EI generic 10/20/40 (MDD 120, doses 12): 10 mg column selected; exposures 
+  correct.
+RS Chlorpromazine (25mg/mL & 50mg/2mL, MDD 2400 mg): daily volume 96 mL; 
+  single strength; solvent exposures + equiv ppm correct.
+RS/EI regression set: unchanged outputs.
+All doc types: annexure list shows real names (never "residual solvent" etc.), 
+  filename fallback works, page refs non-empty, headings larger than body, 
+  mapping checklist returned (EI/RS/DEG-EG), BE NOC untouched.
+Daily-exposure self-test: passes (<0.1% diff) for every product.
