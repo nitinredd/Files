@@ -1,398 +1,169 @@
-═══════════════════════════════════════════════════════════════════════════════
-DocGen — FINAL EI + RS RED FLAGS (production). Embedded test fixtures included so
-you can RUN and VERIFY without file access. DO NOT break verified-correct output.
-═══════════════════════════════════════════════════════════════════════════════
-
-RED FLAG 1 — TABLE PAGE OVERFLOW (HIGHEST PRIORITY, EI + RS)
-─────────────────────────────────────────────────────────────
-Bug: EI element tables (24-25 columns) and RS wide solvent tables run past the
-page edge on every product — content clipped, looks broken. Seen on Vasopressin,
-Carboprost, Esomeprazole, Chlorpromazine.
-Fix (renderer, all doc types):
-1. Element/solvent-matrix tables render in A4 LANDSCAPE section (page size swap
-   for those tables only; narrative stays portrait).
-2. Split EI element tables by class (Class1+2A / 2B / 3) — already partly done —
-   AND cap each sub-table so total column count × min width ≤ landscape width.
-   If a class still overflows, wrap to a second table continuation.
-3. Auto-fit column widths; concentration/exposure cells to 4 significant figs
-   max (0.15 not 0.1500; 1188.0 not 1188.000000). Trim trailing zeros.
-4. Reduce table font (e.g. 7-8pt) for wide matrices; header bold.
-5. Freeze first two label columns; never let a single table exceed the printable
-   width. Verify no cell is clipped at the right margin.
-Acceptance: no table crosses the page boundary in any EI or RS output; all
-element/solvent columns fully visible in landscape.
-
-RED FLAG 2 — INJECTION COLUMN HEADERS/VALUES WRONG (EI + RS)
-─────────────────────────────────────────────────────────────
-Bug: For injections the AI shows Column1="mg/dose"=36000 and Column2="Qty in
-MDD (mg)"=36000 for Dextrose. Both wrong. Approved uses Column1="Qty/mL (mg)"=50
-(per-mL quantity) and Column2="Amount in maximum dose (g)"=36.
-Fix:
-- Injection tables: Column1 = Qty per mL (mg/mL) — the composition per-mL value,
-  NOT the amount in max dose. Dextrose=50, Acetic=0.0546, Na acetate=0.012.
-- Column2 = Amount in maximum dose in GRAMS = qty_per_mL × daily_volume_mL / 1000.
-  Dextrose = 50 × 720 / 1000 = 36 g.
-- Solid OSD keeps mg/dose = qty_per_unit × doses; amount in mg.
-- Daily Exposure = amount_in_max_dose_g × conc_µg_per_g (EI) — unchanged.
-Acceptance (Vaso 20u): Dextrose Qty/mL=50, Amount=36 g; Acetic 0.0546/0.03931 g;
-Na acetate 0.012/0.00864 g; Vasopressin 0.000377/0.000272 g.
-
-RED FLAG 3 — BELOW-LIMIT / "<30% PERM CONC" → 0 (EI ONLY)
-─────────────────────────────────────────────────────────────
-Bug: Merck EMPROVE CoAs report every element "<30% of Option-1 permitted conc"
-(qualitative below-limit). Approved uses ZERO. AI kept the 30%-of-Option-1 ppm
-(0.45,0.06,0.15,0.6,7.5,21,33…) as real values → huge fake exposures → false
-FAIL (Pb 3605% PDE). ND=0 convention (EI):
-Fix (annexure_converter + EI):
-- "<X" / "≤X" / "BDL" / "BLQ" / "Below LOD/LOQ" / "ND" / "Not detected" /
-  "<30% of Perm Conc" / "meets/below Option 1" → concentration_value = 0.0.
-  Keep observed_level raw text for audit. Only an explicit measured number with
-  a real unit (ppm/ppb/µg/g) is a value.
-- EXCEPTION (presence-flagged): a CoA with a "Likely Present = Yes" checkbox and
-  a bound ABOVE the detection floor (e.g. Ni "<0.7", MRL 0.05, marked Yes) →
-  keep the bound (0.7). To decide 0-vs-keep, read THREE fields: the <X value,
-  the presence flag (if the format has one), and the MRL/Option-1 reference
-  (X at the detection floor or =30%×Option-1 → 0; X above floor + Yes → keep).
-- "Not intentionally added" declaration with no measured table → all 0.
-- IGNORE CONEG/RoHS "Pb+Cd+Cr(VI)+Hg as a sum 100 ppm" packaging limits (West
-  stopper) — never per-element EI values.
-Acceptance (Vaso): all excipient "<30% Perm Conc" → 0; Table 4 excipient rows 0;
-conclusion PASS, no confirmatory testing.
-
-RED FLAG 4 — RS BELOW-LIMIT KEEPS NMT SPEC (RS ONLY — OPPOSITE OF EI)
-─────────────────────────────────────────────────────────────
-Bug risk: applying EI's ND=0 to RS would wrongly zero every solvent.
-Rule (RS): a solvent batch result BDL/BLQ/ND that has an accompanying vendor NMT
-SPECIFICATION limit → use the NMT spec as worst-case, NOT zero. Only zero a
-solvent when there is NO spec AND it is declared NIL/absent.
-Verified correct in Chlorpromazine run: Toluene BLQ(5.53)+NMT890→890;
-t-Butanol BDL+NMT68→68; DMSO BDL+NMT5000→5000. KEEP this behavior; do not
-regress by importing EI ND=0 into RS.
-
-RED FLAG 5 — SALT/BASE FOOTNOTE IN INJECTION DOSING (EI + RS)
-─────────────────────────────────────────────────────────────
-Bug: Carboprost footnote "#332 mcg tromethamine ≡ 250 mcg carboprost" ignored;
-volume derived off salt (332) not base (250).
-Fix: parse composition footnote markers (#,*,@,superscript); classify salt/base
-vs overage vs q.s. vs informational; for salt/base use BASE for daily-volume /
-multiplier, SALT weight for component amounts. Chlorpromazine HCl and Vasopressin
-are salt-basis MDD → NO conversion; their "#" markers are vendor/informational.
-Warning-only if a marker has no footnote (never hard-block; default factor 1.0).
-
-RED FLAG 6 — INGREDIENT COLUMN DETECTION (EI + RS)
-─────────────────────────────────────────────────────────────
-Bug: Chlorpromazine Excel with a "Pharmaceutical Function" column → parser used
-"Antioxidant"/"Tonicity agent" as ingredient NAMES → nothing mapped → empty doc.
-Carboprost/Vaso "Quantity per mL" / "Quantity/Vial" headers unrecognized.
-Fix (RS + EI composition parser):
-- Ingredient-name column: prefer headers "ingredient"/"material name"/"name of
-  ingredient"/"component". EXPLICITLY EXCLUDE any header containing
-  "function"/"role"/"category"/"purpose" from being the name column; read it as
-  the ROLE field instead (for q.s./active detection).
-- Quantity columns: recognize "quantity per ml", "quantity/vial", "qty/1ml",
-  "qty/2ml", "quantity per 1ml/2ml", "mg/ml", plus existing hints.
-- Injection mg-basis: daily_volume = MDD ÷ api_conc_per_mL (2400÷25=96;
-  144units÷0.2=720). Do NOT compute implied_strength=MDD÷doses for mg/mL
-  injections (that's for solid tablet strengths). Dedup identical-concentration
-  columns (Qty/1mL & Qty/2mL both 25mg/mL → one).
-- Self-test FAIL if ingredient names resolve to function words
-  (antioxidant/tonicity/buffer/vehicle/active-as-a-name).
-
-RED FLAG 7 — API ROW FALLBACK + GIBBERISH PRODUCT NAME (EI + RS)
-─────────────────────────────────────────────────────────────
-Fix _identify_api_row: (1) Function contains "active"; (2) product-name↔material
-token overlap; (3) FALLBACK first quantitative non-q.s. row = API (never abort on
-placeholder names "Test"/"abc"). Gibberish product-name guard → WARNING only.
-
-RED FLAG 8 — DAILY-EXPOSURE SELF-TEST MUST FAIL ON EMPTY (EI + RS)
-─────────────────────────────────────────────────────────────
-Self-test currently "reconciles" on 0 rows (0==0). FAIL if: rows==0, mdd<=0, any
-non-q.s. component has blank/"–"/non-numeric mg-dose or daily-intake, or (EI) salt
-footnote present but volume used salt not base.
-
-RED FLAG 9 — ANNEXURE LIST: REMOVE "PAGES", FIX MATERIAL NAME (ALL 4)
-─────────────────────────────────────────────────────────────
-Bug: List of Annexures generates unreliable "Pages" (p.2, pp.3-4); material name
-defaults to product/API name (Chlorpromazine RS listed DSM Ascorbic COA, Merck
-NaCl, West stopper, Schott vial all as "Chlorpromazine Hydrochloride").
-Fix:
-- REMOVE the "Pages" column entirely (all doc types). Columns = Annexure |
-  Material | Supplier.
-- Material name resolves per-annexure: matched ingredient name, else the
-  annexure's own extracted material (Ascorbic acid, Sodium chloride, Rubber
-  stopper, Glass vial), stripped of grade/compendia/® noise; then filename;
-  NEVER default to the product/API name.
-- Sequential Annexure 1..N; Table 3 supplier-declaration cross-refs must be
-  per-ingredient sequential numbers, not all "Annexure 10".
-
-RED FLAG 10 — CANONICAL SOLVENT ALIAS DEDUP (RS)
-─────────────────────────────────────────────────────────────
-Bug: DMSO appeared TWICE — "Dimethyl Sulphoxide" (API COA) and "Dimethyl
-sulfoxide" (API decl) as two solvent columns → double-count.
-Fix: normalize British/American spelling: sulphoxide=sulfoxide, sulphate=sulfate,
--ph-/-f-. Merge to ONE canonical DMSO. General: apply spelling normalization
-before alias lookup so one solvent never appears twice.
-
-RED FLAG 11 — DISPLAY-NAME GRADE STRIP + NO "–"/BLACK BOX (EI + RS)
-─────────────────────────────────────────────────────────────
-- Strip vendor grade (EMPROVE/EXPERT/ESSENTIAL/bio) INCLUDING ® and trailing
-  fragment (no bare "® exp"). Compendia lists removed. No "…" ellipsis.
-- No "–" in a quantitative cell that had a number.
-- EI Figure 1: empty placeholder or bare caption — NEVER a black box.
-
-RED FLAG 12 — DRUG PRODUCT MASS FOR INJECTION (RS + EI)
-─────────────────────────────────────────────────────────────
-Injection drug-product mass = daily_volume_mL × density_g_per_mL × 1000.
-Chlorpromazine showed 129600 mg; expected ~96000 (96 mL × 1.0). Verify; density
-optional/auto-estimate. Affects equivalent-ppm total only, not pass/fail.
+EI + RS Converter — Data-Interpretation Fixes (renderer/parser fixes already 
+landed; these did NOT). Carboprost run confirms: 0.05 placeholder persists, 
+"<30% Perm Conc" not zeroed, salt/base volume wrong, mass-basis contradiction. 
+Fix in annexure_converter.py (EI) and verify OPPOSITE behavior in 
+residual_solvent_annexure_converter.py (RS).
 
 ═══════════════════════════════════════════════════════════════
-EMBEDDED TEST FIXTURES — RUN THESE TO VERIFY (no file access needed)
+FIX 1 — EI: "<X" / BDL / ND → 0 (parser mapping, not just prompt)
 ═══════════════════════════════════════════════════════════════
+Bug: report shows 0.05 for every element on Carboprost + Tromethamine (Avantor 
+CoA is "<0.05 ppm"). The less_than status still resolves to the LIMIT value, 
+not 0. The prompt text was updated but the CODE mapping was not.
 
---- FIXTURE A: Vasopressin composition (EI injection) ---
-{ "product":"Vasopressin in 5% Dextrose Injection", "route":"parenteral",
-  "mdd_value":144, "mdd_unit":"units", "doses_per_day":1,
-  "api_conc_per_mL_units":0.2, "density_g_per_mL":1.016,
-  "salt_note":"1 mg = 530 units; MDD 144 units = 0.272 mg",
-  "rows":[
-   {"name":"Vasopressin","function":"active","qty_per_mL_mg":0.000377,"qs":false},
-   {"name":"D(+)-Glucose anhydrous","function":"stabilizer","qty_per_mL_mg":50,"qs":false},
-   {"name":"Glacial Acetic Acid","function":"buffer","qty_per_mL_mg":0.0546,"qs":false},
-   {"name":"Sodium acetate trihydrate","function":"buffer","qty_per_mL_mg":0.012,"qs":false},
-   {"name":"Hydrochloric acid","function":"pH adjuster","qty":"q.s.","qs":true},
-   {"name":"Sodium Hydroxide","function":"pH adjuster","qty":"q.s.","qs":true},
-   {"name":"Water for Injection","function":"vehicle","qty":"q.s.","qs":true},
-   {"name":"Nitrogen","function":"process aid","qty":"q.s.","qs":true}]}
-Expected: daily_volume = 144 ÷ 0.2 = 720 mL/day. Drug product mass = 720×1.016
-×1000 = 731520 mg (731.52 g) > 10 g → Option 2b. Dextrose amount = 50×720/1000
-= 36 g. Acetic = 0.03931 g. Na acetate = 0.00864 g. Vasopressin = 0.000272 g.
+Fix in annexure_converter.py parse_observed_level() and resolve_element_reading():
+The status→value mapping MUST be:
+    nd, not_tested, below_detection            → 0.0
+    bdl, blq, less_than, derived_loq           → 0.0   (was: return the limit)
+    below_option1_qualitative                  → 0.0
+    actual (explicit printed number+real unit) → normalize_to_ppm(value, unit)
+Remove any branch that returns the bracketed/limit number for less_than/bdl.
+Keep observed_level raw text ("<0.05","BDL") for audit; only concentration_value 
+becomes 0. Delete the 0.05 default entirely — never emit a hardcoded 0.05.
 
---- FIXTURE B: Dextrose annexure (Merck EMPROVE) ---
-{ "material":"D(+)-Glucose anhydrous EMPROVE","supplier":"Merck KGaA",
-  "declaration":"All ICH Q3D elements reported as <30% of Option-1 permitted
-   concentration; none intentionally added; below reporting limit.",
-  "elements_all":"<30% of Perm Conc" }
-Expected: EVERY element concentration → 0.0 (below-limit qualitative). Dextrose
-contributes 0 to every column in Table 4.
+EXCEPTION (presence-flagged, keep the bound):
+Only when the CoA has an explicit "Likely to be Present = Yes" checkbox AND the 
+"<X" bound is clearly above the detection floor (X > ~1.5×MRL), keep X.
+  Avantor Tromethamine: As/Cd/Hg/Pb/Co/V "<0.05" + No → 0; 
+                        Ni "<0.7" (14×MRL) + Yes → 0.7.
+Read THREE fields to decide: the <X value, the presence flag (if present), the 
+MRL/Option-1 reference.
 
---- FIXTURE C: Sodium acetate annexure (has one measured) ---
-{ "material":"Sodium acetate trihydrate","supplier":"Merck",
-  "note":"All <30% Option-1 EXCEPT Arsenic monitored NMT 0.0001% (=1 ppm) spec",
-  "As":"1 ppm measured spec", "others":"<30% of Perm Conc" }
-Expected: As = 1.0 µg/g kept (explicit spec); all others 0.
-
---- FIXTURE D: Vasopressin APPROVED result (gold) ---
-{ "option":"2b", "daily_volume_mL":720, "drug_product_g":731.52,
-  "table4_excipient_rows":"ALL ZERO (below-limit → 0)",
-  "batch_analysis":"3 EB batches each strength: all ND/BLD/BLQ, <30% PDE",
-  "conclusion":"All below 30% PDE Option 2b; NO further testing required; PASS",
-  "amounts_g":{"Dextrose":36,"Acetic":0.03931,"Na_acetate":0.00864,"Vaso":0.000272}}
-Verify AI matches: excipients 0, PASS, no false confirmatory-testing flag.
-
---- FIXTURE E: Chlorpromazine RS composition (injection) ---
-{ "product":"Chlorpromazine HCl Injection","route":"parenteral",
-  "mdd_value":2400,"mdd_unit":"mg","doses_per_day":1,"api_conc_per_mL_mg":25,
-  "rows":[
-   {"name":"Chlorpromazine Hydrochloride","function":"active","qty_per_mL_mg":25,"qs":false},
-   {"name":"Ascorbic acid","function":"antioxidant","qty_per_mL_mg":2,"qs":false},
-   {"name":"Sodium Metabisulfite","function":"antioxidant","qty_per_mL_mg":1,"qs":false},
-   {"name":"Sodium sulfite","function":"antioxidant","qty_per_mL_mg":1,"qs":false},
-   {"name":"Sodium chloride","function":"tonicity","qty_per_mL_mg":6,"qs":false},
-   {"name":"Water for injection","function":"vehicle","qty":"q.s.","qs":true},
-   {"name":"Nitrogen","function":"process aid","qty":"q.s.","qs":true}]}
-Expected: daily_volume=2400÷25=96 mL. Amounts: CPZ 2400, Ascorbic 192,
-Metabisulfite 96, sulfite 96, NaCl 576 mg. Water/N2 → NA.
-
---- FIXTURE F: Chlorpromazine solvent annexures ---
-{ "Chlorpromazine_HCl_Maithri":{
-    "Methanol":"NMT 3000","Toluene":"NMT 890 (batch BLQ 5.53)",
-    "t-Butanol":"NMT 68 (batch BDL 3.20)","Isopropyl alcohol":"263 ppm / NMT 5000",
-    "n-Heptane":"NMT 5000 (batch BDL 0.19)","Dimethyl Sulphoxide":"NMT 5000 (batch BDL 39.99)"},
-  "Ascorbic_DSM":{"Methanol":"NMT 3000","Ethanol":"NMT 1000"},
-  "Sodium_Metabisulfite_Finar":"NIL all classes",
-  "Sodium_sulfite_Finar":"NIL all classes",
-  "Sodium_chloride_Merck":"excluded by production process",
-  "Vial_Schott":"annealed 600C inorganic — no solvents",
-  "Stopper_West":"residual solvents not certified — no data" }
-Expected RS result: solvents = {Methanol 3000, Toluene 890, t-Butanol 68,
-Isopropyl alcohol 5000, n-Heptane 5000, DMSO 5000 (SINGLE, merged
-Sulphoxide/sulfoxide), Ethanol 1000}. NMT worst-case (NOT zeroed).
-Cross-component: Methanol from CPZ(2400×3000/1e6=7.2)+Ascorbic(192×3000/1e6=
-0.576)=7.776 mg. All < USP<467> → PASS. Annexure list: per-material names
-(Ascorbic/NaCl/Metabisulfite/sulfite/stopper/vial), NO Pages column, DMSO once.
+Acceptance (Carboprost):
+  Carboprost API COA (residual-solvent doc, no EI data) → all 0 (no 0.05).
+  Tromethamine → all 0 except Ni 0.7.
 
 ═══════════════════════════════════════════════════════════════
-ACCEPTANCE (run fixtures, assert)
+FIX 2 — EI: "<30% of Perm Conc" / "meets Option 1" → 0
 ═══════════════════════════════════════════════════════════════
-Vasopressin (A+B+C+D): Option 2b; Dextrose Qty/mL=50, Amount=36 g; all excipient
-"<30% Perm Conc" → 0; Vasopressin API row present; PASS, no false testing; no
-table overflow (landscape); columns labeled Qty/mL and Amount(g) not mg/dose.
-Chlorpromazine (E+F): 96 mL/day; 7 ingredients; solvents NMT worst-case (not 0);
-DMSO single; annexure names per-material; no Pages column; no overflow; PASS.
+Bug: Merck EMPROVE Sodium chloride + Benzyl alcohol show 0.15/0.45/0.06/…/33/45 
+(exactly 30% of oral Option 1). These CoAs state "no impurities ≥30% of Option 1 
+detected" — a qualitative below-limit declaration. Per DRL convention → 0.
 
-═══════════════════════════════════════════════════════════════
-GLOBAL NON-NEGOTIABLES
-═══════════════════════════════════════════════════════════════
-- EI: ND/"<X"/"<30% Perm Conc" → 0 (except presence-flagged bound). RS: BDL/BLQ
-  with NMT spec → NMT worst-case (never 0). NEVER conflate the two.
-- Salt/base: BASE for volume, SALT for amounts. Strength = MDD÷doses only for
-  solid OSD; injections derive volume = MDD÷conc.
-- Never force max strength; never sum multiple strength columns.
-- No fabricated values; empty → "Not provided."; no black box; no "–"; no
-  ellipsis; no Pages column; DMSO/spelling variants merged.
-- No table exceeds page width (landscape for matrices).
-- Warning-first; hard-block only: no files / all extractions failed / zero rows.
-- Preserve verified maths (EI per-element formula, RS Trilaciclib/Epinephrine/
-  Chlorpromazine amounts, RS NMT worst-case). No Streamlit in backend.
-
-
-#####################
-RED FLAG 13 — PRODUCT NAME FROM EXCEL, NOT UI FIELD (EI + RS + DEG/EG)
-─────────────────────────────────────────────────────────────
-Bug: UI product-name field is unreliable ("test", "abc", "asdfghjkl",
-"Esome", "5mg120mg"). Current logic tries to use it, then guards gibberish.
-Better: don't depend on the UI field for identity at all.
-
-Fix: Derive the product/subject identity from the Excel composition FIRST row
-(the API / first quantitative non-q.s. ingredient), NOT from the UI field.
-Priority for the document's product identity:
-  1. Excel API row ingredient name (Function contains "active"), else the
-     first quantitative non-q.s. row's ingredient name.
-  2. UI product-name field ONLY if it is non-empty AND not gibberish
-     (len ≥ 4, has a vowel, not in {test,abc,xxx,demo,sample,asdf,qwerty},
-      not a pure dose string like "5mg120mg").
-  3. Fallback: first Excel row name.
-Never pick a gibberish/placeholder UI value over a real Excel ingredient.
-The UI field becomes an OPTIONAL override, not the source of truth.
-Applies to EI, RS, DEG/EG (Excel-driven). BE NOC excluded (no composition
-Excel — keep its metadata product name).
+Fix in annexure_converter.py:
+When observed/raw text matches "<30% of Perm. Conc.", "% of Permitted 
+Concentration", "no elemental impurities exceeding/equal to 30% of the Option 1 
+limit … detected", "meets/below/within Option 1" (no explicit per-element 
+number) → concentration_value = 0.0, data_status="below_option1_qualitative".
+REMOVE the 30%×Option1 computation entirely. Only an explicit printed measured 
+number with a real unit (ppm/ppb/µg/g) is a value.
 
 Acceptance:
-- Vaso EI, UI="Vasopressin" (valid) → used.
-- Carboprost EI, UI="Test" → ignored; product = "Carboprost Tromethamine"
-  (Excel row 1).
-- Chlorpromazine RS, UI="CHLORPROMAZINE HYDROCHLORIDE" (valid) → used; if UI
-  were "test" → falls back to Excel row 1 "Chlorpromazine Hydrochloride".
-- Never emit a placeholder as the product/title.
-
-RED FLAG 14 — EXCEL COLUMN SELECTION: RELEVANT FIELDS ONLY (ALL EXCEL TYPES)
-─────────────────────────────────────────────────────────────
-Bug: Parser picked "Pharmaceutical Function" as the ingredient-name column
-(Chlorpromazine) → "Antioxidant"/"Tonicity agent" as names → empty doc.
-General rule needed: only the RELEVANT composition columns are consumed;
-decorative / metadata / role columns are dropped elegantly.
-
-Fix (RS + EI + DEG/EG composition parser):
-Whitelist-then-exclude column classification by header semantics:
-  INGREDIENT-NAME col  ← "ingredient","material name","name of ingredient",
-                          "component","raw material"  (highest priority)
-  MATERIAL-CODE col    ← "material code","item code","sap code"
-  QUANTITY col(s)      ← "qty","quantity","mg/ml","/ml","/vial","/tab","/unit",
-                          "amount","per 1ml","per 2ml","strength"
-  FUNCTION/ROLE col    ← "function","pharmaceutical function","role","category",
-                          "purpose"   → read as ROLE (q.s./active detection),
-                          NEVER as ingredient name
-  REFERENCE/STD col    ← "reference","quality standard","grade","compendia"
-                          → metadata only
-  VENDOR col           ← "vendor","supplier","manufacturer"  → supplier field
-  DROP silently        ← unlabeled decorative columns, S.No/serial, blank
-                          headers, banner/subtitle/notes rows, merged title
-                          rows, filter-dropdown rows
-Rules:
-- The ingredient-name column must NEVER be a header containing function/role/
-  category/purpose/reference/vendor.
-- If multiple columns qualify as ingredient-name, pick the leftmost pure-name
-  column (not a code, not a function).
-- Skip banner/subtitle/notes rows (merged cell spanning many cols, or prose
-  >60 chars, or starting with "Note"/"*"/"q.s.").
-- Self-test FAIL if resolved ingredient names are role words
-  (antioxidant/tonicity/buffer/vehicle/diluent/active/lubricant/binder as a
-  NAME) — signals wrong-column pick.
-Apply to every doc type's Excel and to edge cases (extra columns, reordered
-columns, non-standard headers, decorative title banners, Qty/1mL+Qty/2mL,
-multi-strength tablet columns).
-
-Acceptance:
-- Chlorpromazine (has Function col) → 7 real ingredients, Function read as role.
-- Vaso/Carboprost ("Quantity per mL/Vial") → quantities read; function/reference
-  columns dropped; no role word becomes a name.
+  Merck NaCl + Benzyl alcohol EMPROVE → all elements 0.
+  (Was the same false-positive class as Vasopressin Dextrose.)
 
 ═══════════════════════════════════════════════════════════════
-ANNEXURE-CONVERTER SANITY — COVERAGE AUDIT (EI + RS)
+FIX 3 — EI: "not intentionally added" + CONEG/RoHS sums → 0
 ═══════════════════════════════════════════════════════════════
-Confirm ALL of the following are implemented in BOTH converters
-(annexure_converter.py = EI, residual_solvent_annexure_converter.py = RS).
-Items marked [ADD] were discussed but must be explicitly verified/added.
+Bug: West 4023/50 Grey narrative says "elements detected: Pb, Cd, Hg, Cr" — 
+actually West states "not intentionally added" with only a CONEG packaging sum 
+(Pb+Cd+Cr(VI)+Hg ≤100 ppm). Not per-element EI.
 
-Shared (EI + RS):
-[✓] Multi-page rasterization — process EVERY page, merge results, concat raw_text.
-[✓] safe_json_parse hardened — markdown fences, first{..last}, bare-array→dict
-    wrap, trailing commas, single quotes, unescaped newlines; never raises.
-[✓] Per-file isolation in bulk — reset state, UNIQUE temp path per file (UUID/
-    index), per-file try/except, retry once, exponential backoff+jitter on
-    rate-limit, one failure never corrupts the next.
-[✓] JSON default handler for set/frozenset/datetime at every dump (both
-    converters + payload builders).
-[✓] Unicode-normalize filenames + responses (®, µ, ™, Ph.Eur.) for bulk safety.
-[✓] Claude error taxonomy — 429/529/5xx/timeout retry; auth → clear message;
-    empty response → retry; surface "Claude error, please try again"; failed
-    call RAISES (never silent empty extraction).
-[✓] Descriptor stripping — "Material Characterization for X" → X; bare
-    descriptor → "".
-[✓] Material-name fallback chain — material_name → candidates[0] → document_
-    title(stripped) → filename(stripped of "Annexure N"/ext/SAP/date) →
-    "Material N". NEVER the product/API name (RF9).
-[✓] Descriptor/document-type words NEVER a material name — reject list:
-    "residual solvent","elemental impurity","risk assessment","declaration",
-    "certificate of analysis","specification","statement","CoA".
-[ADD] Content-vs-filename mismatch — "Sodium Hydroxide.pdf" body is actually a
-    Sodium chloride CoA. Converter reads TRUE content (correct); surface a
-    warning "filename says X but content is Y — possible mislabel" in the
-    checklist; do NOT silently trust the filename.
-[ADD] Content-identical duplicate warning — two files, same material identity
-    signature (code/name) → log + checklist flag; do NOT auto-dedup blindly.
-[✓] Grade/purity/compendia strip INCLUDING ® and trailing fragment (no bare
-    "® exp"); no "…" ellipsis; no truncation artifacts.
-[✓] Unit sanity check — value >10000 µg/g flags possible unit misread (audit).
+Fix in annexure_converter.py:
+- Vendor declaration "not intentionally added"/"does not intentionally add" with 
+  NO measured table → all elements 0.0, observed_level "Not intentionally added".
+- IGNORE CONEG/RoHS/packaging "…as a sum … ppm max" limits. Never extract as 
+  per-element values.
+- Schott glass ("100% inorganic, annealed 600°C, not added") → all 0.
 
-EI-specific:
-[✓] ND / "<X" / BDL / BLQ / Below LOD-LOQ / Not detected → 0.0.
-[✓] "<30% of Perm Conc" / "meets/below Option 1" → 0.0 (qualitative below-limit).
-[✓] Presence-flag exception — "Likely Present=Yes" + bound above detection floor
-    (Ni <0.7, MRL 0.05) → keep bound. Read <X + presence flag + MRL/Option-1.
-[✓] "Not intentionally added" declaration, no measured table → all 0.
-[✓] IGNORE CONEG/RoHS "Pb+Cd+Cr(VI)+Hg as a sum 100 ppm" packaging limits.
-[✓] ppb→ppm normalization (÷1000); %→ppm (×10000); mg/g→ppm (×1000).
-[✓] Peter Greven — read "Content measured" column; fall back to RL only on "<RL".
-[✓] 0.05 placeholder leak (Avantor Tromethamine) → auto-fixed by ND=0; remove
-    hardcoded 0.05; warning becomes audit note only.
-[✓] DRL API declaration — max across batches; all "Below LOD" → 0.
-[✓] Route-aware Option-1 concentration + PDE (oral/parenteral/inhalation).
+Acceptance: West rubber + Schott glass → all 0; narrative says "not 
+intentionally added", not "detected".
 
-RS-specific:
-[✓] BDL/BLQ/ND WITH vendor NMT spec → NMT worst-case (NOT 0). OPPOSITE of EI.
-[✓] Negative/NIL declaration ("excluded by production process", "NIL all
-    classes") → no solvents for that material (0 contribution).
-[✓] Canonical alias normalization — DMSO (Dimethyl Sulphoxide=Dimethyl
-    sulfoxide), TFA, CPME, Me-THF, MTBE, etc.; British/American spelling merge
-    (sulph/sulf, -ph-/-f-) BEFORE alias lookup so a solvent never appears twice.
-[✓] Compendial priority USP/NF > EP > JP > ASMF; multi-compendial dedup, keep
-    superseded in audit.
-[✓] Non-USP solvent inclusion (canonical=None + numeric) with N/A USP row.
-[✓] Vendor content vs USP master separation — ingredient rows use vendor content
-    ONLY; USP master only in comparison row (no fallback).
-[✓] Single-solvent quality-box + discussion-embedded-limit patterns (Epinephrine
-    Benzene page-8 style).
-[✓] Master JSON overlay loaded (71 solvents; TFA 3400/3.4, CPME 1500/15 not NA).
+═══════════════════════════════════════════════════════════════
+FIX 4 — EI INJECTION: salt/base footnote drives daily volume
+═══════════════════════════════════════════════════════════════
+Bug: Observation shows "daily volume = 7.25 ÷ 0.332 (salt) = 21.8 mL". Footnote 
+"# 332 mcg Carboprost tromethamine ≡ carboprost 250 mcg" and label "250 mcg/mL" 
+ignored.
 
-If any [ADD] or [✓] above is NOT actually present in code, implement it. The two
-[ADD] items (mislabel warning, content-identical duplicate warning) were
-discussed but must be explicitly confirmed in both converters.
+Fix in injection_support.py:
+Parse composition footnote markers (#,*,@,superscript); classify salt/base vs 
+overage vs q.s. vs informational. For salt/base:
+  daily_volume = MDD_base ÷ base_conc_per_mL   (7.25 ÷ 0.250 = 29 mL/day)
+Component amounts still use the formulation (salt) weight in the tables.
+Cross-check against label strength (250 mcg/mL); warn if footnote base ≠ label.
+detect_composition_footnote already exists — WIRE it into the volume derivation.
 
-Acceptance:
-- Bulk 15+ mixed annexures per doc type → no crash, no set-serialization error,
-  partial success on any single failure, checklist returned.
-- Sodium Hydroxide.pdf (actually NaCl content) → extracted as Sodium chloride +
-  mislabel warning in checklist; NaOH row (q.s.) renders NA.
-- No annexure shows a document-type word or the product name as its material.
+Acceptance: Carboprost daily volume = 29 mL/day (base 250), not 21.84.
+Trilaciclib/Chlorpromazine (salt-basis MDD, no base footnote) unchanged.
+
+═══════════════════════════════════════════════════════════════
+FIX 5 — EI: single consistent mass basis (Option 1 vs 2b)
+═══════════════════════════════════════════════════════════════
+Bug: Observation says "Option 2b, 21.84 g/day"; Tables use TOTAL 0.412 g/day + 
+Option 1 PDE + 30% threshold; Conclusion says "within Option 1". Three bases.
+
+Fix in EI backend:
+Compute ONE drug-product daily mass:
+  injection: daily_volume_mL × density × 1000  (mg)  → grams
+If drug-product mass > 10 g/day → Option 2b (concentration-based). Else Option 1.
+Use that SAME basis in Observation, Tables, and Conclusion. Remove the 0.412-vs-
+21.84 discrepancy. For Carboprost with corrected 29 mL: 29 × 1.0 = 29 g > 10 → 
+Option 2b (or state the chosen basis consistently everywhere).
+
+Acceptance: one basis, no contradiction across narrative/tables/conclusion.
+
+═══════════════════════════════════════════════════════════════
+FIX 6 — RS: VALIDATE THE OPPOSITE RULE (do NOT zero solvents)
+═══════════════════════════════════════════════════════════════
+CRITICAL: RS handling of "<X"/BDL/ND is the OPPOSITE of EI. Do NOT let Fix 1's 
+"less_than → 0" leak into the RS converter.
+
+Verify in residual_solvent_annexure_converter.py:
+- A solvent batch result BDL/BLQ/ND/"<X" that HAS an accompanying vendor NMT 
+  SPECIFICATION limit → use the NMT spec as worst-case (NOT 0).
+- Zero a solvent ONLY when it is declared NIL/absent AND has no spec limit.
+- EI's ND=0 rule must NOT be applied in the RS converter.
+
+Regression (Chlorpromazine RS — must stay correct):
+  Toluene batch BLQ(5.53) + NMT 890 → 890 (not 0, not 5.53)
+  t-Butanol BDL + NMT 68 → 68
+  DMSO BDL + NMT 5000 → 5000
+  Methanol NMT 3000 → 3000; Ethanol NMT 1000 → 1000
+  Finar Metabisulfite/sulfite "NIL all classes" → no solvents
+  Merck NaCl "excluded by production process" → no solvents
+All within USP <467> → PASS. Also confirm DMSO single (Dimethyl Sulphoxide = 
+Dimethyl sulfoxide merged), annexure names per-material, no Pages column.
+
+═══════════════════════════════════════════════════════════════
+ROOT-CAUSE NOTE FOR DEV
+═══════════════════════════════════════════════════════════════
+The renderer/parser fixes (Qty/mL + Amount(g) headers, product-name-from-Excel, 
+Pages-column removal, API-row fallback, MDD flow) LANDED. The remaining bugs are 
+all in DATA INTERPRETATION:
+  annexure_converter.py: parse_observed_level / resolve_element_reading 
+    (less_than→limit instead of 0; perm-conc; not-added; CONEG)
+  injection_support.py: volume derivation uses salt conc not footnote base; 
+    mass-basis / Option-1-vs-2b consistency
+Fix those two functions. RS converter must be verified to KEEP NMT-worst-case 
+(opposite of EI) — do not regress it while fixing EI.
+
+═══════════════════════════════════════════════════════════════
+FINAL ACCEPTANCE
+═══════════════════════════════════════════════════════════════
+EI Carboprost: Carboprost/Tromethamine all 0 (Ni 0.7 kept via presence flag); 
+  Merck NaCl + Benzyl alcohol all 0; West/Schott all 0; daily volume 29 mL 
+  (base 250); one consistent mass basis; conclusion PASS with defensible (near-
+  zero) numbers.
+EI Vasopressin (regression): Dextrose/excipient "<30% Perm Conc" → 0; API units→
+  mg via 530 units/mg; Option 2b; PASS.
+RS Chlorpromazine (regression): NMT worst-case KEPT (Toluene 890, DMSO 5000, 
+  etc.); DMSO single; PASS.
+Do NOT conflate EI (ND→0) and RS (BDL+NMT→NMT worst-case). No hardcoded 0.05 
+anywhere.
+secondly you are doing a beautiful job with the expansion of the tables in landscape its beautiful but just nneds this 
+Header block width on landscape pages:
+- The document header table (IPDO | Technical Summary Report | logo; 
+  Title / Dept / Strength / Market / Protocol; Document No | Product Name | 
+  Dosage Form | Version) must use table width = 100% of the landscape 
+  printable width (page width − left/right margins), the SAME width as the 
+  Table 3/4/5/6 element tables on that page.
+- Set the header table's total width and its cell column widths to fill the 
+  landscape width (e.g. width="100%" / w:tblW pct 5000, or explicit twips = 
+  landscape content width). Do not leave it at the portrait default.
+- Apply consistently: whichever pages are landscape (the wide element 
+  tables), the header on those pages spans the full landscape width. If the 
+  header repeats per section/page, each instance matches its section 
+  orientation.
+- Also fix the empty "Page  of " footer — page-number field is blank 
+  ("Page 11 of 18" shows in the viewer but the DOCX footer text is empty).
