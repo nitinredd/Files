@@ -1,137 +1,54 @@
-# DocGen — Final Sitagliptin Red-Flag Fix (EI + RS), Product-Agnostic
+  Status
 
-Every item below was traced against the LIVE code (`ei_core.py`, `annexure_converter.py`, `residual_solvent.py`, `residual_solvent_annexure_converter.py`, `annexure_identity_clustering.py`) and against the REAL Sitagliptin source documents (IFF PRDS, Evonik Aerosil declarations, Fujicalin statement, Olon Trilaciclib API spec). Nothing here is a guess dressed as a fix — every item states the confirmed root cause, the exact function, why it is safe for every OTHER product, and what to verify before closing it. Where the trail did not reach a confirmed cause, that is stated explicitly and a diagnostic step is given instead of a blind patch.
+  Full suite green (9/9 stages): source fidelity 92 assertions (82 before this round), workflow 316, engine 323, parallel dispatch 40, no-bleed 32
+  comparisons, end-to-end green, no-hardcoding clean. Round 1 is committed as 0c9f926; this round touches 5 files, uncommitted (+271/−22).
 
-**Non-negotiable for every item:** the fix must be decided by WHERE a piece of evidence came from (a column label, a section heading, a document structure) — never by comparing a VALUE to a known constant (an ICH limit, a USP limit, a round number). Value-based heuristics are what caused the Trila/Vaso whack-a-mole earlier in this project; provenance-based rules are what actually generalizes across products.
+  Per item
 
----
+  A1 — Option-1 table in the API row. Resolver untouched, as instructed. make_ei_prompt Section E now defines the whole-column test: a column is a reference
+  when every element carries its Option-1 concentration and the document reports the real result in prose, with an explicit note that one or two elements
+  coinciding is normal and is not a reference column.
 
-## PART A — EI (Elemental Impurity)
+  ⚠️ The numbers in your spec were wrong. You listed "5, 15, 5, 30, 50, 100, 200, 3000 µg/g for Pb/As/Cd/Hg/Co/V/Ni/Cu" as the Option-1 concentrations.
+  Those are the µg/day PDEs. The Option-1 concentration is PDE ÷ 10 g/day: Pb 0.5, As 1.5, Cd 0.5, Hg 3, Co 5, V 10, Ni 20, Cu 300 µg/g — which is exactly
+  the row Sitagliptin was showing. I encoded the corrected values.
 
-### A1. API row filled with the ICH Q3D Option-1 limit table instead of the vendor's actual result
+  A2 — Aerosil all-zero. The stated code-side cause does not hold in the current code. I verified directly: a plain <X keeps its bound with no presence flag
+  present, and a "not intentionally added" note beside the bound no longer zeroes it (both fixed in round 1, re-verified today). _presence_flag_is_yes only
+  gates the stricter presence_flagged_bound status, which is what you asked for. That leaves exactly your second branch — a class-level sentence with no
+  per-element rows — so the prompt now says to split "Class 1 and Class 2A: Pb < 0.5 ppm, As < 1.5 ppm…" into per-element rows. No resolver change.
 
-**Confirmed symptom.** Sitagliptin's API row shows Pb=0.5, As=1.5, Cd=0.5, Hg=3, Co=5, V=10, Ni=20, Cu=300 — these are exactly the ICH Q3D Option-1 oral concentrations (PDE ÷ 10 g), not measured content. The vendor declaration says results were "not detected above the reporting limit," directly contradicting the table.
+  A3 — Croscarmellose no-match. Your diagnosis matched the code. EI's per-page prompt had no covered_materials at all; only the page-1 metadata read asked
+  for it. Added it per page plus _union_covered_materials, mirroring _merge_rs_pages, and strengthened Section G with the "<Product> Example" heading
+  pattern. I did not scope the generic Section-8 checklist to Croscarmellose.
 
-**Root cause, confirmed in `annexure_converter.py`.** `resolve_element_reading` already has the correct provenance-based exclusion for this: a number arriving in a `regulatory_limit` field (Section 4E of `make_ei_prompt`: "a column of ICH Q3D/USP <232> Option 1 limits... goes in regulatory_limit ONLY... NEVER copy a regulatory_limit number into concentration_value") is routed to `_regulatory_reference()` and excluded. **This logic is correct and must not be touched.** The bug is that the Option-1 column in this vendor's declaration was extracted into `concentration_value`/`observed_level` directly, rather than into `regulatory_limit`, meaning the model-side extraction (not the resolver) misclassified the column.
+  A4 — Aerosil no-match. No fix written. The POST-CLUSTER: line is in calculate_ei_tables, printing each surviving annexure's material name, error flag and
+  scopes. Run Sitagliptin EI once and send me that line.
 
-**Fix — extraction-side, not resolver-side.** In `make_ei_prompt`'s Section 4E instructions, strengthen the column-classification guidance with concrete positive/negative examples so the model reliably recognizes an Option-1/PDE reference column even when it is NOT explicitly labelled "Option 1": add instruction that a column whose values are constant across every element class boundary matching known PDE-derived concentrations (5, 15, 5, 30, 50, 100, 200, 3000 µg/g for Pb/As/Cd/Hg/Co/V/Ni/Cu) — **regardless of its header text** — should be treated with the same suspicion as an explicitly labelled Option-1 column, and the model should look for accompanying vendor language ("not detected above reporting limit," "meets Option 1," "below Option 1") that indicates the ACTUAL result is qualitative/ND, with the numeric column being a reference table rather than a per-batch measurement. **This is still provenance-based, not value-based**: the trigger is "this column's pattern matches a known reference table's structure across ALL rows simultaneously," not "this one number happens to equal a limit" (a real API legitimately controlled AT the ICH limit on one or two elements must never be excluded — only when the WHOLE column reproduces the reference table exactly should it be suspected).
+  A5 — material listed twice. _ei_used_annexures scopes both the annexure list and the narrative's material directory to what the matcher selected,
+  including RS's never-empty guard. Display only; matching untouched.
 
-**Why this cannot break other products.** The existing `regulatory_limit` exclusion path is untouched. This only strengthens what counts as evidence that a column IS a regulatory reference at extraction time. A vendor whose real results happen to be conservative on a couple of elements will not trigger this (single-element coincidence is normal); only a column that reproduces the ENTIRE reference table is affected.
+  B1 — Croscarmellose ethanol 5000. The guideline-context extractor from round 1 already returns 100 for all four phrasings of that sentence pair. The
+  remaining hole was in de-duplication: an entry mentioning "USP/NF" with no number outranked the material's own 100 ppm spec on compendial priority and
+  emptied the cell. has_ppm now outranks the compendial tag.
 
-**Verify:** re-extract the Sitagliptin API declaration; confirm the API row now shows ND/bound values consistent with the vendor's "not detected" language, not the Option-1 table. Re-run every other EI product in the regression set (Trila, Vaso, Diazoxide, Medroxy if available) and confirm no real API/excipient result is zeroed by this change — only whole-column reference-table matches are affected.
+  B2 — Iron / Triethylamine / Formic acid. One correction to the plan: these can't be gated as "non-master" substances, because formic acid and
+  triethylamine are both ICH Q3C Class 3 solvents — the master list contains them, so the name can never separate them from real solvent evidence. Only the
+  heading can. Both RS prompts now return source_section verbatim and are told that an inventory or screening checklist is not solvent evidence;
+  process_rs_annexure diverts a statement whose section is an inventory heading. When no section is named, behaviour is unchanged, so no existing extraction
+  regresses.
 
----
+  B3 — untouched, as instructed. Also untouched: _ei_material_scopes/_ei_elements_for_scope/_ei_material_views, _rs_labelled_content, the regulatory_limit
+  exclusion path, brand/family tables and thresholds.
 
-### A2. Aerosil renders all-zero when the source states explicit `<X` bounds
+  What I could not verify
 
-**Confirmed symptom.** Evonik's ICH Q3D statement declares Class 1/2A as blanket bounds (`<0.5 Pb, <1.5 As, <3 Hg, <10 V, <20 Ni`) but Aerosil's row is entirely 0 in the generated doc.
+  Your regression protocol (a)–(d) cannot run here: there are still no source PDFs, workbooks or approved reports in the repo, no debug artifacts in the
+  temp directory, and no Claude credentials. Every item above is proven on synthetic cases built to your descriptions. In particular, A1, A2 and A3 are now
+  extraction-side, so they can only be confirmed by re-converting the real annexures — cached JSON will not show the change.
 
-**Root cause, confirmed in `annexure_converter.py`.** `_presence_flag_is_yes(el)` requires the `likely_to_be_present`/`potentially_present` flag to be affirmatively "Yes" before a `<X` bound is kept as `source_bound` under the presence-flagged-bound exception. Evonik's blanket per-class statement does not carry a per-element presence checkbox at all (it is a class-level declaration, not a per-element form), so every element falls through to `non_detect_zero` and the printed bound is discarded.
+  Still open from round 1
 
-**Fix — separate "is this bound evidence at all" from "is this a presence-flagged upper bound."** The printed `<X` bound must be kept as `source_bound` (via `stated_bound()`, which already exists and already extracts it correctly) **regardless of the presence flag.** The presence flag should only gate the STRICTER `presence_flagged_bound` status (used for the "known present, `<X` is a real ceiling on a known analyte" case), not whether a bound is recorded at all. Concretely: in `resolve_element_reading`, the branch that currently only sets `policy = POLICY_REPORTING_BOUND` when a bound is found should NOT additionally require a presence flag to keep that bound in `calculation_value` for a blanket class-level statement — this is the SAME reporting-bound path already used for `less_than`/`bdl`/`blq` status elements elsewhere in the function; Aerosil's issue is that its blanket per-class `<X` values are not reaching that path because they are class-level text, not per-element `observed_level` cells.
-
-**Precise mechanism to check before writing code:** confirm whether Evonik's declaration presents Pb/As/Hg/V/Ni as individual ROWS with their own `<X` observed_level (in which case `stated_bound`/`_LESS_THAN_BOUND_RE` should already catch them and the bug is elsewhere — check `_NOT_INTENTIONALLY_ADDED_RE` isn't firing and zeroing them via the "not intentionally added, no measured number" branch before the bound-check runs), or whether it is a single class-level sentence with no per-element rows at all (in which case `make_ei_prompt` needs a new instruction: "a class-level blanket bound statement naming multiple elements with individual `<X` values, e.g. 'Class 1: Pb <0.5 ppm, As <1.5 ppm, Cd <0.5 ppm, Hg <3 ppm' — extract THIS as each named element's own observed_level, exactly as if each were printed in its own row" — this is Section 4E's own text: *"A blanket bound the document states for an element as its OWN... IS that element's result: copy '<0.5' into observed_level for Pb"* — so the instruction already exists; verify it is actually being followed for this specific document's phrasing).
-
-**Why this cannot break other products.** This only affects elements whose ONLY evidence is a printed `<X` bound with no presence flag and no other disqualifying statement (packaging sum, not-intentionally-added-with-no-bound). A genuine non-detect with nothing printed still returns 0 exactly as before.
-
-**Verify:** Aerosil's row after fix should show Pb=0.5, As=1.5, Hg=3, V=10, Ni=20 (its stated bounds) under conservative_bound — consistent with how Mag Stearate's `<RL` bounds are already correctly kept in the current run. Confirm no previously-correct all-zero non-detect (e.g. a product with a genuine blank/ND cell) becomes non-zero after this change.
-
----
-
-### A3. Croscarmellose Sodium reports "NO ANNEXURE MATCH" despite the source document containing dedicated Croscarmellose elemental-impurity data
-
-**Confirmed from the real IFF PRDS source (56 pages).** Section 9.14 ("Ac-Di-Sol® Example for 2023," page 53) is a dedicated, product-labelled scanned CoA specifically for Croscarmellose Sodium's elemental impurities — this is real, present evidence, not a case where the source lacks the data.
-
-**Root cause, confirmed by comparing the EI and RS converters side by side.** RS's per-page prompt (`make_rs_page_prompt` in `residual_solvent_annexure_converter.py`) asks for `covered_materials` on EVERY page and `_merge_rs_pages` unions it across all pages. EI's per-page prompt (`make_ei_prompt` in `annexure_converter.py`) has **no `covered_materials` field anywhere in its JSON schema** — only the page-1-only `META_PROMPT` asks for it, and `convert_pdf_to_json` never unions later pages' product mentions into the final `covered_materials` list. Compounding this: `META_PROMPT` runs ONLY on page 1 (the title/cover page), while the actual product list ("Avicel® PH... Ac-Di-Sol® (Croscarmellose Sodium)...") appears on **page 4**, and the dedicated Croscarmellose CoA is on **page 53** — neither of which page 1 can see.
-
-**Fix — mirror RS's existing, working mechanism exactly:**
-1. Add `covered_materials` to `make_ei_prompt`'s return schema (the per-page prompt, run on every page), with instruction: "when this page's heading or table clearly names a specific product this data belongs to (e.g. a subsection titled '<Product> Example' directly above a results table, or a product list on a title/overview page), list it in covered_materials."
-2. In `convert_pdf_to_json`, after collecting all `page_summaries`/`ei_parsed` results, union `covered_materials` across ALL pages into the final annexure JSON's top-level `covered_materials` field — mirroring `_merge_rs_pages`'s existing union loop exactly (same pattern, same dedup-by-lowercase-string approach).
-3. Section G of `make_ei_prompt` already instructs per-row `material_name` tagging when a page shows a product split ("set material_name on EVERY element row to the product that row belongs to"); strengthen it with the concrete pattern seen in this source: "a heading like '9.14 Ac-Di-Sol® Example for 2023' or '<Product> Example' directly above a table means EVERY element on this page belongs to that named product."
-4. **Do not attempt to retroactively scope the generic Section-8 checklist table (pages 40-48) to Croscarmellose.** That table carries no product name anywhere in the source and legitimately cannot be attributed to one product without fabricating an association the document doesn't support. Only Section 9.14's explicitly-labelled scan is legitimate Croscarmellose-specific evidence — the fix should let THAT data (once correctly scoped) populate Croscarmellose's material view, while Section 8's generic data continues to populate whichever product it is already (most likely correctly) attributed to.
-
-**Why this cannot break other products.** This adds a field and a union step that exactly mirrors RS's already-proven-safe mechanism. A single-product document will simply have one covered_materials entry (or none), identical to today's behavior — the union of one thing with itself changes nothing. `_ei_material_scopes`, `_ei_elements_for_scope`, and `_ei_material_views` in `ei_core.py` are ALREADY correctly scope-aware and were verified correct twice this session; they will start working correctly the moment they receive real scope data, with zero changes needed on their side.
-
-**Verify:** re-run Sitagliptin EI from source PDFs (not cached JSON). Confirm the IFF annexure's `covered_materials` now includes both "Microcrystalline Cellulose" and "Croscarmellose Sodium," and that Croscarmellose gets its own non-zero element profile sourced from page 53's scan (not from Section 8's generic table). Confirm MCC's own values are unaffected. Re-run any other multi-material document in the regression set (any product using a combined vendor datasheet) to confirm no previously-single-scoped material now incorrectly splits.
-
----
-
-### A4. Aerosil "NO ANNEXURE MATCH" — root cause NOT found this session; 
-
-**What was checked and ruled out.** `BRAND_IDENTITY_RULES["aerosil"]` correctly covers "aerosil"/"aerosil 200"/"aerosil 200 pharma." `annexure_identity_clustering.py` (`_pick_primary_annexure`, `_pair_score`, `_ei_disambiguate_material_names`) was read in full — nothing in it explains a match failure, because whichever of the two uploaded Aerosil documents wins as the cluster's primary annexure, its `material_name` string still literally contains "AEROSIL" either way, and disambiguation only renames on cross-cluster exact-duplicate collisions (not relevant here, since both documents cluster together). `_ei_material_scopes`/`_resolve_ingredient_match` were already verified correct in isolation.
-
-**Required action — one diagnostic log line, not a hypothesis.** Add, in `ei_core.calculate_ei_tables`, immediately after the clustering step:
-```python
-annexure_data = _cluster_merge_ei_annexures(annexure_data)
-logger.warning("POST-CLUSTER: %s", [(a.get('material_name'), a.get('_error')) for a in annexure_data])
-```
-Re-run Sitagliptin EI once and report that exact log line. This will show definitively whether both Aerosil documents survived conversion, whether they clustered into one annexure, and what `material_name` the merged result carries into matching. **Do not write a fix until this line is captured** — every plausible code-level explanation available from static reading has been exhausted; the remaining possibilities (a conversion error on one file, an issue inside `RS._rs_pool_identity`/`RS._rs_score` not yet traced for this exact case) require a runtime artifact to distinguish between.
-
----
-
-### A5. EI annexure list/narrative shows one material twice (e.g. Asahi CEOLUS + IFF MCC both appearing as separate rows/paragraphs for one composition ingredient)
-
-**Confirmed root cause.** `assemble_and_generate`'s `annexure_list` and `generate_text_sections`'s `material_directory` both iterate over ALL of `annexure_data` unconditionally, with no filter to annexures actually selected by the matcher (`calc_tables["_match_audit"]`). RS already solves this exact problem in `residual_solvent.build_rs_payload` (the "unreferenced annexures" scoping, with a fallback that never empties the list if nothing matched at all) — EI never received the equivalent fix.
-
-**Fix — mirror RS's existing, working mechanism exactly:**
-1. Build the set of annexures actually used: every distinct `matched_key` in `calc_tables["_match_audit"]` where `matched=True`.
-2. Filter `annexure_list` (in `assemble_and_generate`) and `material_directory` (in `generate_text_sections`) to only annexures whose `material_name` (or one of `_ei_material_scopes(ann)`) is in that used-set.
-3. Guard: if the used-set is empty (e.g. every ingredient unmatched), fall back to showing ALL uploaded annexures — exactly mirroring RS's existing `if _mapped:` guard — so a totally-unmatched run still shows what was uploaded, never an empty list.
-4. This is a display/scoping filter applied strictly AFTER matching completes. Do not touch `_resolve_ingredient_match`, `BRAND_IDENTITY_RULES`, or any scoring logic.
-
-**Why this cannot break other products.** A document set where every uploaded annexure IS used (the common case — one annexure per composition ingredient) is unaffected, since the used-set equals the full set and the filter is a no-op. This only changes behavior when an uploaded annexure was never selected by the matcher, which by definition means it was not contributing to any calculation anyway — only its redundant DISPLAY is removed.
-
-**Verify:** Sitagliptin EI's annexure list/narrative shows MCC once (via the IFF source, the one actually used), not twice. Any single-annexure-per-ingredient product's annexure list is byte-identical to before.
-
----
-
-## PART B — RS (Residual Solvent)
-
-### B1. Croscarmellose Ethanol calculated at 5000 ppm (USP/ICH guideline reference) instead of the material's own 100 ppm specification
-
-**Confirmed from the real IFF source.** Section 4.36.2 states Ac-Di-Sol's ethanol is *"typically less than <100 ppm. The agreed specification is nmt 100ppm."* Section 4.42 (WADA statement, a different section) separately states ethanol is used *"at levels <100 ppm, which is significantly less than the USP/NF guideline of < 5000 ppm."* These are two different sentences in two different sections — one is the material's actual spec (100 ppm), the other is a guideline comparison (5000 ppm) used only to argue the material is well within a broader industry limit.
-
-**Root cause.** `_extract_nmt_ppm_exact` (or the equivalent NMT-extraction logic in `residual_solvent.py`) takes the LARGEST NMT-style number found across the combined extracted text for a solvent, without distinguishing which sentence each number came from. Since both sentences may end up concatenated in the same solvent's `raw_text` (RS's own `_merge_rs_pages` concatenates page excerpts together), the extractor sees both "100" and "5000" and picks the larger as "conservative" — but conservatism must only apply among the material's OWN candidate values, never between the material's own spec and an unrelated guideline comparison.
-
-**Fix.** In the NMT-number extractor, before taking the max, exclude any numeric match whose immediate surrounding text matches the existing `_RS_POLICY_CONTEXT_RE` / `_RS_REGULATORY_LABEL_RE` guideline-reference patterns (already present in the codebase — "USP/NF guideline of," "significantly less than," "ICH Q3C guideline") UNLESS that same number is also directly attached to the material's own NMT/specification wording (per the already-implemented citation-vs-reference distinction: "Methanol (as per USP <467>): NMT 3000 ppm" is a spec citing its standard and must be kept). Concretely: "the USP/NF guideline of < 5000 ppm" has no NMT/spec wording attached to the 5000 itself — it is a bare guideline mention — so it is excluded; "the agreed specification is nmt 100ppm" IS the material's own spec wording and is kept.
-
-**Why this cannot break other products.** This uses the exact same citation-vs-reference distinction already implemented and verified correct for the "Methanol (as per USP <467>): NMT 3000 ppm" case earlier this session — it is being applied consistently to a second real example, not introducing a new rule. A product whose vendor spec genuinely has no separate guideline-comparison sentence is entirely unaffected.
-
-**Verify:** Croscarmellose Ethanol spec becomes 100 ppm (not 5000); exposure recalculates to 8 mg × 100/1e6 = 0.0008 mg, not 0.04 mg. Re-run Trila and confirm its 9 solvents (all correctly at their own NMT specs, several of which legitimately equal ICH limits) are unaffected by this change, since none of Trila's solvent statements carry a separate bare-guideline-comparison sentence alongside their spec.
-
----
-
-### B2. Non-solvent substances (Iron, Triethanolamine, Formic acid) appearing as "residual solvents" in the report
-
-**Confirmed from the real IFF source.** Page 15 of the source lists "Iron (contained)* Iron – nmt 10ppm" inside section §4.6.1 "Other Chemicals Not Tested" — a general chemical-inventory checklist covering dozens of substances (Ethylene Glycol, Formaldehyde, Formic Acid, Triethylamine, Sodium, Potassium, Sugar, etc.), explicitly NOT the residual-solvent section (§4.36). Note also: the source names **"Triethylamine"** (page 15), not "Triethanolamine" — the generated report's "Triethanolamine" is either a misread of this name or a genuinely different, unsupported number.
-
-**Root cause, confirmed in `residual_solvent.py`.** `process_rs_annexure` has an explicit rule: `is_non_usp = (sinfo is None) or (sinfo.get("class") is None)`, and when `is_non_usp` and a converted ppm number exists, the substance is kept in `norm_solvents` and rendered as an RS column — regardless of which section of the document it was extracted from. This rule exists to preserve legitimate non-master specialty solvents (e.g. CPME, TFA) that have real numeric evidence but aren't in the ICH Q3C master list. It does not check WHICH section the substance was mentioned in.
-
-**Fix — provenance/section-context gate, not a stricter whitelist.** Do not restrict to a fixed USP-only list (this would break legitimate specialty-solvent products like Trila's CPME/TFA). Instead, require that a non-master substance carry supported residual-solvent context before entering `norm_solvents`: it must (a) appear within a section/table the extractor recognizes as residual-solvent evidence (a table titled or headed with "residual solvent," "USP <467>," "ICH Q3C," or the equivalent — which the RS extraction prompts already look for), OR (b) have explicit surrounding prose stating it is used/generated/controlled/tested AS a solvent (e.g. "used as a process aid... residual levels... specification is nmt X ppm" — the exact phrasing the IFF document uses for Ethanol in §4.36.2). A substance appearing only in a general chemical-inventory/allergen/contaminant checklist section (like §4.6.1's "Other Chemicals Not Tested" list, which explicitly states these substances are "not intentionally added" and "the site does not test for these chemicals") does not meet this bar and must be excluded from the RS solvent universe.
-
-**Why this cannot break other products.** Trila's CPME and TFA both have explicit residual-solvent context (found in the API vendor's own residual-solvent-specific declaration, not a general chemical checklist), so they remain correctly included. This only excludes substances whose sole textual evidence is a general/unrelated inventory list — which by definition were never real solvent evidence to begin with.
-
-**Verify:** Iron, Triethylamine/Triethanolamine, and Formic acid disappear from Sitagliptin's RS tables (all three are §4.6.1 "not tested, not intentionally added" chemical-inventory entries, not residual-solvent evidence). Confirm Trila's 9 solvents (all from the Olon API's dedicated residual-solvent declaration) are unaffected.
-
----
-
-### B3. Croscarmellose maps correctly to the IFF annexure (regression check — currently WORKING, do not touch)
-
-**Confirmed working in the latest RS run.** Unlike EI, RS's Table 3/Section 9 already correctly lists Croscarmellose Sodium mapped to Annexure 3 alongside MCC, both sourced from the IFF document. This is because RS's converter ALREADY has the `covered_materials` per-page schema + cross-page union (see A3 above — this is the exact mechanism being ported to EI). **No RS change is needed here; this is confirmation that the mechanism proposed for A3 is proven and safe, since it is the same code path already running correctly in production for RS.**
-
----
-
-## Cross-cutting notes for the dev agent
-
-1. **A3's fix is not new logic — it is porting RS's own already-proven mechanism to EI.** RS uses this exact pattern in production right now, successfully. The risk of this specific change breaking something is low precisely because it isn't novel.
-2. **A1, A2, B1 are all the same family of fix**: distinguish a material's OWN evidence from a REFERENCE/COMPARISON value, by provenance (which column, which section, which sentence structure), never by whether a value happens to equal a known constant. Apply the same discipline consistently; do not special-case any material name, vendor name, or specific ppm/µg value in the code.
-3. **A4 must not be patched without the runtime log.** Every static-code hypothesis has been exhausted. Writing a "fix" now would be guessing, and guessing is what caused the Trila/Vaso regressions earlier — get the log line first.
-4. **Regression protocol for every item:** after implementing, re-run (a) Sitagliptin EI, (b) Sitagliptin RS, (c) Trilaciclib RS (compare against approved TSR-TRC-01-00052: all 9 solvents, same exposures), (d) at least one other previously-correct single-material, single-annexure EI and RS document to confirm byte-identical output. Do not close any item without this comparison.
-5. **Do not touch:** `_ei_material_scopes`, `_ei_elements_for_scope`, `_ei_material_views` (EI, confirmed correct), `_rs_labelled_content` (RS content-vs-limit column logic, confirmed correct), `resolve_element_reading`'s existing `regulatory_limit` exclusion path (confirmed correct — A1's fix is upstream of this, at extraction), `BRAND_IDENTITY_RULES`/`MATERIAL_FAMILY_ALIASES`/matching thresholds (no evidence implicates these), the citation-vs-reference NMT logic already implemented for Methanol-style cases (B1 reuses it, does not replace it).
-
-## Final regression gate (all must pass)
-- Sitagliptin EI: API = ND/bound, not Option-1 table; Aerosil carries its stated `<` bounds; Croscarmellose has its own non-zero profile from IFF §9.14; annexure list shows each material once.
-- Sitagliptin RS: Croscarmellose Ethanol = 100 ppm (0.0008 mg exposure), not 5000 ppm; Iron/Triethylamine/Formic acid absent from solvent tables; Croscarmellose mapping unchanged (already correct).
-- Trilaciclib RS: all 9 Olon solvents present, exposures match TSR-TRC-01-00052.
-- At least one other existing single-material EI and RS document: byte-identical output before/after.
-- No product, vendor, filename, or specific numeric value hardcoded anywhere in the fix.
+  The RS filter _rs_is_policy_context discards any solvent statement mentioning "ICH Q3C", so an API spec line reading "Methanol (as per ICH Q3C): NMT 3000
+  ppm" is dropped before any of the new logic runs. It predates this work and has no test. If Olon's lines cite ICH Q3C, the Trila gate will still fail
+  there — tell me if you want it narrowed.
