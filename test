@@ -1,1 +1,104 @@
-testttt
+# DocGen — Complete Sitagliptin Fix (EI + RS), product-agnostic
+
+**Global rule (every ticket):** product-agnostic; never hardcode a product, material, code, value, or limit. A number's ROLE — the material's CONTENT vs a REGULATORY LIMIT/REFERENCE — is decided ONLY by WHERE it was read from (its source column label / evidence type / structured field), NEVER by whether its value equals a regulatory constant. Delete every heuristic that decides role by comparing a value to an ICH/USP limit — they are product-specific in disguise (fix one product, break the next). Display layers copy the source faithfully; only calculations restrict to the selected worst case. No float regressions, no request-state bleed.
+
+---
+
+## TICKET 1 — EI: delete the value-based Option-1 collapse (`ei_core.py` + `annexure_converter.py`)
+
+**Bug.** `_ei_apply_document_statements` guesses role by value: if ≥3 `stated_limit` elements each equal their Option-1 concentration for one route, it relabels them `regulatory_limit_reference` → 0. This deletes a real material's data the instant its spec legitimately sits at the ICH limit (the same failure that zeroed 8/9 Trila solvents in RS, latent in EI). It duplicates and overrides the extractor's correct provenance path.
+
+**Fix.**
+1. In `_ei_apply_document_statements`, DELETE the entire `limit_only` / `_ei_equals_option1` block. KEEP only the `declared_absent_classes` half (a document STATEMENT = provenance). DELETE the unused `_ei_equals_option1` helper.
+2. Make extractor provenance authoritative: `make_ei_prompt` STEP 4-E already routes an "Option 1 / ICH / USP <232> / permitted concentration / PDE" column to `regulatory_limit` and results to `observed_level`; strengthen it so a `regulatory_limit` value is NEVER copied into `concentration_value` or `specification_limit`.
+3. In `resolve_element_reading`, add `_REGULATORY_REF_KEYS = ("regulatory_limit","ich_limit","permitted_limit","option1_limit")` checked BEFORE the spec/compliance-limit branch: a number from any of those fields (or a column flagged `column_is_regulatory` / `value_is_regulatory_reference`) contributes NOTHING to content → `source_state=regulatory_limit_reference`, `calculation_policy=excluded_by_declaration`, `calculation_value=0.0`. Decided by the FIELD, never the value.
+
+**Expected.** Sitagliptin API (declares "nothing above RL", prints an Option-1 reference column) → excluded as a regulatory reference; API contributes ND/bound, NOT 0.5/1.5/…/Cu 300; Ni/V/Cu totals no longer dominated by a fabricated API row. A real API spec whose values equal the ICH limits, read from a result/spec column → KEPT.
+
+---
+
+## TICKET 2 — EI: Aerosil (and any blanket `<X` class declaration) must keep its bound (`annexure_converter.py`)
+
+**Bug.** Aerosil renders all-zero. The Evonik ICH Q3D statement declares Class 1/2A as blanket bounds (`<0.5 Pb, <1.5 As, <3 Hg, <10 V, <20 Ni`) without a per-element "Likely present = Yes" checkbox, so `_presence_flag_is_yes` is False and `resolve_element_reading` routes each `<X` to `non_detect_zero` — dropping the stated bound. Under conservative_bound a stated `<X` bound is evidence and must contribute.
+
+**Fix (provenance/evidence, not value).** When a vendor prints an explicit `<X` reporting bound for an element (a `less_than` result with a numeric bound in the cell or in `mrl/lod/loq`), the bound must be KEPT as `source_bound` and used under conservative_bound — regardless of the presence checkbox. Tighten only the reverse: the presence checkbox gates whether a bound counts as a *measured-ish* upper bound on something *known present*; it must NOT be a precondition for recording a printed `<X` bound at all. A genuine ND with NO printed bound stays 0. Do not special-case Aerosil, Evonik, or any name.
+
+**Expected.** Aerosil contributes Pb 0.5, As 1.5, Hg 3, V 10, Ni 20 (its stated `<` bounds) under conservative_bound; consistent with how Mag Stearate's `<RL` bounds are already kept.
+
+---
+
+## TICKET 3 — EI: Table 1 must show the FULL composition, all strengths (`ei_core.py`)
+
+**Bug.** Table 1 renders only the selected worst-case strength under a "For 100 mg" banner, dropping the 50 mg and 25 mg columns; the extractor picks the largest-value amount column for the CALCULATION and displays only that.
+
+**Fix (display-only; no math change).** Mirror `residual_solvent._build_display_columns` ("Table 1 shows the composition as uploaded — including EVERY strength column; only the calculation is restricted to the one selected column"). In `parse_composition_excel` / `_ei_finish_composition` and the template path `_TPL.ei_osd_result`: keep ALL detected quantity/strength columns in `columns`/`_display_columns` and every row's full `columns` map verbatim (100/50/25 mg, material code, function, vendor — every column the sheet has); remove the "For {N} mg" single-strength banner; show strengths side by side; never sum/merge/average across strengths in the display. The worst-case selection feeds ONLY `calculate_ei_tables`, never Table 1. Single-strength products unaffected.
+
+**Expected.** Table 1 is a faithful copy of the uploaded Excel with all strength columns present; calculation tables unchanged.
+
+---
+
+## TICKET 4 — RS: delete the value-based restated-limit deletion (`residual_solvent.py`)
+
+**Bug.** In `process_rs_annexure`, after `_dedup_rs_solvents`, the `restated_regulatory_limits` block deletes solvents whose `calculation_basis` is in `_RS_LIMIT_BASES` with no measured actual when ≥3 equal their ICH Q3C limit. On Trila's Olon API declaration (9 solvents "NMT <spec>" where specs equal the ICH limits — normal for an API spec) it deleted 8 of 9, leaving only non-classed TFA, vs approved TSR-TRC-01-00052 which assesses all 9.
+
+**Fix.**
+1. DELETE the entire `restated_regulatory_limits` block and the `_RS_LIMIT_BASES` constant.
+2. Rely on the existing provenance path — `_rs_labelled_content` with `_RS_EXPECTED_LABEL_RE` (content column) and `_RS_REGULATORY_LABEL_RE` (Option-1/ICH/USP limit column): it reads the vendor content column into `converted_ppm` and routes a regulatory-labelled value to `regulatory_limit_reference` (excluded from content, kept for the comparison row). Keep exactly.
+3. A vendor's stated NMT spec (`nmt_conservative`) is the material's worst-case CONTENT and is ALWAYS kept, even when equal to the ICH limit. No block may remove it by value.
+4. To still exclude a standalone ICH-limit reference SHEET, gate on PROVENANCE only — reuse `is_policy_letter` (no resolved `material_name` AND title matches `_RS_POLICY_TITLE_RE`). A named declaration/CoA/API spec keeps every solvent.
+
+**Expected.** Trila → all 9 Olon solvents kept (Methanol 1.51, IPA 2.52, Acetonitrile 0.21, CPME 0.75, DCM 0.30, Toluene 0.45, Acetic Acid 2.52, Sulfolane 0.08, TFA 1.71). Sitagliptin RS Opadry unchanged.
+
+---
+
+## TICKET 5 — RS: pick the material's own spec, not a USP-guideline reference, inside a cell (`residual_solvent.py`)
+
+**Bug.** Sitagliptin Croscarmellose Ethanol = 0.04 using 5000 ppm. The IFF Ac-Di-Sol statement prints BOTH the material spec ("nmt 100 ppm", §4.36.2) AND a USP-guideline reference ("USP/NF guideline of < 5000 ppm", §4.42). `_extract_nmt_ppm_exact` takes the LARGEST NMT number in the text, so it grabs the 5000 guideline reference instead of the 100 spec. Same provenance principle as Ticket 1/4: a guideline reference is not the material's value.
+
+**Fix.** In `_extract_nmt_ppm_exact` (and any NMT/limit extractor), EXCLUDE any numeric match whose immediate context matches `_RS_POLICY_CONTEXT_RE` / `_RS_REGULATORY_LABEL_RE` (e.g. "USP/NF guideline of", "ICH Q3C", "guideline", "PDE", "significantly less than", "as per USP <467>"). Take the max of only the NON-reference NMT numbers. So "nmt 100 ppm" (material spec) is used and "< 5000 ppm (USP/NF guideline)" is ignored. Provenance-driven, no value threshold, no product name.
+
+**Expected.** Croscarmellose Ethanol spec = 100 ppm → exposure 8 mg × 100/1e6 = 0.0008, not 0.04.
+
+---
+
+## TICKET 6 — RS: annexure-number collapse (`residual_solvent.py`)
+
+**Bug.** Logs show every material `→ annexure 1`: each PDF is converted separately as "annexure 1", so number-keyed lookup collapses distinct annexures and excipients read the API's evidence.
+
+**Fix.** In `build_rs_payload`, key each ingredient's annexure reference on the annexure's POSITION in the uploaded list (`_annexure_index` / `_display_by_pos`), never its repeated `annexure_number`; assign unique sequential display numbers before mapping; resolve the supplier table and annexure list through `_display_for(mp)`, not `orig_to_display[annexure_number]`.
+
+**Expected.** Olon API → Annexure 1, Roquette Mannitol → 2, Merck Citric Acid → 3; each maps to its own material; Mannitol/Citric read their OWN negative declarations.
+
+---
+
+## TICKET 7 — RS: material-name fallback must never default to the API/product name (`residual_solvent.py` / `residual_solvent_annexure_converter.py`)
+
+**Bug.** RS Section 9 shows a truncated "Magnesium" (unmatched, supplier "-") though the LIGAMED negative declaration is uploaded; and three annexures (CEOLUS/Asahi, both Opadry) were labelled "Sitagliptin phosphate monohydrate". When the vendor material name can't be parsed, extraction falls back to the request's product/API name and/or truncates.
+
+**Fix.** The material-name fallback ladder must be: document body → extractor candidates → document title → filename-derived name (`_rs_filename_derived_name`) → "Material [N]". It must NEVER fall back to the product/API name, and must not truncate a name to a single word. Same class as the DEG/EG "raw filename as name" fix. Product-agnostic.
+
+**Expected.** Magnesium stearate → full name, mapped to the LIGAMED declaration (all-NA, correct); CEOLUS and both Opadry annexures show their real vendor identities, not the API name.
+
+---
+
+## TICKET 8 — RS: coating-variant-per-strength + duplicate annexure (`residual_solvent.py`)
+
+**Bug (a).** For the assessed 100 mg strength (Opadry Brown, 12 mg) the tables also render Opadry Yellow (50 mg variant) as a "q.s." row and drop Orange (25 mg). **Bug (b).** MCC appears twice — Annexure 3 (IFF, covering MCC + Croscarmellose) and Annexure 4 (Asahi CEOLUS) — a duplicate from the many-to-many mapping over-firing.
+
+**Fix.** (a) For the selected strength, a composition variant whose quantity is NA/blank at that strength is NOT part of the formulation — exclude it entirely from the tables (never render it, never as q.s.). Only the variant present at the selected strength (Brown at 100 mg) is assessed. (b) When two annexures legitimately cover the same material, map that material to ONE (prefer the material-specific CoA over a multi-material PRDS, else the higher-confidence identity); do not emit two annexure rows for one composition material. Product-agnostic; keep the many-to-many mapping for genuinely distinct materials (MCC + Croscarmellose from one IFF doc stays correct).
+
+**Expected.** 100 mg tables show only Opadry Brown; Yellow/Orange absent (not q.s.); MCC maps to a single annexure.
+
+---
+
+## Cross-cutting
+Tickets 1, 4, 5 are the SAME provenance principle (a regulatory/guideline number is a reference, never the material's content) applied in three places — the pattern that fixed Aerosil/Sitagliptin-API and then broke Trila/Vaso when done by value. Ticket 2 is its mirror (a stated `<X` bound IS the material's evidence and must be kept). Ticket 3 is the display twin (copy the source faithfully; restrict only the calculation). Tickets 6/7/8 are identity/mapping fidelity. No per-product logic; nothing inspects a value against a constant.
+
+## Regression gates (field-level diff vs approved where available; all must pass)
+- Sitagliptin EI: API = ND/bound (not the Option-1 table); Aerosil carries its `<` bounds; Table 1 shows 100/50/25 mg; Croscarmellose matched.
+- Sitagliptin RS: Croscarmellose Ethanol 0.0008 (100 ppm, not 5000); Magnesium stearate full-named + mapped (all-NA); Opadry Brown only at 100 mg; MCC single annexure; each ingredient → its own annexure number.
+- Trila RS vs TSR-TRC-01-00052: all 9 solvents present, exposures match.
+- Aerosil (EI): regulatory/food-additive reference columns excluded via `regulatory_limit` provenance; no phantom Class 2B/3; `<X` bounds kept.
+- Vaso: unchanged (ND via conservative_bound).
+- A material whose real spec equals the ICH/USP limit: KEPT.
+- No float regressions, no request-state bleed, no hardcoding.
