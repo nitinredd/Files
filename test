@@ -1,40 +1,55 @@
-# DocGen — EI Ticket 3: Material identity on a later page with no element data (Propyl Gallate)
+# DocGen — EI Ticket 4: Grade-named ingredient can't find its own explicitly-named annexure
 
-**Confirmed from the actual source document** (`WI-GLOB-QA-0529 EI declaration.PDF`). This is a third, distinct failure mode in the same family as the Fujicalin scope-split (T3) and the Aerosil scope-narrowing bug — but neither of those fixes covers this case. Do not attempt to patch this with the existing `_ei_scope_same` merge logic; it is the wrong mechanism (explained below).
+**Confirmed by hand-tracing `_resolve_ingredient_match` and reproducing the exact log message from source code alone.** This is a genuinely new failure mode — not a repeat of the Fujicalin (T3) or Aerosil scope-selection bugs — with two independent root causes, both fixable without any hardcoded product/brand name.
 
-## The confirmed document structure
+## Root cause 1 (primary) — the ingredient's own stated grade is never checked against annexures' own stated names
 
-- **Pages 1-3**: generic Dr. Reddy's WI-GLOB-QA-0529 template — a 30-element checklist (Cd, Pb, As, Hg, Pd, Pt, ... B), almost entirely "No/No". Only Pb has any data: "2ppm", frequency "6 months for third party test", "Yes — per customer request". No material name appears anywhere on these three pages.
-- **Page 4 (the LAST page)**: contains the actual identity — **"Name of the material: Propyl gallate"**, "Manufacturer Name: Wufeng Chicheng Biotech Co., LTD", address, signature, company seal. This page has NO element rows at all — it is purely an identity/signature page.
+The composition ingredient is **"Microcrystalline Cellulose (Ceolus UF711)"** — it explicitly names its grade in the parenthetical. An uploaded annexure (Asahi Kasei's CEOLUS document) has `material_name_candidates` including `"CEOLUS UF-711"` — i.e., the EXACT grade the ingredient names is present, verbatim, as a candidate annexure's own stated identity.
 
-## Why this produces "no annexure match"
+But `BRAND_IDENTITY_RULES` (in `ei_core.py`) has no `"ceolus"` entry. `_detect_brand` only recognizes brands present in this fixed dictionary, so it never fires for "Ceolus" — Stage 1 of `_resolve_ingredient_match` (brand-is-authoritative) never engages, and the CEOLUS annexure never enters consideration. The match is instead fought out among seven unrelated "Avicel"-branded candidates from a different annexure (IFF), all scoring an identical ~0.82 via the family-equality floor in `_candidate_score`, producing the "ambiguous family" outcome.
 
-1. `META_PROMPT` (the metadata-extraction call) runs only on `page_images[0]`. Page 1 is the generic checklist header with no material name — so the annexure's top-level `material_name` is extracted as something generic or blank, never "Propyl gallate."
-2. The per-page prompt (`make_ei_prompt`) does run on page 4 and, per Section G, could tag `material_name: "Propyl gallate"` — but Section G's tagging attaches names to ELEMENT ROWS, and page 4 has zero element rows to tag. There is nothing for that mechanism to attach the name to.
-3. Result: the Pb data (page 1) ends up associated with a generic/blank material identity, and "Propyl gallate" (page 4) never gets linked to any data. When the ingredient "Propyl gallate" is matched against annexures, no annexure resolves to that identity — hence "no annexure match," even though the document was fully uploaded and processed.
+**This is the same class of gap identified for Aerosil, generalized:** the resolver's Stage 1 depends on a hardcoded brand vocabulary. Any grade/brand name not already in `BRAND_IDENTITY_RULES` is invisible to Stage 1, no matter how explicitly the composition names it and no matter how clearly an uploaded annexure declares that exact identity.
 
-## Why this is NOT the same fix as T3 (Fujicalin) or the Aerosil ticket
+**Fix — a new, DATA-DRIVEN matching stage, not another dictionary entry.** Add a stage (before or alongside Stage 1) that checks: does the ingredient's own parenthetical/bracketed text (already extracted via `_extract_material_identity`'s `parenthetical` field) match — by exact fragment or canonical-core containment — any CANDIDATE annexure's own `material_name` or `material_name_candidates`? This requires no brand dictionary at all: it directly compares what the composition SAYS the grade is against what each annexure SAYS its own identity is. Concretely:
 
-- Fujicalin's bug: ONE material, its name spelled two ways across pages, both spellings correctly attached to their own element rows — fixed by merging equivalent scope-keys.
-- Aerosil's bug: SIX genuinely different materials in one cluster, correct per-row scoping, but the wrong one being selected — fixed by normalizing the scope-selection comparison.
-- **This bug**: the identity statement and the element data are on entirely different pages, and the page with the identity has no data of its own to tag. Neither a scope-merge nor a scope-selection fix applies — there is no scope conflict here, there is a missing LINK between an identity found on one page and data found on another page in the same document.
+```
+For the ingredient's parenthetical text(s) (e.g. "Ceolus UF711"):
+  for each candidate annexure:
+    if the parenthetical's canonical core (or exact normalized fragment)
+       matches / is contained in / contains
+       any of the candidate's own material_name_candidates or material_name:
+      record this as a "stated-grade match"
+if exactly one candidate has a stated-grade match:
+  return it with high confidence (same tier as exact_brand)
+if more than one candidate has a stated-grade match, fall through to existing tie-break logic
+```
 
-Do not reuse `_ei_scope_same` or the Aerosil scope-selection normalization for this. This needs a fallback at the material-name resolution level, not the scope-comparison level.
+This generalizes to ANY future grade name (e.g. "PROSOLV SMCC 90 LM", "AEROSIL R972") without ever touching `BRAND_IDENTITY_RULES` — it works because it compares the ingredient's own stated identity against the annexure's own stated identity, which is exactly the kind of match a human reviewer would make by reading both documents.
 
-## The fix
+## Root cause 2 (compounding) — hyphen/no-hyphen tokenization mismatch would still block the match
 
-When the top-level, page-1-derived `material_name` is missing, generic, or matches the document's own boilerplate title (e.g. "Manufacturer Declaration on Elemental Impurities Information" — the template's own heading, not a substance name), fall back to any material name surfaced by the per-page extraction anywhere in the document — including a page that has no element rows of its own. That name then becomes the annexure's material identity for matching purposes, regardless of which page it was found on or whether that page carried any data.
+Even with Fix 1 in place, verify this does not silently fail: the ingredient names the grade **"UF711"** (no hyphen), while the annexure's own candidate reads **"UF-711"** (hyphenated). `_norm_identity_text` replaces the hyphen with a space, so "UF-711" tokenizes to `{"uf", "711"}` while "UF711" tokenizes to `{"uf711"}` as ONE glued token — these do not overlap under the current tokenizer, so canonical-core / containment matching would still see zero overlap between "ceolus uf711" and "ceolus uf 711" even after Fix 1 locates both as candidates for stated-grade comparison.
 
-Concretely: after the per-page loop completes, if `meta.get("material_name")` is empty or equals a known boilerplate/template title, scan all per-page results for any non-empty `material_name` value (from Section G's tagging or an equivalent per-page identity field) and use the first one found as the document-level `material_name`. Do not require that page to also contain elements — a document's identity statement and its data table may legitimately be on different pages.
+**Fix — a letter-digit boundary normalization rule in the tokenizer**, applied identically to both the ingredient's and the annexure's identity text: insert a token boundary at every letter→digit transition (and digit→letter transition) before splitting into tokens, so "UF711" and "UF-711" both normalize to the same token sequence `{"uf", "711"}`. This is a general string-normalization rule (not a product-specific one) and should be added to `_norm_identity_text` or applied as a pre-processing step before tokenization in `_canonical_tokens`.
 
-## Why this cannot break other documents
+## Root cause 3 (contributing, upstream, informational only) — extraction granularity is unstable across runs for the same PDF
 
-- This is a FALLBACK, triggered only when the page-1 metadata extraction already failed to produce a real material name. Any document where page 1 correctly names the material (the normal case, unaffected) never reaches this fallback path.
-- It does not change how element data itself is read, scoped, or calculated — only how a document's overall material identity is resolved when the standard page-1 path comes up empty.
-- It does not touch `_ei_scope_same`, the Fujicalin merge logic, or the Aerosil scope-selection normalization — this is an independent code path.
+Confirmed by comparing two runs of the SAME IFF PRDS file: one run produced `covered_materials = ['Microcrystalline Cellulose', 'Croscarmellose Sodium']` (clean product names); this run produced 11 raw SKU-grade strings (`'Avicel PH LN'`, `'Avicel RC-591'`, `'Ac-Di-Sol SD-711 Grade'`, etc.) instead. This is a vision-extraction stability issue in `annexure_converter.py`'s per-page `covered_materials` prompt (Section G) — the model is reading a different page/table each run and extracting at a different level of granularity. **This is not something `ei_core.py` should paper over**, but it does explain why the same document sometimes produces 2 clean scopes and sometimes 11 fragmented ones. Flag for a separate investigation into whether Section G's instructions can be made to consistently prefer product-family-level names over individual SKU/grade codes when both are visible on a page — but do not guess a fix without checking the actual page content that produced this run's 11-item list.
+
+## Root cause 4 (contributing, in `ei_core.py`) — the generic material name loses its full candidate pool once scopes fragment
+
+Confirmed in `_build_identity_pool`: when `_ei_material_scopes(ann)` returns ANY non-empty list, and the top-level `material_name` is scope-same with one of those scopes, the function `continue`s past pooling the material's own full `material_name_candidates` list — so the rich, general-purpose candidate pool (which in a single-scope document would include ALL of "Avicel PH", "Avicel PH-101", etc. together) is never available as a fallback once fragmentation occurs. This means a generically-named ingredient (with no scope-specific brand) has only the narrow, fragmented per-scope identities to match against, never the fuller generic-name identity.
+
+**Fix — keep the generic material_name pool entry as an ADDITIONAL fallback candidate, not a replacement.** Even when per-scope views exist, also pool the material's own full identity (material_name + full material_name_candidates + supplier) under its own key, so a generically-worded ingredient (or one whose own brand/grade doesn't match any single fragmented scope) still has a complete, well-evidenced candidate to match against — in addition to, not instead of, the per-scope views used for genuinely distinct multi-material documents.
+
+## Why these fixes cannot break other documents
+
+- Fix 1 is purely additive: it only activates when the ingredient's own parenthetical text exists AND matches a candidate's own stated identity. A composition ingredient with no parenthetical, or a document set with no stated-grade overlap, is completely unaffected — falls through to existing Stage 2/2b/3/4 logic unchanged.
+- Fix 2 (letter-digit boundary) only changes tokenization for identity comparison; it does not change how quantities, concentrations, or any numeric value is parsed. A name with no letter-digit boundary anywhere is unaffected.
+- Fix 4 is additive (adds a candidate, never removes one); a single-scope document (the common case) is entirely unaffected since it never reaches the scope-fragmentation branch at all.
 
 ## Regression checks
-- Re-run Sitagliptin EI: Propyl gallate should now resolve to Annexure named "Propyl gallate" (Wufeng Chicheng Biotech), no longer "NO ANNEXURE MATCH." Its Pb value (2 ppm on page 1) should now correctly attach to the ingredient.
-- Confirm Fujicalin's scope-merge (Pb=0.1, Cd=0.4, V=0.7) is unaffected.
-- Confirm Aerosil's scope-selection (Class 1/2A bounds) is unaffected.
-- Confirm any document where page 1 already names the material correctly (e.g. Evonik's own declarations, IFF's PRDS) is unaffected — the fallback must never override a correctly-extracted page-1 name.
+- Re-run Sitagliptin EI: "Microcrystalline Cellulose (Ceolus UF711)" should now match the Asahi CEOLUS annexure directly (Stage 1-equivalent "stated-grade match"), not report ambiguous family.
+- Confirm Croscarmellose Sodium (same IFF document) still resolves correctly to its own scoped data — Fix 4 must not cause it to fall back to a generic pooled identity when its own specific scope match is the correct one.
+- Confirm Fujicalin's earlier scope-merge (T3) and Aerosil's scope-selection fix are unaffected — neither touches `_build_identity_pool`'s pooling logic or the tokenizer.
+- Confirm an ingredient with NO parenthetical grade name (e.g. plain "Magnesium stearate") is unaffected by Fix 1 — it should never trigger the new stated-grade-match stage at all.
