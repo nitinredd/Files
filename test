@@ -1,50 +1,73 @@
-● All 8 tickets are implemented. Suite green: 345 assertions in test_workflow_fixes.py (+29 new in a group called evidence), all 9 suites passing.
+# DocGen — Two Confirmed Fixes (RS vendor-column + EI Aerosil match)
 
-  EI
+Both items below are confirmed against real source documents with exact reproduction. Everything else already fixed this session (Croscarmellose, Fujicalin, Magnesium Stearate, Opadry content-vs-limit, phantom Class-1 columns, Toluene alias, `<QL` extraction, T1-T4 EI header-based classification) is CONFIRMED CORRECT and must not be touched.
 
-  T1 — truncation. claude_vision() gained max_tokens (still defaulting to 8192, so the metadata read and the other three workflows' own copies are
-  untouched); the per-page make_ei_prompt reads now pass EI_PAGE_MAX_TOKENS = 16000 (annexure_converter.py:875). I also closed the silence: a page that
-  answers but parses to {} now writes a ⚠️ line into extraction_notes (annexure_converter.py:1619) — previously that was a total, invisible loss of the
-  page.
+---
 
-  T2 + T4 — prompt only. Section E2 is rewritten header-first (DECIDED BY THE HEADER, NEVER BY THE VALUES), with the explicit rule that a
-  product/grade/batch-labelled column stays the material's even if every value equals Option 1. New section E3 resolves a limit column beside a result
-  column from headers alone, with Do NOT require a narrative spelled out.
+## TICKET 1 (P0) — RS: vendor's own "Specification Limit" column misclassified as regulatory reference
 
-  T3 — scope split. _ei_scope_same (token-run containment) plus a merge pass in _ei_material_scopes (ei_core.py:3736). One thing the ticket didn't
-  anticipate: merging the scope list alone would have lost data. With [A_long, A_short, B] merging to [A_long, B], an element tagged A_short matches neither
-  view and disappears entirely. So _ei_elements_for_scope and _ei_material_views had to learn the same equivalence. Verified: Fujicalin-shape → [] with all
-  3 elements in one view; IFF-shape → 2 scopes, Croscarmellose keeps its element; 3-material mixed case → element correctly retrieved under the merged
-  scope.
+**Confirmed root cause.** Jiuzhou's RS declaration (`16 RS Declaration.pdf`) prints two columns per solvent:
+- "Vendor's Specification Limit" — e.g. Toluene `<QL (89ppm)`, Methanol `<QL (300ppm)`, Ethanol `<QL (500ppm)` — this is the material's own content.
+- "Limit as per ICH/Current USP" — e.g. Toluene `≤890ppm`, Methanol `≤3000ppm`, Ethanol `≤5000ppm` — this is the regulatory reference.
 
-  RS
+The generated document uses the SECOND column (the ICH/USP reference) as the API's content for every single solvent — Benzene=2 (should be 0.6), Toluene=890 (should be 89), Methanol=3000 (should be 300), Ethyl acetate/Isopropanol/Ethanol/Acetone/Ethanoic acid/Isopropyl acetate=5000 (should be 500 each), Triethanolamine=1500 (should be 500). Every affected exposure is inflated ~10x.
 
-  T1 — phantom columns. Two changes, both required. The RF2 gate now asks for evidence, not ICH class. But that alone would not have worked: if the model
-  types the Propyl Gallate mention negative_declaration, the gate keeps it by design. So _annexure_solvent_universe now returns (assessed, declared_only)
-  and drops any solvent no material states a content for, with an audit flag. Two guards: a chemical name's own digits are not a concentration (the test is
-  number + unit, not bare \d), and a statement printing a number or a BDL marker stays visible for manual review rather than vanishing.
+**Likely mechanism (verify before patching).** The vendor's own column header literally contains the word "Limit" ("Vendor's **Specification Limit**"). If the regulatory-reference classifier flags any header containing "Limit" in isolation — rather than requiring a regulatory qualifier ("ICH," "USP," "Q3C," "current") to co-occur with "Limit" — it will misclassify the vendor's own spec column as a reference and fall through to the actual ICH/USP column instead.
 
-  T2/T3 — alias + <QL. toulene added; _RS_QL_BOUND_RE wired into _extract_nmt_ppm_exact, with ql loq lod dl rl added to the reference-gap words so RS-7's
-  exclusion still reaches through the marker. Verified: <QL (500ppm) → 500 as vendor content, while "the ICH Q3C limit is <QL (5000 ppm)" → None.
+**Fix — semantic, header-phrase-based, NOT positional or value-based.**
+1. Locate the regulatory-reference header classifier in `residual_solvent.py` (the pattern matching "Limit" in column headers, likely `_RS_REGULATORY_LABEL_RE` or equivalent).
+2. Require a regulatory qualifier word ("ICH," "USP," "Q3C," "current," "compendial," "guideline") to be present in the SAME header as "Limit" before classifying it as a regulatory reference. A header containing "Limit" WITHOUT any such qualifier (e.g. "Vendor's Specification Limit," "Supplier Limit," "Agreed Limit," "Manufacturer's Limit") must be classified as the material's own content, not a reference.
+3. Do NOT implement this as "pick the smaller number," "pick the first column," or any value/position-based rule. The classification must be driven entirely by which qualifying words appear in the header text, exactly as the existing T2/T4 EI fix already does for Option-1/ICH columns — this ticket applies that same discipline to RS's vendor-vs-regulatory column split.
 
-  Latent bug found while doing T3: _RS_BDL_TEXT_RE had its leading \b outside the whole group, making the <LOD/<LOQ alternative unreachable — no word
-  boundary exists before <. Fixed, and I checked 12 shapes before/after: zero converted numbers change, only the audit basis improves.
+**Why this is scoped narrowly enough not to break other documents.** This only changes classification for a header containing "Limit" with NO regulatory qualifier word anywhere in it — a narrow, identifiable pattern. Any header that already correctly reads "Option 1 Limit," "Maximum Expected Amount," "ICH/USP Limit," etc. is untouched, since those either already have a qualifier or were never misclassified.
 
-  T4 — the intense one. It is not an extraction guess. I proved by exhaustion that every deterministic path already returns 100 (both sentences separately,
-  joined, two entries deduped, raw_value 100/5000/empty). The actual failure is a thin raw_text: when the extractor returns raw_value=5000 with raw_text
-  trimmed to "Ethanol" or "", RS-1/2/7 have no introducing words left and take the number at face value — confirmed, that path yields 5000. The fix is RS-11
-  (_rs_statement_context): when a statement doesn't print its own number, the document's own sentences that print that exact number are put back in front
-  of the classifier. Only same-number sentences are added, so no foreign value can be introduced, and nothing looks at how big the number is. Both RS
-  prompts also gained "a comparison to a guideline is not a second spec" and "raw_text IS THE AUDIT TRAIL".
+**Mandatory regression checks before this is considered fixed (do not skip):**
+1. Re-run Sitagliptin RS: Benzene=0.6/0.077µg→0.6ppm exposure recalculates to ~0.000077mg, Toluene=89ppm→~0.011mg, Methanol=300ppm→~0.03855mg, Ethyl acetate/Isopropanol/Ethanol/Acetone/Ethanoic acid/Isopropyl acetate=500ppm each→~0.06425mg each, Triethanolamine=500ppm→~0.06425mg.
+2. Re-run Opadry-sourced values (Ethylene glycol=101, 1,4-Dioxane=1, Methanol=2000, Methyl acetate=2000 from Colorcon's "Maximum Expected Amount" column) — MUST remain unchanged, since that header already correctly has no bare "Limit" ambiguity.
+3. Re-run Croscarmellose Ethanol (IFF, =100ppm via the prose-based `_rs_statement_context` fix) — MUST remain unchanged, this is a different code path.
+4. Re-run Trilaciclib RS (the original 9-solvent API-spec fix: Methanol 1.51, IPA 2.52, Acetonitrile 0.21, CPME 0.75, DCM 0.30, Toluene 0.45, Acetic Acid 2.52, Sulfolane 0.08, TFA 1.71) — MUST remain unchanged; this is the fixture that proves a vendor spec sitting AT the ICH limit is still correctly kept as content, not regressed back to zero.
+5. If any of checks 2-4 change, the fix is too broad — narrow the qualifier-word list further rather than accepting the regression.
 
-  Two things to flag
+---
 
-  One residual shape is deliberately left open. If the extractor returns raw_text = "Ethanol < 5000 ppm" — a number with a unit but stripped of the
-  guideline framing — RS-11 does not fire. Making it fire would mean always preferring document context over what the statement actually says, which would
-  let context override genuine vendor bounds. That shape is closed on the prompt side only. If the next run still shows Ethanol 5000, send me the raw
-  raw_text/raw_value for that entry and this is where to look.
+## TICKET 2 (P1) — EI: Aerosil identity matches but concentration lookup returns empty
 
-  Your regression protocol item 2 — "byte-identical output before/after" — I did not run. It needs a pre-change tree, and the working tree already carried
-  uncommitted changes from earlier sessions, so I had no clean baseline to diff against. What I ran instead: the end-to-end suite (renders all 4 workflows,
-  identical output across duplicated, concurrent and reordered runs), the Trilaciclib 9-solvent API spec and the Opadry content-vs-limit case in
-  test_source_fidelity (both unchanged), and the explicit 12-case before/after on the BDL regex. Items 1 and 4 need the source PDFs and remain unverified.
+**You do not have access to the source PDFs or a live environment to add logging and re-run. You must find and fix this by reading the code alone.** Do not propose "add a log line and report back" as your deliverable — that instruction is only useful in an interactive loop with the source files present, which you do not have. Instead, trace the actual data flow through the existing functions and reason out where the two paths (identity matching vs. concentration lookup) diverge for this specific case. Read this whole explanation before touching any code.
+
+**The confirmed symptom (from a real run's logs).** For the composition ingredient "Colloidal Silicon dioxide (Aerosil 200)":
+```
+Identity validation for 'Colloidal Silicon dioxide (Aerosil 200)': Detected brand 'aerosil' and matched the same brand annexure.
+...
+NO ANNEXURE MATCH: 'Colloidal Silicon dioxide (Aerosil 200)' — contributes 0.
+```
+Two Evonik source documents were uploaded and clustered together, confirmed from the POST-CLUSTER log:
+```
+('AEROSIL® Pharma grades and AEROPERL® 300 Pharma', False,
+ ['AEROSIL® Pharma grades', 'AEROPERL® 300 Pharma', 'AEROSIL® 200 Pharma',
+  'AEROSIL® R 972 Pharma', 'AEROSIL® 200 VV Pharma', 'AEROSIL® 300 Pharma'])
+```
+Both source documents genuinely contain real Class 1/2A bounds for AEROSIL 200 Pharma specifically (Cd<0.5, Pb<0.5, As<1.5, Hg<3, Co<5, V<10, Ni<20 µg/g) — this is not a case of missing data. The data exists in the cluster; it is failing to reach the ingredient.
+
+**Why this is a genuinely different failure shape than the Fujicalin bug already fixed this session, and must not be "fixed" the same way.** Fujicalin's earlier bug was ONE real material whose name was extracted two different ways across pages ("Fujicalin SG" vs. its full name) — the fix was to MERGE those two scope-keys into one, via `_ei_scope_same`'s containment check, so the material stopped being incorrectly split into two.
+
+Aerosil's cluster is NOT one material split into two spellings — it is six GENUINELY DIFFERENT products (AEROSIL 200, AEROSIL R972, AEROSIL 300, AEROSIL 200 VV, AEROSIL Pharma grades, AEROPERL 300), each a distinct silica grade with its own row of element data in a comparison table. `_ei_scope_same`'s containment/merge logic correctly does NOT merge these six — merging them would incorrectly average or collapse six different products' data into one, which would be a worse bug than the current one. Do not extend `_ei_scope_same` to cover this case; that would very likely corrupt Aerosil's data by conflating six distinct grades, and could also affect any other future multi-grade comparison document (e.g. other Evonik/silica documents, other multi-grade vendor declarations) that legitimately needs six separate scopes kept apart.
+
+**The actual mechanism to trace.** The composition ingredient name is "Colloidal Silicon dioxide (Aerosil 200)." Two separate matching steps happen for this ingredient:
+1. A document/brand-level identity match — this only needs the substring "aerosil" to appear anywhere in a candidate annexure's identity, and it succeeds (log confirms this).
+2. A SECOND, more specific step that must select which ONE of the six scopes within the matched cluster ("AEROSIL® 200 Pharma" specifically, not the other five) actually supplies the element data — this is where the failure lives. Find the function that takes a matched annexure/cluster plus the ingredient's own name/candidate string and narrows it down to a single scope's element set (this is very likely `_ei_elements_for_scope`, the same function that reads `material_scope` per element, since that is the only place in the codebase responsible for narrowing a multi-scope cluster down to one). Read its comparison logic exactly as written: it very likely does an exact-equality check between a "target" string derived from the ingredient name and each element's stored `material_scope` string. Compare what that target string would actually be (derived from "Aerosil 200" or "Colloidal Silicon dioxide (Aerosil 200)") against what the stored scope strings actually are (from the POST-CLUSTER log: "AEROSIL® 200 Pharma" — note the registered-trademark symbol ® and the trailing word "Pharma," neither of which appears in the ingredient's own name). An exact-equality comparison between these two strings will fail even though they clearly refer to the same product to a human reader.
+
+**The fix, once you locate this exact comparison.** Do NOT loosen it into a containment merge like Fujicalin's (that would wrongly conflate the six distinct grades). Instead, the per-element scope-selection comparison needs a NORMALIZED equality check specific to this narrowing step — strip registered-trademark/trademark symbols (®, ™), strip generic trailing/leading qualifier words that are not part of the product's distinguishing identity (e.g. "Pharma," "grades," "NF," "USP" — check what normalization helper already exists elsewhere in the codebase for comparable purposes, such as whatever the composition-ingredient-to-annexure identity matcher already uses to succeed at step 1 above, since that function ALREADY correctly equates "Aerosil 200" with "AEROSIL® 200 Pharma" — reuse or call that same normalization here instead of writing a new one), then compare the normalized strings for equality (not containment) — this must remain an exact match after normalization between "aerosil 200" and "aerosil 200 pharma"-minus-generic-qualifier, while still correctly staying DISTINCT from "aerosil 300," "aerosil r 972," "aerosil 200 vv," etc. Verify your normalization does not accidentally collapse "aerosil 200" and "aerosil 200 vv" into the same key — these are different grades and must remain separately keyed.
+
+**Do this by reading the code, not by guessing.** Locate the exact function performing step 1 (the brand/identity match that already succeeds) and the exact function performing step 2 (the scope-narrowing that fails) by tracing from the log messages upward through the call chain. Identify precisely which normalization step 1 applies that step 2 does not, then apply the same (or an equivalent, already-tested) normalization to step 2 — do not invent a new fuzzy-matching heuristic from scratch when an existing, working one likely already solves this exact string-variant problem elsewhere in the file.
+
+**Regression check once fixed.** Aerosil should show Pb=0.5, As=1.5, Cd=0.5, Hg=3, Co=5, V=10, Ni=20 (µg/g, the Evonik `<X` bounds) under conservative_bound — consistent with how Magnesium Stearate's `<RL` bounds are already correctly kept. Re-confirm Fujicalin's own scope-merge (Pb=0.1, Cd=0.4, V=0.7) is unaffected. Re-confirm that a hypothetical document naming both "Aerosil 200" and "Aerosil 200 VV" would still correctly keep them as two separate scopes, not merge them — construct this as a reasoning check even without a live file to run, by tracing your normalization logic against both strings by hand.
+
+---
+
+## Do NOT touch (confirmed correct this session, do not re-open)
+- EI: T1-T4 header-based classification, Croscarmellose scope-merge (`_ei_scope_same`), Fujicalin real-value extraction, Magnesium Stearate token-limit fix, annexure list scoping.
+- RS: Opadry content-vs-limit column split (`_RS_EXPECTED_LABEL_RE`), Croscarmellose Ethanol via `_rs_statement_context`, phantom Class-1 exclusion, Toluene alias, `<QL` bound extraction, negative-declaration handling for Fujicalin/CEOLUS/LIGAMED/Evonik.
+- Do not hardcode "Jiuzhou," "Sitagliptin," "Aerosil," "Vendor's Specification Limit," or any other product/vendor/header string as a literal match condition. Both fixes must be driven by generic qualifier-word/scope-key logic that applies to any future document with the same structural pattern.
+
+## Delivery
+For Ticket 1: confirm all 5 regression checks pass before reporting done. For Ticket 2: report the diagnostic log output FIRST; do not submit a fix in the same pass unless the diagnostic confirms the Fujicalin-pattern hypothesis.
