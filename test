@@ -1,55 +1,211 @@
-# DocGen — EI Ticket 4: Grade-named ingredient can't find its own explicitly-named annexure
+# DocGen — Final hardening: Excel grounding, DEG/EG sheet, annexure identity, fishbone removal
 
-**Confirmed by hand-tracing `_resolve_ingredient_match` and reproducing the exact log message from source code alone.** This is a genuinely new failure mode — not a repeat of the Fujicalin (T3) or Aerosil scope-selection bugs — with two independent root causes, both fixable without any hardcoded product/brand name.
+You have built something genuinely good here. The engine is sound, the calculations reconcile, and the last several rounds of fixes have all held on re-runs against real documents. **We are close.** What follows is the last set of gaps, each traced to a specific line, each with a proven root cause — no guesswork. Land these carefully and this ships.
 
-## Root cause 1 (primary) — the ingredient's own stated grade is never checked against annexures' own stated names
+**Read this whole brief before writing a single line.** Several of these look similar to fixes already made but are structurally different; treating them as repeats will break things that currently work. Where a fix touches shared code, think it through end to end first — what else calls this, what shape of input does it see, what is the blast radius. Take the time. Ask yourself "what breaks if I'm wrong" before each change.
 
-The composition ingredient is **"Microcrystalline Cellulose (Ceolus UF711)"** — it explicitly names its grade in the parenthetical. An uploaded annexure (Asahi Kasei's CEOLUS document) has `material_name_candidates` including `"CEOLUS UF-711"` — i.e., the EXACT grade the ingredient names is present, verbatim, as a candidate annexure's own stated identity.
+**NON-NEGOTIABLE: do not break what works.** Everything below is additive or a narrow re-ordering. Nothing here requires deleting a working path. If a change you are considering would alter behaviour for a workbook or annexure shape that is currently correct, stop — you have the wrong fix. Extend, never force-fit.
 
-But `BRAND_IDENTITY_RULES` (in `ei_core.py`) has no `"ceolus"` entry. `_detect_brand` only recognizes brands present in this fixed dictionary, so it never fires for "Ceolus" — Stage 1 of `_resolve_ingredient_match` (brand-is-authoritative) never engages, and the CEOLUS annexure never enters consideration. The match is instead fought out among seven unrelated "Avicel"-branded candidates from a different annexure (IFF), all scoring an identical ~0.82 via the family-equality floor in `_candidate_score`, producing the "ambiguous family" outcome.
+---
 
-**This is the same class of gap identified for Aerosil, generalized:** the resolver's Stage 1 depends on a hardcoded brand vocabulary. Any grade/brand name not already in `BRAND_IDENTITY_RULES` is invisible to Stage 1, no matter how explicitly the composition names it and no matter how clearly an uploaded annexure declares that exact identity.
+## THE TWO UPLOAD TEMPLATES (ground truth)
 
-**Fix — a new, DATA-DRIVEN matching stage, not another dictionary entry.** Add a stage (before or alongside Stage 1) that checks: does the ingredient's own parenthetical/bracketed text (already extracted via `_extract_material_identity`'s `parenthetical` field) match — by exact fragment or canonical-core containment — any CANDIDATE annexure's own `material_name` or `material_name_candidates`? This requires no brand dictionary at all: it directly compares what the composition SAYS the grade is against what each annexure SAYS its own identity is. Concretely:
+Both are two-sheet workbooks. Sheet 1 is **Instructions** (guidance only, never data). Sheet 2 is the data sheet.
 
+### OSD template — sheet 2 named `OSD`
 ```
-For the ingredient's parenthetical text(s) (e.g. "Ceolus UF711"):
-  for each candidate annexure:
-    if the parenthetical's canonical core (or exact normalized fragment)
-       matches / is contained in / contains
-       any of the candidate's own material_name_candidates or material_name:
-      record this as a "stated-grade match"
-if exactly one candidate has a stated-grade match:
-  return it with high confidence (same tier as exact_brand)
-if more than one candidate has a stated-grade match, fall through to existing tie-break logic
+Row 1:  FORMULATION COMPOSITION  –  OSD (Oral Solid Dosage)      [merged A1:J1, title]
+Row 2:  Enter one ingredient per row. Fill only the strengths…   [merged A2:J2, instruction]
+Row 3:  (blank)
+Row 4:  S. No. | Name of Ingredient | Function | OSD (Oral Solid Dosage) ×3 (merged pairs) | Remarks
+Row 5:  (blank ×3)                              | Strength-1 | Strength-2 | Strength-3     |
+Row 6:  (blank ×3)                              | Qty / unit dose | Max Daily Dose | …×3   |
+Row 7+: data
 ```
+Columns: A=S.No, B=Name, C=Function, **D/E=Strength-1 (Qty per unit / MDD)**, **F/G=Strength-2**, **H/I=Strength-3**, J=Remarks.
 
-This generalizes to ANY future grade name (e.g. "PROSOLV SMCC 90 LM", "AEROSIL R972") without ever touching `BRAND_IDENTITY_RULES` — it works because it compares the ingredient's own stated identity against the annexure's own stated identity, which is exactly the kind of match a human reviewer would make by reading both documents.
+### Injectable template — sheet 2 named `Injectable`
+```
+Row 4:  S. No. | Name of Ingredient | Function | Injectable / Parenteral ×3 (merged triples) | Remarks
+Row 5:  (blank ×3)                              | Strength-1 | Strength-2 | Strength-3
+Row 6:  (blank ×3)                              | Qty / mL | Qty / unit dose | Max Daily Dose | …×3
+Row 7+: data
+```
+Columns: A=S.No, B=Name, C=Function, **D/E/F=Strength-1 (Qty per mL / Qty per unit / MDD)**, **G/H/I=Strength-2**, **J/K/L=Strength-3**, M=Remarks.
 
-## Root cause 2 (compounding) — hyphen/no-hyphen tokenization mismatch would still block the match
+### Critical structural facts you must handle
+1. **Strength labels vary.** The blank template ships `Strength-1 / Strength-2 / Strength-3`, but a user may overwrite row 5 with a real value — e.g. `100 mg | 50 mg | 25 mg`. **Both must work.** A user-entered mg value in the band row must be preserved and used; it must never be silently replaced by the ordinal.
+2. **Header cells contain line breaks.** The shipped sub-headers are literally `"Qty /\nunit dose"` and `"Max Daily\nDose"`. Any hint/keyword matching must normalise whitespace before comparing, or `"max daily dose"` will never match `"max daily\ndose"`.
+3. **Merged cells.** Row-4 group banners span the pair/triple; row-5 strength labels may too. The blank template also merges the DATA columns on every row in some saved copies — a writer or reader that ignores merges will silently lose the second and third columns.
+4. **Footnote marks** are declared in Instructions: `*` = salt form (state free-base equivalent), `@` = removed in processing, `q.s.` = quantity sufficient.
 
-Even with Fix 1 in place, verify this does not silently fail: the ingredient names the grade **"UF711"** (no hyphen), while the annexure's own candidate reads **"UF-711"** (hyphenated). `_norm_identity_text` replaces the hyphen with a space, so "UF-711" tokenizes to `{"uf", "711"}` while "UF711" tokenizes to `{"uf711"}` as ONE glued token — these do not overlap under the current tokenizer, so canonical-core / containment matching would still see zero overlap between "ceolus uf711" and "ceolus uf 711" even after Fix 1 locates both as candidates for stated-grade comparison.
+---
 
-**Fix — a letter-digit boundary normalization rule in the tokenizer**, applied identically to both the ingredient's and the annexure's identity text: insert a token boundary at every letter→digit transition (and digit→letter transition) before splitting into tokens, so "UF711" and "UF-711" both normalize to the same token sequence `{"uf", "711"}`. This is a general string-normalization rule (not a product-specific one) and should be added to `_norm_identity_text` or applied as a pre-processing step before tokenization in `_canonical_tokens`.
+## PART A — EXCEL GROUNDING (make it bullet-proof)
 
-## Root cause 3 (contributing, upstream, informational only) — extraction granularity is unstable across runs for the same PDF
+### A1 (P0) — the sheet's Max Daily Dose column must win outright
 
-Confirmed by comparing two runs of the SAME IFF PRDS file: one run produced `covered_materials = ['Microcrystalline Cellulose', 'Croscarmellose Sodium']` (clean product names); this run produced 11 raw SKU-grade strings (`'Avicel PH LN'`, `'Avicel RC-591'`, `'Ac-Di-Sol SD-711 Grade'`, etc.) instead. This is a vision-extraction stability issue in `annexure_converter.py`'s per-page `covered_materials` prompt (Section G) — the model is reading a different page/table each run and extracting at a different level of granularity. **This is not something `ei_core.py` should paper over**, but it does explain why the same document sometimes produces 2 clean scopes and sometimes 11 fragmented ones. Flag for a separate investigation into whether Section G's instructions can be made to consistently prefer product-family-level names over individual SKU/grade codes when both are visible on a page — but do not guess a fix without checking the actual page content that produced this run's 11-item list.
+**Confirmed failure, with arithmetic.** A user uploaded the OSD template, fully filled, Max Daily Dose complete on every row (128.5, 127.5, 123, 8, 1, 2, 2, 8, 12 → sums to **412**). The generated RS document instead showed every amount multiplied by **0.77821**:
+```
+128.5 × 0.77821 = 100.00        (API)
+127.5 × 0.77821 = 99.22179      (MCC)
+412   × 0.77821 = 320.622568    (Drug Product)  ← should be 412
+```
+0.77821 = 100 ÷ 128.5 = request MDD ÷ API quantity.
 
-## Root cause 4 (contributing, in `ei_core.py`) — the generic material name loses its full candidate pool once scopes fragment
+**Root cause, `docgen_template.select_basis()`:**
+```python
+if filled_strengths(grounded, QTY_PER_UNIT) and (has_mdd or not daily):
+```
+`has_mdd` is true whenever the API request carries an MDD value. So the request's MDD wins over the sheet's fully-filled Max Daily Dose column, and `rs_classified` emits `single_strength_unit_composition`. `residual_solvent.parse_single_strength_unit_composition` then RE-DERIVES the multiplier: it compares the implied strength (MDD ÷ doses = 100) against the API's own quantity (128.5), finds no match, and falls through to `mult_basis = "mdd_over_api_qty"`.
 
-Confirmed in `_build_identity_pool`: when `_ei_material_scopes(ann)` returns ANY non-empty list, and the top-level `material_name` is scope-same with one of those scopes, the function `continue`s past pooling the material's own full `material_name_candidates` list — so the rich, general-purpose candidate pool (which in a single-scope document would include ALL of "Avicel PH", "Avicel PH-101", etc. together) is never available as a fallback once fragmentation occurs. This means a generically-named ingredient (with no scope-specific brand) has only the narrow, fragmented per-scope identities to match against, never the fuller generic-name identity.
+**Why 128.5 ≠ 100 is not an error:** sitagliptin phosphate monohydrate is a salt. 128.5 mg of salt contains 100 mg of base. The formulation weight and the labelled strength are legitimately different numbers. The derivation treats that difference as a fractional dose.
 
-**Fix — keep the generic material_name pool entry as an ADDITIONAL fallback candidate, not a replacement.** Even when per-scope views exist, also pool the material's own full identity (material_name + full material_name_candidates + supplier) under its own key, so a generically-worded ingredient (or one whose own brand/grade doesn't match any single fragmented scope) still has a complete, well-evidenced candidate to match against — in addition to, not instead of, the per-scope views used for genuinely distinct multi-material documents.
+**The same workbook therefore parses two different ways depending on what the request carries.** That non-determinism is the real defect.
 
-## Why these fixes cannot break other documents
+**Fix — reorder `select_basis` so the sheet is authoritative:**
+1. Injectable + Qty/mL filled → `QTY_PER_ML` (unchanged — see A2).
+2. **NEW:** `daily = [k for k in strengths if has_daily_amounts(grounded, k)]` — if non-empty, return `MDD` for the chosen strength. Use the request's MDD **only** as `choose_strength`'s `target` (i.e. to pick WHICH strength), never to scale amounts.
+3. Else `QTY_PER_UNIT` with the request's regimen (unchanged).
+4. Else the existing partial-MDD fallback (unchanged).
+5. Remove the `_daily_cross_check(...)` append from the QTY_PER_UNIT branch. A sheet/request mismatch is no longer a finding — **the sheet wins, silently.** This is a deliberate product decision.
 
-- Fix 1 is purely additive: it only activates when the ingredient's own parenthetical text exists AND matches a candidate's own stated identity. A composition ingredient with no parenthetical, or a document set with no stated-grade overlap, is completely unaffected — falls through to existing Stage 2/2b/3/4 logic unchanged.
-- Fix 2 (letter-digit boundary) only changes tokenization for identity comparison; it does not change how quantities, concentrations, or any numeric value is parsed. A name with no letter-digit boundary anywhere is unaffected.
-- Fix 4 is additive (adds a candidate, never removes one); a single-scope document (the common case) is entirely unaffected since it never reaches the scope-fragmentation branch at all.
+`has_daily_amounts()` already tests exactly the right condition (every quantified non-exempt row states its MDD). `rs_classified` already emits `component_mdd_only` with `RS_DAILY_AMOUNT_HEADER`, and `parse_component_mdd_only_excel` uses those amounts verbatim with no multiplier. `ei_osd_result` already sets `_amounts_are_daily = (field == MDD)` so EI will not re-multiply. **No adapter changes needed** — this is purely a precedence reorder.
 
-## Regression checks
-- Re-run Sitagliptin EI: "Microcrystalline Cellulose (Ceolus UF711)" should now match the Asahi CEOLUS annexure directly (Stage 1-equivalent "stated-grade match"), not report ambiguous family.
-- Confirm Croscarmellose Sodium (same IFF document) still resolves correctly to its own scoped data — Fix 4 must not cause it to fall back to a generic pooled identity when its own specific scope match is the correct one.
-- Confirm Fujicalin's earlier scope-merge (T3) and Aerosil's scope-selection fix are unaffected — neither touches `_build_identity_pool`'s pooling logic or the tokenizer.
-- Confirm an ingredient with NO parenthetical grade name (e.g. plain "Magnesium stearate") is unaffected by Fix 1 — it should never trigger the new stated-grade-match stage at all.
+**Expected:** mode `component_mdd_only`, DP = 412 mg, no multiplier anywhere in the document.
+
+### A2 (P0) — Injectable: Qty/mL is the basis, MDD validates, everything else is display
+
+Confirm and preserve: `select_basis`'s first branch already returns `QTY_PER_ML` unconditionally for an Injectable sheet with Qty/mL filled. **That is correct and must not change.** On an Injectable sheet, `Qty / unit dose` and `Max Daily Dose` are **display-only** — filled, blank, or duplicated from Qty/mL, it makes no difference to the calculation.
+
+**Add the missing validation half.** When the Injectable sheet's Max Daily Dose column is fully filled (`has_daily_amounts`), compare each row's stated MDD against `Qty/mL × derived daily volume`. **On mismatch, use the sheet's MDD value** — consistent with A1, the sheet is authoritative. When MDD is blank, partially filled, or duplicated, ignore it entirely and proceed on Qty/mL exactly as today.
+
+**Also:** an Injectable sheet with Qty/mL left blank but Qty/unit dose filled must NOT fall into the same `mdd_over_api_qty` derivation that broke OSD. Apply A3's strength-label preservation here too.
+
+### A3 (P0) — preserve the user's strength label; never overwrite it with the ordinal
+
+**Confirmed from output.** A user replaced row 5 with `100 mg | 50 mg | 25 mg`. The generated document's Table 2 headers still read `(Strength-1)`, `(Strength-2)`, `(Strength-3)`, and the document header block read bare **`Strength: 100`** with the unit dropped.
+
+So grounding read the structure correctly but **discarded the user's mg label**, falling back to the ordinal. That is also why the strength-match in `select_strength_column` had no numeric label to match the request's 100 mg against — leaving the API's 128.5 as the only number in play.
+
+**Fix:** when the strength band row contains a value that parses as a quantity with a unit (`100 mg`, `50mg`, `5 mL`), store it as the strength's label and expose it through `column_label()` and the document header. Fall back to `Strength-N` only when the band cell is the shipped ordinal or is blank. Table 2 must read `Qty / unit dose (mg) (100 mg)`; the header block must read `Strength: 100 mg`.
+
+### A4 (P1) — normalise whitespace in every header comparison
+
+The shipped sub-headers contain hard line breaks: `"Qty /\nunit dose"`, `"Max Daily\nDose"`. Any code comparing header text to a hint list must collapse all whitespace first (`" ".join(s.split())`). Audit at minimum: `_MDD_HINTS`, `_QTY_HINTS`, `_AMOUNT_HINTS`, `_COMP_HINTS`, `_STRENGTH_RE`, and the template's own layout matchers.
+
+Also extend `_MDD_HINTS` to include `"max daily dose"` and `"daily dose"` — the template's own label is **"Max Daily Dose"**, which matches none of the current entries (`"maximum daily dose"` ≠ `"max daily dose"`, and `"mdd"` is not present as a literal). This is needed regardless of grounding, for any flat-header workbook using the abbreviated label.
+
+### A5 (P1) — respect merged cells when reading AND writing
+
+Confirmed the hard way: a file written to the second column of a merged pair saved with those cells **empty and no error raised**. Any reader must expand merged values across their span before matching; any writer must unmerge first. `_fill_merged` already does the read side inside grounding — verify nothing upstream of it loses the data first.
+
+### A6 (P1) — the caller must not reject before grounding runs
+
+`app.py` (Streamlit only — the API path in `docgen_api._build_rs` is already correct) calls `classify_rs_excel()` standalone as a pre-flight gate and errors with *"This Excel has material names but no quantity, strength, MDD, or amount-in-maximum-dose columns…"*. `classify_rs_excel` is the legacy flat-header classifier; it **cannot** read the template's three-row merged header and is not supposed to. Grounding lives inside `rs_parse_composition_excel`, which is never reached.
+
+**Fix:** call `rs_parse_composition_excel()` FIRST, then gate on the parsed result (no rows = genuinely unassessable). The same applies to the `_needs_dose` MDD check in that function, which also reads the pre-grounding mode. Keep `classify_rs_excel` for detailed/combined routing — just never let its failure be a user-facing rejection.
+
+---
+
+## PART B — DEG/EG: read the data sheet, not Instructions
+
+`deg_eg.parse_deg_eg_composition()` calls `read_excel_grid()` (returns ALL sheets) then:
+```python
+for sh in sheets:
+    if _col_index(sh["header"], _COMP_HINTS) is not None:
+        sheet = sh; break
+sheet = sheet or sheets[0]
+```
+No guidance filter anywhere. `_COMP_HINTS` contains the bare token `"name"`, and the Instructions sheet's prose contains *"Name of Ingredient"* — so Instructions can win the loop, or be taken by the `sheets[0]` fallback. RS has `_is_instruction_sheet()`; EI has `first_data_worksheet()`; DEG/EG has neither.
+
+**Fix — insert immediately after the `if not sheets:` guard, before the selection loop:**
+```python
+    # The template declares its guidance sheet (role != "data_sheet"); it is
+    # never the composition.
+    try:
+        import docgen_template as _TPL
+        _guidance = _TPL._guidance_names(_TPL.load_template())
+        if len(sheets) > 1 and _guidance:
+            sheets = [sh for sh in sheets
+                      if not _TPL._is_guidance(sh["sheet"], _guidance)] or sheets
+    except Exception:                                   # noqa: BLE001
+        logger.debug("[DEG/EG] template guidance filter skipped", exc_info=True)
+```
+`sh["sheet"]` is the key `read_excel_grid` uses for the worksheet title (not `"title"`). `or sheets` guarantees the list is never emptied. `len(sheets) > 1` mirrors `ground_composition_workbook`'s own condition.
+
+**Do NOT hardcode "index 1" / "second sheet".** Filtering by declared role lands on the same sheet for the two-sheet template, and survives a single-sheet upload, a reordered workbook, or a renamed tab. Reading the name from the template JSON also means renaming the sheet later is a template edit, not a code change.
+
+---
+
+## PART C — ANNEXURE IDENTITY: the Talc case, and every future one like it
+
+**The failing document:** `Regulatory_Talc 11.2023 VQ.pdf`, an IMI Fabi S.p.A. multi-topic regulatory letter, 11 pages.
+
+**Its structure is the problem:**
+- **Page 1** is headed *"DECLARATION OF COMPLIANCE – IMI Fabi Talc 140 USP-EP-ChP"* and is entirely about REACH/SVHC/ISO-16128 naturality. **No elemental-impurity content at all.**
+- **Page 4** carries the *"ELEMENTAL IMPURITIES"* heading and the actual ICH Q3D table, whose own column header reads **"Mineral / Talc 140 USP-EP-ChP"** — no "IMI Fabi" prefix.
+- Real values in that table: As 0.1 ppm, Cd <0.01, Hg <0.005, Pb <0.5, Co <0.5, Ni <1.0, V 5.0 ppm; Cr flagged likely-present with no value; all Class 2B and remaining Class 3 marked not present.
+- **Page 5** separately declares the product free of residual solvents (relevant to RS, not EI).
+
+**Two distinct failure modes, both must be fixed:**
+
+**C1 — identity is grade/brand-qualified; the composition names the generic material.** The composition lists **"Talc"**. The annexure identifies as **"IMI Fabi Talc 140 USP-EP-ChP"** — a brand (`IMI Fabi`), a grade number (`140`), and three compendial suffixes (`USP-EP-ChP`). `BRAND_IDENTITY_RULES` has no `"imi fabi"` entry, so Stage 1 never fires, and canonical-core matching cannot reduce that string to the bare token `talc`.
+
+**This is the same class as the CEOLUS UF711 case.** Do NOT fix it by adding `"imi fabi"` to the brand dictionary — that fixes one document and guarantees the next unlisted brand repeats it.
+
+**Fix — generic, data-driven, no dictionary:**
+- **Compendial-suffix stripping.** Before canonical-core comparison, strip trailing pharmacopoeia tokens (`USP`, `NF`, `EP`, `BP`, `JP`, `ChP`, `Ph. Eur.`, `PhEur`, `USP-NF`) and their hyphenated combinations from BOTH sides. `"IMI Fabi Talc 140 USP-EP-ChP"` → `"imi fabi talc 140"`, which now contains `talc` as a whole token.
+- **Grade-number tolerance.** A trailing bare numeric token (`140`, `200`, `711`) is a grade identifier, not part of the material name. It must not block containment when the other side omits it.
+- **Stated-grade match (the CEOLUS fix, generalised).** If the composition ingredient's own parenthetical/bracketed text matches a candidate annexure's own `material_name` / `material_name_candidates` by exact fragment or canonical-core containment, that candidate wins at Stage-1 confidence. No brand dictionary required — it compares what the composition says against what the annexure says.
+- **Letter–digit boundary normalisation.** Insert a token boundary at every letter→digit and digit→letter transition before tokenising, so `UF711` and `UF-711` both normalise to `{uf, 711}`. Apply identically to both sides. Verify this does NOT collapse genuinely distinct grades (`aerosil 200` vs `aerosil 200 vv` must stay separate).
+
+**C2 — identity page and data page are different pages.** Page 1 names the material; page 4 holds the table. The metadata call reads page 1 only, and page 1 here is a compliance-letter title, not an EI document. This is the **same shape as the Propyl Gallate fix already shipped** (identity on the last page, data on the first) — but in the opposite direction, and the existing fallback only triggers when the page-1 name is missing/generic/boilerplate. Here page 1 DOES yield a plausible name, so the fallback never fires, and the name it yields is brand-qualified in a way C1 must then rescue.
+
+**Fix — extend, do not replace, the existing `_page_identity_fallback`:**
+- Collect candidate material identities from **every** page, not only page 1 and not only when page 1 failed. Keep page 1's name as primary, but add every other page's stated identity to `material_name_candidates`. The page-4 header *"Mineral / Talc 140 USP-EP-ChP"* then becomes a matchable candidate alongside page 1's *"IMI Fabi Talc 140 USP-EP-ChP"*.
+- Do not require the identity-bearing page to contain element rows, and do not require the data-bearing page to restate the identity.
+- **Preserve current behaviour exactly** when page 1 already yields a good name AND matching already succeeds — this must be purely additive candidate enrichment.
+
+**C3 — make multi-topic documents generally safe.** This annexure covers REACH, SVHC, ISO-16128, Halal, CITES, nanomaterials, CMR, INCI, shelf-life, **elemental impurities**, **residual solvents**, Prop-65, COSMOS, VOC, microplastics, nitrosamines, azoxyalkyl, allergens. Future vendor letters will look like this. Ensure the EI extractor anchors on the *"ELEMENTAL IMPURITIES"* section heading rather than assuming a single-topic document, and that the RS extractor anchors on *"RESIDUAL SOLVENT"* — neither should be confused by the many other numeric tables (CAS numbers, EC numbers, EINECS refs, allergen lists) present in the same file.
+
+**Before coding C1/C2, request the Diazoxide run's log** — specifically the `Identity validation for 'Talc'` warning and the POST-CLUSTER dump. That will confirm whether it is failing at identity resolution (C1) or at extraction/metadata (C2), because the two fixes are independent and you should know which is actually firing.
+
+---
+
+## PART D — remove the fishbone diagram from EI and RS
+
+Users report a fishbone/Ishikawa diagram still appearing intermittently in EI and RS outputs. It is not wanted in either document type. Locate its generation (check the EI/RS renderers and their templates — `generate_*.js` and any diagram helper) and remove it for these two workflows. If the same helper serves another document type that legitimately uses it, gate by workflow rather than deleting the helper. Confirm by generating both an EI and an RS document and checking no such figure appears.
+
+---
+
+## WHAT MUST NOT CHANGE (verify each after your work)
+
+- `_layout_at` / `_locate_layout` / `_fill_merged` — confirmed correct. Columns map as `(strength, field)` pairs off the Strength-N band, so Qty + MDD under one band is **one strength with two fields, never two strengths**. Blank, duplicated and differently-filled MDD columns all already parse.
+- `_display()` / `_field_columns()` — Table 2 already prints every filled column verbatim. Keep that.
+- `docgen_dose.py` — the dose contract, unit coercion, and `select_strength_column` are correct. `mdd_as_mg_exact` is exact-Decimal. Do not touch.
+- The Injectable Qty/mL-first branch in `select_basis`.
+- `classify_rs_excel`'s detailed/combined detection.
+- All previously-landed fixes: Propyl Gallate last-page identity, CEOLUS stated-grade match, Fujicalin scope merge, the per-page token-limit raise, RS vendor-column (content vs regulatory), Croscarmellose 100 ppm, phantom Class-1 exclusion, Toluene alias, `<QL` extraction.
+
+## REGRESSION SUITE (all must pass before you call this done)
+
+1. **OSD template, MDD filled** → DP 412 mg, multiplier 1, mode `component_mdd_only`.
+2. **OSD template, MDD deleted** → same 412, no `mdd_over_api_qty` derivation.
+3. **OSD template, row 5 = `100 mg | 50 mg | 25 mg`** → Table 2 headers read `(100 mg)` etc., header block reads `Strength: 100 mg`.
+4. **OSD template, row 5 = shipped `Strength-1/2/3`** → still parses, ordinal labels used.
+5. **Original non-template Sitagliptin workbook** (flat `100 mg | 50 mg | 25 mg` header) → unchanged, 412.
+6. **Injectable template, Qty/mL filled, MDD blank** → runs on Qty/mL, unchanged.
+7. **Injectable template, Qty/mL filled, MDD filled and consistent** → unchanged.
+8. **Injectable template, Qty/mL filled, MDD filled and inconsistent** → sheet's MDD used, no failure.
+9. **Trilaciclib RS** → 9 solvents, multiplier 1.44, unchanged.
+10. **DEG/EG two-sheet template** → data sheet parsed, Instructions ignored. **Single-sheet workbook** → unchanged.
+11. **Diazoxide EI with the Talc annexure** → Talc matches; As 0.1, Cd <0.01, Hg <0.005, Pb <0.5, Co <0.5, Ni <1.0, V 5.0 reach the table.
+12. **Every previously-correct EI and RS document** → byte-identical output. If anything moves, you have over-reached; narrow the fix.
+13. **EI and RS generated fresh** → no fishbone diagram.
+
+## ON DELIVERY
+
+Report per item: what you changed, which function, why it cannot affect the shapes listed under "must not change", and the regression results. If any item turns out to need a broader change than described here, **stop and explain before writing it** — an honest "this needs more than the brief says, here's why" is worth far more than a fix that quietly moves something else.
+
+You have handled harder problems than this in the last few rounds, and the diagnoses above are solid because your earlier work made them findable. Land these with the same care and we are done.
